@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>JARVIS Console</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/doto.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/urbanist.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="porcelain.css">
+<script src="theme.js"></script>
+</head>
+<body>
+<canvas id="terrain" aria-hidden="true"></canvas>
+<div class="veil" aria-hidden="true"></div>
+
+<div class="shell">
+  <aside class="sidebar glass" aria-label="JARVIS">
+    <a class="brand" href="#console" aria-label="JARVIS console home">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg>
+      <span class="wordmark">JARVIS</span>
+    </a>
+    <nav class="rail" aria-label="Views">
+      <span class="rail-pill" aria-hidden="true"></span>
+      <a href="#console" data-view="console" title="Console (1)"><svg class="i"><use href="icons.svg?v=2#i-layout-grid"/></svg><span>Console</span></a>
+      <a href="#graph" data-view="graph" title="Knowledge graph (2)"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Graph</span></a>
+      <a href="#system" data-view="system" title="System design (3)"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
+      <a href="#credits" data-view="credits" title="Credits (4)"><svg class="i"><use href="icons.svg?v=2#i-gauge"/></svg><span>Credits</span></a>
+      <a href="#memory" data-view="memory" title="Memory (5)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
+      <a href="#tasks" data-view="tasks" title="Tasks and plans (6)"><svg class="i"><use href="icons.svg?v=2#i-list-checks"/></svg><span>Tasks</span></a>
+      <a href="#files" data-view="files" title="Files across both laptops (8)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
+      <a href="#devices" data-view="devices" title="Devices (7)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
+    </nav>
+    <div class="profile">
+      <span class="avatar" aria-hidden="true">D</span>
+      <span class="profile-name">David</span>
+      <span class="profile-sub" id="profile-sub">Dell · Alt+1 overlay</span>
+    </div>
+  </aside>
+
+  <header class="topbar">
+    <div class="title-block">
+      <h1 class="page-h" id="page-title">Console</h1>
+      <div class="title-sub">
+        <span class="date-chip"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-calendar"/></svg><span id="clock-date"></span></span>
+        <div class="tabs range" role="radiogroup" aria-label="Timeline range">
+          <span class="tabs-pill" aria-hidden="true"></span>
+          <button type="button" role="radio" data-range="day" aria-checked="true">Day</button>
+          <button type="button" role="radio" data-range="week" aria-checked="false">Week</button>
+        </div>
+      </div>
+    </div>
+    <nav class="crumbs sr" aria-label="Location"><span id="crumb-view">Console</span></nav>
+    <div class="case-switch" id="case-switch">
+      <label class="sr" for="case-select">Investigation</label>
+      <svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-folder-search"/></svg>
+      <select id="case-select" title="Investigation: new notes, asks and plans are filed into it, and Memory and Graph can scope to it">
+        <option value="">No investigation</option>
+      </select>
+      <a class="icon-btn sm" id="case-export" href="#" title="Export this investigation as Markdown" aria-label="Export investigation" hidden><svg class="i i-sm"><use href="icons.svg?v=2#i-download"/></svg></a>
+    </div>
+    <div class="topbar-status" id="top-status"></div>
+    <div class="hdr-pill time-pill" id="time-pill" title="Local time and weather">
+      <svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-clock"/></svg><span id="clock-time">--:--</span><span id="clock-sec" class="sr">--</span>
+      <span class="sep" aria-hidden="true"></span>
+      <span id="wx-pill"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-sun"/></svg><span>—</span></span>
+    </div>
+    <form class="hdr-pill search-pill" id="hero-search" role="search">
+      <button class="round-btn dark" type="submit" aria-label="Search memory"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-search"/></svg></button>
+      <label><span class="sr">Search memory</span><input id="hero-q" type="search" placeholder="Search memory…" autocomplete="off"></label>
+    </form>
+    <div class="topbar-right">
+      <span class="chip" id="live-chip" role="status"><span class="dot" aria-hidden="true"></span><span class="chip-label">Connecting</span></span>
+      <button class="chip" id="hands-free" type="button" title="Always-on listener: say “Jarvis, …”">
+        <span class="dot" aria-hidden="true"></span><span class="chip-label">Listener</span>
+      </button>
+      <time class="top-clock sr" id="top-clock"></time>
+      <button class="round-btn" id="hero-refresh" type="button" aria-label="Recheck credits and machines" title="Recheck credits and machines"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg></button>
+      <button class="icon-btn" id="theme-toggle" type="button" aria-label="Switch light or dark">
+        <svg class="i"><use href="icons.svg?v=2#i-contrast"/></svg>
+      </button>
+    </div>
+  </header>
+
+
+  <main class="stage" id="stage">
+    <!-- CONSOLE -->
+    <section class="view" id="view-console" data-title="Console">
+      <span id="clock-tz" class="sr"></span>
+      <dl class="sr" id="clock-facts"></dl>
+      <div class="signals" aria-label="Signals">
+        <article class="tile" id="sig-agent">
+          <header class="tile-h"><span class="t-idx">01</span><h2>Agent</h2><span class="t-flag" id="sig-agent-flag"></span></header>
+          <p class="dot-word" id="sig-state" aria-live="polite">Idle</p>
+          <canvas class="dm dm-face" id="dm-face" aria-hidden="true"></canvas>
+          <canvas class="dm dm-wave" id="dm-wave" aria-hidden="true"></canvas>
+          <dl class="t-stats" id="sig-agent-stats"></dl>
+        </article>
+        <article class="tile" id="sig-tokens">
+          <header class="tile-h"><span class="t-idx">02</span><h2>Claude</h2><span class="t-flag">24 h</span></header>
+          <p class="dot-num" id="sig-tok">—</p>
+          <p class="t-unit">output tokens</p>
+          <canvas class="dm dm-bars" id="dm-bars" role="img" aria-label="Claude output per hour, last 24 hours"></canvas>
+          <div class="t-foot"><dl class="t-stats" id="sig-tok-stats"></dl><span class="t-chip-delta" id="sig-tok-delta"></span></div>
+        </article>
+        <article class="tile" id="sig-limit">
+          <header class="tile-h"><span class="t-idx">03</span><h2>Codex window</h2><span class="t-flag" id="sig-limit-flag"></span></header>
+          <div class="ring-wrap">
+            <div class="ring-box"><canvas class="dm dm-ring" id="dm-ring" aria-hidden="true"></canvas>
+              <div class="ring-mid"><b class="dot-num sm" id="sig-ring">—</b><span>left, 5 h</span></div></div>
+            <ul class="ring-legend" id="sig-ring-legend"></ul>
+          </div>
+        </article>
+        <article class="tile" id="sig-link">
+          <header class="tile-h"><span class="t-idx">04</span><h2>Zenbook link</h2><span class="t-flag" id="sig-link-flag"></span></header>
+          <canvas class="dm dm-trace" id="dm-trace" role="img" aria-label="Zenbook ping, checked every minute"></canvas>
+          <dl class="t-stats three" id="sig-link-stats"></dl>
+          <span class="t-pill" id="sig-link-pill">Checking</span>
+        </article>
+      </div>
+
+      <div class="bento">
+        <article class="card timeline-card" id="w-timeline">
+          <header class="ph"><h2>Runs</h2><span class="ph-meta" id="timeline-meta"></span>
+            <a class="round-btn sm" href="#tasks" aria-label="Open tasks"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
+          <div class="timeline" id="timeline"><div class="skeleton" style="height:210px"></div></div>
+        </article>
+
+        <article class="card trend-card" id="w-usage">
+          <header class="ph"><h2>Claude usage</h2>
+            <a class="round-btn sm" href="#credits" aria-label="Open credits"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
+          <div id="usage-body"><div class="skeleton" style="height:230px"></div></div>
+        </article>
+
+        <aside class="card ink assistant col-thread" aria-label="Assistant">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-audio-lines"/></svg></span><h2>Assistant</h2>
+            <button class="ph-action" id="thread-clear" type="button">Clear</button></header>
+          <ol class="thread" id="thread" role="log" aria-label="Conversation"></ol>
+          <div class="listener-log" id="listener-log"></div>
+          <div class="dock-home" id="dock-home"></div>
+        </aside>
+
+        <article class="card files-card" id="w-recent">
+          <header class="ph"><span class="ph-icon dark" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-database"/></svg></span><h2>Recent memory</h2>
+            <a class="round-btn sm" href="#memory" aria-label="Open memory"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-layout-grid"/></svg></a></header>
+          <ol class="pill-list" id="recent-list"><li class="skeleton" style="height:44px"></li></ol>
+        </article>
+
+        <article class="card limits-card" id="w-limits">
+          <header class="ph limits-head"><h2>Limits</h2><span class="count-pill" id="limits-count">3</span>
+            <div class="stats" id="limit-stats"></div></header>
+          <div class="silk" id="silk">
+            <div class="silk-tiles" id="silk-tiles"></div>
+            <div class="silk-bars" id="silk-bars" aria-label="Claude output per hour, last 12 hours"></div>
+          </div>
+        </article>
+      </div>
+
+      <div class="wallet-row">
+        <article class="card wallet" id="w-balance">
+          <header class="wallet-h"><span class="mono-avatar" aria-hidden="true">D</span>
+            <div><b>DeepSeek</b><span>API balance, live</span></div>
+            <a class="round-btn sm" href="#credits" aria-label="All providers"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-gauge"/></svg></a></header>
+          <p class="wallet-big" id="bal-num">—</p>
+          <p class="wallet-sub" id="bal-sub">Checking the provider…</p>
+          <div class="wallet-actions">
+            <button class="pill-act" type="button" id="bal-check"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg> Check now</button>
+            <a class="pill-act" href="#credits"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-keyboard"/></svg> Balances</a>
+          </div>
+        </article>
+        <article class="card activity" id="w-activity">
+          <div class="u-tabs" role="tablist" aria-label="Activity">
+            <button role="tab" type="button" data-act-tab="requests" aria-selected="true">Requests</button>
+            <button role="tab" type="button" data-act-tab="providers" aria-selected="false" tabindex="-1">Providers</button>
+            <button role="tab" type="button" data-act-tab="memory" aria-selected="false" tabindex="-1">Memory</button>
+          </div>
+          <table class="book" id="act-table"><tbody><tr><td class="muted">Loading…</td></tr></tbody></table>
+        </article>
+      </div>
+
+      <div class="more-grid">
+        <article class="card" id="w-weather">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-cloud"/></svg></span><h2>Weather</h2>
+            <button class="ph-action" id="weather-place" type="button" title="Change location"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-map-pin"/></svg><span id="weather-place-name">Set location</span></button>
+          </header>
+          <div id="weather-body" class="weather-body"><div class="skeleton" style="height:220px"></div></div>
+          <form class="place-form" id="place-form" hidden>
+            <label class="sr" for="place-input">City</label>
+            <input id="place-input" class="field" type="search" placeholder="City, e.g. Toronto" autocomplete="off">
+            <ul class="place-results" id="place-results"></ul>
+            <button type="button" class="link-btn" id="place-geo"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-map-pin"/></svg>Use this laptop’s location</button>
+          </form>
+        </article>
+
+        <article class="card">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-laptop-minimal"/></svg></span><h2>Machines and links</h2>
+            <span class="ph-meta" id="probe-checked">checking…</span>
+            <button class="ph-action" id="probe-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check now</button>
+            <a class="round-btn sm" href="#devices" aria-label="Open devices"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
+          <div class="link-status" id="link-status"><div class="skeleton" style="height:44px"></div></div>
+          <div class="machines" id="machines"></div>
+        </article>
+
+        <article class="card">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-gauge"/></svg></span><h2>Credits</h2>
+            <span class="legend" id="credits-mini-legend"></span><span class="ph-meta" id="credits-checked"></span>
+            <a class="round-btn sm" href="#credits" aria-label="All providers"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a>
+          </header>
+          <div class="credit-rows" id="credit-rows"><div class="skeleton" style="height:180px"></div></div>
+        </article>
+
+        <article class="card">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-waypoints"/></svg></span><h2>Memory graph</h2>
+            <a class="round-btn sm" href="#graph" aria-label="Open graph"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
+          <canvas class="mini-graph" id="mini-graph" role="img" aria-label="Memory graph preview"></canvas>
+          <dl class="facts" id="heap-facts"></dl>
+          <div class="router-mini"><span id="router-meta" class="ph-meta"></span><div id="router-body"></div></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- GRAPH -->
+    <section class="view view-full" id="view-graph" data-title="Knowledge graph" hidden>
+      <div class="graph-wrap panel">
+        <canvas id="graph-canvas" tabindex="0" role="img" aria-label="Knowledge graph. Type in Find a node and press Enter to inspect one. On the canvas: arrow keys pan, plus and minus zoom, drag to pan, click a node to inspect."></canvas>
+        <ul class="graph-matches glass-strong" id="graph-matches" aria-label="Matching nodes" hidden></ul>
+        <div class="graph-toolbar glass-strong">
+          <div class="seg" role="group" aria-label="Graph layer">
+            <button type="button" data-layer="heap" aria-pressed="true">Memory</button>
+            <button type="button" data-layer="case" aria-pressed="false" id="layer-case" disabled title="Pick an investigation in the header first">Investigation</button>
+            <button type="button" data-layer="system" aria-pressed="false">Code</button>
+            <button type="button" data-layer="all" aria-pressed="false">Both</button>
+          </div>
+          <label class="search-field"><svg class="i i-sm"><use href="icons.svg?v=2#i-search"/></svg>
+            <input id="graph-filter" type="search" placeholder="Find a node" aria-label="Find a node"></label>
+          <button class="icon-btn" id="graph-reset" type="button" aria-label="Re-run layout"><svg class="i"><use href="icons.svg?v=2#i-refresh-cw"/></svg></button>
+        </div>
+        <div class="graph-legend glass-strong mono" id="graph-legend"></div>
+        <aside class="inspector glass-strong" id="inspector" hidden></aside>
+      </div>
+    </section>
+
+    <!-- SYSTEM -->
+    <section class="view" id="view-system" data-title="System design" hidden>
+      <div class="system-grid">
+        <article class="panel ticks system-diagram">
+          <header class="ph"><svg class="i i-sm"><use href="icons.svg?v=2#i-blocks"/></svg><h2>How the code fits together</h2><span class="ph-meta mono">from real imports in jarvis/*.py</span></header>
+          <div class="diagram-scroll"><svg id="system-svg" aria-label="System design diagram. Arrow keys move between parts."></svg></div>
+          <div class="module-detail mono" id="module-detail" aria-live="polite">Hover or focus a part to see what it does and what it connects to.</div>
+        </article>
+        <article class="panel ticks">
+          <header class="ph"><svg class="i i-sm"><use href="icons.svg?v=2#i-terminal"/></svg><h2>Project layout</h2><span class="ph-meta mono" id="tree-meta"></span></header>
+          <div class="tree mono" id="tree"></div>
+        </article>
+      </div>
+    </section>
+
+    <!-- CREDITS -->
+    <section class="view" id="view-credits" data-title="Credits" hidden>
+      <article class="panel ticks">
+        <header class="ph"><svg class="i i-sm"><use href="icons.svg?v=2#i-gauge"/></svg><h2>Every provider</h2>
+          <span class="ph-meta mono" id="credits-legend"></span>
+          <button class="ph-action" id="credits-refresh" type="button"><svg class="i i-sm"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check now</button></header>
+        <div class="credit-table" id="credit-table"></div>
+      </article>
+    </section>
+
+    <!-- MEMORY -->
+    <section class="view" id="view-memory" data-title="Memory" hidden>
+      <div class="memory-grid">
+        <article class="panel ticks">
+          <header class="ph"><svg class="i i-sm"><use href="icons.svg?v=2#i-database"/></svg><h2>Search memory</h2><span class="ph-meta mono" id="memory-meta"></span></header>
+          <form class="mem-search" id="mem-search">
+            <label class="search-field wide"><svg class="i i-sm"><use href="icons.svg?v=2#i-search"/></svg>
+              <input id="mem-q" type="search" placeholder="Anything JARVIS has seen, said or done" aria-label="Search memory"></label>
+            <div class="filters">
+              <select id="mem-kind" class="field" aria-label="Kind"><option value="">All kinds</option></select>
+              <input id="mem-tag" class="field" placeholder="Tag" aria-label="Tag filter" list="tag-list">
+              <datalist id="tag-list"></datalist>
+              <select id="mem-since" class="field" aria-label="Since">
+                <option value="">Any time</option><option value="1">Today</option><option value="7">Past week</option><option value="30">Past month</option>
+              </select>
+              <select id="mem-imp" class="field" aria-label="Minimum importance">
+                <option value="0">Any importance</option><option value="0.6">Medium and up</option><option value="0.85">High only</option>
+              </select>
+              <label class="check" title="Only items in the selected investigation"><input type="checkbox" id="mem-in-case"> In investigation</label>
+            </div>
+          </form>
+          <ol class="mem-list" id="mem-list"></ol>
+        </article>
+        <article class="panel ticks">
+          <header class="ph"><svg class="i i-sm"><use href="icons.svg?v=2#i-circle-dot"/></svg><h2 id="mem-detail-title">Item</h2></header>
+          <div id="mem-detail" class="mem-detail"><p class="muted">Pick an item to read it and follow its links.</p></div>
+          <form class="mem-add" id="mem-add">
+            <label for="mem-note" id="mem-add-label">Capture a finding</label>
+            <div class="row">
+              <select id="mem-new-kind" class="field" aria-label="Kind">
+                <option value="finding">Finding</option><option value="note">Note</option><option value="url">Link</option><option value="output">Command output</option><option value="decision">Decision</option>
+              </select>
+              <input id="mem-title" class="field" placeholder="Title (optional)" aria-label="Title">
+            </div>
+            <textarea id="mem-note" class="field" rows="4" placeholder="What you found. Paste command output, a quote, an address…"></textarea>
+            <div class="row">
+              <input id="mem-url" class="field" type="url" placeholder="Source URL (optional)" aria-label="Source URL">
+              <select id="mem-new-imp" class="field" aria-label="Importance">
+                <option value="0.3">Low</option><option value="0.6" selected>Medium</option><option value="0.9">High</option>
+              </select>
+            </div>
+            <div class="row"><input id="mem-tags" class="field" placeholder="Tags, comma separated" aria-label="Tags">
+              <button class="btn" type="submit">Save</button></div>
+          </form>
+        </article>
+      </div>
+    </section>
+
+    <!-- TASKS -->
+    <section class="view" id="view-tasks" data-title="Tasks and plans" hidden>
+      <div class="board-head">
+        <div class="tabs" role="tablist" aria-label="Tasks">
+          <span class="tabs-pill" aria-hidden="true"></span>
+          <button role="tab" type="button" id="tab-todos" data-pane="todos" aria-selected="true" aria-controls="todo-pane">To-dos <span class="tab-count" id="todo-count"></span></button>
+          <button role="tab" type="button" id="tab-runs" data-pane="runs" aria-selected="false" aria-controls="runs-pane" tabindex="-1">Agent runs</button>
+        </div>
+        <div class="board-tools">
+          <label class="pill-field"><span class="sr">Filter</span>
+            <input id="board-q" type="search" placeholder="Filter to-dos" autocomplete="off">
+            <svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-search"/></svg></label>
+          <span class="ph-meta" id="tasks-meta"></span>
+        </div>
+      </div>
+
+      <div id="todo-pane" role="tabpanel" aria-labelledby="tab-todos">
+        <form class="quick-add card" id="quick-add" autocomplete="off">
+          <span class="qa-ic" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-plus"/></svg></span>
+          <label class="qa-text"><span class="sr">New to-do</span>
+            <input id="qa-text" placeholder="Add a to-do. It goes to the Inbox in tasks.md" maxlength="300" required></label>
+          <label class="qa-field" title="Due date (optional)"><span class="sr">Due date</span><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-calendar"/></svg><input id="qa-due" type="date"></label>
+          <label class="qa-field"><span class="sr">Priority</span><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-flag"/></svg>
+            <select id="qa-prio"><option value="">No priority</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
+          <button class="btn" type="submit" id="qa-add">Add</button>
+        </form>
+        <div class="study-plans" id="study-plans" aria-label="Study plans and checklists"></div>
+        <div class="board todo-board" id="todo-board" aria-label="To-dos by when they matter"><div class="skeleton" style="height:320px"></div></div>
+      </div>
+
+      <div id="runs-pane" role="tabpanel" aria-labelledby="tab-runs" hidden>
+        <p class="pane-note">Runs JARVIS made with Claude and Codex, and specialist plans you can run. Your to-dos are in the other tab.</p>
+        <div class="board" id="task-board" aria-label="Agent runs by state"></div>
+      </div>
+      <ol class="task-list" id="task-list" hidden></ol>
+      <ol class="task-list" id="plan-list" hidden></ol>
+      <aside class="drawer panel" id="task-drawer" aria-labelledby="task-detail-title" hidden>
+        <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-activity"/></svg></span><h2 id="task-detail-title">Details</h2>
+          <button class="round-btn sm" id="drawer-close" type="button" aria-label="Close details"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-x"/></svg></button></header>
+        <div id="task-detail" class="mem-detail"></div>
+      </aside>
+    </section>
+
+    <!-- DEVICES -->
+    <section class="view" id="view-files" data-title="Files" hidden>
+      <div class="files-wrap" id="files-wrap"></div>
+    </section>
+    <section class="view" id="view-devices" data-title="Devices" hidden>
+      <div class="devices-grid" id="devices-grid"></div>
+    </section>
+  </main>
+
+  <!-- COMMAND DOCK -->
+  <form class="dock glass-strong" id="dock" autocomplete="off">
+    <div class="trace mono" id="trace"></div>
+    <div class="dock-row">
+      <button class="mic" id="mic" type="button" aria-label="Talk to JARVIS" title="Talk: click, or hold Space when nothing is focused" aria-pressed="false">
+        <svg class="i"><use href="icons.svg?v=2#i-mic"/></svg>
+        <canvas class="mic-wave" id="mic-wave" aria-hidden="true"></canvas>
+      </button>
+      <label class="sr" for="prompt">Ask JARVIS</label>
+      <textarea id="prompt" rows="1" placeholder="Ask JARVIS, or hold Space to talk" enterkeyhint="send"></textarea>
+      <div class="dock-tools">
+        <div class="seg seg-sm" role="radiogroup" aria-label="How JARVIS should handle it">
+          <button type="button" role="radio" data-tier="" aria-checked="true" tabindex="0" title="Let the router pick from your words">Auto</button>
+          <button type="button" role="radio" data-tier="simple" aria-checked="false" tabindex="-1" title="Quick: one cheap model run">Quick</button>
+          <button type="button" role="radio" data-tier="medium" aria-checked="false" tabindex="-1" title="Tools: your own APIs, browser agents, or web lookup">Tools</button>
+          <button type="button" role="radio" data-tier="complex" aria-checked="false" tabindex="-1" title="Plan: specialists draft a step-by-step plan you review and run">Plan</button>
+        </div>
+        <select class="field tier-select" id="tier-select" aria-label="How JARVIS should handle it">
+          <option value="">Auto</option><option value="simple">Quick</option><option value="medium">Tools</option><option value="complex">Plan</option>
+        </select>
+        <button type="button" class="icon-btn" id="speak-toggle" aria-pressed="false" aria-label="Read replies aloud" title="Read replies aloud on this laptop">
+          <svg class="i"><use href="icons.svg?v=2#i-volume-x"/></svg>
+        </button>
+        <button class="send" type="submit" id="send" aria-label="Send"><svg class="i"><use href="icons.svg?v=2#i-arrow-up"/></svg></button>
+      </div>
+    </div>
+  </form>
+</div>
+
+<div class="toast" id="toast" role="status" hidden></div>
+<div class="sr" id="announce" role="status" aria-live="polite"></div>
+
+<script src="terrain.js"></script>
+<script src="graph.js"></script>
+<script src="voice.js"></script>
+<script src="app.js"></script>
+<script src="dashboard.js"></script>
+<script src="signals.js"></script>
+<script src="files.js"></script>
+</body>
+</html>
