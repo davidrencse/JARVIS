@@ -1,0 +1,34 @@
+{
+  "downloaded_at": "2026-10-21",
+  "registration": "local-reference-only",
+  "skills": [
+    {
+      "skill": "system-design",
+      "repository": "wondelai/skills",
+      "commit": "c172996495bed0fcd26896a9416b2093fd7073f0",
+      "source_path": "system-design",
+      "files_sha256": {
+        "LICENSE": "87c3c90f9e673a76b8ca81049b8fe30996b910a7a80140c3ed57a2ee922d2579",
+        "references/building-blocks.md": "3cd43ba2763d1cdeb11c689b2a210f9d929d97fe215660ad283061c4d843c130",
+        "references/common-designs.md": "a6a8ce0d4f7a8e5e511f7f8e70c6f53104357437df1442f4b27ade5aefac14e1",
+        "references/database-scaling.md": "ebbfc992ba16746c7abd558f77533ceb82fa28292fef99269eb3f4f94d72809f",
+        "references/estimation-numbers.md": "ac8b16c67e6d52082a44ebc6ea64e0bce84769619a223f1c59cd967ad2c4ebe4",
+        "references/four-step-process.md": "9674d371459a4ab47306c0ccc96fc1e1d16743a31bfce0c17b9bb7a4180e0ec3",
+        "references/reliability-operations.md": "157e6b215d72e5e487f326f98ba6742cc447507fad59d99b10a829d01f9c837f",
+        "SKILL.md": "57548bbec281e73fed47ed8f2e16394ece68129342d04047f44c8c5b9ef64c38"
+      }
+    },
+    {
+      "skill": "architecture-patterns",
+      "repository": "wshobson/agents",
+      "commit": "0874a27b17a22e2b7c2e2bcd725768e0803cad06",
+      "source_path": "plugins/backend-development/skills/architecture-patterns",
+      "files_sha256": {
+        "LICENSE": "f89abb55d9f073f38f1703e4518f0613c788c6174be7f13b8dfe48a1c076c746",
+        "references/advanced-patterns.md": "e1cb31c83b532e579991de277836a1ea5e3d88b2ca30fc8ac16f6047ceca439e",
+        "references/details.md": "a53411600b253b343247db9d86140f3136ee7bd26a67aa8411962bcc1f5ff981",
+        "SKILL.md": "350caf22b856b7d2908a10a69a8cc13e743c757ba9838716051b4e29fc1d7595"
+      }
+    }
+  ]
+}
