@@ -95,6 +95,7 @@ class ChatGPTLane:
         self.tool_log = []  # (tool, success, text) of the current turn
         self.proc = self.lines = self.thread = None
         self._reader = None
+        self.mcp_status = {}
         self.turns, self.next_id, self.started = 0, 0, 0.0
         self.lock = threading.Lock()
 
@@ -128,8 +129,11 @@ class ChatGPTLane:
             lines.put(None)
 
     def _send(self, message):
-        self.proc.stdin.write(json.dumps(message) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps(message) + "\n")
+            self.proc.stdin.flush()
+        except OSError as exc:  # the app-server died; ask() retries or falls back on this
+            raise RuntimeError(f"ChatGPT lane process is gone: {exc}") from None
 
     def _next(self, deadline):
         remaining = deadline - time.monotonic()

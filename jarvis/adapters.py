@@ -32,6 +32,7 @@ def call_api(adapter, query, context=()):
         with urllib.request.urlopen(request, timeout=int(adapter.get("timeout", 120))) as resp:
             data = json.loads(resp.read(5_000_000))
     except urllib.error.HTTPError as exc:
+        exc.close()  # the error object holds the response; drop its socket now
         raise RuntimeError(f"Adapter {adapter.get('name')} returned HTTP {exc.code}.") from None
     if not isinstance(data, dict) or not isinstance(data.get("answer"), str):
         raise RuntimeError(f"Adapter {adapter.get('name')} must return JSON with an 'answer'.")

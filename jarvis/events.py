@@ -23,7 +23,7 @@ from pathlib import Path
 
 FEED = "events.jsonl"
 MAX_FEED = 1_000_000  # bytes before the feed rolls over to events.1.jsonl
-RELAYED = ("turn.", "voice.")  # kinds other processes may put on the feed
+RELAYED = ("turn.", "voice.", "kb.")  # kinds other processes may put on the feed
 
 
 class Bus:
@@ -173,7 +173,10 @@ class Watcher:
             for name in names:
                 if name.endswith(".md"):
                     count += 1
-                    newest = max(newest, os.stat(os.path.join(folder, name)).st_mtime)
+                    try:
+                        newest = max(newest, os.stat(os.path.join(folder, name)).st_mtime)
+                    except OSError:  # saved or deleted while we were walking
+                        continue
         return count, newest
 
     def _poll_vault(self):

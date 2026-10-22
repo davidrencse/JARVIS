@@ -9,7 +9,6 @@ import subprocess
 from pathlib import Path
 
 POSITIONS = ("left", "right", "top", "bottom")
-OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 
 # Runs on the remote host; reads the CERTIFICATE block only and prints its fingerprint.
 REMOTE_FINGERPRINT = r"""

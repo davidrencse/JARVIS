@@ -47,7 +47,7 @@ def _when(day, today):
 
 
 def _event(text):
-    """'14:00–15:50 OS — Room 101 Main Hall' → 'at 2 PM, OS'."""
+    """'14:00–15:50 OS — Room 101 Main Hall' → 'OS at 2 PM'."""
     match = re.match(r"^(\d{1,2}:\d{2})(?:\s*[–-]\s*\d{1,2}:\d{2})?\s+(.*)$", text)
     if match:
         return f"{match.group(2).split(' — ')[0].strip()} at {_clock(match.group(1))}"
@@ -129,7 +129,7 @@ def answer(text, vault, tasks, now=None):
             line = " ".join(p for p in (line, tasks_line(tasks, today)) if p)
         return line
     if (match := DUE.match(text)):
-        if match.group(1) and match.group(1).lower() == "overdue" or re.search(r"behind|late|overdue", text, re.I):
+        if (match.group(1) and match.group(1).lower() == "overdue") or re.search(r"behind|late|overdue", text, re.I):
             overdue = tasks.agenda(today)["overdue"]
             if not overdue:
                 return "Nothing is overdue."

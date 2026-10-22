@@ -73,6 +73,7 @@ def _get_json(url, headers):
         with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
             return json.loads(response.read(2_000_000))
     except urllib.error.HTTPError as exc:
+        exc.close()  # the error object holds the response; drop its socket now
         raise RuntimeError(f"HTTP {exc.code} from {urllib.parse.urlparse(url).netloc}"
                            + (" — check the key" if exc.code in (401, 403) else "")) from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -111,6 +112,7 @@ def _subscription_json(url, headers):
             raise ValueError("Expected an object")
         return data
     except urllib.error.HTTPError as exc:
+        exc.close()
         raise UsageEndpointError(exc.code) from None
     except Exception:
         # Exception text and response bodies can contain credentials; never surface them.
@@ -145,6 +147,14 @@ def _window_label(minutes, fallback):
     if isinstance(minutes, (int, float)) and minutes > 0:
         return f"{minutes / 60:g}-hour window" if minutes % 60 == 0 else f"{minutes:g}-minute window"
     return fallback
+
+
+def owner_only(path):
+    """Keys live in this file; keep it readable only by its owner."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:  # a filesystem without POSIX modes (FAT, some network shares)
+        pass
 
 
 def _credential_path(provider):
@@ -364,7 +374,7 @@ class Credits:
 
     def _apply_manual(self, reading):
         entry = self.manual().get(reading["id"])
-        if not entry or reading["source"] == "live" and reading["status"] == "ok":
+        if not entry or (reading["source"] == "live" and reading["status"] == "ok"):
             return
         reading.update(source="manual", status="ok")
         reading["headline"] = {"value": entry["remaining"], "unit": entry["unit"],
@@ -424,7 +434,6 @@ class Credits:
             reading["note"] = "No Codex session logs with rate limits in ~/.codex/sessions."
             return
         reading.update(source="local", status="ok")
-        now = time.time()
         for key, label in (("primary", "5-hour window"), ("secondary", "Weekly window")):
             window = _object(limits.get(key))
             if window.get("used_percent") is not None:
@@ -657,6 +666,7 @@ def save_key(state_dir, provider, config=None, secret=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(".part")
     partial.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    owner_only(partial)  # set the mode before the name is live, never after
     partial.replace(path)
     out = {"saved": keys[0], "file": str(path), "key": f"…{key[-4:]}", "status": reading["status"]}
     if reading.get("headline"):

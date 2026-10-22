@@ -3,7 +3,8 @@
 `jarvis voice start` launches the listener hidden (no console window) with output in
 .jarvis/logs/voice.log. `stop` / `status` manage it via a PID file; an exclusive file
 lock guarantees two listeners never share the mic. `autostart on` adds a hidden
-launcher to the Windows Startup folder (same pattern as Lan Mouse).
+launcher to the Windows Startup folder (same pattern as Lan Mouse), or on Linux a
+systemd user unit that runs `voice start` at login.
 """
 
 import atexit
@@ -16,6 +17,7 @@ from pathlib import Path
 
 ACK = "On it."
 STARTUP_NAME = "JARVIS Voice.vbs"
+UNIT_NAME = "jarvis-voice.service"
 
 
 def log(message):
@@ -55,16 +57,20 @@ def listen_loop(state, config, base, threshold=None, require_wake=True):
 
     from .events import Turn, emit, feed_sender
     from .instant import answer as instant_answer
-    from .listen import Transcriber, VoicePrint, record_utterance
+    from .listen import Transcriber, VoicePrint, _np, record_utterance
     from .memory import Memory
     from .speech import SpeechQueue, Voice, spoken
-    from .store import Store
+    from .store import Store, lanes_from
 
-    store, memory, voice = Store(state), Memory(state), Voice(state, config)
+    store = Store(state, lanes_from(config))
+    memory, voice = Memory(state), Voice(state, config)
     speaker = SpeechQueue(voice)
     ears, stt = VoicePrint(state, config), Transcriber(config)
     lane = make_lane(config, base, state)
     pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ears")
+    if not ears.path.is_file():  # fail once, clearly, instead of on every utterance
+        log(f"error: {NOT_ENROLLED}")
+        raise SystemExit(2)
     with InstanceLock(state):
         foreground_priority()
         pid_file = Path(state) / "voice.pid"
@@ -72,8 +78,7 @@ def listen_loop(state, config, base, threshold=None, require_wake=True):
         # A stale pid file can name an unrelated process once Windows reuses the number.
         atexit.register(lambda: pid_file.unlink(missing_ok=True))
         # Warm up so the first real request isn't slow: load Whisper, cache the ack line.
-        import numpy as np
-        stt(np.zeros(16000, dtype="float32"))
+        stt(_np().zeros(16000, dtype="float32"))
         voice.synth(ACK)
         lane.warm()
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
@@ -106,7 +111,7 @@ def listen_loop(state, config, base, threshold=None, require_wake=True):
                 budget = [voice.limit]
                 turn = Turn(feed_sender(state), "voice", request)
 
-                def speak_sentence(sentence):
+                def speak_sentence(sentence, turn=turn, budget=budget):
                     # Queue streamed sentences as they land, up to the spoken-length cap.
                     turn.sentence(sentence)
                     if budget[0] > 0:
@@ -193,24 +198,33 @@ def status(state):
     tail = []
     if log_path.is_file():
         tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
-    return {"listening": _pid(state) is not None, "pid": _pid(state),
-            "autostart": _startup_file().is_file() if os.name == "nt" else None,
+    pid = _pid(state)
+    voice = Path(state).resolve() / "voice"
+    return {"listening": pid is not None, "pid": pid,
+            "enrolled": (voice / "voiceprint.json").is_file(),
+            "autostart": _startup_file().is_file(),
             "log": str(log_path), "recent": tail}
+
+
+NOT_ENROLLED = ("No voiceprint on this machine, so every voice would be rejected. "
+                "Run: jarvis voice enroll  (each laptop needs its own)")
 
 
 def start(state):
     if _pid(state):
         return {"started": False, **status(state)}
+    if not (Path(state).resolve() / "voice" / "voiceprint.json").is_file():
+        return {"started": False, "note": NOT_ENROLLED, **status(state)}
     logs = Path(state).resolve() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
-    out = open(logs / "voice.log", "a", encoding="utf-8")
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
              if os.name == "nt" else 0)
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
-    subprocess.Popen([sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()),
-                      "voice", "listen"], stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                     creationflags=flags, start_new_session=os.name != "nt", env=env,
-                     close_fds=True)
+    with open(logs / "voice.log", "a", encoding="utf-8") as out:
+        subprocess.Popen([sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()),
+                          "voice", "listen"], stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                         creationflags=flags, start_new_session=os.name != "nt", env=env,
+                         close_fds=True)
     for _ in range(60):  # model loading takes a few seconds
         time.sleep(0.5)
         if _pid(state):
@@ -231,13 +245,50 @@ def stop(state):
 
 
 def _startup_file():
+    if os.name != "nt":
+        config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        return config / "systemd" / "user" / UNIT_NAME
     return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
             / "Programs" / "Startup" / STARTUP_NAME)
 
 
+def _systemctl(*args):
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True,
+                              timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _systemd_autostart(state, enable):
+    """`voice start` detaches the listener, so the unit is a oneshot that stays active;
+    `voice stop` still works through the PID file."""
+    path = _startup_file()
+    if not enable:
+        _systemctl("disable", UNIT_NAME)
+        path.unlink(missing_ok=True)
+        _systemctl("daemon-reload")
+        return {"autostart": False}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = Path(state).resolve()
+    path.write_text(
+        "# JARVIS: start the voice listener at login. `jarvis voice autostart off` removes it.\n"
+        "[Unit]\nDescription=JARVIS voice listener\n"
+        "After=pipewire.service pipewire-pulse.service\n\n"
+        f"[Service]\nType=oneshot\nRemainAfterExit=yes\n"
+        f"WorkingDirectory={Path(__file__).resolve().parent.parent}\n"
+        # systemd's PATH lacks ~/.local/bin, where the claude CLI usually lives.
+        f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"\n'
+        f'ExecStart="{sys.executable}" -m jarvis --state "{state}" voice start\n'
+        f'ExecStop="{sys.executable}" -m jarvis --state "{state}" voice stop\n\n'
+        "[Install]\nWantedBy=default.target\n", encoding="utf-8")
+    enabled = _systemctl("daemon-reload") and _systemctl("enable", UNIT_NAME)
+    return {"autostart": True, "unit": str(path), "enabled": enabled}
+
+
 def autostart(state, enable):
     if os.name != "nt":
-        raise RuntimeError("Autostart is set up for Windows; on Arch use a systemd user unit.")
+        return _systemd_autostart(state, enable)
     path = _startup_file()
     if not enable:
         path.unlink(missing_ok=True)

@@ -3,8 +3,27 @@
 import json
 import re
 import shutil
+import socket
 import subprocess
 from pathlib import Path
+
+
+def devices_here(devices, hostname=None):
+    """The config is written from the Dell's side: Dell local, Zenbook over SSH. Seen from
+    the machine whose hostname matches a device, that device is local instead, and a
+    "local" device for another host has no route from here, so it is left out."""
+    hostname = (hostname or socket.gethostname()).lower()
+    if not any(d.get("hostname", "").lower() == hostname for d in devices.values()):
+        return devices
+    here = {}
+    for name, device in devices.items():
+        if device.get("hostname", "").lower() == hostname:
+            here[name] = {k: v for k, v in device.items() if k not in ("target", "identity_file",
+                                                                       "host_fingerprint")}
+            here[name]["transport"] = "local"
+        elif device.get("transport") != "local":
+            here[name] = device
+    return here
 
 
 def ssh_inventory(target, identity_file=None):

@@ -4,6 +4,7 @@ import re
 
 from .adapters import call_api
 from .instant import answer as instant_answer
+from .knowledge import recall as kb_recall
 from .orchestrator import Orchestrator
 from .router import classify, pick_adapter
 from .runner import run_task
@@ -47,8 +48,10 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
     text = text.strip()
     routing = config.get("routing", {})
     route = decide(text, config, tier, lane is not None, write)
-    # Vault notes first (what David knows and decided), then the heap (what was said).
-    recall = vault_recall(config, memory.path.parent, text) + memory.context(text)
+    # Vault notes first (what David knows and decided), then wiki claims with their
+    # sources and dates, then the heap (what was said).
+    recall = (vault_recall(config, memory.path.parent, text)
+              + kb_recall(config, memory.path.parent, text) + memory.context(text))
     inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
                          meta={"route": route, "channel": channel}, importance=0.4)
     if on_start:

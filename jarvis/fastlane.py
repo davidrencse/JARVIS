@@ -127,9 +127,12 @@ class FastLane:
             self._spawn()
         notes = "\n".join(f"- {r}" for r in recall) or "- (none)"
         message = f"{now_line()}\nMemory recall:\n{notes}\n\nDavid: {text}"
-        self.proc.stdin.write(json.dumps({"type": "user", "message": {
-            "role": "user", "content": message}}) + "\n")
-        self.proc.stdin.flush()
+        try:
+            self.proc.stdin.write(json.dumps({"type": "user", "message": {
+                "role": "user", "content": message}}) + "\n")
+            self.proc.stdin.flush()
+        except OSError as exc:  # the child died between the poll above and this write
+            raise RuntimeError(f"Fast lane process is gone: {exc}") from None
         self.turns += 1
         deadline = time.monotonic() + self.timeout
         pending, spoke = "", False

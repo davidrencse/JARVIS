@@ -9,11 +9,11 @@ from pathlib import Path
 
 from . import __version__
 from .desktop import lan_mouse_config, local_fingerprint, remote_fingerprint
-from .devices import ssh_inventory
+from .devices import devices_here, ssh_inventory
 from .inventory import collect
 from .prompts import build_prompt, prompt_engineer_prompt
 from .runner import make_plan, run_task, workspace
-from .store import Store
+from .store import Store, lanes_from
 from .voice import speak
 
 # Anchor config and state to the project so `jarvis` works from any folder.
@@ -119,6 +119,19 @@ def main():
     ov.add_argument("--opacity", type=float, help="0.3-1.0 (default 0.96)")
     ov.add_argument("--hidden", action="store_true", help="start hidden; the hotkey shows it")
     ov.add_argument("--autostart", choices=("on", "off"), help="start hidden at Windows login")
+    kb = sub.add_parser("kb", help="Knowledge engine: reader, librarian, checker (raw/ -> wiki/)")
+    kb.add_argument("action", choices=("ingest", "digest", "ask", "check", "status", "page",
+                                       "sources", "log", "schedule", "conflicts", "resolve",
+                                       "merge", "sync"))
+    kb.add_argument("value", nargs="*", help="ingest: files or URLs | ask: question | "
+                                             "page: slug | digest: source id | schedule: on|off | "
+                                             "resolve: CLAIM keep|drop|both | merge: FROM INTO")
+    kb.add_argument("--text", help="ingest: a typed note instead of a file")
+    kb.add_argument("--title", help="ingest: title for the source")
+    kb.add_argument("--no-file", action="store_true", help="ask: don't file the answer back")
+    kb.add_argument("--llm", choices=("none", "claude"), help="ask: let Claude phrase the answer")
+    kb.add_argument("--notify", action="store_true", help="check: desktop notification on flags")
+    kb.add_argument("--at", default="02:00", help="schedule: nightly time, HH:MM")
     vt = sub.add_parser("vault", help="Obsidian second brain: search, context, notes, health")
     vt.add_argument("action", choices=("status", "search", "read", "backlinks", "world",
                                        "recall", "health", "log", "capture", "append", "index",
@@ -148,13 +161,15 @@ def main():
         config_path = Path(args.config).resolve()
         base = config_path.parent
         config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["devices"] = devices_here(config.get("devices", {}))
         if args.command == "doctor":
             emit({"version": __version__, "tools": {name: shutil.which(name) is not None
                   for name in ("codex", "claude", "ssh", "tailscale", "lan-mouse",
                                "sunshine", "moonlight")},
                   "voice": {name: bool(os.environ.get(name)) for name in
                             ("ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID")},
-                  "devices": config["devices"], "personal_agents": config["personal_agents"],
+                  "devices": config.get("devices", {}),
+                  "personal_agents": config.get("personal_agents", {}),
                   "desktop": config.get("desktop", {}), "vault": vault_doctor(config, args.state),
                   "note": "Installed tools do not prove authentication or connectivity."})
         elif args.command == "overlay":
@@ -180,7 +195,7 @@ def main():
             if args.device == "local":
                 result = collect()
             else:
-                device = config["devices"].get(args.device)
+                device = config.get("devices", {}).get(args.device)
                 if not device:
                     raise ValueError("Unknown configured device.")
                 if device["transport"] == "local":
@@ -194,8 +209,9 @@ def main():
             emit(result)
         elif args.command == "lanmouse":
             if args.action == "fingerprint":
-                device = config["devices"].get(args.device, {"transport": "local"})
-                if args.device != "local" and args.device not in config["devices"]:
+                devices = config.get("devices", {})
+                device = devices.get(args.device, {"transport": "local"})
+                if args.device != "local" and args.device not in devices:
                     raise ValueError("Unknown configured device.")
                 emit({"device": args.device, "fingerprint": local_fingerprint()
                       if device["transport"] == "local" else
@@ -234,6 +250,8 @@ def main():
             return 1 if any(r["flag"] == "FAIL" for r in results) else 0
         elif args.command in COGNITION:
             return cognition(args, config, base)
+        elif args.command == "kb":
+            return kb_command(args, config)
         elif args.command == "vault":
             return vault_command(args, config)
         elif args.command in ("tasks", "task"):
@@ -250,7 +268,7 @@ def main():
         elif args.command == "speak":
             emit(speak(args.text, args.output))
         else:
-            store = Store(args.state)
+            store = Store(args.state, lanes_from(config))
             if args.command == "add":
                 spec = json.loads(Path(args.spec).read_text(encoding="utf-8-sig"))
                 build_prompt(spec)
@@ -285,6 +303,68 @@ def vault_doctor(config, state):
     except (ValueError, OSError) as exc:
         return {"error": str(exc)}
     return vault.status() if vault else "not configured (set vault.path)"
+
+
+def kb_command(args, config):
+    from .knowledge import kb_for
+    kb = kb_for(config, args.state)
+    value = " ".join(args.value).strip()
+    if hasattr(sys.stdout, "reconfigure"):  # claims are full of dashes and quotes
+        sys.stdout.reconfigure(encoding="utf-8")
+    if args.action == "ingest":
+        if args.text:
+            emit(kb.ingest(text=args.text, title=args.title))
+        elif not args.value:
+            raise ValueError("Usage: jarvis kb ingest FILE|URL ... or --text 'note'")
+        for item in args.value:
+            emit(kb.ingest(item, title=args.title))
+    elif args.action == "digest":
+        emit(kb.digest(value))
+    elif args.action == "ask":
+        result = kb.ask(value, file=not args.no_file, llm=args.llm)
+        print(result["answer"])
+        if result["filed"]:
+            print(f"\n(filed as wiki/{result['filed']}.md)", file=sys.stderr)
+    elif args.action == "check":
+        report = kb.check(notify=args.notify)
+        emit({k: v if not isinstance(v, list) or k in ("new_conflicts", "orphans", "mutated")
+              else len(v) for k, v in report.items()})
+    elif args.action == "status":
+        snap = kb.snapshot()
+        emit({"root": snap["root"], **snap["stats"], "last_check": snap["checker"]["last"],
+              "schedule": snap["checker"]["schedule"]})
+    elif args.action == "page":
+        print(kb.page(value)["markdown"], end="")
+    elif args.action == "sources":
+        emit(kb.snapshot()["sources"])
+    elif args.action == "log":
+        for e in kb.log(40):
+            print(f"{e['at'][11:]}  {e['bot']:<9} {e['action']:<9} {e['target']}  {e['message'][:90]}")
+    elif args.action == "sync":
+        from .vault import vault_for
+        vault = vault_for(config, args.state)
+        if vault is None:
+            raise ValueError("No vault configured: set vault.path in jarvis.config.json.")
+        result = kb.sync_vault(vault)
+        emit({"added": len(result["added"]), "unchanged": result["unchanged"],
+              "failed": result["failed"]})
+    elif args.action == "conflicts":
+        for c in kb.open_conflicts(kb.pages(), limit=200):
+            print(f"{c['claim']} [{c['page']}] {c['text']}\n  vs {c['rival']} [{c['rival_page']}] "
+                  f"{c['rival_text']}\n  ({c['why']})  ->  jarvis kb resolve {c['claim']} keep|drop|both {c['rival']}\n")
+    elif args.action == "resolve":
+        if len(args.value) not in (2, 3):
+            raise ValueError("Usage: jarvis kb resolve CLAIM keep|drop|both [AGAINST-CLAIM]")
+        emit(kb.resolve(args.value[0], args.value[1], against=(args.value[2:] or [None])[0]))
+    elif args.action == "merge":
+        if len(args.value) != 2:
+            raise ValueError("Usage: jarvis kb merge FROM-PAGE INTO-PAGE")
+        emit(kb.merge(args.value[0], args.value[1]))
+    elif args.action == "schedule":
+        if value not in ("on", "off"):
+            raise ValueError("Usage: jarvis kb schedule on|off [--at 02:00]")
+        emit(kb.schedule(value == "on", args.config, args.state, args.at))
+    return 0
 
 
 def vault_command(args, config):
@@ -424,7 +504,7 @@ def cognition(args, config, base):
     from .router import pick_adapter
     from .speech import Voice
 
-    store, memory = Store(args.state), Memory(args.state)
+    store, memory = Store(args.state, lanes_from(config)), Memory(args.state)
     if args.command == "route":
         from .assistant import decide
         route = decide(args.text, config, conversational=True)
@@ -472,7 +552,7 @@ def cognition(args, config, base):
                 budget = [voice.limit]
                 turn = Turn(feed_sender(args.state), "cli", text)
 
-                def speak_sentence(sentence):
+                def speak_sentence(sentence, turn=turn, budget=budget):
                     turn.sentence(sentence)
                     if speaker and budget[0] > 0:
                         budget[0] -= len(sentence)
@@ -572,7 +652,7 @@ def cognition(args, config, base):
             print("Read each line the way you'd normally talk to JARVIS, from where you "
                   "usually sit.", file=sys.stderr)
             for i, phrase in enumerate(ENROLL_PHRASES, 1):
-                for attempt in range(3):
+                for _ in range(3):
                     print(f"[{i}/{len(ENROLL_PHRASES)}]  \"{phrase}\"", file=sys.stderr)
                     audio = record_utterance(max_seconds=12, min_voiced=0.7)
                     if audio is not None:

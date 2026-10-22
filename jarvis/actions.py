@@ -1,4 +1,4 @@
-"""Hands: what JARVIS can do on David's Windows 11 PC.
+"""Hands: what JARVIS can do on David's Windows 11 PC or his Arch laptop.
 
 ChatGPT (through the Codex app-server) decides; JARVIS executes. Two kinds of tools:
 
@@ -15,6 +15,7 @@ Windows-MCP exposes full desktop control including arbitrary PowerShell; Agent-R
 reads sites (X, Reddit, YouTube...) but doesn't operate apps or a browser.
 """
 
+import configparser
 import difflib
 import json
 import os
@@ -23,6 +24,8 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+
+MACHINE = "Windows 11 PC" if os.name == "nt" else "Arch Linux laptop"
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.83"  # pinned; published 2026-09-28
 
@@ -33,7 +36,7 @@ ACTION = re.compile(
     r"fill|log\s*in|sign\s*in|check|show\s+me|download|scroll|close)\b", re.I)
 
 INSTRUCTIONS = (
-    "You are JARVIS operating David's Windows 11 PC on his behalf. Tools: open_app "
+    f"You are JARVIS operating David's {MACHINE} on his behalf. Tools: open_app "
     "launches an installed application (call list_apps if the name is unclear); open_url "
     "only opens a link in his normal browser for him to look at himself. For anything "
     "that involves a website (going to a page, searching a site, reading, clicking, "
@@ -53,7 +56,7 @@ BROWSERISH = re.compile(r"\b(?:in|with|using|use)\s+(?:the\s+|my\s+|a\s+)?(?:bro
                         r"https?://|\bwww\.", re.I)
 
 
-# What people say vs. what Windows calls it.
+# What people say vs. what the desktop calls it.
 ALIASES = {"vs code": "visual studio code", "vscode": "visual studio code", "code": "visual studio code",
            "word": "word", "excel": "excel", "powerpoint": "powerpoint", "edge": "microsoft edge",
            "terminal": "terminal", "cmd": "command prompt", "file explorer": "file explorer",
@@ -74,7 +77,7 @@ class DesktopTools:
     def specs(self):
         return [
             {"type": "function", "name": "open_app",
-             "description": "Open an installed Windows application by name, e.g. "
+             "description": "Open an installed application by name, e.g. "
                             "'Google Chrome', 'Spotify', 'Notepad', 'Visual Studio Code'.",
              "inputSchema": {"type": "object", "required": ["name"], "additionalProperties": False,
                              "properties": {"name": {"type": "string"}}}},
@@ -106,6 +109,9 @@ class DesktopTools:
     # -- apps ------------------------------------------------------------------------
     def apps(self):
         if not self._apps or time.time() - self._loaded > self.cache_seconds:
+            if os.name != "nt":
+                self._apps, self._loaded = desktop_entries(), time.time()
+                return self._apps
             out = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                  "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"],
@@ -147,6 +153,8 @@ class DesktopTools:
         app = hits[0]
         if not re.fullmatch(r"[\w .{}\\:!~()+\-]+", app["AppID"]):
             return False, "Refusing an app ID with unexpected characters."
+        if os.name != "nt":
+            return launch_desktop_entry(app)
         subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app['AppID']}"],
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return True, f"Opened {app['Name']}."
@@ -158,8 +166,57 @@ class DesktopTools:
                 url = "https://" + url
             else:
                 return False, "Only http(s) links can be opened."
-        os.startfile(url)  # default browser
+        from .vault import open_link
+        open_link(url)  # his default browser, whatever this OS calls it
         return True, f"Opened {url} in your browser."
+
+
+def _application_dirs():
+    """XDG application folders, highest priority first (flatpak exports included)."""
+    home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    roots = [home, *dirs.split(":"), "/var/lib/flatpak/exports/share",
+             str(Path.home() / ".local/share/flatpak/exports/share")]
+    seen = []
+    for root in roots:
+        folder = Path(root) / "applications"
+        if root and folder.is_dir() and folder not in seen:
+            seen.append(folder)
+    return seen
+
+
+def desktop_entries():
+    """Linux counterpart of Get-StartApps: visible .desktop applications as
+    {"Name", "AppID", "Path"}, AppID being the desktop-file ID gtk-launch takes."""
+    apps, ids = [], set()
+    for folder in _application_dirs():
+        for path in sorted(folder.rglob("*.desktop")):
+            app_id = str(path.relative_to(folder)).replace("/", "-")
+            if app_id in ids:  # an earlier folder overrides this one
+                continue
+            ids.add(app_id)
+            parser = configparser.RawConfigParser(interpolation=None, strict=False)
+            try:
+                parser.read(path, encoding="utf-8")
+                entry = parser["Desktop Entry"]
+            except (configparser.Error, KeyError, OSError, UnicodeDecodeError):
+                continue
+            if (entry.get("Type", "Application") != "Application"
+                    or entry.get("NoDisplay", "").lower() == "true"
+                    or entry.get("Hidden", "").lower() == "true" or not entry.get("Name")):
+                continue
+            apps.append({"Name": entry["Name"], "AppID": app_id, "Path": str(path)})
+    return apps
+
+
+def launch_desktop_entry(app):
+    # gio takes the file itself, so it works even if this process's XDG_DATA_DIRS differs.
+    for command in (["gio", "launch", app.get("Path", "")], ["gtk-launch", app["AppID"]]):
+        if shutil.which(command[0]) and command[-1]:
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return True, f"Opened {app['Name']}."
+    return False, "Can't launch apps: install gtk3 (gtk-launch) or glib2 (gio)."
 
 
 BROWSER_BLOCKED = {"browser_file_upload", "browser_run_code_unsafe", "browser_evaluate"}
