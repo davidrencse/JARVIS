@@ -9,7 +9,7 @@ description = "David's personal workflow OS"
 requires-python = ">=3.10"
 
 [project.optional-dependencies]
-voice = ["numpy", "sounddevice", "faster-whisper", "sherpa-onnx"]
+voice = ["numpy", "sounddevice", "faster-whisper", "sherpa-onnx", "kokoro-onnx"]
 
 [project.scripts]
 jarvis = "jarvis.__main__:main"

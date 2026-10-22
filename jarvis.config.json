@@ -135,11 +135,24 @@
     "enabled": true,
     "browser": true
   },
+  "knowledge": {
+    "stale_days": 30,
+    "llm": "none",
+    "llm_model": "haiku"
+  },
   "vault": {
-    "path": "C:\\Users\\jdoe\\Documents\\Vault",
+    "path": {
+      "windows": "C:\\Users\\jdoe\\Documents\\Vault",
+      "linux": "~/Documents/obsidian-vault"
+    },
     "recall": true,
     "write": true,
     "calendar": "calendar.md",
-    "protected": ["calendar.md"]
+    "protected": [
+      "calendar.md"
+    ]
+  },
+  "orchestration": {
+    "lanes": 2
   }
 }
