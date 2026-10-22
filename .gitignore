@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+.jarvis/
+__pycache__/
+*.pyc
+.venv/
+*.mp3

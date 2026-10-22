@@ -1,0 +1,8 @@
+[mcp_servers.jarvis-vault]
+command = 'C:\Users\jdoe\MiniConda3\python.exe'
+args = [
+    "-m",
+    "jarvis",
+    "vault",
+    "mcp",
+]
