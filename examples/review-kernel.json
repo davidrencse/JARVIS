@@ -1,0 +1,18 @@
+{
+  "objective": "Review the JARVIS kernel for task lifecycle bugs, incorrect capability claims, and credential handling errors. Do not modify files.",
+  "provider": "codex",
+  "role": "reviewer",
+  "mode": "read-only",
+  "workspace": ".",
+  "context": "A Python standard-library local workflow kernel for Windows and Arch Linux. Muse/Grokbot identities are pending; Jev is planned.",
+  "constraints": [
+    "Inspect source and tests without accessing credentials or browser profiles.",
+    "Do not run external paid APIs.",
+    "Report findings with file paths and concrete failure cases."
+  ],
+  "acceptance_criteria": [
+    "Identify reproducible correctness issues, or explicitly state none were found.",
+    "Separate implemented behavior from future integrations."
+  ],
+  "owned_paths": []
+}
