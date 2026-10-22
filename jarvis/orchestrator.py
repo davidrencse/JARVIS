@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .router import specialists
@@ -20,9 +21,15 @@ READ_ONLY_SPECIALISTS = {"architect", "reviewer", "researcher", "security", "sco
 MAX_SUBTASKS = 20
 
 
-def planner_spec(goal, catalog, recall, workspace="."):
+def planner_spec(goal, catalog, recall, workspace=".", lanes=1):
     roster = "\n".join(f"- {name} (default power {s['power']}): {s['description']}"
                        for name, s in catalog.items())
+    lane_rule = (
+        f"JARVIS runs up to {lanes} subtasks at once, so subtasks that do not depend on "
+        "each other start together: leave depends_on empty wherever one step genuinely "
+        "does not need another's output, and only chain steps that really are sequential."
+        if lanes > 1 else
+        "JARVIS runs one subtask at a time, in dependency order.")
     return {
         "objective": "Plan this goal as specialist subtasks. Return ONLY one JSON object.",
         "provider": "claude", "role": "researcher", "mode": "read-only", "power": "high",
@@ -41,10 +48,13 @@ Return JSON exactly in this shape (no prose before or after):
                 "depends_on": ["s0"], "acceptance_criteria": ["..."]}}]}}
 
 Rules: at most {MAX_SUBTASKS} subtasks; ids unique; depends_on only earlier ids.
-Give writers non-overlapping owned_paths. Use the LOWEST power that can do each
-subtask: low for lookups and mechanical edits, mid for normal implementation,
-high only for architecture, hard debugging, security and final review. Use codex
-for well-specified implementation and claude for design, review and research.
+{lane_rule}
+Writers that can run together must own non-overlapping paths, and a folder counts as
+overlapping every path inside it: "src" and "src/app.py" collide, "src/a.py" and
+"src/b.py" do not. Use the LOWEST power that can do each subtask: low for lookups and
+mechanical edits, mid for normal implementation, high only for architecture, hard
+debugging, security and final review. Use codex for well-specified implementation and
+claude for design, review and research.
 End with a reviewer subtask that checks the whole result.""",
         "evidence": recall,
     }
@@ -94,11 +104,20 @@ def validate_plan(plan, catalog):
             sub["mode"] = "read-only"
         if sub.get("mode", "read-only") == "workspace-write":
             for path in sub.get("owned_paths", []):
-                if path in owners:
-                    raise ValueError(f"{sid}: {path} already owned by {owners[path]}.")
+                clash = next((p for p in owners if _nested(p, path)), None)
+                if clash is not None:
+                    raise ValueError(f"{sid}: {path} overlaps {clash}, owned by {owners[clash]}.")
                 owners[path] = sid
         seen.append(sid)
     return plan
+
+
+def _nested(a, b):
+    """Do two owned_paths cover any of the same files? Writers run side by side, so
+    'src/' and 'src/app.py' are a collision even though the strings differ."""
+    a = str(a).replace("\\", "/").strip("/")
+    b = str(b).replace("\\", "/").strip("/")
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
 
 
 def subtask_spec(sub, plan, catalog, prior, workspace):
@@ -158,7 +177,7 @@ class Orchestrator:
         if plan is None:
             evidence = vault_recall(self.config, self.memory.path.parent, goal, limit=6,
                                     max_chars=2500) + self.memory.context(goal)
-            spec = planner_spec(goal, self.catalog, evidence, workspace)
+            spec = planner_spec(goal, self.catalog, evidence, workspace, self.store.lanes)
             planner_task = self.store.add(spec)["id"]
             result = run_task(self.store, planner_task, self.config, self.base, timeout)
             if result["state"] != "finished":
@@ -182,7 +201,11 @@ class Orchestrator:
                 and all(d in done for d in s.get("depends_on", []))]
 
     def run(self, plan_id, timeout=1800, max_steps=MAX_SUBTASKS):
-        """Run ready subtasks one at a time until done, blocked, or max_steps."""
+        """Run ready subtasks until done, blocked, or max_steps.
+
+        Steps whose dependencies are all satisfied run together, up to the ledger's lane
+        count; the planner is told to give concurrent writers non-overlapping owned_paths
+        and validate_plan refuses a plan that does not."""
         if not 1 <= timeout <= 3600:
             raise ValueError("timeout must be between 1 and 3600 seconds.")
         if not 1 <= max_steps <= MAX_SUBTASKS:
@@ -209,32 +232,73 @@ class Orchestrator:
         record["state"] = "running"
         steps = 0
         while steps < max_steps and (batch := self.ready(record)):
-            sub = batch[0]
-            prior = {d: record["results"][d].get("answer") or "" for d in sub.get("depends_on", [])}
-            spec = subtask_spec(sub, record, self.catalog, prior, record["workspace"])
-            task_id = record.get("resume_tasks", {}).pop(sub["id"], None)
-            if task_id is None:
-                task_id = self.store.add(spec)["id"]
-            record["tasks"][sub["id"]] = task_id
+            wave = batch[:max(1, min(self.store.lanes, max_steps - steps))]
+            # Every dispatch is checkpointed before any of them starts, so a crash mid-wave
+            # leaves each step recoverable by its own recorded task id.
+            dispatch = []
+            for sub in wave:
+                prior = {d: record["results"][d].get("answer") or ""
+                         for d in sub.get("depends_on", [])}
+                spec = subtask_spec(sub, record, self.catalog, prior, record["workspace"])
+                task_id = record.get("resume_tasks", {}).pop(sub["id"], None)
+                if task_id is None:
+                    task_id = self.store.add(spec)["id"]
+                record["tasks"][sub["id"]] = task_id
+                dispatch.append((sub, task_id))
             self._save(record)
-            result = run_task(self.store, task_id, self.config, self.base, timeout)
-            record["results"][sub["id"]] = {"state": result["state"], "task": task_id,
-                                            "answer": (result.get("answer") or "")[:20000]}
-            if result["state"] != "finished":
-                record["state"] = "blocked"
+
+            results, error = self._execute_wave(dispatch, timeout)
+            for sub, task_id in dispatch:  # wave order, so a replay records identically
+                result = results.get(sub["id"])
+                if result is None:
+                    continue  # never came back; its dispatch stands, for recover() to judge
+                record["results"][sub["id"]] = {"state": result["state"], "task": task_id,
+                                                "answer": (result.get("answer") or "")[:20000]}
+                if result["state"] != "finished":
+                    record["state"] = "blocked"
             # Execution is authoritative; failure to index memory must not replay work.
             self._save(record)
-            if result.get("answer"):
-                self._index_result(record, sub, result["answer"])
-            steps += 1
-            if result["state"] != "finished":
-                record["state"] = "blocked"
+            for sub, _ in dispatch:
+                answer = (results.get(sub["id"]) or {}).get("answer")
+                if answer:
+                    self._index_result(record, sub, answer)
+            if error is not None:  # raised only once the finished siblings are durable
+                raise error
+            steps += len(results)
+            if record["state"] == "blocked":
                 break
         if record["state"] == "running":
             record["state"] = ("finished" if len(record["results"]) == len(record["subtasks"])
                                else "planned")
         self._save(record)
         return record
+
+    def _execute_wave(self, dispatch, timeout):
+        """Run a wave; return ({step id: result}, first error or None).
+
+        An ordinary step failure comes back from run_task as a non-finished state, so a
+        raise means the bookkeeping itself is unsafe (a lane claim lost to another
+        process, a disk error) and must reach the caller. It is handed back rather than
+        thrown so the steps that did finish can be checkpointed first."""
+        def one(task_id):
+            return run_task(self.store, task_id, self.config, self.base, timeout)
+
+        if len(dispatch) == 1:  # the serial path, unchanged
+            sub, task_id = dispatch[0]
+            try:
+                return {sub["id"]: one(task_id)}, None
+            except Exception as exc:
+                return {}, exc
+        results, error = {}, None
+        with ThreadPoolExecutor(max_workers=len(dispatch),
+                                thread_name_prefix="jarvis-step") as pool:
+            futures = {sub["id"]: pool.submit(one, task_id) for sub, task_id in dispatch}
+            for sid, fut in futures.items():
+                try:
+                    results[sid] = fut.result()
+                except Exception as exc:
+                    error = error or exc
+        return results, error
 
     def _index_result(self, record, sub, answer):
         """Content-deduped indexing can be retried without executing the task."""

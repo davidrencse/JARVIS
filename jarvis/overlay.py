@@ -16,11 +16,10 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 if os.name == "nt":
-    import ctypes.wintypes  # noqa: F401  (MSG for the message loop)
+    import ctypes.wintypes  # MSG, used by the message loop in Overlay.run
 
 TITLE = "JARVIS Overlay"
 MODIFIERS = {"alt": 0x0001, "ctrl": 0x0002, "control": 0x0002, "shift": 0x0004, "win": 0x0008}
@@ -118,7 +117,7 @@ class Window:
         self.hwnd = None
 
     def alive(self):
-        return bool(self.hwnd) and bool(self.user32.IsWindow(self.hwnd)) or bool(self.find())
+        return (bool(self.hwnd) and bool(self.user32.IsWindow(self.hwnd))) or bool(self.find())
 
     def launch(self, timeout=20):
         from .ui import APP_BROWSERS
@@ -301,12 +300,12 @@ def free_port(start):
 def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=False):
     if os.name != "nt":
         raise RuntimeError("The overlay is Windows-only; on Arch, bind a Hyprland key to "
-                           "the console URL instead.")
+                           "`jarvis app` instead.")
     from .ui import Console, ConsoleServer, Handler
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\JARVIS-Overlay")
     if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
         raise RuntimeError("The JARVIS overlay is already running; press its hotkey.")
-    flags, vk, label = parse_hotkey(hotkey)
+    label = parse_hotkey(hotkey)[2]  # validates the hotkey and names it for the page
     # The overlay hosts its own console so the page's "hide" button can reach it, on a
     # fixed port so the page's saved settings (theme, weather place) persist across runs.
     port = free_port(port)
@@ -345,6 +344,9 @@ def _startup_file():
 
 def autostart(state, enable, hotkey="alt+1"):
     """Start the overlay hidden at login, so the hotkey works all day."""
+    if os.name != "nt":
+        raise RuntimeError("The overlay is Windows-only; on Arch, bind a Hyprland key to "
+                           "`jarvis app` instead.")
     path = _startup_file()
     if not enable:
         path.unlink(missing_ok=True)

@@ -12,6 +12,7 @@ Speaker model: SPEAKER_MODEL_URL below, saved to .jarvis/voice/.
 """
 
 import json
+import os
 from pathlib import Path
 
 RATE = 16000
@@ -70,6 +71,15 @@ def segment(samples, noise_floor, start_ratio=3.0, min_speech=0.25, max_silence=
     return [(s * FRAME, e * FRAME) for s, e in segments if e - s >= keep]
 
 
+def _input_device(sd):
+    """On Linux, ALSA's "default" is the raw sound card unless pipewire-alsa is installed,
+    and a DSP mic read that way is pure silence. Go through PipeWire (or Pulse) instead."""
+    if os.name == "nt":
+        return None
+    names = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
+    return next((n for n in ("pipewire", "pulse") if n in names), None)
+
+
 def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_seconds=30,
                      min_voiced=0.4):
     """Block until one spoken utterance ends; return float32 mono 16 kHz audio or None."""
@@ -79,7 +89,8 @@ def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_second
     except ImportError:
         raise RuntimeError(INSTALL_HINT) from None
     onset = 5  # 150 ms of continuous sound starts an utterance; a click or tap doesn't
-    with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME) as mic:
+    with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME,
+                        device=_input_device(sd)) as mic:
         floor_frames = [mic.read(FRAME)[0][:, 0] for _ in range(int(calibrate * RATE / FRAME))]
         floor = float(np.sqrt(np.mean(np.concatenate(floor_frames) ** 2)))
         threshold = max(floor * 3.0, 0.004)
@@ -184,7 +195,8 @@ class VoicePrint:
         np = _np()
         profile = data.get("profile") or [data["embedding"]]
         pinned = profile[:data.get("clips", 0)]
-        learned = (profile[len(pinned):] + [embedding.tolist()])[-(self.MAX_PROFILE - len(pinned)):]
+        room = max(1, self.MAX_PROFILE - len(pinned))  # [-0:] would keep everything
+        learned = (profile[len(pinned):] + [embedding.tolist()])[-room:]
         data["profile"] = pinned + learned
         data["embedding"] = self._unit(np.mean(data["profile"], axis=0)).tolist()
         self._save(data)
@@ -278,7 +290,7 @@ class Transcriber:
         cfg = (config or {}).get("voice", {})
         self.model_name = cfg.get("stt_model", "large-v3-turbo")
         self.language = cfg.get("language", "en")
-        self._model = None
+        self._model, self.device = None, None
 
     def __call__(self, audio):
         if self._model is None:
@@ -288,6 +300,9 @@ class Transcriber:
             except ImportError:
                 raise RuntimeError(INSTALL_HINT) from None
             try:
+                import ctranslate2
+                if not ctranslate2.get_cuda_device_count():  # e.g. the Zenbook: skip the
+                    raise RuntimeError("no CUDA device")    # big GPU model's download
                 self._model = WhisperModel(self.model_name, device="cuda", compute_type="float16")
                 self.device = "cuda"
             except Exception:  # no CUDA runtime: fall back to CPU

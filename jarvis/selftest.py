@@ -138,7 +138,7 @@ class TypingProbe:
             send_key(vk, up=True)
             self.pump(0.03)
         self.pump(0.3)
-        lat = [(a - s) * 1000 for s, a in zip(sent, self.arrivals)]
+        lat = [(a - s) * 1000 for s, a in zip(sent, self.arrivals, strict=False)]
         return self.entry.get(), lat
 
     def close(self):
@@ -175,14 +175,15 @@ def check_lan_mouse():
                       path + ("" if path.lower() == patched else
                               "  (watchdog fell back to the official build: keyboard fix absent)")))
     try:
-        has_fix = FIX_MARKER in Path(path).read_bytes()
+        binary = Path(path).read_bytes()  # one read; both markers are looked for in it
+        has_fix = FIX_MARKER in binary
     except OSError as exc:
         has_fix = None
         out.append(result("keyboard fix in binary", "WARN", f"couldn't read binary: {exc}"))
     if has_fix is not None:
         out.append(result("keyboard fix in binary", "PASS" if has_fix else "FAIL",
                           "contains the no-drop key retry" if has_fix else "old build: keys can be dropped"))
-        guard = ACK_MARKER in Path(path).read_bytes()
+        guard = ACK_MARKER in binary
         out.append(result("stuck-capture guard in binary", "PASS" if guard else "FAIL",
                           "input returns to the Dell if the ASUS doesn't acknowledge in 2.5 s" if guard
                           else "old build: an unanswered hand-over locks the Dell keyboard"))
@@ -269,7 +270,9 @@ def check_typing(probe, label="Dell typing (not captured)"):
     got, lat = probe.type(text)
     if got != text:
         return result(label, "FAIL", f"typed {text!r}, window received {got!r}")
-    worst = max(lat) if lat else 0
+    if not lat:
+        return result(label, "WARN", f"all {len(text)} keys arrived, but none were timed")
+    worst = max(lat)
     flag = "PASS" if worst < 30 else "WARN" if worst < 100 else "FAIL"
     return result(label, flag, f"all {len(text)} keys arrived; latency median "
                   f"{sorted(lat)[len(lat) // 2]:.1f} ms, worst {worst:.1f} ms")

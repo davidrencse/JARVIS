@@ -159,6 +159,7 @@ class Voice:
             with urllib.request.urlopen(request, timeout=60) as response:
                 pcm = response.read(25_000_000)
         except urllib.error.HTTPError as exc:
+            exc.close()  # the error object holds the response; drop its socket now
             raise RuntimeError(f"ElevenLabs returned HTTP {exc.code}; check key, voice and "
                                "credits.") from None
         if not pcm or len(pcm) % 2:
@@ -249,6 +250,7 @@ def setup(state_dir, config=None, ask=input, secret=None):
     try:
         voices = list_voices(key)
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code == 401:
             print("Key works for speech only (no 'voices' permission); using the default "
                   "British voice 'Daniel'.")
@@ -272,21 +274,37 @@ def setup(state_dir, config=None, ask=input, secret=None):
         data = {}
     data.update(ELEVENLABS_API_KEY=key, ELEVENLABS_VOICE_ID=choice)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    from .credits import owner_only
+    owner_only(path)
     result = Voice(state_dir, config).say("JARVIS online. Good to hear you, David.")
     return {"saved": str(path), "voice_id": choice, "test": result["source"]}
 
 
+_playing = None  # the one unwaited player from a wait=False call
+
+
 def play_wav(path, wait=True):
     """wait=False returns immediately; the next play_wav call cuts it off."""
+    global _playing
     if sys.platform == "win32":
         import winsound
         winsound.PlaySound(str(path), winsound.SND_FILENAME | (0 if wait else winsound.SND_ASYNC))
         return
+    if _playing is not None:  # stop the previous async clip and reap it, as on Windows
+        if _playing.poll() is None:
+            _playing.terminate()
+        try:
+            _playing.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _playing.kill()
+        _playing = None
     for player in ("pw-play", "paplay", "aplay"):
         if shutil.which(player):
             proc = subprocess.Popen([player, str(path)])
             if wait:
                 proc.wait(timeout=120)
+            else:
+                _playing = proc
             return
     raise RuntimeError("No audio player found (install pipewire or alsa-utils).")
 

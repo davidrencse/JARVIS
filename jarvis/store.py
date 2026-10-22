@@ -1,4 +1,10 @@
-"""Durable task and event ledger; every execution is claimed atomically."""
+"""Durable task and event ledger; every execution is claimed atomically.
+
+A ledger has a fixed number of run *lanes*. Claiming a lane is one UPDATE whose WHERE
+clause counts the running tasks, so the count is evaluated under SQLite's write lock and
+two processes can never take the same free lane. One lane (the default) reproduces the
+old single-running-task rule exactly; more lanes let the orchestrator run the independent
+steps of a plan side by side."""
 
 import json
 import os
@@ -9,12 +15,25 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+MAX_LANES = 4  # more than this thrashes the subscription without finishing sooner
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def lanes_from(config):
+    """How many tasks this ledger may run at once, from jarvis.config.json."""
+    want = (config.get("orchestration") or {}).get("lanes", 1)
+    try:
+        return max(1, min(int(want), MAX_LANES))
+    except (TypeError, ValueError):
+        return 1
+
+
 class Store:
-    def __init__(self, directory):
+    def __init__(self, directory, lanes=1):
+        self.lanes = max(1, min(int(lanes), MAX_LANES))
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / "tasks.sqlite3"
@@ -26,8 +45,10 @@ class Store:
                 CREATE TABLE IF NOT EXISTS events(
                   seq INTEGER PRIMARY KEY, task_id TEXT NOT NULL, at TEXT NOT NULL,
                   kind TEXT NOT NULL, detail TEXT NOT NULL);
-                CREATE UNIQUE INDEX IF NOT EXISTS single_running_task
-                  ON tasks(state) WHERE state='running';
+                -- Superseded by the lane count in transition(), which enforces the same
+                -- rule at lanes=1 and generalises it. Dropped so existing ledgers migrate.
+                DROP INDEX IF EXISTS single_running_task;
+                CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state);
                 CREATE INDEX IF NOT EXISTS tasks_created_at ON tasks(created_at);
             """)
 
@@ -85,22 +106,33 @@ class Store:
         if state == "running":  # who owns the claim, so a crashed owner can be recognised
             detail = {**(detail or {}), "pid": os.getpid()}
         for attempt in (1, 2):
-            try:
-                with self.connect() as db:
+            with self.connect() as db:
+                if state == "running":
+                    # One statement: the lane count is evaluated under the write lock, so
+                    # two processes can never be handed the same free lane.
+                    changed = db.execute(
+                        "UPDATE tasks SET state=?,updated_at=? WHERE id=? AND state=? "
+                        "AND (SELECT COUNT(*) FROM tasks WHERE state='running') < ?",
+                        (state, now(), task_id, expected, self.lanes)).rowcount
+                else:
                     changed = db.execute(
                         "UPDATE tasks SET state=?,updated_at=? WHERE id=? AND state=?",
                         (state, now(), task_id, expected)).rowcount
-                    if changed != 1:
-                        raise ValueError(f"Task must be {expected}; it may already have been "
-                                         "claimed.")
+                if changed == 1:
                     db.execute("INSERT INTO events(task_id,at,kind,detail) VALUES(?,?,?,?)",
                                (task_id, now(), state, json.dumps(detail or {})))
-                return
-            except sqlite3.IntegrityError:
-                if attempt == 1 and self.reap_stale():
-                    continue  # a dead process held the single running slot; it's free now
-                raise ValueError("Another task is running in this ledger. Wait for it to "
-                                 "finish.") from None
+                    return
+                # Nothing moved. Tell apart "the lanes are full" from "someone else
+                # already claimed this task", because only the first is worth retrying.
+                row = db.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+                busy = state == "running" and row is not None and row["state"] == expected
+            if busy and attempt == 1 and self.reap_stale():
+                continue  # a dead process was holding a lane; it is free now
+            if busy:
+                raise ValueError(
+                    f"All {self.lanes} run lane{'' if self.lanes == 1 else 's'} in this "
+                    "ledger are busy. Wait for a task to finish.")
+            raise ValueError(f"Task must be {expected}; it may already have been claimed.")
 
     def reap_stale(self, legacy_after=timedelta(hours=2)):
         """Fail 'running' tasks whose owning process is gone (crash, kill, power loss).

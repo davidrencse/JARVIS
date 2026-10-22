@@ -25,7 +25,7 @@ def command(args):
 
 def read_text(path):
     try:
-        return Path(path).read_text().strip()
+        return Path(path).read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None
 
@@ -47,7 +47,7 @@ def linux_displays():
 def linux_batteries():
     fields = ("manufacturer", "model_name", "technology", "energy_full_design",
               "energy_full", "charge_full_design", "charge_full", "voltage_min_design")
-    return [{**{"name": battery.name}, **{field: read_text(battery / field) for field in fields}}
+    return [{"name": battery.name, **{field: read_text(battery / field) for field in fields}}
             for battery in Path("/sys/class/power_supply").glob("*")
             if read_text(battery / "type") == "Battery"]
 

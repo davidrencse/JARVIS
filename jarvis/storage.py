@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 from .transfer import _check_target, _fail, _ssh_args, collision_name, safe_name
 
 MAX_ENTRIES = 3000
+MAX_COLLISIONS = 200  # each probe is an SSH round trip, so don't hunt for a free name forever
 
 # Runs on the remote host. REQUEST is spliced in as a JSON string literal, so no remote
 # path or root is ever interpreted by a shell.
@@ -208,6 +209,9 @@ class Storage:
         while self.resolve(dst_device, str(Path(dst["path"]) / final) if local_dst
                            else str(PurePosixPath(dst["path"]) / final), "exists")["exists"]:
             n += 1
+            if n > MAX_COLLISIONS:
+                raise ValueError(f"{normalized} and {MAX_COLLISIONS} numbered copies of it "
+                                 "already exist there; tidy up or pick another folder.")
             final = collision_name(normalized, n, directory=src["dir"])
         remote_id = src_device if self.is_remote(src_device) else dst_device
         device = self.device(remote_id)

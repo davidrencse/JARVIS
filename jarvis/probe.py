@@ -1,7 +1,8 @@
 """Live link checks for the console: is each laptop reachable, and is Lan Mouse up?
 
 - Local (Windows): the Lan Mouse process and its UDP sockets from `tasklist` and
-  `netstat`, which also show which peer address the daemon is talking to.
+  `netstat`, which also show which peer address the daemon is talking to. Local on
+  Arch runs the remote script below in-process.
 - Remote (SSH devices): one fixed, read-only bash script sent over stdin with the
   configured key, BatchMode and strict host keys, so it never prompts and never
   installs anything. It reports the Lan Mouse units, the UDP 4242 socket, memory
@@ -75,8 +76,11 @@ def tcp_ping(host, port=22, timeout=2.0):
 
 def probe_local():
     out = {"lan_mouse": {"running": False, "pid": None, "listening": False, "peers": []}}
-    if os.name != "nt":
-        out["note"] = "Local probe is written for Windows."
+    if os.name != "nt":  # on the Arch laptop: the same script the Dell sends over SSH
+        try:
+            out.update(remote_summary(parse_kv(_run(["bash", "-s"], 15, input=REMOTE_SCRIPT).stdout)))
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            out["error"] = f"Couldn't read local status: {exc}"
         return out
     try:
         tasks = _run(["tasklist", "/FI", "IMAGENAME eq lan-mouse.exe", "/FO", "CSV", "/NH"], 8)

@@ -27,6 +27,7 @@ import hashlib
 import json
 import re
 import threading
+import weakref
 from datetime import date, datetime, timedelta
 
 from .vault import CONFLICT, HEADING, _raw, plain, split_frontmatter
@@ -82,7 +83,7 @@ def parse_date(text, today=None, roll=True):
         target = [d[:3] for d in days].index(match.group(2)[:3])
         ahead = (target - today.weekday()) % 7 or 7
         if match.group(1) == "next" and ahead < 7:
-            ahead += 7 if today.weekday() >= target else 0
+            ahead += 7  # "next friday" is the one after this coming Friday, either way
         return (today + timedelta(days=ahead)).isoformat()
     match = re.fullmatch(r"([a-z]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?(?:,? (\d{4}))?", text)
     if match and match.group(1) in MONTHS:
@@ -103,7 +104,7 @@ def parse_line(line, written=None):
     body = match.group("body")
     task = {"status": STATUS.get(match.group("status"), "other"), "mark": match.group("status"),
             "indent": len(match.group("indent").expandtabs(4)), "priority": None, "recur": None,
-            **{k: None for k in ("due", "scheduled", "start", "created", "done", "cancelled")}}
+            **dict.fromkeys(("due", "scheduled", "start", "created", "done", "cancelled"))}
     for sign, value in DATE_FIELD.findall(body):
         task[DATES[sign]] = value
     if (prio := PRIO_FIELD.search(body)):
@@ -546,7 +547,9 @@ class TaskTools:
         return False, f"Unknown tool {name}."
 
 
-_OPEN_TASKS, _OPEN_LOCK = {}, threading.Lock()
+# Keyed by the vault object itself: id() can be reused after a vault is collected, and a
+# plain dict would keep every vault (and its index) alive for the life of the process.
+_OPEN_TASKS, _OPEN_LOCK = weakref.WeakKeyDictionary(), threading.Lock()
 
 
 def tasks_for(vault):
@@ -554,4 +557,7 @@ def tasks_for(vault):
     if vault is None:
         return None
     with _OPEN_LOCK:
-        return _OPEN_TASKS.setdefault(id(vault), Tasks(vault))
+        reader = _OPEN_TASKS.get(vault)
+        if reader is None:
+            reader = _OPEN_TASKS[vault] = Tasks(vault)
+        return reader
