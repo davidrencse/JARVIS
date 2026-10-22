@@ -152,6 +152,87 @@ to every prompt. It is not registered by default.
 The index is `.jarvis/vault.sqlite3` (SQLite FTS5). It updates incrementally on every
 query: about 0.2 s to build for 221 notes, and 3–25 ms per search.
 
+## Knowledge engine (a wiki that writes itself)
+
+Karpathy's second-brain pattern, run by three bots that are plain scripts. The vault
+above is David's own writing; this is JARVIS's wiki of what its sources say.
+It lives in `.jarvis/knowledge/` (`knowledge.path` to move it).
+
+- **Reader collects.** `raw/` keeps every file, link, note or voice memo exactly as it
+  arrived, read-only and SHA-256 hashed, with a text extract (`pdftotext` for PDFs,
+  Whisper for audio). Nothing edits `raw/`.
+- **Librarian writes.** It pulls declarative claims out of a source, files each into
+  the page it's about (TF-IDF routing) or into new topic pages (a greedy cover over
+  noun-like terms), reconfirms claims a new source repeats, relinks related pages, and
+  logs every atomic write with its diff. One source usually touches 5–20 pages.
+- **Checker doubts.** Nightly it re-hashes `raw/`, looks for contradictions across the
+  whole wiki, marks claims with no fresh source for 30 days `[!unconfirmed]`, and lists
+  orphan pages and broken links. A contradiction is never overwritten: both claims stay,
+  both get `[!conflict …]`, the page goes to `status: review`, and you get a
+  notification.
+- **You rule.** `keep` one claim, `drop` it, or say `both` are true. The loser is
+  marked `[!superseded …]`: it stays on the page as history but is no longer evidence.
+  Each bot keeps its own memory in `bots/`. The checker remembers your rulings so it
+  never raises the same pair again. The librarian remembers merged pages, so future
+  claims about a merged topic go where you put them.
+
+Every claim shows the claim, its sources and the date it was last confirmed:
+
+```
+- The review routine runs daily at 02:00. ^ca8117b — source: [[source-001]] · confirmed: 2026-09-01
+```
+
+Contradictions are found without a model. Claims about the same subject (shared
+content words) that disagree on a facet are flagged: how often (daily ≠ weekly), a
+quantity with units (16 GB ≠ 32 GB; 90 s and 1.5 min agree), a clock time, a port or
+version, on/off, or a negation.
+
+Answers come from claims, with citations. An answer that cites two or more claims is
+filed back as `wiki/answer-NNN.md`, so the wiki grows from use as well as reading.
+Asking the same question again refreshes that page. Set `knowledge.llm` to `claude`
+(or pass `--llm claude`) to let Claude phrase the answer. Its text is only accepted
+if every citation is one of the retrieved claims; otherwise JARVIS uses the plain
+extractive answer. Wiki claims are also part of what `jarvis ask` and the voice
+listener recall.
+
+```fish
+jarvis kb ingest notes.md paper.pdf https://example.com/post memo.m4a
+jarvis kb ingest --text "Lan Mouse uses UDP port 4242 on both laptops."
+jarvis kb ask "how often does the review routine run?"
+jarvis kb sync                       # read your Obsidian vault in (changed notes only;
+                                     # one wiki page per note; daily/, templates/, archive/ skipped)
+jarvis kb check                      # the nightly audit, now
+jarvis kb conflicts                  # what's waiting on you
+jarvis kb resolve c5513ad keep ca8117b   # or drop / both; the last id limits it to one pair
+jarvis kb merge later review         # fold a page into another; the librarian remembers
+jarvis kb schedule on --at 02:00     # systemd user timer (Task Scheduler on Windows)
+jarvis kb status | log | sources | page review-routine
+```
+
+The console's **Wiki** link (`/knowledge.html`) shows it live: the graph turns,
+and each reader/librarian/checker event pulses the node it touched (`LOCKED`, `PATCH`,
+`SAVED`, `CONFLICT`). Eight panels show the shared chat, write queue, page inspector,
+graph index, raw sources with hash checks, the latest diff, a page × source citation
+matrix and the nightly checker. When the checker has flagged something, the inspector
+shows the two claims side by side with **Keep A / Keep B / Both true**. Drop files
+anywhere on the page (or use **+ FILE**) to hand them to the reader: text, HTML, PDF
+or audio, up to 200 MB each. The command line takes `ingest URL`, `note TEXT`,
+`ask QUESTION`, `check`, `resolve CLAIM keep|drop|both [AGAINST]` and `merge FROM INTO`.
+
+## System design page
+
+The console's **System** link (`/design.html`) explains how JARVIS works and checks it,
+live:
+
+1. **What happens when you say "Jarvis, …"**: seven stations (hear, decide, remember,
+   think, act, speak, log). Each is described in plain words, shows a health dot, and
+   opens to the real modules behind it. Type a request into **Try a request** to light up
+   the path it would take.
+2. **Is everything working?**: every requirement (voiceprint, microphone, vault, CLIs,
+   browser, voice files, nightly check) with the exact command that fixes it.
+3. **Where your data lives**: each store, what it holds, how big it is.
+4. **Under the hood**: modules grouped by station, with their imports.
+
 ## Console
 
 Double-click **`start.bat`**: it starts the voice listener if it isn't running, then
@@ -281,6 +362,41 @@ Current offline validation and commands are recorded in the
 [pipeline review](docs/pipeline-architecture-review.md#measurement-and-verification).
 Tests include local child processes and mocked HTTP/SSH interfaces; they do not
 establish live provider authentication, inference or physical hardware behavior.
+
+## Running on Arch (Zenbook)
+
+The same checkout runs on the ASUS. Commands below are fish-safe.
+
+```fish
+uv venv .venv --python 3.12                         # Arch's python refuses system pip
+uv pip install --python .venv/bin/python -e '.[voice]'
+mkdir -p .jarvis/voice/kokoro                         # local voice model, ~350 MB
+for f in kokoro-v1.0.onnx voices-v1.0.bin
+    curl -fLo .jarvis/voice/kokoro/$f https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/$f
+end
+./start.sh                                            # voice listener + console window
+.venv/bin/python -m jarvis voice autostart on         # systemd user unit, starts at login
+```
+
+What differs from the Dell:
+
+- **Devices.** The config is written from the Dell's side. On the machine whose
+  hostname matches a device (`archmain`), that device becomes local, and the
+  Dell is left out, since there is no SSH route to Windows. Drop-folder transfers
+  therefore run from the Dell.
+- **Apps.** `open_app` lists `.desktop` entries (including Flatpak) and launches
+  them with `gio launch`; links open in the default browser.
+- **Console window.** `jarvis app` uses `google-chrome-stable`, Chromium, Brave,
+  Edge or Vivaldi in `--app` mode. The hotkey overlay is Windows-only; bind a
+  Hyprland key to `start.sh` instead.
+- **Voice.** Kokoro and Whisper run on CPU (no CUDA on the Zenbook, so the GPU
+  model is never downloaded). The mic is read through PipeWire, because without
+  `pipewire-alsa` ALSA's default device is the raw DSP mic and reads silence.
+  Playback uses `pw-play`/`paplay`; the fallback voice is `espeak-ng`.
+- **Vault.** `vault.path` takes `{"windows": ..., "linux": ...}`. A Windows path is
+  treated as unconfigured on Linux. On the Zenbook it is `~/Documents/obsidian-vault`.
+- **Not ported.** The Windows keyboard self-test (`selftest keyboard`) and the
+  overlay. Both say so and skip.
 
 ## Hardware and SSH
 
