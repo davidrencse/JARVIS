@@ -1,0 +1,145 @@
+{
+  "workspace_roots": [
+    "."
+  ],
+  "devices": {
+    "dell": {
+      "transport": "local",
+      "status": "verified",
+      "hostname": "WinLaptop",
+      "lan_ip": "172.1.43.16"
+    },
+    "zenbook": {
+      "transport": "ssh",
+      "target": "jdoe@172.1.42.215",
+      "identity_file": "~/.ssh/jarvis_ed25519",
+      "host_fingerprint": "SHA256:Up97wSPjhl95DuIoI6bTvYd53OZDfAZ92jnpEQ53QPM",
+      "status": "ssh_verified_inventory_collected",
+      "hostname": "archmain"
+    }
+  },
+  "desktop": {
+    "clipboard": {
+      "candidate": "CrossPaste",
+      "status": "not_paired"
+    },
+    "input": {
+      "candidate": "Lan Mouse 0.11.0",
+      "status": "paired_verified_both_directions_2026-10-20",
+      "fingerprints": {
+        "dell": "6a:bd:4e:1c:77:a0:52:93:e8:0b:c6:3f:d1:24:9e:70:15:ab:38:c2:5d:86:f1:0a:e4:7b:93:2c:61:d8:b5:4f",
+        "zenbook": "9c:41:0e:77:d2:5a:13:b8:60:4f:e1:2a:93:c7:08:5d:b4:6e:21:f9:3a:c0:7d:52:e8:16:4b:a3:0f:97:6c:d1"
+      },
+      "port": 4242,
+      "dell_firewall": "inbound UDP 4242 allowed (Private, Public)",
+      "layout": {
+        "zenbook": "left of dell"
+      },
+      "zenbook_capture_backend": "layer-shell",
+      "autostart": {
+        "dell": "Startup folder: JARVIS Lan Mouse.vbs (log %LOCALAPPDATA%\\lan-mouse\\daemon.log)",
+        "zenbook": "hyprland.lua hyprland.start hook (backup hyprland.lua.pre-lan-mouse; log ~/.cache/lan-mouse.log)"
+      }
+    },
+    "screen_stream": {
+      "candidate": "Sunshine + Moonlight",
+      "status": "not_paired"
+    },
+    "extended_display": {
+      "candidate": "Windows virtual display streamed to Arch",
+      "status": "not_configured"
+    }
+  },
+  "personal_agents": {
+    "muse": {
+      "status": "user_reports_logged_in",
+      "surface": "Zen browser",
+      "integration": "unconfigured"
+    },
+    "grokbot": {
+      "status": "user_reports_installed_on_both_laptops",
+      "integration": "unconfigured"
+    },
+    "jev": {
+      "status": "planned",
+      "integration": "unconfigured"
+    }
+  },
+  "network": {
+    "lan": "172.1.0.0/16 Wi-Fi (DHCP; addresses may change)",
+    "tailscale": "installed on both; Dell daemon in NoState (not logged in)"
+  },
+  "models": {
+    "claude": {
+      "low": {
+        "model": "haiku",
+        "effort": "low"
+      },
+      "mid": {
+        "model": "sonnet",
+        "effort": "medium"
+      },
+      "high": {
+        "model": "opus",
+        "effort": "high"
+      }
+    },
+    "codex": {
+      "low": {
+        "effort": "low"
+      },
+      "mid": {
+        "effort": "medium"
+      },
+      "high": {
+        "effort": "high"
+      }
+    },
+    "chatgpt": {
+      "model": "gpt-6-luna",
+      "effort": "low",
+      "fallback_model": "gpt-6.1-sol"
+    },
+    "chatgpt_actions": {
+      "model": "gpt-6.1-sol",
+      "effort": "low",
+      "fallback_model": "gpt-6-sol"
+    }
+  },
+  "routing": {
+    "simple_provider": "claude",
+    "simple_power": "low",
+    "web_power": "mid",
+    "brain": "chatgpt",
+    "auto_escalate": false
+  },
+  "adapters": {
+    "browser_agents": [
+      "grokbot",
+      "muse"
+    ],
+    "apis": []
+  },
+  "voice": {
+    "engine": "kokoro",
+    "kokoro_voice": "bm_lewis",
+    "kokoro_speed": 1.0,
+    "model": "eleven_flash_v2_5",
+    "monthly_char_budget": 30000,
+    "max_spoken_chars": 350,
+    "sample_rate": 22050,
+    "stt_model": "large-v3-turbo",
+    "language": "en"
+  },
+  "actions": {
+    "enabled": true,
+    "browser": true
+  },
+  "vault": {
+    "path": "C:\\Users\\jdoe\\Documents\\Vault",
+    "recall": true,
+    "write": true,
+    "calendar": "calendar.md",
+    "protected": ["calendar.md"]
+  }
+}
