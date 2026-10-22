@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "David's personal workflow OS"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+voice = ["numpy", "sounddevice", "faster-whisper", "sherpa-onnx"]
+
+[project.scripts]
+jarvis = "jarvis.__main__:main"
+
+[tool.setuptools]
+packages = ["jarvis"]
+
+[tool.setuptools.package-data]
+jarvis = ["web/*", "web/fonts/*"]
