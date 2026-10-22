@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "jarvis-console",
+      "runtimeExecutable": "C:/Users/jdoe/MiniConda3/python.exe",
+      "runtimeArgs": ["-m", "jarvis", "ui", "--port", "7777"],
+      "port": 7777
+    },
+    {
+      "name": "jarvis-console-alt",
+      "runtimeExecutable": "C:/Users/jdoe/MiniConda3/python.exe",
+      "runtimeArgs": ["-m", "jarvis", "ui", "--port", "7778"],
+      "port": 7778
+    }
+  ]
+}
