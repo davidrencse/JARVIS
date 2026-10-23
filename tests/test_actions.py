@@ -1,4 +1,3 @@
-import json
 import os
 import sys
 import tempfile
@@ -63,18 +62,26 @@ class DesktopToolTests(unittest.TestCase):
         self.assertEqual(self.tools.match("spotfy")[0]["Name"], "Spotify")  # typo
         self.assertEqual(self.tools.match("photoshop"), [])
 
+    @unittest.skipUnless(os.name == "nt", "Windows launches through the Start Apps folder")
     @patch("jarvis.actions.subprocess.Popen")
     def test_open_app_launches_through_shell_apps_folder(self, popen):
-        ok, text = self.tools.call("open_app", {"name": "notepad"})
-        self.assertTrue(ok)
+        self.assertTrue(self.tools.call("open_app", {"name": "notepad"})[0])
         self.assertEqual(popen.call_args.args[0],
                          ["explorer.exe", "shell:AppsFolder\\Microsoft.WindowsNotepad_8wekyb3d8bbwe!App"])
+
+    @unittest.skipIf(os.name == "nt", "Linux launches the .desktop entry")
+    @patch("jarvis.actions.launch_desktop_entry", return_value=(True, "Opened Notepad."))
+    def test_open_app_launches_the_desktop_entry(self, launch):
+        self.assertTrue(self.tools.call("open_app", {"name": "notepad"})[0])
+        self.assertEqual(launch.call_args.args[0]["Name"], "Notepad")
+
+    def test_open_app_needs_a_matching_app(self):
         self.assertFalse(self.tools.call("open_app", {"name": "photoshop"})[0])
 
-    @patch("jarvis.actions.os.startfile", create=True)
-    def test_open_url_only_http(self, startfile):
+    @patch("jarvis.vault.open_link")
+    def test_open_url_only_http(self, open_link):
         self.assertTrue(self.tools.call("open_url", {"url": "youtube.com"})[0])
-        startfile.assert_called_with("https://youtube.com")
+        open_link.assert_called_with("https://youtube.com")
         for bad in ("file:///C:/Windows/win.ini", "javascript:alert(1)", "C:\\Windows\\notepad.exe"):
             self.assertFalse(self.tools.call("open_url", {"url": bad})[0], bad)
 

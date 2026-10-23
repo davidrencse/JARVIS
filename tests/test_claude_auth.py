@@ -39,7 +39,7 @@ class ClaudeRenewalTests(unittest.TestCase):
                    "'cwd':os.getcwd(),'config':os.environ.get('CLAUDE_CONFIG_DIR'),"
                    "'home':os.environ.get('HOME'),'keys':list(os.environ)}))\n"
                    "print('private-test-output')\n")
-        with patch.dict(os.environ, {key: "private-test-secret" for key in auth._AUTH_ENV}), \
+        with patch.dict(os.environ, dict.fromkeys(auth._AUTH_ENV, "private-test-secret")), \
                 patch.dict(os.environ, {"HOME": "preserved-home"}):
             auth.renew_claude_session()
         data = json.loads(report.read_text())

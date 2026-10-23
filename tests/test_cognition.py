@@ -17,6 +17,12 @@ from jarvis.runner import final_message, make_plan
 from jarvis.speech import Voice, spoken
 from jarvis.store import Store
 
+try:  # numpy is an optional extra ([voice]); these tests exercise the audio path
+    import numpy  # noqa: F401
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = specialists(ROOT)
 
@@ -212,6 +218,7 @@ class SpeechTests(Temp):
             voice = Voice(self.base, {"voice": {"engine": "elevenlabs"}})
             self.assertEqual(voice.synth("hi")[1], "no-credentials")
 
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_kokoro_is_default_local_and_cached(self):
         import numpy as np
         from jarvis import speech
@@ -449,7 +456,7 @@ class ListenTests(unittest.TestCase):
             import numpy as np
         except ImportError:
             self.skipTest("numpy not installed")
-        from jarvis.listen import RATE, VoicePrint, segment
+        from jarvis.listen import RATE, segment
         quiet = np.zeros(RATE, dtype="float32")
         loud = (0.2 * np.sin(np.arange(RATE) / 5)).astype("float32")
         audio = np.concatenate([quiet, loud, quiet, quiet, loud[: RATE // 10]])

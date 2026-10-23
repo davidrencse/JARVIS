@@ -232,6 +232,7 @@ class EventStreamTests(Temp):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(req, timeout=5)
         self.assertEqual(caught.exception.code, 403)
+        caught.exception.close()  # the error object holds the response
         req = urllib.request.Request(self.url + "/api/route?text=check+my+instagram&tier=",
                                      headers={"Sec-Fetch-Site": "same-origin"})
         with urllib.request.urlopen(req, timeout=5) as res:

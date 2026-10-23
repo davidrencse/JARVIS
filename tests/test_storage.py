@@ -122,7 +122,7 @@ class FakeRemote:
         """Emulate scp: the remote side is `jdoe@10.0.0.2:<path>` on this machine."""
         self.calls.append((args, kw.get("cwd")))
         import shutil
-        clean = [a for a in args[args.index("--") + 1:]]
+        clean = list(args[args.index("--") + 1:])
         src, dst = clean
         cwd = Path(kw["cwd"])
 

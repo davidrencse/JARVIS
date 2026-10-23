@@ -84,8 +84,9 @@ class BriefingTests(Case):
 class ObsidianTests(Case):
     def test_open_uses_obsidian_links_and_makes_todays_note(self):
         opened = []
-        with patch("jarvis.vault.os.startfile", opened.append, create=True), \
-                patch("jarvis.vault.os.name", "nt"):
+        # Patch the opener, not os.name: setting os.name switches pathlib to WindowsPath
+        # for the whole interpreter, which breaks every other path in this process.
+        with patch("jarvis.vault.open_link", opened.append):
             self.vault.open("Operating Systems")
             made = self.vault.open("today", when=NOW)
         self.assertEqual(opened, ["obsidian://open?vault=Vault&file=courses%2Fos",

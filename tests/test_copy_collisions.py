@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import test_storage as fixtures
 from jarvis import transfer
 from jarvis.storage import REMOTE_SCRIPT, Storage
+
+from . import test_storage as fixtures
 
 
 class CopyCollisionTests(fixtures.Temp):
