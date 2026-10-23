@@ -34,6 +34,13 @@ jarvis voice test | recalibrate                                     # check / re
 
 Tiers, agent hierarchy, memory and voice-cost design: [docs/architecture.md](docs/architecture.md).
 
+Web tasks get two browsers, both driven by ChatGPT over MCP with their own Chrome
+profiles under `.jarvis/`: Playwright MCP (`browser_*`, primary) and Vercel's
+[agent-browser](https://github.com/vercel-labs/agent-browser) (`agent_browser_*`, core
+tools only; `agent_browser_read` fetches a page as text without opening Chrome). Pick
+with `actions.browser_engines` in `jarvis.config.json`. Page scripts (`eval`), uploads,
+raw CLI flags, other sessions and screenshot files on disk are refused.
+
 ## Second brain (Obsidian)
 
 JARVIS reads and adds to your Obsidian vault (`vault.path` in `jarvis.config.json`, now
