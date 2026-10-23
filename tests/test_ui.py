@@ -244,7 +244,8 @@ class HttpTests(Temp):
             with urllib.request.urlopen(req, timeout=10) as res:
                 return res.status, res.read()
         except urllib.error.HTTPError as exc:
-            return exc.code, exc.read()
+            with exc:  # an HTTPError is the response; closing it keeps the socket from leaking
+                return exc.code, exc.read()
 
     def test_static_and_traversal(self):
         status, body = self.call("/")

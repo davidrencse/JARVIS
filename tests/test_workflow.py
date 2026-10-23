@@ -23,6 +23,12 @@ from jarvis.orchestrator import Orchestrator
 from jarvis.store import Store
 from jarvis.ui import Console
 
+try:  # numpy is an optional extra ([voice]); these tests exercise the audio path
+    import numpy  # noqa: F401
+    HAVE_NUMPY = True
+except ImportError:
+    HAVE_NUMPY = False
+
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8"))
 
@@ -348,6 +354,7 @@ class ConsoleWorkflowTests(Temp):
 class VoiceWorkflowTests(Temp):
     """listen_loop with the microphone, speaker model, Whisper and TTS replaced by fakes."""
 
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_owner_with_wake_word_is_answered_strangers_and_chatter_are_not(self):
         from jarvis import daemon
         heard = {"owner": "Jarvis, remind me to push the branch",
@@ -402,6 +409,7 @@ class VoiceWorkflowTests(Temp):
         self.assertEqual(memory.search("million"), [])
         ears.learn.assert_called_once()  # only the verified + wake-worded clip adapts the print
 
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_listener_survives_a_failed_turn_and_keeps_listening(self):
         from jarvis import daemon
         queue_ = ["a", "b", KeyboardInterrupt]
