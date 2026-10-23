@@ -133,7 +133,11 @@
   },
   "actions": {
     "enabled": true,
-    "browser": true
+    "browser": true,
+    "browser_engines": [
+      "playwright",
+      "agent-browser"
+    ]
   },
   "knowledge": {
     "stale_days": 30,
