@@ -1,0 +1,171 @@
+/* Run view: a whole JARVIS plan on one screen, in the dense key/value idiom.
+   Grammar, not decoration:
+     - every box is a title bar plus `key -> value` rows, values right-aligned, no prose
+     - counters read `done / total`, so progress needs no bar
+     - colour means state and nothing else: dim = waiting, accent = live, ok = finished
+     - the dependency graph is the background, not a separate panel
+     - the human gate is a panel, never a modal: the run parks there
+   It inherits app.css's tokens; only state colour and the grid are new. */
+
+.rv {
+  --rv-accent: #e4556c;
+  --rv-accent-dim: rgba(228, 85, 108, .16);
+  --rv-ok: #cfd3d7;
+  --rv-head: 28px;
+  --rv-gap: 10px;
+  height: 100%;
+  display: grid;
+  grid-template-rows: var(--rv-head) minmax(0, 1fr) auto auto;
+  gap: var(--rv-gap);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0;
+  min-height: 0;
+}
+:root[data-theme="light"] .rv { --rv-accent: #b02a42; --rv-accent-dim: rgba(176, 42, 66, .12); --rv-ok: #2a2e33; }
+
+/* ---------- header strip ---------- */
+.rv-head {
+  display: flex; align-items: center; gap: 18px;
+  padding: 0 10px; height: var(--rv-head);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--glass-strong);
+  text-transform: uppercase; letter-spacing: .06em; font-size: 10.5px;
+  color: var(--ink-3); white-space: nowrap; overflow: hidden;
+}
+.rv-head b { color: var(--ink); font-weight: 500; text-transform: none; letter-spacing: 0; font-size: 11.5px; }
+.rv-head .rv-spacer { margin-left: auto; }
+.rv-head .rv-state { color: var(--rv-accent); }
+.rv-head .rv-state[data-state="finished"] { color: var(--rv-ok); }
+
+/* ---------- body: inputs | graph | stages ---------- */
+.rv-body { display: grid; grid-template-columns: 172px 128px minmax(0, 1fr); gap: var(--rv-gap); min-height: 0; }
+.rv-inputs { display: flex; flex-direction: column; gap: var(--rv-gap); overflow: auto; min-height: 0; }
+.rv-spine { position: relative; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--glass); overflow: hidden; }
+.rv-spine canvas { width: 100%; height: 100%; display: block; }
+.rv-spine .rv-spine-label {
+  position: absolute; left: 6px; bottom: 6px; font-size: 9.5px; color: var(--ink-3);
+  text-transform: uppercase; letter-spacing: .08em; pointer-events: none;
+}
+.rv-stages {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(188px, 1fr));
+  gap: var(--rv-gap); align-content: start; overflow: auto; min-height: 0; padding-right: 2px;
+}
+
+/* ---------- the card, the one repeated unit ---------- */
+.rv-card { border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--glass); overflow: hidden; }
+.rv-card > h3 {
+  margin: 0; padding: 3px 7px; font: 500 11px/1.5 var(--mono);
+  background: rgba(255, 255, 255, .045); border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 6px; color: var(--ink-2);
+}
+:root[data-theme="light"] .rv-card > h3 { background: rgba(10, 12, 14, .05); }
+.rv-card > h3 .rv-tag { margin-left: auto; font-size: 9.5px; color: var(--ink-3); letter-spacing: .05em; }
+
+/* state lives on the card: the title bar carries it, the body stays neutral */
+.rv-card[data-state="running"] { border-color: var(--rv-accent); }
+.rv-card[data-state="running"] > h3 { background: var(--rv-accent-dim); color: var(--ink); }
+.rv-card[data-state="running"] > h3 .rv-tag { color: var(--rv-accent); }
+.rv-card[data-state="blocked"] { border-color: var(--rv-accent); }
+.rv-card[data-state="blocked"] > h3 { color: var(--rv-accent); }
+.rv-card[data-state="finished"] > h3 { color: var(--ink); }
+.rv-card[data-state="pending"], .rv-card[data-state="queued"] { opacity: .62; }
+
+.rv-rows { display: grid; grid-template-columns: auto 1fr; gap: 1px 10px; padding: 5px 7px 6px; }
+.rv-rows dt { color: var(--ink-3); }
+.rv-rows dd { margin: 0; text-align: right; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-rows dd.rv-live { color: var(--rv-accent); }
+.rv-rows dd.rv-mute { color: var(--ink-3); }
+.rv-note { padding: 0 7px 6px; color: var(--ink-3); font-size: 10.5px; line-height: 1.35; }
+
+/* sparkline strip, for the input cards that have a history */
+.rv-spark { display: flex; align-items: flex-end; gap: 1px; height: 26px; padding: 0 7px 6px; }
+.rv-spark i { flex: 1; background: var(--track); min-height: 1px; }
+.rv-spark i.on { background: var(--rv-accent); }
+
+/* ---------- funnel: the one line that says what the run is doing ---------- */
+.rv-funnel {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--glass-strong);
+}
+.rv-funnel .rv-phase { color: var(--rv-accent); text-transform: uppercase; letter-spacing: .08em; font-size: 10px; }
+.rv-funnel .rv-flow { color: var(--ink-2); }
+.rv-funnel .rv-flow b { color: var(--ink); font-weight: 500; }
+.rv-funnel .rv-flow span { color: var(--ink-3); margin: 0 4px; }
+
+/* ---------- bottom triptych ---------- */
+.rv-foot { display: grid; grid-template-columns: 1.15fr 1fr .95fr; gap: var(--rv-gap); }
+.rv-foot .rv-card { display: flex; flex-direction: column; min-height: 0; }
+.rv-scroll { overflow: auto; max-height: 168px; padding: 5px 7px 6px; }
+
+/* run log: timestamp, actor tag, text */
+.rv-log { display: grid; grid-template-columns: auto auto 1fr; gap: 1px 8px; align-items: baseline; }
+.rv-log time { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.rv-log .rv-actor { color: var(--rv-accent); }
+.rv-log .rv-actor[data-kind="finished"] { color: var(--ink-2); }
+.rv-log .rv-actor[data-kind="queued"] { color: var(--ink-3); }
+.rv-log span.rv-text { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* dispatch: one lane per worker */
+.rv-lanes { display: grid; grid-template-columns: auto 1fr auto; gap: 3px 8px; align-items: center; }
+.rv-lanes .rv-w { color: var(--ink-3); }
+.rv-lanes .rv-name { color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-lanes .rv-bar { grid-column: 2; height: 5px; background: var(--track); border-radius: 1px; overflow: hidden; }
+.rv-lanes .rv-bar i { display: block; height: 100%; background: var(--rv-accent); }
+.rv-lanes .rv-bar.done i { background: var(--fill-2); }
+.rv-lanes .rv-st { color: var(--ink-3); text-align: right; }
+.rv-lanes .rv-st[data-state="done"], .rv-lanes .rv-st[data-state="finished"] { color: var(--ink-2); }
+.rv-lanes .rv-st[data-state="run"], .rv-lanes .rv-st[data-state="running"] { color: var(--rv-accent); }
+
+/* human gate: the headline, then exactly what is being waited on */
+.rv-gate { padding: 7px 10px 9px; display: flex; flex-direction: column; gap: 5px; }
+.rv-big { font: 400 34px/1 var(--mono); letter-spacing: -.02em; color: var(--ink); display: flex; align-items: baseline; gap: 9px; }
+.rv-big small { font-size: 10.5px; color: var(--ink-3); letter-spacing: .04em; }
+.rv-gate .rv-sub { color: var(--ink-2); }
+.rv-gate .rv-wait { color: var(--rv-accent); }
+.rv-gate .rv-run { align-self: flex-start; margin-top: 3px; }
+
+/* ---------- command line ---------- */
+.rv-cmd {
+  display: flex; align-items: center; gap: 8px; padding: 5px 10px;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--glass-strong);
+  color: var(--ink-2);
+}
+.rv-cmd .rv-prompt { color: var(--rv-accent); }
+.rv-cmd .rv-caret { width: 7px; height: 13px; background: var(--rv-accent); display: inline-block; }
+.rv-cmd .rv-right { margin-left: auto; color: var(--ink-3); font-size: 10.5px; }
+
+/* System view: same grammar, but the spine holds the layered diagram, so it needs room.
+   The diagram's own styles live in app.css keyed off #system-svg and survive the move;
+   only .diagram-scroll's panel-padding compensation has to be undone here. */
+.sv-body { grid-template-columns: 162px minmax(300px, 1.3fr) minmax(216px, 1fr); }
+.sv-diagram { display: flex; flex-direction: column; padding: 8px; overflow: hidden; }
+.sv-diagram .diagram-scroll { margin: 0; padding: 0; flex: 1; min-height: 0; }
+.sv-diagram .module-detail { margin-top: 8px; padding-top: 8px; min-height: 0; font-size: 11px; }
+.sv-diagram #system-svg { min-width: 760px; }
+.rv-scroll.tree { font-size: 11px; }
+@media (max-width: 1100px) { .sv-body { grid-template-columns: 162px minmax(0, 1fr); } .sv-diagram { display: none; } }
+@media (max-width: 760px) { .sv-body { grid-template-columns: 1fr; } }
+
+.rv-empty { padding: 14px; color: var(--ink-3); line-height: 1.5; }
+.rv-empty b { display: block; color: var(--ink); font-weight: 500; margin-bottom: 4px; }
+
+@media (prefers-reduced-motion: no-preference) {
+  .rv-card[data-state="running"] > h3 .rv-tag { animation: rv-pulse 1.9s var(--ease) infinite; }
+  @keyframes rv-pulse { 50% { opacity: .42; } }
+}
+
+/* Narrow windows: the grammar survives, the three columns stack. */
+@media (max-width: 1100px) {
+  .rv-body { grid-template-columns: 158px minmax(0, 1fr); }
+  .rv-spine { display: none; }
+  .rv-foot { grid-template-columns: 1fr 1fr; }
+  .rv-foot .rv-gate-card { grid-column: 1 / -1; }
+}
+@media (max-width: 760px) {
+  .rv-body { grid-template-columns: 1fr; }
+  .rv-inputs { flex-direction: row; overflow-x: auto; }
+  .rv-inputs .rv-card { min-width: 168px; }
+  .rv-foot { grid-template-columns: 1fr; }
+}

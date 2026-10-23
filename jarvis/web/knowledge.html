@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>JARVIS Knowledge Engine</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="knowledge.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>JARVIS / KNOWLEDGE ENGINE</h1>
+    <p class="counts" id="counts">SRC 000 / 0 DOCS / 0 NODES / 0 LINKS</p>
+  </div>
+  <div class="clock">
+    <span class="dim" id="mode">LIVE</span>
+    <span id="clock">00:00:00</span>
+    <span id="fps">60FPS</span>
+    <span class="rec" aria-hidden="true"></span>
+  </div>
+</header>
+
+<nav class="roles" aria-label="Bots">
+  <div class="role reader" id="role-reader"><b>● READER</b><span>RAW / LOCKED</span></div>
+  <div class="role librarian" id="role-librarian"><b>● LIBRARIAN</b><span>00/00 COMMITTED</span></div>
+  <div class="role checker" id="role-checker"><b>● CHECKER</b><span>QUEUED 02:00</span></div>
+  <div class="role cmd" id="last-cmd">&gt; reader idle</div>
+</nav>
+
+<main class="stage">
+  <div class="graph-head">
+    <span id="graph-count">GRAPH / 0 RECORDS · 0 LINKS</span>
+    <span class="layers" role="group" aria-label="Show layers">
+      <button type="button" data-layer="wiki" aria-pressed="true">● WIKI</button>
+      <button type="button" data-layer="vault" aria-pressed="true">● VAULT</button>
+      <button type="button" data-layer="claims" aria-pressed="true">● CLAIMS</button>
+      <span id="graph-angle">AZ 0.0° Z 100</span>
+    </span>
+  </div>
+  <canvas id="graph" tabindex="0" role="img"
+          aria-label="Knowledge graph: wiki pages, their claims and raw sources. Drag to turn, scroll to zoom, click a node to inspect it."></canvas>
+  <div class="ticker" id="ticker">00.00 &nbsp; reader :: idle</div>
+</main>
+
+<form class="command" id="command" autocomplete="off">
+  <label for="command-input">&gt;</label>
+  <input id="command-input" spellcheck="false"
+         placeholder="ingest https://…  ·  note …  ·  ask …  ·  check  ·  resolve c1a2b3c keep  ·  merge from into">
+  <label class="file" title="Give the reader files (or drop them anywhere)">+ FILE
+    <input id="command-file" type="file" multiple accept=".md,.markdown,.txt,.rst,.csv,.json,.html,.htm,.pdf,.wav,.mp3,.m4a,.ogg,.flac,.opus,.webm"></label>
+  <span class="who" id="command-who">READER</span>
+</form>
+
+<section class="panels" aria-label="Engine panels">
+  <article class="panel" id="p-chat">
+    <header><h2>01 SHARED CHAT</h2><span id="chat-bots">3 BOTS</span></header>
+    <ol class="chat" id="chat"></ol>
+    <footer id="chat-foot">—</footer>
+  </article>
+  <article class="panel" id="p-queue">
+    <header><h2>02 WRITE QUEUE</h2><span id="queue-count">0 DOC</span></header>
+    <ol class="queue" id="queue"></ol>
+    <footer><span id="queue-foot">0/0 ATOMIC WRITES</span><span>NO RAW EDITS</span></footer>
+  </article>
+  <article class="panel" id="p-inspect">
+    <header><h2>03 PAGE INSPECTOR</h2><span id="inspect-tag">TRACE</span></header>
+    <div class="inspect" id="inspect"><p class="dim">Click a node.</p></div>
+  </article>
+  <article class="panel" id="p-index">
+    <header><h2>04 GRAPH INDEX</h2><span>LIVE</span></header>
+    <div class="index">
+      <canvas id="minimap" aria-hidden="true"></canvas>
+      <dl><dt>PAGES</dt><dd id="idx-pages">0</dd><dt>LINKS</dt><dd id="idx-links">0</dd></dl>
+    </div>
+    <footer id="idx-foot">SELECT 00/00</footer>
+  </article>
+  <article class="panel" id="p-raw">
+    <header><h2>05 RAW / IMMUTABLE</h2><span>LOCK</span></header>
+    <table class="raw"><thead><tr><th>PATH</th><th>SHA-256</th><th></th></tr></thead><tbody id="raw"></tbody></table>
+    <footer><span id="raw-mut">0 MUTATIONS</span><span id="raw-verify">VERIFY —</span></footer>
+  </article>
+  <article class="panel" id="p-diff">
+    <header><h2>06 DOCUMENT DIFF</h2><span id="diff-tag">PATCH</span></header>
+    <pre class="diff" id="diff"></pre>
+    <footer id="diff-foot">—</footer>
+  </article>
+  <article class="panel" id="p-matrix">
+    <header><h2>07 CITATION MATRIX</h2><span id="matrix-size">0×0</span></header>
+    <div class="matrix" id="matrix" role="table" aria-label="Pages by sources"></div>
+    <footer><span id="matrix-foot">0 PAGES + 0 RAW SOURCES</span><span>■ CITED ■ CONFLICT</span></footer>
+  </article>
+  <article class="panel" id="p-checker">
+    <header><h2>08 NIGHTLY CHECKER</h2><span id="check-state">WAIT</span></header>
+    <div class="check-body">
+      <p id="check-when">NIGHTLY 02:00</p>
+      <p id="check-scan">SCANNED 000 / 000</p>
+      <div class="bars" id="bars" aria-label="Claim age, newest left"></div>
+    </div>
+    <footer><span id="check-foot">0 CHECKS · 0 FLAGS</span><span>READ · WRITE · CHECK</span></footer>
+  </article>
+</section>
+
+<script src="knowledge.js"></script>
+</body>
+</html>

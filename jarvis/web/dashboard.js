@@ -177,7 +177,7 @@
     const stat = (ic, label, value, sub, tone) => `<div class="stat ${tone || ""}"><span class="stat-ic" aria-hidden="true">${icon(ic)}</span>
       <div><span class="stat-label">${esc(label)}</span><b>${value == null ? "—" : value}</b><span class="stat-sub">${esc(sub || "")}</span></div></div>`;
     $("#limit-stats").innerHTML =
-      stat("gauge", "Codex, 5 h", left(five) == null ? null : left(five) + "%", five ? (five.refilled ? "refilled" : five.resets_at ? "resets in " + until(five.resets_at) : "left") : "no data") +
+      stat("gauge", "Codex, 5 h", left(five) == null ? null : left(five) + "%", five ? (five.resets_at ? "resets in " + until(five.resets_at) : "left") : "no data") +
       stat("calendar", "Codex, week", left(week) == null ? null : left(week) + "%", week?.resets_at ? "resets in " + until(week.resets_at) : "left") +
       stat("laptop-minimal", "Zenbook memory", zen?.mem_avail_pct == null ? null : zen.mem_avail_pct + "%", "free", zen?.mem_avail_pct != null && zen.mem_avail_pct < 10 ? "alert" : "");
     const tile = (title, sub, bits, prog, progLabel, tone) => `<div class="silk-tile">

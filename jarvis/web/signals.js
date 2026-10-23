@@ -164,7 +164,7 @@
     ring($("#dm-ring"), left);
     $("#sig-ring").textContent = left == null ? "—" : Math.round(left) + "%";
     $("#sig-limit").classList.toggle("low", left != null && left < 15);
-    $("#sig-limit-flag").textContent = five?.refilled ? "refilled" : five?.resets_at ? "resets in " + until(five.resets_at) : "";
+    $("#sig-limit-flag").textContent = five?.resets_at ? "resets in " + until(five.resets_at) : "";
     const row = (k, v, tone) => `<li class="${tone || ""}"><i aria-hidden="true"></i><span>${esc(k)}</span><b>${esc(v)}</b></li>`;
     $("#sig-ring-legend").innerHTML = codex ? row("5 h used", five ? Math.round(five.pct ?? 0) + "%" : "—", "lit") +
       row("Week left", week ? Math.round(100 - (week.pct ?? 0)) + "%" : "—", "half") +
@@ -214,7 +214,7 @@
     const t = $("#act-table");
     let head = "", rows = [];
     if (actTab === "requests") {
-      head = `<tr><th>Asked</th><th class="num">Tier</th><th class="num">Answer</th><th class="num">Time</th></tr>`;
+      head = `<tr><th>Asked</th><th class="num">Tier</th><th class="num">Took</th><th class="num">At</th></tr>`;
       rows = activityRequests.slice(-6).reverse().map((h) => {
         const secs = h.reply ? Math.max(0, (Date.parse(h.reply.at) - Date.parse(h.at)) / 1000) : null;
         return `<tr><td class="ident" title="${esc(h.text)}">${esc(h.text)}</td><td class="num">${esc(J.tierName(h.tier) || "—")}</td><td class="num">${secs == null ? "—" : secs < 60 ? secs.toFixed(1) + " s" : Math.round(secs / 60) + " min"}</td><td class="num">${hhmm(h.at)}</td></tr>`;

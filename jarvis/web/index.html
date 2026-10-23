@@ -12,6 +12,7 @@
 <link rel="preload" href="fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="app.css">
 <link rel="stylesheet" href="porcelain.css">
+<link rel="stylesheet" href="runview.css">
 <script src="theme.js"></script>
 </head>
 <body>
@@ -28,12 +29,14 @@
       <span class="rail-pill" aria-hidden="true"></span>
       <a href="#console" data-view="console" title="Console (1)"><svg class="i"><use href="icons.svg?v=2#i-layout-grid"/></svg><span>Console</span></a>
       <a href="#graph" data-view="graph" title="Knowledge graph (2)"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Graph</span></a>
-      <a href="#system" data-view="system" title="System design (3)"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
+      <a href="design.html" data-page="design" title="System design: how JARVIS works and what needs fixing (3)"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
       <a href="#credits" data-view="credits" title="Credits (4)"><svg class="i"><use href="icons.svg?v=2#i-gauge"/></svg><span>Credits</span></a>
       <a href="#memory" data-view="memory" title="Memory (5)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
+      <a href="knowledge.html" data-page="knowledge" title="Knowledge engine: reader, librarian, checker — opens its own page"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Wiki</span></a>
       <a href="#tasks" data-view="tasks" title="Tasks and plans (6)"><svg class="i"><use href="icons.svg?v=2#i-list-checks"/></svg><span>Tasks</span></a>
+      <a href="#run" data-view="run" title="Run: a plan on one screen (7)"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Run</span></a>
       <a href="#files" data-view="files" title="Files across both laptops (8)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
-      <a href="#devices" data-view="devices" title="Devices (7)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
+      <a href="#devices" data-view="devices" title="Devices (9)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
     </nav>
     <div class="profile">
       <span class="avatar" aria-hidden="true">D</span>
@@ -223,6 +226,11 @@
       </div>
     </section>
 
+    <!-- RUN: one plan on one screen -->
+    <section class="view view-full" id="view-run" data-title="Run" hidden>
+      <div class="rv" id="rv"></div>
+    </section>
+
     <!-- GRAPH -->
     <section class="view view-full" id="view-graph" data-title="Knowledge graph" hidden>
       <div class="graph-wrap panel">
@@ -245,18 +253,8 @@
     </section>
 
     <!-- SYSTEM -->
-    <section class="view" id="view-system" data-title="System design" hidden>
-      <div class="system-grid">
-        <article class="panel ticks system-diagram">
-          <header class="ph"><svg class="i i-sm"><use href="icons.svg?v=2#i-blocks"/></svg><h2>How the code fits together</h2><span class="ph-meta mono">from real imports in jarvis/*.py</span></header>
-          <div class="diagram-scroll"><svg id="system-svg" aria-label="System design diagram. Arrow keys move between parts."></svg></div>
-          <div class="module-detail mono" id="module-detail" aria-live="polite">Hover or focus a part to see what it does and what it connects to.</div>
-        </article>
-        <article class="panel ticks">
-          <header class="ph"><svg class="i i-sm"><use href="icons.svg?v=2#i-terminal"/></svg><h2>Project layout</h2><span class="ph-meta mono" id="tree-meta"></span></header>
-          <div class="tree mono" id="tree"></div>
-        </article>
-      </div>
+    <section class="view view-full" id="view-system" data-title="System design" hidden>
+      <div class="rv sv" id="sv"></div>
     </section>
 
     <!-- CREDITS -->
@@ -407,6 +405,8 @@
 <script src="app.js"></script>
 <script src="dashboard.js"></script>
 <script src="signals.js"></script>
+<script src="run.js"></script>
+<script src="system.js"></script>
 <script src="files.js"></script>
 </body>
 </html>

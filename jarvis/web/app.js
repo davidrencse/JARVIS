@@ -65,7 +65,7 @@
   const tierName = (t) => TIER[t] || t || "";
   function plainError(msg) {
     msg = String(msg || "");
-    if (/Another task is running/i.test(msg)) return "Another task is still running in the ledger. Wait for it to finish, then ask again.";
+    if (/run lanes? in this ledger are busy/i.test(msg)) return msg.replace(/^.*?All/, "All") + " Raise orchestration.lanes in jarvis.config.json to run more at once.";
     if (/not installed|not on PATH/i.test(msg)) return msg + " Install it or switch the provider in jarvis.config.json.";
     if (/Failed to fetch|NetworkError/i.test(msg)) return "Lost contact with the console server. Is `python -m jarvis ui` still running?";
     return msg.replace(/^(RuntimeError|ValueError|TypeError|OSError): /, "");
@@ -81,18 +81,20 @@
                   case: store.get("jarvis.case", "") };
 
   // ---------- views ----------
-  const VIEWS = ["console", "graph", "system", "credits", "memory", "tasks", "devices", "files"];
+  // Order is the rail's own order, so the number keys read top to bottom.
+  const VIEWS = ["console", "graph", "system", "credits", "memory", "tasks", "run", "files", "devices"];
   const loaded = {};
   async function show() {
     const name = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "console";
     for (const v of VIEWS) $("#view-" + v).hidden = v !== name;
-    $$(".rail a").forEach((a) => { if (a.dataset.view === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
+    $$(".rail a[data-view]").forEach((a) => { if (a.dataset.view === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
     $("#crumb-view").textContent = $("#view-" + name).dataset.title;
     // The overlay controller finds its window by this exact title, so it never changes there.
     document.title = OVERLAY ? "JARVIS Overlay" : `JARVIS · ${$("#view-" + name).dataset.title}`;
     emit("view", name);
-    const load = { graph: loadGraph, system: loadSystem, credits: () => renderCreditTable(state.credits),
-                   memory: loadMemory, tasks: loadTasks, devices: renderDevices, files: () => window.JarvisFiles?.open() }[name];
+    const load = { graph: loadGraph, credits: () => renderCreditTable(state.credits),
+                   memory: loadMemory, tasks: loadTasks, devices: renderDevices, files: () => window.JarvisFiles?.open(),
+                   run: () => window.JarvisRun?.open(), system: (a) => window.JarvisSystem?.open(a) }[name];
     if (load) { try { if ((await load(loaded[name])) !== false) loaded[name] = true; } catch (e) { toast(plainError(e.message)); } }
   }
   addEventListener("hashchange", show);
@@ -123,7 +125,7 @@
     $("#clock-date").textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", year: "numeric" });
     $("#clock-tz").textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const start = new Date(d.getFullYear(), 0, 0), doy = Math.floor((d - start) / 86400000);
-    const days = (new Date(d.getFullYear(), 11, 31) - start) / 86400000;
+    const days = Math.round((new Date(d.getFullYear(), 11, 31) - start) / 86400000);
     $("#clock-facts").innerHTML = [
       ["UTC", d.toISOString().slice(11, 16)], ["Week", "W" + String(isoWeek(d)).padStart(2, "0")],
       ["Day", `${doy} / ${days}`], ["Year", Math.round((doy / days) * 100) + "% done"],
@@ -243,7 +245,7 @@
     return r.meters.slice(0, max).map((m) => {
       const pct = m.pct ?? 0, left = Math.max(0, 100 - pct);
       const num = m.unit === "%" ? `${Math.round(left)}% left` : `${compact(Math.max(0, m.limit - m.used))} of ${compact(m.limit)} left`;
-      const when = m.refilled ? "refilled since last run" : m.resets_at ? `resets ${dayTime(Date.parse(m.resets_at))} · in ${until(Date.parse(m.resets_at))}` : "";
+      const when = m.resets_at ? `resets ${dayTime(Date.parse(m.resets_at))} · in ${until(Date.parse(m.resets_at))}` : "";
       return `<div class="meter"><span class="meter-label">${esc(m.label)}${when ? `<small>${esc(when)}</small>` : ""}</span>
         <span class="bar ${r.source === "local" ? "local" : ""}" role="img" aria-label="${esc(num)}"><i style="width:${left.toFixed(1)}%"></i></span>
         <span class="meter-num">${num}</span></div>`;
@@ -552,109 +554,6 @@
     $$("[data-id]", box).forEach((b) => b.addEventListener("click", () => big.select(b.dataset.id)));
     box.querySelector("[data-open]")?.addEventListener("click", (e) => { pendingOpen = e.currentTarget.dataset.open; });
     announce(`${ForceGraph.LABELS[node.kind] || node.kind}: ${node.label}. ${links.length} connections.`);
-  }
-
-  // ---------- system design ----------
-  async function loadSystem(again) {
-    if (again) return;
-    try {
-      const [g, tree] = await Promise.all([api("/api/graph/system"), api("/api/tree")]);
-      drawSystem(g); drawTree(tree);
-    } catch (e) { toast("System: " + plainError(e.message)); return false; }
-  }
-  function drawSystem(g) {
-    const mods = g.nodes.filter((n) => n.kind === "module");
-    const allImports = g.edges.filter((e) => e.rel === "imports");
-    // Modules that import each other form cycles; drop the edges that close a cycle
-    // (found by depth-first search) so layering terminates with real depths.
-    const out = new Map(mods.map((m) => [m.id, []]));
-    allImports.forEach((e) => out.get(e.src)?.push(e));
-    const back = new Set(), seen = new Set(), onPath = new Set();
-    const visit = (id) => {
-      seen.add(id); onPath.add(id);
-      for (const e of out.get(id) || []) {
-        if (onPath.has(e.dst)) back.add(e);
-        else if (!seen.has(e.dst)) visit(e.dst);
-      }
-      onPath.delete(id);
-    };
-    mods.forEach((m) => { if (!seen.has(m.id)) visit(m.id); });
-    const imports = allImports.filter((e) => !back.has(e));
-    const depth = new Map(mods.map((m) => [m.id, 0]));
-    for (let pass = 0; pass < mods.length; pass++) {
-      let changed = false;
-      for (const e of imports) {
-        const d = depth.get(e.src) + 1;
-        if (d > depth.get(e.dst)) { depth.set(e.dst, d); changed = true; }
-      }
-      if (!changed) break;
-    }
-    // Top-down layers: whoever imports sits above what it imports.
-    const maxD = Math.max(...depth.values());
-    const bands = [];
-    for (let d = 0; d <= maxD; d++) bands.push({ label: d === 0 ? "Entry points" : d === maxD ? "Foundations" : `Layer ${d + 1}`, nodes: mods.filter((m) => depth.get(m.id) === d).sort((a, b) => b.loc - a.loc) });
-    bands.push({ label: "External services", nodes: g.nodes.filter((n) => ["provider", "local-model", "state", "device"].includes(n.kind)) });
-    bands.push({ label: "Agents", nodes: g.nodes.filter((n) => n.kind === "specialist" || n.kind === "personal-agent") });
-    const BW = 150, BH = 40, GX = 12, GY = 12, BAND = 30, LEFT = 124, PER = 7;
-    const pos = new Map(), order = [];
-    let y = 8;
-    const labelsAt = [];
-    bands.forEach((b) => {
-      if (!b.nodes.length) return;
-      labelsAt.push([b.label, y]);
-      b.nodes.forEach((n, i) => { pos.set(n.id, { x: LEFT + (i % PER) * (BW + GX), y: y + Math.floor(i / PER) * (BH + GY), n }); order.push(n.id); });
-      y += Math.ceil(b.nodes.length / PER) * (BH + GY) - GY + BAND;
-    });
-    const W = LEFT + PER * (BW + GX), H = y - BAND + 8;
-    const svg = $("#system-svg");
-    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-    svg.style.minWidth = W * 0.82 + "px";
-    const edges = g.edges.filter((e) => pos.has(e.src) && pos.has(e.dst)).map((e) => {
-      const a = pos.get(e.src), b = pos.get(e.dst), down = b.y > a.y;
-      const x1 = a.x + BW / 2, x2 = b.x + BW / 2;
-      const y1 = down ? a.y + BH : a.y, y2 = down ? b.y : b.y + BH;
-      const dy = Math.max(18, Math.abs(y2 - y1) / 2) * (down ? 1 : -1);
-      return `<path class="edge" aria-hidden="true" data-s="${esc(e.src)}" data-t="${esc(e.dst)}" d="M${x1},${y1} C${x1},${y1 + dy} ${x2},${y2 - dy} ${x2},${y2}" ${e.rel !== "imports" ? 'stroke-dasharray="3 3"' : ""}/>`;
-    }).join("");
-    const labels = labelsAt.map(([label, ly]) => `<text class="col-label" aria-hidden="true" x="0" y="${ly + 24}">${esc(label)}</text>`).join("");
-    const sub = (n) => n.kind === "module" ? `${n.loc} lines` : n.kind === "specialist" ? `${n.model || ""} · ${n.power || ""} effort` : words(n.kind);
-    const nodes = order.map((id, i) => { const { x, y, n } = pos.get(id); return `<g class="node ${n.kind === "module" ? "" : "ext"}" data-id="${esc(n.id)}" transform="translate(${x},${y})" tabindex="${i ? -1 : 0}" role="button" aria-label="${esc(n.label)}, ${esc(sub(n))}">
-      <rect width="${BW}" height="${BH}" rx="3"/><text x="10" y="17">${esc(n.label.length > 22 ? n.label.slice(0, 21) + "…" : n.label)}</text><text class="sub" x="10" y="31">${esc(sub(n))}</text></g>`; }).join("");
-    svg.innerHTML = labels + `<g>${edges}</g>` + nodes;
-    const detail = $("#module-detail"), byId = new Map(g.nodes.map((n) => [n.id, n]));
-    const focus = (nid) => {
-      svg.classList.toggle("focus", !!nid);
-      const near = new Set();
-      $$(".edge", svg).forEach((p) => { const hot = p.dataset.s === nid || p.dataset.t === nid; p.classList.toggle("hot", hot); if (hot) { near.add(p.dataset.s); near.add(p.dataset.t); } });
-      $$(".node", svg).forEach((el) => { el.classList.toggle("hot", el.dataset.id === nid); el.classList.toggle("near", near.has(el.dataset.id)); });
-      if (!nid) return;
-      const n = byId.get(nid), out = g.edges.filter((e) => e.src === nid), inn = g.edges.filter((e) => e.dst === nid);
-      const names = (list, k) => list.map((e) => esc(byId.get(e[k])?.label || e[k])).join(", ") || "—";
-      detail.innerHTML = `<b>${esc(n.label)}</b> — ${esc(n.doc || words(n.kind))}<br>` +
-        (n.kind === "module" ? `Uses: ${names(out, "dst")}<br>Used by: ${names(inn, "src")}` : `Connected from: ${names(inn, "src")}`);
-    };
-    const els = $$(".node", svg);
-    els.forEach((el, i) => {
-      el.addEventListener("mouseenter", () => focus(el.dataset.id)); el.addEventListener("focus", () => focus(el.dataset.id));
-      el.addEventListener("mouseleave", () => focus(null));
-      el.addEventListener("keydown", (e) => { // roving focus: one tab stop, arrows move
-        const step = { ArrowRight: 1, ArrowDown: PER, ArrowLeft: -1, ArrowUp: -PER, Home: -i, End: els.length - 1 - i }[e.key];
-        if (step === undefined) return;
-        e.preventDefault();
-        const next = els[Math.max(0, Math.min(els.length - 1, i + step))];
-        el.tabIndex = -1; next.tabIndex = 0; next.focus();
-      });
-    });
-  }
-  function drawTree(tree) {
-    let files = 0, lines = 0;
-    const walk = (list) => list.map((e) => {
-      if (e.dir) return `<details ${["jarvis", "docs"].includes(e.name) ? "open" : ""}><summary>${icon("chevron-right")}<span>${esc(e.name)}/</span><span>${e.children.length}</span></summary><div class="kids">${walk(e.children)}</div></details>`;
-      files++; lines += e.lines || 0;
-      return `<div class="f"><span>${esc(e.name)}</span><span>${e.lines ? e.lines + " ln" : compact(e.bytes) + " B"}</span></div>`;
-    }).join("");
-    $("#tree").innerHTML = walk(tree.children);
-    $("#tree-meta").textContent = `${files} files · ${compact(lines)} lines`;
   }
 
   // ---------- memory ----------
@@ -1072,7 +971,7 @@
     }
     if (typing() || e.metaKey || e.altKey) return;
     if (e.code === "Space" && !e.repeat && pageFocused()) { e.preventDefault(); spaceAt = Date.now(); startMic(); }
-    else if (!e.ctrlKey && /^[1-8]$/.test(e.key) && pageFocused()) location.hash = VIEWS[+e.key - 1];
+    else if (!e.ctrlKey && /^[1-9]$/.test(e.key) && pageFocused()) location.hash = VIEWS[+e.key - 1];
     else if (e.key === "/" || (e.key.toLowerCase() === "k" && e.ctrlKey)) { e.preventDefault(); prompt.focus(); }
   });
   // Hold Space to talk; a quick tap leaves it listening until you pause.

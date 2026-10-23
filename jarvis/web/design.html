@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>JARVIS System Design</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="design.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <p class="crumb"><a href="/">← Console</a> · <a href="knowledge.html">Wiki</a></p>
+    <h1>JARVIS / SYSTEM DESIGN</h1>
+    <p class="lede">How a request moves through JARVIS on this laptop, and what has to be working for it to.</p>
+  </div>
+  <div class="score" id="score" aria-live="polite">checking…</div>
+</header>
+
+<main>
+  <section class="block" aria-labelledby="flow-h">
+    <header class="block-head">
+      <h2 id="flow-h"><span>01</span> What happens when you say “Jarvis, …”</h2>
+      <p>Seven stations, left to right. Click one to see the code behind it and what it needs.</p>
+    </header>
+    <form class="tester" id="tester" autocomplete="off">
+      <label for="try">Try a request</label>
+      <input id="try" placeholder="what's on tomorrow?  ·  open spotify  ·  check my reddit  ·  build a dashboard app">
+      <button type="submit">TRACE</button>
+    </form>
+    <p class="verdict" id="verdict" aria-live="polite">Type something above to light up the path it would take.</p>
+    <ol class="flow" id="flow"></ol>
+    <div class="side" id="side"></div>
+    <div class="drawer" id="drawer" hidden></div>
+  </section>
+
+  <section class="block" aria-labelledby="health-h">
+    <header class="block-head">
+      <h2 id="health-h"><span>02</span> Is everything working?</h2>
+      <p>Every check is read live from this laptop. Anything red or amber comes with the command that fixes it.</p>
+    </header>
+    <ul class="checks" id="checks"></ul>
+  </section>
+
+  <section class="block" aria-labelledby="data-h">
+    <header class="block-head">
+      <h2 id="data-h"><span>03</span> Where your data lives</h2>
+      <p>All of it is on this machine. Nothing here is uploaded anywhere.</p>
+    </header>
+    <div class="stores" id="stores"></div>
+  </section>
+
+  <section class="block" aria-labelledby="code-h">
+    <header class="block-head">
+      <h2 id="code-h"><span>04</span> Under the hood</h2>
+      <p>The real Python modules, grouped by station. Lines show who imports whom. Hover or focus a module.</p>
+    </header>
+    <div class="setup" id="setup"></div>
+    <div class="codemap"><svg id="codemap" role="img" aria-label="Modules by station with their imports"></svg></div>
+    <p class="module-note" id="module-note" aria-live="polite"></p>
+  </section>
+</main>
+
+<script src="design.js"></script>
+</body>
+</html>
