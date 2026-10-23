@@ -9,6 +9,10 @@ ChatGPT (through the Codex app-server) decides; JARVIS executes. Two kinds of to
   API key of its own; ChatGPT drives it). It runs Google Chrome with a separate JARVIS
   profile in .jarvis/browser-profile, so sign-ins there persist but stay apart from
   David's everyday Chrome.
+- A second browser through Vercel's agent-browser MCP server (open source, native
+  Rust CLI, no model or key of its own). Its agent_browser_read fetches a page as text
+  without opening Chrome, and its compact snapshots help on pages where Playwright
+  struggles. Own profile in .jarvis/agent-browser-profile.
 
 Considered and not used: browser-use and Stagehand need their own paid LLM API key;
 Windows-MCP exposes full desktop control including arbitrary PowerShell; Agent-Reach
@@ -28,6 +32,8 @@ from pathlib import Path
 MACHINE = "Windows 11 PC" if os.name == "nt" else "Arch Linux laptop"
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.83"  # pinned; published 2026-09-28
+AGENT_BROWSER = "agent-browser@0.39.1"  # pinned; published 2026-10-13
+BROWSER_ENGINES = ("playwright", "agent-browser")
 
 ACTION = re.compile(
     r"^\W*(?:hey\s+|ok(?:ay)?\s+)?(?:jarvis\W+)?(?:can\s+you\s+|could\s+you\s+|please\s+|"
@@ -41,7 +47,10 @@ INSTRUCTIONS = (
     "only opens a link in his normal browser for him to look at himself. For anything "
     "that involves a website (going to a page, searching a site, reading, clicking, "
     "filling), use the browser_* tools: browser_navigate, then browser_snapshot to read "
-    "the page, then click/type as needed. Always actually load and read the page; never "
+    "the page, then click/type as needed. If those tools are missing or keep failing on "
+    "a page, the agent_browser_* tools are a second browser: agent_browser_read gets a "
+    "page as text quickly, or agent_browser_open, agent_browser_snapshot, then click/fill "
+    "by the @e refs it returns. Always actually load and read the page; never "
     "answer website questions from memory or web search. Do the task, then reply in one "
     "or two plain spoken sentences (no markdown or links) saying what you did or found. Never buy anything, send messages or email, post, delete, change account "
     "settings, or submit forms with personal or payment details unless David explicitly "
@@ -220,34 +229,66 @@ def launch_desktop_entry(app):
 
 
 BROWSER_BLOCKED = {"browser_file_upload", "browser_run_code_unsafe", "browser_evaluate"}
+AGENT_BROWSER_BLOCKED = {"agent_browser_eval"}
+# agent-browser tool arguments that become CLI flags: raw extra flags, other sessions or
+# saved states, TLS trust, JS checks, and screenshot files written to disk.
+AGENT_BROWSER_BLOCKED_ARGS = {"extraArgs", "namespace", "session", "restore", "restoreSave",
+                              "restoreCheckFn", "restoreCheckUrl", "restoreCheckText",
+                              "caCert", "clearCaCert", "useSystemCa", "path", "screenshotDir"}
 
 
 def approve_browser(params):
-    """JARVIS's answer when Codex asks to run an MCP tool. Only the Playwright browser;
+    """JARVIS's answer when Codex asks to run an MCP tool. Only the JARVIS browsers;
     never the blocked tools; navigation only to http(s), so no file:// reads of the disk.
     Returns (approved, reason)."""
-    if params.get("serverName") != "playwright":
-        return False, "only the JARVIS browser is allowed"
+    server = params.get("serverName")
     message = params.get("message", "")
     tool = message.split('"')[1] if message.count('"') >= 2 else ""
-    if not tool.startswith("browser_") or tool in BROWSER_BLOCKED:
-        return False, f"{tool or 'unknown tool'} is not allowed"
     args = (params.get("_meta") or {}).get("tool_params") or {}
+    if server == "playwright":
+        if not tool.startswith("browser_") or tool in BROWSER_BLOCKED:
+            return False, f"{tool or 'unknown tool'} is not allowed"
+    elif server == "agent_browser":
+        if not tool.startswith("agent_browser_") or tool in AGENT_BROWSER_BLOCKED:
+            return False, f"{tool or 'unknown tool'} is not allowed"
+        bad = sorted(AGENT_BROWSER_BLOCKED_ARGS & set(args))
+        if bad:
+            return False, f"argument {bad[0]} is not allowed"
+    else:
+        return False, "only the JARVIS browser is allowed"
     url = args.get("url")
     if url is not None and not re.match(r"https?://", str(url), re.I):
         return False, "only http(s) pages may be opened"
     return True, "browser tool"
 
 
-def browser_mcp(state_dir):
-    """Codex `mcp_servers` entry for Playwright MCP on Chrome with a JARVIS profile."""
+def browser_mcp(state_dir, engines=BROWSER_ENGINES):
+    """Codex `mcp_servers` entries for the JARVIS browsers, each with its own profile:
+    Playwright MCP on Chrome, and agent-browser (auto-detects the installed Chrome)."""
     npx = shutil.which("npx")
     if not npx:
         return {}
-    profile = Path(state_dir).resolve() / "browser-profile"
-    profile.mkdir(parents=True, exist_ok=True)
-    return {"playwright": {
-        "command": npx,
-        "args": ["-y", PLAYWRIGHT_MCP, "--browser", "chrome", "--user-data-dir", str(profile)],
-        # No uploading local files to sites; no arbitrary page scripts.
-        "disabled_tools": sorted(BROWSER_BLOCKED)}}
+    state = Path(state_dir).resolve()
+    servers = {}
+    if "playwright" in engines:
+        profile = state / "browser-profile"
+        profile.mkdir(parents=True, exist_ok=True)
+        servers["playwright"] = {
+            "command": npx,
+            "args": ["-y", PLAYWRIGHT_MCP, "--browser", "chrome", "--user-data-dir", str(profile)],
+            # No uploading local files to sites; no arbitrary page scripts.
+            "disabled_tools": sorted(BROWSER_BLOCKED)}
+    if "agent-browser" in engines:
+        profile = state / "agent-browser-profile"
+        profile.mkdir(parents=True, exist_ok=True)
+        servers["agent_browser"] = {
+            "command": npx,
+            # The core tool set only: no network interception, cookies, uploads or plugins.
+            "args": ["-y", AGENT_BROWSER, "mcp", "--tools", "core"],
+            "disabled_tools": sorted(AGENT_BROWSER_BLOCKED),
+            # A visible window so David can sign in himself, like the Playwright one.
+            "env": {"AGENT_BROWSER_PROFILE": str(profile), "AGENT_BROWSER_HEADED": "true"},
+            # Codex hands MCP servers a minimal environment; Chrome needs the display.
+            "env_vars": ["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LOCALAPPDATA",
+                         "PROGRAMFILES", "USERPROFILE"]}
+    return servers

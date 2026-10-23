@@ -177,7 +177,7 @@ def checks(console):
     chrome = next((b for b in ("google-chrome-stable", "google-chrome", "chrome") if shutil.which(b)), None) \
         or (os.name == "nt" and "chrome")
     out.append(_check("act", "Browser for web tasks", bool(shutil.which("npx") and chrome),
-                      "Playwright drives Chrome with its own profile" if shutil.which("npx") and chrome
+                      "Playwright and agent-browser drive Chrome with their own profiles" if shutil.which("npx") and chrome
                       else "needs Node (npx) and Google Chrome", "install nodejs, npm and google-chrome"))
     kokoro = all((voice_dir / "kokoro" / f).is_file() for f in ("kokoro-v1.0.onnx", "voices-v1.0.bin"))
     out.append(_check("speak", "Kokoro voice files", kokoro,

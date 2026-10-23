@@ -56,9 +56,11 @@ def lean_command(binary, mcp_servers=None, overrides=()):
         if name not in (mcp_servers or {}):
             args += ["-c", f"mcp_servers.{name}.enabled=false"]
     for name, spec in (mcp_servers or {}).items():
-        for key in ("command", "args", "disabled_tools"):
+        for key in ("command", "args", "disabled_tools", "env_vars"):
             if key in spec:  # values as TOML; JSON strings/arrays are valid TOML
                 args += ["-c", f"mcp_servers.{name}.{key}={json.dumps(spec[key])}"]
+        for var, value in (spec.get("env") or {}).items():  # a JSON object isn't TOML
+            args += ["-c", f"mcp_servers.{name}.env.{var}={json.dumps(value)}"]
     for override in overrides:
         args += ["-c", override]
     return args
@@ -370,12 +372,14 @@ def make_lane(config, base, state_dir=None):
         return chat
     tools, instructions, extra = [], [], {}
     if actions:
-        from .actions import INSTRUCTIONS as ACT, DesktopTools, approve_browser, browser_mcp
+        from .actions import (BROWSER_ENGINES, INSTRUCTIONS as ACT, DesktopTools,
+                              approve_browser, browser_mcp)
         tools.append(DesktopTools())
         instructions.append(ACT)
+        browser = config.get("actions", {})
         extra = {"approve": approve_browser,
-                 "mcp_servers": browser_mcp(state) if config.get("actions", {}).get(
-                     "browser", True) else None}
+                 "mcp_servers": browser_mcp(state, browser.get("browser_engines", BROWSER_ENGINES))
+                 if browser.get("browser", True) else None}
     else:
         instructions.append(VAULT_ONLY)
     if vault is not None:
