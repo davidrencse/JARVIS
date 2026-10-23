@@ -31,7 +31,7 @@ from .credits import Credits
 from .events import Bus, Turn, Watcher
 from .memory import Memory
 from .probe import Prober
-from .store import Store
+from .store import Store, lanes_from
 
 WEB = Path(__file__).resolve().parent / "web"
 TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -66,10 +66,12 @@ class Console:
 
     def __init__(self, config, base, state):
         self.config, self.base, self.state = config, Path(base), Path(state).resolve()
-        self.store, self.memory = Store(self.state), Memory(self.state)
+        self.store = Store(self.state, lanes_from(config))
+        self.memory = Memory(self.state)
         self.credits = Credits(self.state, config)
         self.prober = Prober(config)
         self.jobs, self._jobs_lock = {}, threading.Lock()
+        self.max_jobs = 200  # the page only ever polls recent ones; older entries are dropped
         self._ears = self._stt = None
         self._voice_lock = threading.Lock()
         self.bus, self.watcher = Bus(), None
@@ -189,6 +191,7 @@ class Console:
             "models": self.config.get("models", {}),
             "memory": {**self.memory.stats(), "recent": self.memory.search("", limit=8)},
             "tasks": tasks,
+            "orchestration": {"lanes": self.store.lanes},
             "todo": self.task_counts(),
             "plans": self.plans(),
             "brain": self.brain(),
@@ -242,7 +245,7 @@ class Console:
             # Plans run in the task ledger; conversation runs on the brain and can go on.
             if any(j["state"] == "running" and j.get("plan") for j in self.jobs.values()):
                 raise ValueError("Another plan is still running; run this one after it.")
-            self.jobs[job["id"]] = job
+            self._remember(job)
 
         def work():
             try:
@@ -304,6 +307,104 @@ class Console:
         for item_id in item_ids:
             if item_id and item_id != case_id:
                 self.memory.link(item_id, case_id, "part-of")
+
+    # ---- knowledge engine ------------------------------------------------------------
+    def kb(self):
+        if getattr(self, "_kb", None) is None:
+            from .knowledge import kb_for
+            self._kb = kb_for(self.config, self.state, on_event=lambda kind, data: self.bus.publish(kind, data))
+        return self._kb
+
+    def kb_command(self, text):
+        """The knowledge console's command line. Runs in the background; progress and the
+        result arrive as kb.* events. Local files are CLI-only (`jarvis kb ingest FILE`)."""
+        text = re.sub(r"^\s*>\s*", "", str(text or "")).strip()
+        words = text.split()
+        if not words:
+            raise ValueError("Type a command: ingest URL, note TEXT, ask QUESTION, check.")
+        verb = words[0].lower()
+        if verb in ("reader", "librarian", "checker") and len(words) > 1:
+            words, verb = words[1:], words[1].lower()
+        rest = " ".join(words[1:]).strip()
+        kb = self.kb()
+        if verb in ("ingest", "add", "read", "clip"):
+            if not re.match(r"https?://", rest):
+                raise ValueError("From the console the reader takes links; for files use "
+                                 "`jarvis kb ingest FILE`, for text `note ...`.")
+            job = lambda: kb.ingest(rest)
+        elif verb in ("note", "remember"):
+            job = lambda: kb.ingest(text=rest)
+        elif verb in ("check", "audit"):
+            job = kb.check
+        elif verb in ("sync", "vault"):
+            vault = self.vault()
+            if vault is None:
+                raise ValueError("No vault configured: set vault.path in jarvis.config.json.")
+            job = lambda: kb.sync_vault(vault)
+        elif verb == "digest":
+            job = lambda: kb.digest(rest)
+        elif verb == "resolve":
+            if len(words) not in (3, 4):
+                raise ValueError("resolve CLAIM keep|drop|both [AGAINST-CLAIM]")
+            job = lambda: kb.resolve(words[1], words[2].lower(), against=(words[3:] or [None])[0])
+        elif verb == "merge":
+            if len(words) != 3:
+                raise ValueError("merge FROM-PAGE INTO-PAGE")
+            job = lambda: kb.merge(words[1], words[2])
+        else:
+            question = rest if verb in ("ask", "answer") else text
+            job = lambda: kb.ask(question)
+
+        def run():
+            try:
+                job()
+            except Exception as exc:
+                self.bus.publish("kb.error", {"bot": "jarvis", "action": "error",
+                                              "message": str(exc) or type(exc).__name__})
+        threading.Thread(target=run, daemon=True).start()
+        return {"accepted": text}
+
+    KB_UPLOAD_LIMIT = 200 * 1024 * 1024
+
+    def kb_upload(self, stream, length, name):
+        """A file dropped on the knowledge console: streamed to the engine's inbox, then
+        handed to the reader in the background (PDFs and audio take a while)."""
+        from .knowledge import AUDIO_KINDS, TEXT_KINDS
+        name = Path(str(name or "")).name
+        ext = Path(name).suffix.lower()
+        if not name or ext not in TEXT_KINDS | AUDIO_KINDS | {".pdf"}:
+            raise ValueError("Drop text, markdown, HTML, PDF or audio files.")
+        if not 0 < length <= self.KB_UPLOAD_LIMIT:
+            raise ValueError("Files up to 200 MB.")
+        kb = self.kb()
+        inbox = kb.root / "inbox"
+        inbox.mkdir(exist_ok=True)
+        target = inbox / f"{int(time.time() * 1000)}-{re.sub(r'[^A-Za-z0-9._-]+', '-', name)}"
+        left = length
+        try:
+            with open(target, "wb") as out:
+                while left:
+                    chunk = stream.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    left -= len(chunk)
+            if left:
+                raise ValueError("The upload was cut short.")
+        except BaseException:  # reset, stall timeout, short body: leave nothing in the inbox
+            target.unlink(missing_ok=True)
+            raise
+
+        def run():
+            try:
+                kb.ingest(target, title=Path(name).stem.replace("-", " ").replace("_", " "))
+            except Exception as exc:
+                self.bus.publish("kb.error", {"bot": "reader", "action": "error",
+                                              "message": f"{name}: {exc}"})
+            finally:
+                target.unlink(missing_ok=True)
+        threading.Thread(target=run, daemon=True).start()
+        return {"accepted": name, "bytes": length}
 
     def search(self, query):
         limit = max(1, min(int(query.get("limit", 40)), 200))
@@ -489,7 +590,7 @@ class Console:
         def walk(path, depth=0):
             entries = []
             for child in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
-                if child.name in SKIP or child.name.startswith(".env") and child.name != ".env.example":
+                if child.name in SKIP or (child.name.startswith(".env") and child.name != ".env.example"):
                     continue
                 if child.suffix in (".pyc", ".woff2") or child.name == "secrets.json":
                     continue
@@ -539,7 +640,7 @@ class Console:
         with self._jobs_lock:
             if any(j["state"] == "running" and not j.get("plan") for j in self.jobs.values()):
                 raise ValueError("JARVIS is still on the last request.")
-            self.jobs[job["id"]] = job
+            self._remember(job)
         threading.Thread(target=self._work, args=(job, tier or None, speak), daemon=True).start()
         return job
 
@@ -583,6 +684,14 @@ class Console:
         except Exception as exc:
             job.update(state="error", error=f"{type(exc).__name__}: {exc}", finished=time.time())
             turn.error(exc)
+
+    def _remember(self, job):
+        """Add a job and forget the oldest finished ones. Caller holds _jobs_lock."""
+        self.jobs[job["id"]] = job
+        if len(self.jobs) > self.max_jobs:
+            done = [k for k, j in self.jobs.items() if j["state"] != "running"]
+            for key in done[:len(self.jobs) - self.max_jobs]:  # dicts keep insertion order
+                del self.jobs[key]
 
     def job(self, job_id):
         with self._jobs_lock:
@@ -666,7 +775,8 @@ def _plan_view(record, full=False):
     results, tasks = record.get("results", {}), record.get("tasks", {})
     steps = []
     for sub in record.get("subtasks", []):
-        sid, result = sub.get("id"), record.get("results", {}).get(sub.get("id"), {})
+        sid = sub.get("id")
+        result = results.get(sid, {})
         state = result.get("state") or ("running" if sid in tasks and record.get("state") ==
                                         "running" else "pending")
         step = {"id": sid, "specialist": sub.get("specialist"), "power": sub.get("power"),
@@ -674,7 +784,7 @@ def _plan_view(record, full=False):
                 "state": state, "task": tasks.get(sid)}
         if full:
             step["acceptance"] = sub.get("acceptance_criteria", [])
-            step["answer"] = (results.get(sid, {}).get("answer") or "")[:4000]
+            step["answer"] = (result.get("answer") or "")[:4000]
         steps.append(step)
     return {"id": record.get("id"), "goal": record.get("goal", "")[:400],
             "summary": record.get("summary", "")[:600], "state": record.get("state", "planned"),
@@ -710,6 +820,10 @@ def _hw_ram(hw):
     mem = hw.get("memory")
     if isinstance(mem, dict) and mem.get("MemTotal"):
         return str(mem["MemTotal"])
+    if isinstance(mem, str):  # Linux sends /proc/meminfo verbatim: "MemTotal:  16222180 kB"
+        found = re.search(r"^MemTotal:\s+(\d+)\s*kB", mem, re.M)
+        if found:
+            return f"{int(found.group(1)) * 1024 / 2**30:.0f} GB"
     return None
 
 
@@ -814,6 +928,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/vault/tasks": lambda: c.vault_tasks(query.get("q", "")),
             "/api/vault/graph": lambda: c.tasks().vault.graph(),
             "/api/vault/brief": c.vault_brief,
+            "/api/kb/state": lambda: c.kb().snapshot(),
+            "/api/system/design": lambda: __import__("jarvis.sysview", fromlist=["design"]).design(c),
+            "/api/kb/graph": lambda: c.kb().graph(),
+            "/api/kb/page": lambda: c.kb().page(query.get("slug", "")),
         }
         try:
             if url.path == "/api/events":
@@ -855,6 +973,13 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0:
             return self._send(HTTPStatus.BAD_REQUEST, {"error": "Bad Content-Length."})
         c = self.console
+        if url.path == "/api/kb/upload":  # streamed to the knowledge inbox
+            self.connection.settimeout(60)  # a stalled client can't pin this thread
+            try:
+                return self._send(HTTPStatus.OK, c.kb_upload(
+                    self.rfile, length, parse_qs(url.query).get("name", [""])[-1]))
+            except Exception as exc:
+                return self._fail(exc)
         if url.path == "/api/send":  # streamed to disk, never held in memory
             query = {k: v[-1] for k, v in parse_qs(url.query).items()}
             try:
@@ -889,6 +1014,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.credits.set_manual(
                     body.get("provider"), body.get("remaining"), body.get("total"),
                     body.get("unit") or "USD", body.get("note") or ""))
+            if url.path == "/api/kb/resolve":
+                return self._send(HTTPStatus.OK, c.kb().resolve(
+                    str(body.get("claim", "")), str(body.get("decision", "")),
+                    str(body.get("note", "")), body.get("against") or None))
+            if url.path == "/api/kb/command":
+                return self._send(HTTPStatus.OK, c.kb_command(body.get("text")))
             if url.path == "/api/memory":
                 return self._send(HTTPStatus.OK, c.capture(body))
             if url.path == "/api/memory/link":
@@ -913,7 +1044,10 @@ APP_BROWSERS = (  # Chromium browsers with --app: a window with no tabs or addre
     r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
     r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
     r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
-    "msedge", "google-chrome", "chromium", "brave", "chrome")
+    "msedge", "google-chrome", "chromium", "brave", "chrome",
+    # Arch package names
+    "google-chrome-stable", "chromium-browser", "brave-browser", "microsoft-edge-stable",
+    "vivaldi-stable")
 
 
 def app_window(url, size=(1480, 940)):

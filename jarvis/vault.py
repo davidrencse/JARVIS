@@ -135,6 +135,22 @@ def _code_free(text):
     return re.sub(r"`[^`\n]*`", "", text)
 
 
+def _target(names, link):
+    """The note a [[link]] points at, the way Obsidian resolves it: basename, then
+    the full name (which also covers titles and aliases)."""
+    return names.get(link.rsplit("/", 1)[-1].lower()) or names.get(link.lower())
+
+
+def open_link(link):
+    """Hand a link to the desktop's default handler. One seam for the whole package, so
+    no caller (and no test) has to branch on os.name itself."""
+    if os.name == "nt":
+        os.startfile(link)  # hands the obsidian:// link to the Obsidian app
+    else:
+        import webbrowser
+        webbrowser.open(link)
+
+
 def links_in(text):
     # In tables the alias pipe is escaped: [[emotion\|Emotion]].
     found = (m.group(2).rstrip("\\").strip() for m in WIKILINK.finditer(_code_free(text)))
@@ -398,7 +414,7 @@ class Vault:
         names, hits = self.names(), []
         for note in self.notes():
             if note["path"] != path and any(
-                    names.get(t.rsplit("/", 1)[-1].lower()) == path for t in json.loads(note["links"])):
+                    _target(names, t) == path for t in json.loads(note["links"])):
                 hits.append({"path": note["path"], "title": note["title"]})
         return {"path": path, "backlinks": hits}
 
@@ -604,9 +620,13 @@ class Vault:
                 raise RuntimeError(f"{rel} changed while JARVIS was editing it; try again.")
         full.parent.mkdir(parents=True, exist_ok=True)
         temporary = full.with_name(f".{full.name}.jarvis-{os.getpid()}.tmp")
-        with open(temporary, "w", encoding="utf-8", newline="") as stream:
-            stream.write(text)
-        os.replace(temporary, full)
+        try:
+            with open(temporary, "w", encoding="utf-8", newline="") as stream:
+                stream.write(text)
+            os.replace(temporary, full)
+        except BaseException:
+            temporary.unlink(missing_ok=True)  # never leave a half-written file in the vault
+            raise
         with self.connect() as db:
             self._index(db, rel, full)
 
@@ -752,11 +772,7 @@ class Vault:
         if not rel:
             raise ValueError(f"No note matches {ref!r}.")
         link = self.uri(rel)
-        if os.name == "nt":
-            os.startfile(link)  # hands the obsidian:// link to the Obsidian app
-        else:
-            import webbrowser
-            webbrowser.open(link)
+        open_link(link)
         return {"path": rel, "uri": link}
 
     def clip(self, url, title=None, channel="jarvis", when=None, fetch=None):
@@ -794,7 +810,7 @@ class Vault:
         degree = {}
         for note in self.notes():
             for target in json.loads(note["links"]):
-                hit = names.get(target.rsplit("/", 1)[-1].lower()) or names.get(target.lower())
+                hit = _target(names, target)
                 if hit and hit.endswith(".md") and hit != note["path"] \
                         and (note["path"], hit) not in seen:
                     seen.add((note["path"], hit))
@@ -819,7 +835,7 @@ class Vault:
             "broken_links", "orphans", "stale_projects")}
         for note in notes:
             for target in json.loads(note["links"]):
-                hit = names.get(target.rsplit("/", 1)[-1].lower()) or names.get(target.lower())
+                hit = _target(names, target)
                 if hit:
                     inbound[hit] = inbound.get(hit, 0) + 1
                 elif not DATE.fullmatch(target):  # [[2026-11-02]]: a daily note not yet written
@@ -862,7 +878,8 @@ class Vault:
             kinds[note["type"] or "(none)"] = kinds.get(note["type"] or "(none)", 0) + 1
         writes = 0
         if self.audit_path.exists():
-            writes = sum(1 for _ in open(self.audit_path, encoding="utf-8"))
+            with open(self.audit_path, encoding="utf-8") as audit:
+                writes = sum(1 for _ in audit)
         return {"vault": str(self.root), "notes": len(notes), "types": kinds,
                 "write": self.writable, "index": str(self.db_path), "writes_logged": writes,
                 "merge_in_progress": (self.root / ".git" / "MERGE_HEAD").exists()}
@@ -946,6 +963,8 @@ def fetch_page(url, limit=3_000_000, timeout=20):
             final = response.geturl()
             charset = response.headers.get_content_charset() or "utf-8"
     except urllib.error.URLError as exc:
+        if isinstance(exc, urllib.error.HTTPError):
+            exc.close()  # an HTTPError is the response; drop its socket now
         raise ValueError(f"Couldn't fetch the page: {exc.reason}") from exc
     if len(raw) > limit:
         raise ValueError("That page is over 3 MB; not clipping it.")
@@ -980,15 +999,27 @@ def _age_days(value, today):
 _OPEN, _OPEN_LOCK = {}, threading.Lock()
 
 
+def vault_path(settings):
+    """vault.path is one folder, or {"windows": ..., "linux": ...} when the same config
+    serves both laptops. A Windows-only path means "not configured" off Windows."""
+    path = settings.get("path")
+    if isinstance(path, dict):
+        path = path.get("windows" if os.name == "nt" else "linux")
+    if not path or (os.name != "nt" and re.match(r"[A-Za-z]:[\\/]", str(path))):
+        return None
+    return str(path)
+
+
 def vault_for(config, state):
     """The configured vault, shared per process; None when no vault is configured."""
     settings = config.get("vault") or {}
-    if not settings.get("path") or settings.get("enabled", True) is False:
+    path = vault_path(settings)
+    if not path or settings.get("enabled", True) is False:
         return None
-    key = (str(settings["path"]), str(state))
+    key = (path, str(state))
     with _OPEN_LOCK:
         if key not in _OPEN:
-            _OPEN[key] = Vault(settings["path"], state, settings)
+            _OPEN[key] = Vault(path, state, settings)
         return _OPEN[key]
 
 
@@ -1036,6 +1067,7 @@ class VaultTools:
         this PC (the brain has it; MCP clients, which may be remote agents, don't)."""
         self.vault, self.memory, self.channel, self.desktop = vault, memory, channel, desktop
         self.write = vault.writable if write is None else (write and vault.writable)
+        self._names = None
 
     def specs(self):
         specs = [
@@ -1089,7 +1121,9 @@ class VaultTools:
         return specs
 
     def names(self):
-        return {s["name"] for s in self.specs()}
+        if self._names is None:
+            self._names = {s["name"] for s in self.specs()}
+        return self._names
 
     def call(self, name, args):
         """(success, text) for the model."""
@@ -1147,12 +1181,11 @@ class Toolbox:
 
     def __init__(self, *tools):
         self.tools = [t for t in tools if t is not None]
+        self._owner = {spec["name"]: tool for tool in self.tools for spec in tool.specs()}
 
     def specs(self):
         return [spec for tool in self.tools for spec in tool.specs()]
 
     def call(self, name, args):
-        for tool in self.tools:
-            if any(spec["name"] == name for spec in tool.specs()):
-                return tool.call(name, args)
-        return False, f"Unknown tool {name}."
+        tool = self._owner.get(name)
+        return tool.call(name, args) if tool else (False, f"Unknown tool {name}.")
