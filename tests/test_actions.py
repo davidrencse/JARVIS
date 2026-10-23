@@ -50,6 +50,43 @@ class ApprovalTests(unittest.TestCase):
             self.assertIn("browser_file_upload", spec["disabled_tools"])
             self.assertIn(str(Path(d).resolve() / "browser-profile"), spec["args"])
 
+    def test_agent_browser_policy(self):
+        def ab(tool, **args):
+            return {**approval(tool, **args), "serverName": "agent_browser"}
+        self.assertTrue(approve_browser(ab("agent_browser_open", url="https://example.com"))[0])
+        self.assertTrue(approve_browser(ab("agent_browser_snapshot", interactive=True))[0])
+        self.assertTrue(approve_browser(ab("agent_browser_click", selector="@e2"))[0])
+        for bad in (ab("agent_browser_open", url="file:///home/jdoe/.ssh/id_ed25519"),
+                    ab("agent_browser_read", url="chrome://settings"),
+                    ab("agent_browser_eval", script="document.cookie"),
+                    ab("agent_browser_click", selector="@e1", extraArgs=["--profile", "/"]),
+                    ab("agent_browser_snapshot", session="other"),
+                    ab("agent_browser_screenshot", path="/home/jdoe/.bashrc"),
+                    ab("browser_navigate", url="https://example.com"),
+                    approval("agent_browser_open", url="https://example.com")):
+            self.assertFalse(approve_browser(bad)[0], bad)
+
+    def test_agent_browser_server_is_core_only_with_own_profile(self):
+        with tempfile.TemporaryDirectory() as d:
+            servers = browser_mcp(d)
+            spec = servers.get("agent_browser")
+            if spec is None:
+                self.skipTest("npx not installed")
+            self.assertEqual(spec["args"][-3:], ["mcp", "--tools", "core"])
+            self.assertIn("agent_browser_eval", spec["disabled_tools"])
+            self.assertEqual(spec["env"]["AGENT_BROWSER_PROFILE"],
+                             str(Path(d).resolve() / "agent-browser-profile"))
+            self.assertEqual(set(browser_mcp(d, ["playwright"])), {"playwright"})
+            self.assertEqual(set(browser_mcp(d, [])), set())
+
+    def test_lean_command_passes_server_env_as_toml(self):
+        with patch("jarvis.chatgpt.user_mcp_servers", return_value=[]):
+            args = lean_command("codex", {"agent_browser": {
+                "command": "npx", "env": {"AGENT_BROWSER_PROFILE": "C:\\x\\p"},
+                "env_vars": ["DISPLAY"]}})
+        self.assertIn('mcp_servers.agent_browser.env.AGENT_BROWSER_PROFILE="C:\\\\x\\\\p"', args)
+        self.assertIn('mcp_servers.agent_browser.env_vars=["DISPLAY"]', args)
+
 
 class DesktopToolTests(unittest.TestCase):
     def setUp(self):
