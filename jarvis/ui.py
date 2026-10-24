@@ -1112,7 +1112,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/agent/session":
                 return self._send(HTTPStatus.OK, c.agent().session())
             if url.path == "/api/agent/voice":
-                return self._send(HTTPStatus.OK, c.agent().set_voice(body.get("voice_id")))
+                return self._send(HTTPStatus.OK, c.agent().set_voice(
+                    body.get("voice_id"), body.get("voice"), body.get("speed"),
+                    body.get("stability")))
             if url.path == "/api/agent/ask":
                 return self._send(HTTPStatus.OK, c.agent_ask(body.get("text")))
             if url.path == "/api/grokbot":

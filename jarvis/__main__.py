@@ -728,7 +728,7 @@ def cognition(args, config, base):
             from .agent import Agent
             agent = Agent(args.state, config)
             if agent.agent_id() and args.text != "new":
-                emit({**agent.status(), "note": "Agent already set up. "
+                emit({**agent.sync(), "note": "Existing agent updated. "
                       "Make another with: jarvis voice agent-setup new"})
             else:
                 emit(agent.create())
