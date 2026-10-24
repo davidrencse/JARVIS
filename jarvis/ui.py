@@ -75,7 +75,7 @@ class Console:
         self._ears = self._stt = None
         self._voice_lock = threading.Lock()
         self.bus, self.watcher = Bus(), None
-        self._lane = self._speaker = None
+        self._lane = self._speaker = self._agent = None
         self._lane_lock = threading.Lock()
 
     # ---- live: event stream, warm brain, speech ---------------------------------------
@@ -120,6 +120,29 @@ class Console:
                 from .speech import SpeechQueue, Voice
                 self._speaker = SpeechQueue(Voice(self.state, self.config))
             return self._speaker
+
+    # ---- ElevenLabs agent: the live voice front end --------------------------------
+    def agent(self):
+        with self._lane_lock:
+            if self._agent is None:
+                from .agent import Agent
+                self._agent = Agent(self.state, self.config)
+            return self._agent
+
+    def agent_ask(self, text, wait=110):
+        """The agent's ask_jarvis tool: run a normal console ask and return its reply."""
+        job = self.submit(text)
+        deadline = time.time() + wait  # under the tool's 120 s timeout
+        while job["state"] == "running" and time.time() < deadline:
+            time.sleep(0.1)
+        if job["state"] == "running":
+            return {"reply": "That's still running; the answer will appear in the console.",
+                    "job": job["id"]}
+        if job["state"] == "error":
+            return {"reply": f"That failed: {job['error']}", "job": job["id"], "error": True}
+        from .speech import spoken
+        reply = job["result"].get("reply", "")
+        return {"reply": spoken(reply, 1200), "job": job["id"]}
 
     # ---- vault tasks -----------------------------------------------------------------
     def vault(self):
@@ -667,7 +690,7 @@ class Console:
         try:
             result = ask(job["text"], self.store, self.memory, self.config, self.base, tier,
                          lane=self.lane(), on_sentence=sentence, on_start=started,
-                         channel="console")
+                         on_step=turn.step, channel="console")
             if job.get("case"):
                 ids = list(result.get("memory", []))
                 if result.get("plan"):
@@ -863,6 +886,7 @@ class Handler(BaseHTTPRequestHandler):
         if ctype.startswith("text/html"):
             self.send_header("Content-Security-Policy",
                              "default-src 'self'; connect-src 'self' https://api.open-meteo.com "
+                             "wss://api.elevenlabs.io "
                              "https://geocoding-api.open-meteo.com; img-src 'self' data:; "
                              "style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'")
         self.end_headers()
@@ -933,6 +957,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/memory/item": lambda: c.memory.get(query.get("id", "")),
             "/api/route": lambda: c.route(query.get("text", ""), query.get("tier") or None),
             "/api/voice": lambda: c.daemon("status"),
+            "/api/agent": lambda: c.agent().status(),
+            "/api/agent/voices": lambda: c.agent().voices(refresh=query.get("refresh") == "1"),
             "/api/grokbot": lambda: c.grokbot().status(),
             "/api/probe": lambda: c.prober.get(refresh=query.get("refresh") == "1"),
             "/api/usage": lambda: c.credits.claude_hourly(int(query.get("hours", 24))),
@@ -1017,6 +1043,12 @@ class Handler(BaseHTTPRequestHandler):
                                                           body.get("case") or None))
             if url.path == "/api/voice":
                 return self._send(HTTPStatus.OK, c.daemon(body.get("action")))
+            if url.path == "/api/agent/session":
+                return self._send(HTTPStatus.OK, c.agent().session())
+            if url.path == "/api/agent/voice":
+                return self._send(HTTPStatus.OK, c.agent().set_voice(body.get("voice_id")))
+            if url.path == "/api/agent/ask":
+                return self._send(HTTPStatus.OK, c.agent_ask(body.get("text")))
             if url.path == "/api/grokbot":
                 return self._send(HTTPStatus.OK, c.grokbot_command(body))
             if url.path == "/api/fs/copy":

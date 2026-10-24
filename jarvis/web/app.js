@@ -975,7 +975,7 @@
   let firstListen = true, spaceAt = 0;
   const mic = new Mic({ wave: $("#mic-wave"), onLevel: (l) => (Terrain.level = l), onAutoStop: () => stopMic() });
   async function startMic() {
-    if (mic.active || mic.starting) return;
+    if (mic.active || mic.starting || agent.live) return;
     if (busy) return toast("Still answering the last request. Talk again in a moment, or press Esc to stop waiting.");
     try {
       await mic.start();
@@ -1020,6 +1020,58 @@
   });
   // Hold Space to talk; a quick tap leaves it listening until you pause.
   addEventListener("keyup", (e) => { if (e.code === "Space" && (mic.active || mic.starting) && Date.now() - spaceAt > 400) stopMic(); });
+
+  // ---------- live: ElevenLabs agent call (its speech in/out, JARVIS answers) ----------
+  const callBtn = $("#agent-call"), voiceSel = $("#voice-select");
+  const CALL_TITLE = { idle: "Live call: talk back and forth with JARVIS (ElevenLabs voice agent)",
+    connecting: "Connecting to the ElevenLabs agent…", listening: "On a live call: just talk. Click or Esc to hang up.",
+    speaking: "JARVIS is speaking; talk over it to interrupt. Click or Esc to hang up." };
+  const clip = (t, n = 90) => (t.length > n ? t.slice(0, n - 1) + "…" : t);
+  const agent = new ElevenAgent({
+    api,
+    onState(s) {
+      callBtn.dataset.state = s; callBtn.setAttribute("aria-pressed", String(s !== "idle")); callBtn.title = CALL_TITLE[s];
+      if (s === "connecting") trace([["connecting to the voice agent", "active"]]);
+      if (s === "idle") { trace([["call ended", "done"]]); setTimeout(() => { if (!agent.live && !busy) trace([]); }, 3000); }
+    },
+    onLevel: (l) => (Terrain.level = l),
+    onUser: (t) => { if (t) { trace([[`you · ${clip(t)}`, "done"]]); announce("You said: " + t); } },
+    onAgent: (t) => { if (t) trace([[`jarvis · ${clip(t)}`, "done"]]); },
+    onTool: (req, phase) => trace([[`asking JARVIS · ${clip(req, 60)}`, phase === "start" ? "active" : phase]]),
+    onError: (m) => toast(plainError(m)),
+  });
+  async function toggleCall() {
+    if (agent.live) return agent.stop();
+    if (mic.active || mic.starting) await stopMic(true);
+    try { await agent.start(); announce("Live call started. Just talk."); }
+    catch (e) { trace([]); toast(e.name === "NotAllowedError" ? "Microphone permission was denied. Allow it for this page, then try again." : plainError(e.message)); }
+  }
+  callBtn.addEventListener("click", toggleCall);
+  addEventListener("keydown", (e) => { if (e.key === "Escape" && agent.live) { e.preventDefault(); agent.stop(); } });
+  async function loadVoices() {
+    let status;
+    try { status = await api("/api/agent"); } catch (e) { return; }
+    callBtn.hidden = !status.configured;
+    if (!status.has_key) return;
+    try {
+      const { current, voices } = await api("/api/agent/voices");
+      voiceSel.innerHTML = (current && !voices.some((v) => v.voice_id === current) ? `<option value="${esc(current)}">Current voice</option>` : "") +
+        voices.map((v) => `<option value="${esc(v.voice_id)}" title="${esc(v.about)}">${esc(v.name)}</option>`).join("");
+      if (current) voiceSel.value = current;
+      voiceSel.title = "JARVIS's ElevenLabs voice: live calls" + (status.tts_engine === "elevenlabs" ? " and read-aloud replies" : " (read-aloud uses the local Kokoro voice)");
+      voiceSel.hidden = !voices.length;
+    } catch (e) { voiceSel.hidden = true; }
+  }
+  voiceSel.addEventListener("change", async () => {
+    const before = voiceSel.dataset.value;
+    try {
+      const r = await api("/api/agent/voice", { voice_id: voiceSel.value });
+      voiceSel.dataset.value = r.current;
+      if (agent.live) { toast(`Voice set to ${r.name}. Reconnecting the call…`); await agent.stop(); await toggleCall(); }
+      else toast(`Voice set to ${r.name}.`);
+    } catch (e) { if (before) voiceSel.value = before; toast(plainError(e.message)); }
+  });
+  loadVoices().then(() => { voiceSel.dataset.value = voiceSel.value; });
 
   // ---------- live: one event stream for console, voice listener and CLI ----------
   // turn.* events stream every request as it happens, whichever channel it came from;

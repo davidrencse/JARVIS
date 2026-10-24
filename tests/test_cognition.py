@@ -1,4 +1,5 @@
 import io
+import urllib.error
 import json
 import os
 import sys
@@ -75,6 +76,11 @@ class RouterTests(unittest.TestCase):
         config = {"adapters": {"apis": [{"name": "ig", "url": "http://127.0.0.1:9/x",
                                          "sites": ["instagram"]}]}}
         self.assertEqual(pick_adapter("scan my Instagram", config)["name"], "ig")
+        self.assertEqual(pick_adapter("open reddit", config)["kind"], "cli_web")
+
+    def test_window_automation_agents_fall_back_to_web(self):
+        config = {"adapters": {"browser_agents": ["grokbot"], "apis": []},
+                  "personal_agents": {"grokbot": {"integration": "window_automation"}}}
         self.assertEqual(pick_adapter("open reddit", config)["kind"], "cli_web")
 
     def test_specialists_have_tiers(self):
@@ -212,6 +218,17 @@ class SpeechTests(Temp):
             self.assertEqual(Voice(self.base).credential("ELEVENLABS_VOICE_ID"), "uk1")
             with self.assertRaises(ValueError):
                 speech.setup(self.base, secret=lambda _: "not a key!")
+
+    @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "k", "ELEVENLABS_VOICE_ID": "v1"})
+    def test_elevenlabs_failure_falls_back_to_kokoro(self):
+        from jarvis import speech
+        voice = Voice(self.base, {"voice": {"engine": "elevenlabs"}})
+        kokoro = self.base / "k.wav"
+        error = urllib.error.HTTPError("u", 401, "no", {}, io.BytesIO(b""))
+        with patch("jarvis.speech.urllib.request.urlopen", side_effect=error), \
+                patch.object(speech.Voice, "_kokoro", return_value=(kokoro, "kokoro")):
+            self.assertEqual(voice.synth("hi"), (kokoro, "kokoro (elevenlabs-error)"))
+        self.assertIn("401", voice.last_error)
 
     def test_no_credentials_falls_back(self):
         with patch.dict(os.environ, {}, clear=True):

@@ -95,6 +95,7 @@ class ChatGPTLane:
         self.instructions, self.tools, self.mcp_servers = instructions, tools, mcp_servers or {}
         self.approve, self.overrides, self.context = approve, tuple(overrides), context
         self.tool_log = []  # (tool, success, text) of the current turn
+        self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
         self.proc = self.lines = self.thread = None
         self._reader = None
         self.mcp_status = {}
@@ -162,8 +163,10 @@ class ChatGPTLane:
         if message.get("method") == "item/tool/call" and self.tools and "id" in message:
             # ChatGPT called one of JARVIS's own tools: JARVIS runs it and reports back.
             params = message.get("params") or {}
+            key = f"jarvis:{message['id']}"
+            self._tool(key, params.get("tool"), None, "")
             ok, text = self.tools.call(params.get("tool", ""), params.get("arguments") or {})
-            self.tool_log.append((params.get("tool"), ok, text))
+            self._tool(key, params.get("tool"), ok, text)
             self._send({"jsonrpc": "2.0", "id": message["id"], "result": {
                 "success": ok, "contentItems": [{"type": "inputText", "text": text}]}})
             return {}
@@ -175,7 +178,8 @@ class ChatGPTLane:
                        meta.get("codex_approval_kind") == "mcp_tool_call" else (False, "no policy"))
             quoted = params.get("message", "").split('"')  # Allow ... run tool "name"?
             tool = f"{params.get('serverName')}.{quoted[1] if len(quoted) > 2 else '?'}"
-            self.tool_log.append((f"approve {tool}" if ok else f"decline {tool}: {why}", ok, why))
+            self._tool(f"ask:{message['id']}", f"approve {tool}" if ok else f"decline {tool}: {why}",
+                       ok, why)
             self._send({"jsonrpc": "2.0", "id": message["id"],
                         "result": {"action": "accept", "content": {}} if ok else {"action": "decline"}})
             return {}
@@ -261,6 +265,16 @@ class ChatGPTLane:
                     # Model at capacity: swap to the fallback (and back again next time).
                     self.model, self.fallback = self.fallback, self.model
 
+    def _tool(self, key, name, ok, text):
+        """Log a finished tool call (ok True/False) and tell on_tool; ok None = started."""
+        if ok is not None:
+            self.tool_log.append((name, ok, text))
+        if self.on_tool:
+            try:
+                self.on_tool(key, name, ok, text)
+            except Exception:  # reporting must never fail the turn
+                pass
+
     def _ask(self, text, recall, on_sentence):
         self._ensure_thread()
         notes = "\n".join(f"- {r}" for r in recall) or "- (none)"
@@ -291,11 +305,14 @@ class ChatGPTLane:
                     while (match := SENTENCE_END.match(pending)) and match.group(2):
                         on_sentence(match.group(1).strip())
                         pending = pending[match.end():]
+            elif method == "item/started" and (params.get("item") or {}).get("type") == "mcpToolCall":
+                item = params["item"]
+                self._tool(item.get("id"), f"{item.get('server')}.{item.get('tool')}", None, "")
             elif method == "item/completed" and (params.get("item") or {}).get("type") == "mcpToolCall":
                 item = params["item"]
-                self.tool_log.append((f"{item.get('server')}.{item.get('tool')}",
-                                      item.get("status") == "completed",
-                                      (item.get("error") or {}).get("message", "")))
+                self._tool(item.get("id"), f"{item.get('server')}.{item.get('tool')}",
+                           item.get("status") == "completed",
+                           (item.get("error") or {}).get("message", ""))
             elif method == "error" and not params.get("willRetry"):
                 raise RuntimeError(f"ChatGPT error: {params.get('error')}")
             elif method == "turn/completed":
@@ -320,14 +337,26 @@ class Brain:
     def __init__(self, chat, act, wants=None):
         self.chat, self.act, self.wants = chat, act, wants
 
-    def ask(self, text, recall=(), on_sentence=None):
+    @property
+    def on_tool(self):
+        return self.act.on_tool
+
+    @on_tool.setter
+    def on_tool(self, fn):
+        self.chat.on_tool = self.act.on_tool = fn
+
+    def pick(self, text):
+        """'act' (tools) or 'chat': which conversation ask(text) will use."""
         if self.wants is None:
             from .actions import is_action
             from .vault import is_vault_request
             wants = is_action(text) or is_vault_request(text)
         else:
             wants = self.wants(text)
-        lane = self.act if wants else self.chat
+        return "act" if wants else "chat"
+
+    def ask(self, text, recall=(), on_sentence=None):
+        lane = self.act if self.pick(text) == "act" else self.chat
         return lane.ask(text, recall, on_sentence=on_sentence)
 
     def warm(self):

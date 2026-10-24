@@ -6,7 +6,7 @@ paired or validated on both laptops yet.
 
 | Capability | Initial candidate | What still needs testing |
 |---|---|---|
-| Shared clipboard | CrossPaste desktop on both | Text, images and files in Windows and Hyprland; native Wayland apps |
+| Shared clipboard | `jarvis clipboard` over SSH (built) | Dell side on real Windows apps; Zenbook side verified |
 | Shared mouse/keyboard | Lan Mouse | Edge crossing, modifiers, layouts, reconnects and release shortcut |
 | Screen stream/control | Sunshine host + Moonlight client | Encoder, capture backend, latency and input behavior |
 | Dell desktop extended onto ASUS | Windows virtual display + Sunshine, Moonlight fullscreen on Arch | Independent second display, placement and resolution |
@@ -14,25 +14,35 @@ paired or validated on both laptops yet.
 
 ## Clipboard
 
-[CrossPaste](https://github.com/CrossPaste/crosspaste-desktop) documents Windows
-and Linux support, encrypted local-network sharing, and text, image and file
-types. Its Linux/Hyprland behavior must be verified on the actual desktop session;
-general Linux support is not proof every Wayland clipboard path works.
+`jarvis clipboard` is built in: copy on one laptop, paste on the other. Text and
+images (PNG, plus a bitmap on Windows so Paint and Office paste it), both ways.
+It reuses the Dell → Zenbook SSH link from `jarvis send`: same key, BatchMode and
+strict host-key checking. No new port, pairing code, crypto or app on either side.
 
-Use the official Linux distribution appropriate to Arch rather than installing a
-Debian package with apt. Pair the two devices using CrossPaste's displayed code.
-Do not enable its AI/MCP clipboard-history access merely to get human copy/paste.
-The clipboard transport and an agent reading clipboard history are distinct features.
+The Dell hosts it. `jarvis clipboard start` opens one SSH session to the Zenbook and
+sends `jarvis/clipsync.py` itself as the remote half (stdlib Python + `wl-clipboard`,
+finds the Hyprland session even from SSH). One JSON line per copy goes each way.
+It reconnects with backoff after sleep, Wi-Fi changes or a reboot.
 
-Acceptance: copy a unique plain-text marker in each direction, then test a
-screenshot and a small non-sensitive file. Check copying while the other laptop
-is asleep and reconnection behavior. Confirm pause-sync and history retention
-settings before using it for routine work.
+```powershell
+jarvis clipboard start            # on the Dell
+jarvis clipboard status           # running / linked / recent log lines
+jarvis clipboard autostart on     # start hidden at Windows login
+jarvis clipboard stop
+```
 
-Its [CLI](https://crosspaste.com/en/tutorial/cli) provides `crosspaste status` on
-Linux and `crosspaste-cli status` on Windows. That status command does not
-auto-start the app. JARVIS can later use it for health checks without reading
-clipboard contents. Automatic discovery over a VPN is not assumed to work.
+- Nothing is pushed on connect; only new copies sync. Pasting what came from the
+  other side doesn't echo back.
+- Copies a password manager marks secret stay put: KeePassXC/KDE's
+  `x-kde-passwordManagerHint: secret` on Linux, and Windows'
+  `ExcludeClipboardContentFromMonitorProcessing`.
+- Files aren't synced. Use `jarvis send` or drop them on the console.
+- The Zenbook's IP changes with DHCP. Update `devices.zenbook.target` (or use a
+  hostname or Tailscale name) if `status` shows `not linked`.
+- Log: `.jarvis/logs/clipboard.log`. Up to 32 MB per copy.
+
+Acceptance: copy a unique text marker each way, then a screenshot each way
+(Win+Shift+S on the Dell; `grim -g "$(slurp)" - | wl-copy` on the Zenbook).
 
 ## Input
 

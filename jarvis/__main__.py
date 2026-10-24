@@ -54,6 +54,10 @@ def main():
         cmd.add_argument("id")
         if name == "run":
             cmd.add_argument("--timeout", type=int, default=900)
+    cb = sub.add_parser("clipboard", help="Unified clipboard with the other laptop over SSH")
+    cb.add_argument("action", choices=("start", "stop", "status", "run", "autostart", "serve"))
+    cb.add_argument("value", nargs="?", help="autostart: on|off")
+    cb.add_argument("--device", help="configured SSH device (default: the first)")
     lm = sub.add_parser("lanmouse", help="Lan Mouse pairing: fingerprints and config")
     lm.add_argument("action", choices=("fingerprint", "config"))
     lm.add_argument("--device", default="local", help="fingerprint: configured device to query")
@@ -110,7 +114,7 @@ def main():
     vc = sub.add_parser("voice", help="Spoken I/O")
     vc.add_argument("action", choices=("setup", "say", "usage", "demo", "use", "enroll",
                                        "recalibrate", "test", "listen", "start", "stop",
-                                       "status", "autostart"))
+                                       "status", "autostart", "agent-setup", "agent"))
     vc.add_argument("text", nargs="?")
     vc.add_argument("--threshold", type=float, help="test/listen: override the learned cutoff")
     vc.add_argument("--no-wake", action="store_true", help="listen: don't require 'Jarvis'")
@@ -213,6 +217,22 @@ def main():
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(json.dumps(result, indent=2), encoding="utf-8")
             emit(result)
+        elif args.command == "clipboard":
+            from . import clipsync
+            if args.action == "serve":  # the remote half, for manual testing over a pipe
+                clipsync.serve()
+            elif args.action == "run":
+                clipsync.run(config, args.state, args.device)
+            elif args.action == "start":
+                emit(clipsync.start(args.state, args.device))
+            elif args.action == "stop":
+                emit(clipsync.stop(args.state))
+            elif args.action == "autostart":
+                if args.value not in ("on", "off"):
+                    raise ValueError("Usage: jarvis clipboard autostart on|off")
+                emit(clipsync.autostart(args.state, args.value == "on"))
+            else:
+                emit(clipsync.status(args.state))
         elif args.command == "lanmouse":
             if args.action == "fingerprint":
                 devices = config.get("devices", {})
@@ -532,7 +552,8 @@ def cognition(args, config, base):
         turn = Turn(feed_sender(args.state), "cli", args.text.strip())
         try:
             result = ask(args.text, store, memory, config, base, args.tier, args.write,
-                         args.timeout, lane=lane, on_start=turn.start, channel="cli")
+                         args.timeout, lane=lane, on_start=turn.start, on_step=turn.step,
+                         channel="cli")
             turn.done(result)
         except BaseException as exc:
             turn.error(exc)
@@ -575,7 +596,7 @@ def cognition(args, config, base):
                 try:
                     result = ask(text, store, memory, config, base, lane=lane,
                                  on_sentence=speak_sentence, on_start=turn.start,
-                                 channel="cli")
+                                 on_step=turn.step, channel="cli")
                 except (RuntimeError, ValueError) as exc:
                     turn.error(exc)
                     print(f"jarvis: (failed: {exc})")
@@ -660,6 +681,17 @@ def cognition(args, config, base):
             path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
             emit({"engine": "kokoro", "voice": args.text,
                   "note": "Restart the listener to apply: jarvis voice stop; jarvis voice start"})
+        elif args.action == "agent-setup":
+            from .agent import Agent
+            agent = Agent(args.state, config)
+            if agent.agent_id() and args.text != "new":
+                emit({**agent.status(), "note": "Agent already set up. "
+                      "Make another with: jarvis voice agent-setup new"})
+            else:
+                emit(agent.create())
+        elif args.action == "agent":
+            from .agent import Agent
+            emit(Agent(args.state, config).status())
         elif args.action == "enroll":
             from .listen import ENROLL_PHRASES, RATE, VoicePrint, record_utterance, save_wav
             clips, ears = [], VoicePrint(args.state, config)

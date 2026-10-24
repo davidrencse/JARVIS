@@ -254,7 +254,7 @@ class ConsoleWorkflowTests(Temp):
                          self.console.job(job["id"]).get("error"))
         while not sub.empty():
             events.append(sub.get_nowait()["kind"])
-        self.assertEqual([k for k in events if k.startswith("turn.")],
+        self.assertEqual([k for k in events if k.startswith("turn.") and k != "turn.step"],
                          ["turn.start", "turn.sentence", "turn.sentence", "turn.done"])
         history = self.console.history()
         self.assertEqual(history[-1]["reply"]["body"], "Noted. Anything else?")

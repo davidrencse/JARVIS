@@ -38,11 +38,21 @@ def decide(text, config, tier=None, conversational=False, write=False):
     return classify(text, tier)
 
 
+def lane_label(lane, text):
+    """What the brain node of the connection tree is called for this request."""
+    if hasattr(lane, "pick"):
+        return "ChatGPT · tools" if lane.pick(text) == "act" else "ChatGPT · talk"
+    return {"FastLane": "Claude fast lane", "ChatGPTLane": "ChatGPT"}.get(
+        type(lane).__name__, type(lane).__name__)
+
+
 def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, lane=None,
-        on_sentence=None, on_start=None, channel="cli"):
+        on_sentence=None, on_start=None, channel="cli", on_step=None):
     """on_sentence: optional callback for streamed sentences (fast lane only).
     on_start({"route", "message"}): called once the request is routed and remembered.
-    channel: where it came from (console, voice, cli), kept on the inbound message."""
+    channel: where it came from (console, voice, cli), kept on the inbound message.
+    on_step(id, parent, label, detail, state): the request's connection tree as it grows,
+    rooted at "root" (the request itself); state is run, done or fail."""
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Say or type something for JARVIS to do.")
     text = text.strip()
@@ -50,43 +60,60 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
     route = decide(text, config, tier, lane is not None, write)
     # Vault notes first (what David knows and decided), then wiki claims with their
     # sources and dates, then the heap (what was said).
-    recall = (vault_recall(config, memory.path.parent, text)
-              + kb_recall(config, memory.path.parent, text) + memory.context(text))
+    notes = vault_recall(config, memory.path.parent, text)
+    claims = kb_recall(config, memory.path.parent, text)
+    heap = memory.context(text)
+    recall = notes + claims + heap
     inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
                          meta={"route": route, "channel": channel}, importance=0.4)
     if on_start:
         on_start({"route": route, "message": inbound["id"]})
+    step = _stepper(on_step)
+    step("recall", "root", "Recall", f"{len(notes)} vault · {len(claims)} wiki · {len(heap)} heap")
+    step("route", "root", f"Route · {route['tier']}", "; ".join(route["reasons"]))
     reply, detail = None, {}
 
     if route["tier"] == "simple" and not write and (
             quick := instant_answer(text) or vault_answer(text, config, memory.path.parent)):
         reply = quick  # the local clock or the vault: no network, no model
         detail = {"lane": "instant", "streamed": on_sentence is not None}
+        step("instant", "route", "Instant", "clock or vault, no model")
         if on_sentence:
             on_sentence(quick)
 
     if route["tier"] == "simple" and reply is None:
         if lane is not None and not write:
+            step("brain", "route", lane_label(lane, text), "thinking", "run")
             try:
-                reply = lane.ask(text, recall, on_sentence=on_sentence)
+                reply = _with_tools(lane, step, lambda: lane.ask(text, recall,
+                                                                on_sentence=on_sentence))
                 detail = {"lane": type(lane).__name__, "streamed": on_sentence is not None}
+                step("brain", "route", lane_label(lane, text), "answered")
             except RuntimeError as exc:  # fall back to a normal one-shot run below
                 detail = {"lane_error": str(exc)}
+                step("brain", "route", lane_label(lane, text), str(exc), "fail")
         if reply is None:
             spec = {"objective": text, "context": CONVERSATIONAL, "evidence": recall,
                     "provider": routing.get("simple_provider", "claude"),
                     "power": routing.get("simple_power", "low"),
                     "role": "implementer" if write else "assistant",
                     "mode": "workspace-write" if write else "read-only"}
+            label = f"{spec['provider'].title()} run · {spec['power']}"
+            step("task", "route", label, spec["mode"], "run")
             result = run_task(store, store.add(spec)["id"], config, base, timeout)
             reply = result.get("answer")
             detail.update(task=result["task_id"], state=result["state"])
+            step("task", "route", label, f"{result['task_id']} · {result['state']}",
+                 "done" if reply else "fail")
 
     elif route["tier"] == "medium":
         adapter = pick_adapter(text, config)
         detail = {"adapter": adapter.get("name"), "kind": adapter["kind"]}
+        label = f"{adapter.get('name')} · {adapter['kind'].replace('_', ' ')}"
+        step("adapter", "route", label, "", "run")
         if adapter["kind"] == "api":
             reply = call_api(adapter, text, recall)["answer"]
+            step("adapter", "route", label, "answered")
         elif adapter["kind"] == "browser_agent":
             raise RuntimeError(f"{adapter['name']} has no JARVIS interface yet; "
                                "see docs/architecture.md (medium tier).")
@@ -98,9 +125,16 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
             result = run_task(store, store.add(spec)["id"], config, base, timeout)
             reply = result.get("answer")
             detail.update(task=result["task_id"], state=result["state"])
+            step("adapter", "route", label, f"{result['task_id']} · {result['state']}",
+                 "done" if reply else "fail")
 
     elif route["tier"] == "complex":
+        step("plan", "route", "Planner", "writing the plan", "run")
         record = Orchestrator(store, memory, config, base).create(text, timeout=timeout)
+        step("plan", "route", f"Plan {record['id']}", f"{len(record['subtasks'])} steps")
+        for s in record["subtasks"]:
+            step(f"plan:{s['id']}", "plan", f"{s['specialist']} · {s.get('power', 'mid')}",
+                 s["objective"], "wait")
         steps = "; ".join(f"{s['id']} {s['specialist']} ({s.get('power', 'mid')}): "
                           f"{s['objective']}" for s in record["subtasks"])
         how = ("open it in Tasks and press Run" if channel == "console" else
@@ -113,8 +147,36 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
         reply = f"That didn't produce an answer ({detail.get('state', 'no output')})."
     outbound = memory.add("reply", reply, source="jarvis", tags=["outbound", route["tier"]],
                           meta=detail, links=[("answers", inbound["id"])], importance=0.4)
+    step("memory", "root", "Remembered", outbound["id"])
     return {"tier": route["tier"], "reasons": route["reasons"], "reply": reply,
             "memory": [inbound["id"], outbound["id"]], **detail}
+
+
+def _stepper(on_step):
+    def step(id, parent, label, detail="", state="done"):
+        if on_step:
+            try:
+                on_step(id, parent, label, detail, state)
+            except Exception:  # reporting must never fail the turn
+                pass
+    return step
+
+
+def _with_tools(lane, step, call):
+    """Run call() with the lane's tool calls reported as children of the brain node."""
+    if not hasattr(lane, "on_tool"):
+        return call()
+    names = {}
+
+    def on_tool(key, name, ok, text):
+        node = names.setdefault(key, f"tool:{len(names) + 1}")
+        step(node, "brain", name or "tool", text, "run" if ok is None else "done" if ok else "fail")
+
+    lane.on_tool = on_tool
+    try:
+        return call()
+    finally:
+        lane.on_tool = None
 
 
 def wake_word(text, words=("jarvis", "jervis", "travis")):

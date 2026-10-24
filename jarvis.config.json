@@ -11,7 +11,9 @@
     },
     "zenbook": {
       "transport": "ssh",
-      "target": "jdoe@172.1.42.215",
+      "target": "jdoe@192.168.0.194",
+      "fallback_targets": ["jdoe@172.1.42.215", "jdoe@100.64.0.11"],
+      "host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDLTmUvsc7l7vzfOy/yHk0DpdkDZ62R+t93R+78kEG+R",
       "identity_file": "~/.ssh/jarvis_ed25519",
       "host_fingerprint": "SHA256:Up97wSPjhl95DuIoI6bTvYd53OZDfAZ92jnpEQ53QPM",
       "status": "ssh_verified_inventory_collected",
@@ -20,8 +22,9 @@
   },
   "desktop": {
     "clipboard": {
-      "candidate": "CrossPaste",
-      "status": "not_paired"
+      "candidate": "jarvis clipboard (text + images over the SSH link)",
+      "status": "built_untested_on_dell",
+      "note": "2026-10-24: Zenbook (Wayland) half verified end to end; run jarvis clipboard start on the Dell"
     },
     "input": {
       "candidate": "Lan Mouse 0.11.0",
@@ -129,7 +132,7 @@
     "apis": []
   },
   "voice": {
-    "engine": "kokoro",
+    "engine": "elevenlabs",
     "kokoro_voice": "bm_lewis",
     "kokoro_speed": 1.0,
     "model": "eleven_flash_v2_5",

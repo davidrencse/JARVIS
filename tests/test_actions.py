@@ -188,6 +188,8 @@ class ActionLaneTests(unittest.TestCase):
             lane = ChatGPTLane({}, d, timeout=20, command=[sys.executable, str(script)],
                                tools=tools, approve=approve_browser,
                                mcp_servers={"playwright": {"command": "npx"}})
+            seen = []
+            lane.on_tool = lambda key, name, ok, text: seen.append((key, name, ok))
             try:
                 answer = lane.ask("open notepad then example.com")
             finally:
@@ -198,6 +200,10 @@ class ActionLaneTests(unittest.TestCase):
         self.assertIn("open_app", names)
         self.assertIn("playwright.browser_navigate", names)
         self.assertTrue(any(n.startswith("decline") for n in names))
+        # The connection tree sees JARVIS's own tool start, then finish, under one key.
+        self.assertEqual([x for x in seen if x[1] == "open_app"],
+                         [("jarvis:50", "open_app", None), ("jarvis:50", "open_app", True)])
+        self.assertIn("playwright.browser_navigate", [n for _, n, _ in seen])
 
 
 if __name__ == "__main__":
