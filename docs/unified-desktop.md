@@ -100,6 +100,16 @@ not migrate those processes into Arch or combine the machines' RAM/GPUs.
 3. Test video on an existing display, then add the virtual output.
 4. Persist only tested settings and expose their status through JARVIS.
 
+The Grok Bot tunnel (Dell → Zenbook reverse forward on `127.0.0.1:7778`) starts with
+the Dell's console or overlay and reconnects every 5 s. If the Dell sleeps or drops
+Wi-Fi, sshd on the Zenbook keeps the dead session and its port unless it checks
+liveness, which blocks every reconnect. The Zenbook needs:
+
+```bash
+printf 'ClientAliveInterval 15\nClientAliveCountMax 3\n' | sudo tee /etc/ssh/sshd_config.d/50-jarvis-alive.conf
+sudo systemctl reload sshd
+```
+
 Tailscale is installed on the Dell, but its service pipe denied access from the
 agent session. Its login and peer state remain unknown. Tailscale supplies
 connectivity; it does not itself supply SSH, clipboard or desktop services.
