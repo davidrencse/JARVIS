@@ -33,6 +33,7 @@ the one the Playwright browser tools sign in with).
 """
 
 import base64
+import http.client
 import json
 import os
 import re
@@ -271,8 +272,9 @@ class Grokbot:
                 live = _listening(r["tunnel"]) if "tunnel" in r else True
                 out.append({"id": name, "here": r["local"], "os": r["os"], "ok": live,
                             "via": "tunnel" if "tunnel" in r else "here" if r["local"] else "ssh",
-                            **({} if live else {"why_not": f"The tunnel from {name} is down; "
-                                                "restart python -m jarvis grokbot tunnel there."})})
+                            **({} if live else {"why_not": f"{name} isn't answering through "
+                                                "the tunnel; restart the JARVIS console or "
+                                                "python -m jarvis grokbot tunnel there."})})
             except LookupError as exc:
                 out.append({"id": name, "here": False, "ok": False, "why_not": str(exc)})
         return out
@@ -677,11 +679,19 @@ def _loads(raw):
 
 
 def _listening(port):
+    """Whether the relay at the far end of the tunnel answers, not just the forward here:
+    ssh keeps the port open after the relay behind it dies. An empty POST without the
+    token touches nothing there and must come back 403."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/send", data=b"{}", method="POST",
+                                 headers={"Content-Type": "application/json"})
     try:
-        socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
-        return True
-    except OSError:
+        urllib.request.urlopen(req, timeout=3).close()
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        return exc.code == 403
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
         return False
+    return False
 
 
 def relay_server(bot, token, port=RELAY_PORT):

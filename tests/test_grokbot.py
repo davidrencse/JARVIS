@@ -1,4 +1,5 @@
 import json
+import socket
 import os
 import threading
 import urllib.error
@@ -228,6 +229,29 @@ class TunnelTests(unittest.TestCase):
             self.assertFalse({d["id"]: d for d in bot.devices()}["dell"]["ok"])
             with self.assertRaises(ConnectionError):
                 bot.send("hi", device="dell")
+
+    @patch.object(grokbot.socket, "gethostname", return_value="arch_main")
+    def test_open_forward_with_dead_relay_is_down(self, _host):
+        # ssh keeps the forwarded port open after the relay behind it dies:
+        # connections are accepted, then closed without a reply.
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead.listen()
+        self.addCleanup(dead.close)
+
+        def drop():
+            while True:
+                try:
+                    dead.accept()[0].close()
+                except OSError:
+                    return
+        threading.Thread(target=drop, daemon=True).start()
+        Path(self.tmp.name, "grokbot-dell.json").write_text(
+            json.dumps({"port": dead.getsockname()[1], "token": "x"}))
+        with patch.object(grokbot, "TUNNEL_DIR", Path(self.tmp.name)):
+            dell = {d["id"]: d for d in Grokbot(CONFIG, self.tmp.name).devices()}["dell"]
+        self.assertFalse(dell["ok"])
+        self.assertIn("isn't answering", dell["why_not"])
 
     @patch.object(grokbot.socket, "gethostname", return_value="WinLaptop")
     @patch.object(grokbot.shutil, "which", which("ssh"))
