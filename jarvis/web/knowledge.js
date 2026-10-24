@@ -12,7 +12,7 @@ const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 const view = {
   nodes: [], edges: [], byId: new Map(), pages: [],
-  az: -0.13, el: 0.38, zoom: 1, drag: null, hover: null, selected: null,
+  az: -0.13, el: 0.38, zoom: 1, zoomTo: 1, spin: 0, drag: null, hover: null, selected: null,
   pulses: [], snap: null, started: performance.now(), last: "reader :: idle",
   notes: [], flow: [], signals: [], stars: null, claimsOf: new Map(), vault: null,
   layers: { wiki: true, vault: true, claims: true },
@@ -430,7 +430,11 @@ function tooltip(n) {
 /* ---------- loop ---------- */
 let frames = 0, fpsAt = performance.now();
 function frame(now) {
-  if (!view.drag && !reduced) view.az += 0.0011;
+  if (!view.drag) {  // drift, plus whatever spin a flick left behind, easing out
+    view.az += (reduced ? 0 : 0.0011) + view.spin;
+    view.spin *= 0.94; if (Math.abs(view.spin) < 1e-5) view.spin = 0;
+  }
+  view.zoom += (view.zoomTo - view.zoom) * (reduced ? 1 : 0.18);
   if (W && view.nodes.length) draw(now);
   else if (W) { ctx.clearRect(0, 0, W, H); ctx.fillStyle = COLORS.dim; ctx.textAlign = "center";
     ctx.font = "11px 'Geist Mono', monospace"; ctx.fillText("Empty. Type sync to read your Obsidian vault, or ingest https://…", W / 2, H / 2); }
@@ -453,25 +457,29 @@ function nearest(x, y) {
   }
   return best;
 }
-canvas.addEventListener("pointerdown", (e) => { view.drag = { x: e.clientX, y: e.clientY, az: view.az, el: view.el, moved: false }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener("pointerdown", (e) => { view.spin = 0; view.drag = { x: e.clientX, y: e.clientY, az: view.az, el: view.el, moved: false, vx: 0, t: e.timeStamp }; canvas.setPointerCapture(e.pointerId); });
 canvas.addEventListener("pointermove", (e) => {
   const box = canvas.getBoundingClientRect();
   if (view.drag) {
     const dx = e.clientX - view.drag.x, dy = e.clientY - view.drag.y;
     if (Math.abs(dx) + Math.abs(dy) > 3) view.drag.moved = true;
-    view.az = view.drag.az + dx * 0.006; view.el = Math.max(-1.2, Math.min(1.2, view.drag.el + dy * 0.004));
+    const az = view.drag.az + dx * 0.006, dt = Math.max(1, e.timeStamp - view.drag.t);
+    view.drag.vx = ((az - view.az) / dt) * 16; view.drag.t = e.timeStamp;
+    view.az = az; view.el = Math.max(-1.2, Math.min(1.2, view.drag.el + dy * 0.004));
   } else view.hover = nearest(e.clientX - box.left, e.clientY - box.top);
 });
 canvas.addEventListener("pointerup", (e) => {
   const box = canvas.getBoundingClientRect();
   if (view.drag && !view.drag.moved) select(nearest(e.clientX - box.left, e.clientY - box.top));
+  else if (view.drag && !reduced && e.timeStamp - view.drag.t < 80) view.spin = Math.max(-0.08, Math.min(0.08, view.drag.vx));
   view.drag = null;
 });
 canvas.addEventListener("pointerleave", () => { view.hover = null; });
-canvas.addEventListener("wheel", (e) => { e.preventDefault(); view.zoom = Math.max(0.4, Math.min(4, view.zoom * Math.exp(-e.deltaY * 0.0012))); }, { passive: false });
+const zoomBy = (f) => { view.zoomTo = Math.max(0.4, Math.min(4, view.zoomTo * f)); };
+canvas.addEventListener("wheel", (e) => { e.preventDefault(); zoomBy(Math.exp(-e.deltaY * 0.0012)); }, { passive: false });
 canvas.addEventListener("keydown", (e) => {
   const k = { ArrowLeft: () => (view.az -= 0.1), ArrowRight: () => (view.az += 0.1), ArrowUp: () => (view.el -= 0.08),
-    ArrowDown: () => (view.el += 0.08), "+": () => (view.zoom *= 1.15), "=": () => (view.zoom *= 1.15), "-": () => (view.zoom /= 1.15),
+    ArrowDown: () => (view.el += 0.08), "+": () => zoomBy(1.15), "=": () => zoomBy(1.15), "-": () => zoomBy(1 / 1.15),
     Escape: () => select(null) }[e.key];
   if (k) { e.preventDefault(); k(); }
 });
