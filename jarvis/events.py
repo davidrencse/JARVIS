@@ -9,6 +9,9 @@ new memory items, task lifecycle events, plan progress, the listener going up or
 Every request, from any channel, is one `turn`:
   turn.start    {channel, message, text, tier, reasons, job?}
   turn.sentence {channel, message, text, job?}   streamed as the brain answers
+  turn.step     {channel, message, id, parent, label, detail, state, job?}
+                one node of the request's connection tree (recall, route, brain, tools...);
+                sent again with the same id when its state changes (run -> done | fail)
   turn.done     {channel, message, reply_id, reply, tier, seconds, plan?, task?, job?}
   turn.error    {channel, message?, error, job?}
 """
@@ -96,6 +99,10 @@ class Turn:
 
     def sentence(self, text):
         self._send("turn.sentence", text=text)
+
+    def step(self, id, parent, label, detail="", state="done"):
+        self._send("turn.step", id=id, parent=parent, label=label,
+                   detail=str(detail or "")[:160], state=state)
 
     def done(self, result):
         memory = result.get("memory") or [None, None]

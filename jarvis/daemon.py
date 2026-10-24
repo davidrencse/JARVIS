@@ -122,7 +122,7 @@ def listen_loop(state, config, base, threshold=None, require_wake=True):
                 try:
                     result = ask(request, store, memory, config, base, lane=lane,
                                  on_sentence=speak_sentence, on_start=turn.start,
-                                 channel="voice")
+                                 on_step=turn.step, channel="voice")
                 except BaseException as exc:
                     turn.error(exc)
                     raise

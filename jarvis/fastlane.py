@@ -69,6 +69,7 @@ class FastLane:
         self._reader = None
         self.lock = threading.Lock()
         self.command = command  # tests substitute a fake CLI
+        self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
 
     def _spawn(self):
         binary = shutil.which("claude")
@@ -150,6 +151,13 @@ class FastLane:
                 event = json.loads(line)
             except ValueError:
                 continue
+            if self.on_tool and event.get("type") == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        try:
+                            self.on_tool(block.get("id"), block.get("name"), True, "")
+                        except Exception:  # reporting must never fail the turn
+                            pass
             delta = (event.get("event") or {}).get("delta") or {}
             if on_sentence and event.get("type") == "stream_event" and \
                     delta.get("type") == "text_delta":

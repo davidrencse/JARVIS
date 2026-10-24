@@ -690,7 +690,7 @@ class Console:
         try:
             result = ask(job["text"], self.store, self.memory, self.config, self.base, tier,
                          lane=self.lane(), on_sentence=sentence, on_start=started,
-                         channel="console")
+                         on_step=turn.step, channel="console")
             if job.get("case"):
                 ids = list(result.get("memory", []))
                 if result.get("plan"):

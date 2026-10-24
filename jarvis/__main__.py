@@ -552,7 +552,8 @@ def cognition(args, config, base):
         turn = Turn(feed_sender(args.state), "cli", args.text.strip())
         try:
             result = ask(args.text, store, memory, config, base, args.tier, args.write,
-                         args.timeout, lane=lane, on_start=turn.start, channel="cli")
+                         args.timeout, lane=lane, on_start=turn.start, on_step=turn.step,
+                         channel="cli")
             turn.done(result)
         except BaseException as exc:
             turn.error(exc)
@@ -595,7 +596,7 @@ def cognition(args, config, base):
                 try:
                     result = ask(text, store, memory, config, base, lane=lane,
                                  on_sentence=speak_sentence, on_start=turn.start,
-                                 channel="cli")
+                                 on_step=turn.step, channel="cli")
                 except (RuntimeError, ValueError) as exc:
                     turn.error(exc)
                     print(f"jarvis: (failed: {exc})")
