@@ -19,9 +19,8 @@ WEB = re.compile(
     r"gmail|inbox|discord|telegram|notion|canvas|brightspace|website|web ?page|browser|log ?in|"
     r"sign ?in|my account|scan (?:my|the)|check (?:my|the) (?:dm|messages|feed|notifications))\b",
     re.I)
-# Integrations that never return an answer to JARVIS: window_automation only types the
-# prompt into the agent's own window (Devices view), so it can't serve a medium reply.
-NO_REPLY = (None, "unconfigured", "window_automation")
+# Integrations that can't take a task and hand an answer back.
+NO_REPLY = (None, "unconfigured")
 
 
 def classify(text, override=None):

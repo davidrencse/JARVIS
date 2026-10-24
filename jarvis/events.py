@@ -14,6 +14,7 @@ Every request, from any channel, is one `turn`:
                 sent again with the same id when its state changes (run -> done | fail)
   turn.done     {channel, message, reply_id, reply, tier, seconds, plan?, task?, job?}
   turn.error    {channel, message?, error, job?}
+  grok.reply    {id, task, answer}   a Grok Bot answer that arrived after the turn ended
 """
 
 import json
@@ -26,7 +27,7 @@ from pathlib import Path
 
 FEED = "events.jsonl"
 MAX_FEED = 1_000_000  # bytes before the feed rolls over to events.1.jsonl
-RELAYED = ("turn.", "voice.", "kb.")  # kinds other processes may put on the feed
+RELAYED = ("turn.", "voice.", "kb.", "grok.")  # kinds other processes may put on the feed
 
 
 class Bus:

@@ -68,11 +68,12 @@ def main():
     lm.add_argument("--capture-backend", help="config: e.g. layer-shell on Hyprland")
     lm.add_argument("--output", help="config: write here instead of printing")
     gb = sub.add_parser("grokbot", help="Grokbot, a terminal or the JARVIS browser (Devices view)")
-    gb.add_argument("action", choices=("status", "send", "browser-task", "terminal", "browser",
-                                       "tunnel"))
+    gb.add_argument("action", choices=("status", "send", "browser-task", "task", "terminal",
+                                       "browser", "tunnel"))
     gb.add_argument("text", nargs="?", default="", help="prompt, command or URL")
     gb.add_argument("--device", default=None, help="send: which laptop's Grokbot (default: this one)")
     gb.add_argument("--to", default=None, help="tunnel: SSH device to forward to (default: the first)")
+    gb.add_argument("--wait", type=int, default=600, help="task: seconds to wait for Grok's answer")
     for name, helptext in (("send", "Send a file to the other laptop's JARVIS-Drop folder"),
                            ("fetch", "Pull a file from the other laptop's JARVIS-Drop folder"),
                            ("inbox", "List files waiting in the other laptop's JARVIS-Drop")):
@@ -260,6 +261,9 @@ def main():
             bot = Grokbot(config, args.state)
             if args.action == "tunnel":
                 return bot.tunnel(args.to)
+            if args.action == "task":  # hand off, then wait for Grok's answer
+                emit(bot.task(args.text, device=args.device, timeout=args.wait))
+                return 0
             emit(bot.status() if args.action == "status" else bot.command(args.text, {
                 "send": "grokbot", "browser-task": "grokbot-browser"}.get(args.action, args.action),
                 args.device))

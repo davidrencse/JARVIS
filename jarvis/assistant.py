@@ -114,6 +114,21 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
         if adapter["kind"] == "api":
             reply = call_api(adapter, text, recall)["answer"]
             step("adapter", "route", label, "answered")
+        elif adapter["kind"] == "browser_agent" and adapter["name"] == "grokbot" and \
+                adapter.get("integration") == "window_automation":
+            from .grokbot import Grokbot
+            step("adapter", "route", "Grok Bot · agent browser", "typing the task", "run")
+            bot = Grokbot(config, memory.path.parent)
+            sent = bot.handoff(text)
+            step("adapter", "route", "Grok Bot · agent browser",
+                 f"handoff {sent['id']} · waiting for Grok", "run")
+            reply = bot.wait(sent["id"], timeout)
+            if reply is None:
+                step("adapter", "route", "Grok Bot · agent browser", "no answer yet", "fail")
+                raise TimeoutError(f"Grok hasn't answered within {timeout} s (handoff "
+                                   f"{sent['id']}); it may still be working.")
+            detail["grok"] = sent["id"]
+            step("adapter", "route", "Grok Bot · agent browser", f"answered · {sent['id']}")
         elif adapter["kind"] == "browser_agent":
             raise RuntimeError(f"{adapter['name']} has no JARVIS interface yet; "
                                "see docs/architecture.md (medium tier).")
