@@ -115,5 +115,6 @@
     return out;
   }
 
+  Mic.resample = resample;
   window.Mic = Mic;
 })();
