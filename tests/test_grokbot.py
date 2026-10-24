@@ -245,6 +245,83 @@ class TunnelTests(unittest.TestCase):
         self.assertEqual(withdraw[0][-1], "rm -f .config/jarvis/grokbot-dell.json")
 
 
+class HandoffTests(unittest.TestCase):
+    """A task goes out through the window; Grok's answer comes back as an inbox file."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = patch.object(grokbot, "INBOX", Path(self.tmp.name, "grok-inbox"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.bot = Grokbot({}, self.tmp.name)
+        self.sent = []
+        self.bot.send = lambda prompt, browser=False, device=None: (
+            self.sent.append(prompt) or {"sent": prompt, "device": "zenbook"})
+
+    def answer(self, prompt, text):
+        """Play Grok: find the reply address in the prompt and write there."""
+        import re
+        path = Path(re.search(r"rename it to (\S+) ", prompt).group(1))
+        path.write_text(text, encoding="utf-8")
+
+    def test_prompt_carries_the_task_and_a_reply_address(self):
+        out = self.bot.handoff("find cheap flights to Tokyo")
+        prompt = self.sent[0]
+        self.assertTrue(prompt.startswith("find cheap flights to Tokyo"))
+        self.assertIn(out["id"], prompt)
+        self.assertIn(out["path"], prompt)
+        self.assertIn("agent browser", prompt)
+        self.assertIn("Ask David before buying", prompt)
+        self.assertTrue(Path(out["path"]).parent.is_dir())
+
+    def test_wait_reads_then_removes_the_answer(self):
+        out = self.bot.handoff("x")
+        self.assertIsNone(self.bot.wait(out["id"], timeout=0.05, poll=0.01))
+        self.answer(self.sent[0], "  Flights from $612.  ")
+        self.assertEqual(self.bot.wait(out["id"], timeout=2, poll=0.01), "Flights from $612.")
+        self.assertFalse(Path(out["path"]).exists())
+
+    def test_wait_refuses_ids_that_could_escape_the_inbox(self):
+        for bad in ("../../etc/passwd", "g123", "", None):
+            with self.assertRaises(ValueError):
+                self.bot.wait(bad, timeout=0)
+
+    def test_task_times_out_with_the_handoff_id(self):
+        with self.assertRaisesRegex(TimeoutError, "handoff g[0-9a-f]{10}"):
+            self.bot.task("x", timeout=0.05)
+
+    def test_tool_returns_answer_or_hands_off_late_answers(self):
+        late = []
+        tools = grokbot.GrokTools(self.bot, wait_seconds=0.05, late_seconds=5,
+                                  on_late=lambda *a: late.append(a))
+        self.assertEqual([s["name"] for s in tools.specs()], ["grok_agent"])
+        ok, text = tools.call("grok_agent", {"task": "check my Handshake inbox"})
+        self.assertTrue(ok)
+        self.assertIn("still working", text)
+        self.answer(self.sent[0], "2 new messages.")
+        for _ in range(200):
+            if late:
+                break
+            threading.Event().wait(0.02)
+        self.assertEqual(late[0][1:], ("check my Handshake inbox", "2 new messages."))
+
+        tools.wait_seconds = 2
+        threading.Timer(0.1, lambda: self.answer(self.sent[1], "Done.")).start()
+        ok, text = tools.call("grok_agent", {"task": "y"})
+        self.assertTrue(ok)
+        self.assertIn("Done.", text)
+        self.assertIn("not instructions", text)
+
+    def test_tool_reports_when_grok_cant_be_reached(self):
+        def down(*a, **k):
+            raise ValueError("Grok Bot isn't installed here.")
+        self.bot.send = down
+        ok, text = grokbot.GrokTools(self.bot).call("grok_agent", {"task": "x"})
+        self.assertFalse(ok)
+        self.assertIn("isn't installed", text)
+
+
 class StatusTests(unittest.TestCase):
     def test_never_reads_the_credential_file(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -78,9 +78,11 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(pick_adapter("scan my Instagram", config)["name"], "ig")
         self.assertEqual(pick_adapter("open reddit", config)["kind"], "cli_web")
 
-    def test_window_automation_agents_fall_back_to_web(self):
+    def test_grokbot_takes_web_work_once_it_can_answer(self):
         config = {"adapters": {"browser_agents": ["grokbot"], "apis": []},
                   "personal_agents": {"grokbot": {"integration": "window_automation"}}}
+        self.assertEqual(pick_adapter("open reddit", config)["name"], "grokbot")
+        config["personal_agents"]["grokbot"]["integration"] = "unconfigured"
         self.assertEqual(pick_adapter("open reddit", config)["kind"], "cli_web")
 
     def test_specialists_have_tiers(self):
