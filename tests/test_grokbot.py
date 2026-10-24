@@ -1,6 +1,8 @@
 import json
 import socket
 import os
+import re
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -162,6 +164,24 @@ class SendTests(unittest.TestCase):
         self.assertEqual(seen["argv"][0], "powershell.exe")
         self.assertEqual(seen["prompt"], "hello dell")
         self.assertEqual(out["device"], "dell")
+
+    def test_background_keys_carry_only_key_names(self):
+        mapper = re.search(r"python3 -c '\n(.*?)\n' \"\$A\"\)", grokbot.LINUX_SCRIPT, re.S)
+
+        def keys(text, address="0x55aa01"):
+            out = grokbot.subprocess.run([sys.executable, "-c", mapper.group(1), address],
+                                         input=text.encode(), capture_output=True)
+            return out.returncode, out.stdout.decode()
+        code, lua = keys('Hi "x"?\nend)) os.execute("rm")')
+        self.assertEqual(code, 0)
+        pairs = re.findall(r'\{"(\w*)","(\w+)"\}', lua)
+        self.assertEqual(pairs[:5], [("SHIFT", "h"), ("", "i"), ("", "space"),
+                                     ("SHIFT", "apostrophe"), ("", "x")])
+        self.assertIn(("SHIFT", "Return"), pairs)
+        self.assertEqual(pairs[-1], ("", "Return"))
+        self.assertNotIn("os.execute", lua)  # the prompt never becomes Lua
+        self.assertEqual(keys("café")[0], 1)  # not typeable: falls back to paste
+        self.assertEqual(keys("hi", 'x" }) os.exit() --')[0], 1)
 
     def test_empty_and_oversized_prompts(self):
         with self.assertRaises(ValueError):

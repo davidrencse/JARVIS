@@ -3,8 +3,10 @@
 Grokbot (xAI's "Grok Bot" desktop agent, an Electron app) has no local prompt API,
 CLI or deep link for sending a task: its grokbot:// links only import bot templates
 and finish MCP sign-ins, and its local-exec daemon takes work from xAI's servers.
-So JARVIS types to it the way David would: focus its window, paste the prompt into
-the composer, press Enter, then hand focus and the clipboard back.
+So JARVIS types to it the way David would. On Hyprland it types in the background,
+key by key into the unfocused window, so David's screen doesn't move; for text that
+can't be typed that way, and on Windows, it focuses the window, pastes the prompt into
+the composer, presses Enter, then hands focus and the clipboard back.
 
 - Arch/Hyprland: LINUX_SCRIPT (hyprctl, wl-copy, wtype), piped to `bash -s` here or
   over the configured SSH key, so the Dell's JARVIS can type to the Zenbook's
@@ -117,6 +119,42 @@ if [ -z "$A" ]; then
   sleep 1.5
 fi
 [ -n "$A" ] || { echo "error=Grok Bot started but its window never appeared."; exit 4; }
+# In the background: Hyprland's send_shortcut delivers keys to the window without
+# focusing it, so David's screen doesn't jump. Wayland only hands the clipboard to the
+# focused window, so it types key by key (US layout); text it can't type that way
+# (emoji, curly quotes) falls through to focus-and-paste below. The Lua carries only
+# key names from this fixed table and the window address, never the prompt itself.
+LUA=$(printf %s "$P" | python3 -c '
+import re, sys
+a = sys.argv[1]
+if not re.fullmatch(r"0x[0-9a-f]+", a): sys.exit(1)
+base = {" ": "space", "-": "minus", "=": "equal", "[": "bracketleft", "]": "bracketright",
+        "\\": "backslash", ";": "semicolon", "\x27": "apostrophe", ",": "comma",
+        ".": "period", "/": "slash", "`": "grave", "\t": "space"}
+shifted = dict(zip("!@#$%^&*()_+{}|:\"<>?~", "1234567890-=[]\\;\x27,./`"))
+keys = []
+for ch in sys.stdin.read().replace("\r", ""):
+    if ch == "\n": keys.append(("SHIFT", "Return"))
+    elif ch.isascii() and ch.isalnum(): keys.append(("SHIFT" if ch.isupper() else "", ch.lower()))
+    elif ch in base: keys.append(("", base[ch]))
+    elif ch in shifted:
+        k = shifted[ch]; keys.append(("SHIFT", base.get(k, k)))
+    else: sys.exit(1)
+keys.append(("", "Return"))
+for i in range(0, len(keys), 200):
+    t = ",".join("{\"%s\",\"%s\"}" % k for k in keys[i:i + 200])
+    print("(function() for _, k in ipairs({%s}) do hl.dispatch(hl.dsp.send_shortcut("
+          "{ mods = k[1], key = k[2], window = \"address:%s\" })) end "
+          "return hl.dsp.no_op() end)()" % (t, a))
+' "$A") && [ -n "$LUA" ] && {
+  while IFS= read -r line; do
+    hyprctl dispatch "$line" 2>&1 | grep -qx ok || { echo "error=Hyprland refused the keys."; exit 5; }
+  done <<< "$LUA"
+  echo "ok=1"
+  echo "background=1"
+  echo "workspace=$(win workspace)"
+  exit 0
+}
 PREV=$(active)
 OLD=$(timeout 2 wl-paste -n -t text/plain 2>/dev/null || true)
 # Never paste unless Grok Bot really has focus: the keys would land in whatever does.
