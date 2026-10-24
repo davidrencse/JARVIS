@@ -240,6 +240,21 @@ def list_voices(key):
                    for v in voices if v.get("voice_id")), key=jarvisness)
 
 
+def save_secrets(state_dir, **values):
+    """Merge values into .jarvis/secrets.json, readable only by the owner."""
+    path = Path(state_dir).resolve() / "secrets.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data.update(values)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    from .credits import owner_only
+    owner_only(path)
+    return path
+
+
 def setup(state_dir, config=None, ask=input, secret=None):
     """Paste the key once (hidden), pick a voice by number, hear a test line."""
     import getpass
@@ -266,16 +281,7 @@ def setup(state_dir, config=None, ask=input, secret=None):
         if not pick.isdigit() or not 1 <= int(pick) <= len(shown):
             raise ValueError("Pick one of the listed numbers.")
         choice = shown[int(pick) - 1]["voice_id"]
-    path = Path(state_dir).resolve() / "secrets.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    data.update(ELEVENLABS_API_KEY=key, ELEVENLABS_VOICE_ID=choice)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    from .credits import owner_only
-    owner_only(path)
+    path = save_secrets(state_dir, ELEVENLABS_API_KEY=key, ELEVENLABS_VOICE_ID=choice)
     result = Voice(state_dir, config).say("JARVIS online. Good to hear you, David.")
     return {"saved": str(path), "voice_id": choice, "test": result["source"]}
 
