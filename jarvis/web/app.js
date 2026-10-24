@@ -85,6 +85,8 @@
   const VIEWS = ["console", "graph", "system", "credits", "memory", "tasks", "run", "files", "devices"];
   const loaded = {};
   async function show() {
+    // The graph view gave way to the knowledge engine page; old links and key 2 go there.
+    if (location.hash === "#graph") { location.replace("knowledge.html"); return; }
     const name = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "console";
     for (const v of VIEWS) $("#view-" + v).hidden = v !== name;
     $$(".rail a[data-view]").forEach((a) => { if (a.dataset.view === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
