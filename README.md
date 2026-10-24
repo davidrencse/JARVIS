@@ -490,6 +490,38 @@ ElevenLabs voices. A pick is saved as `ELEVENLABS_VOICE_ID`, applies to live cal
 Live-call audio goes to ElevenLabs, so the local voiceprint check doesn't apply to it;
 push-to-talk (**Voice**) and the always-on listener still run locally.
 
+## Markets terminal (True Markets recon)
+
+**Markets** in the console nav opens `terminal.html`: a Bloomberg-style terminal over
+[True Markets](https://truemarkets.co) data. Monitor (top assets by market cap, 1h/24h
+change, range, sparkline), chart with windows from 1H to 365D, security description,
+intel (movers, breadth, BTC dominance, volatility) and a **strategy lab**.
+
+```bash
+jarvis markets setup ~/Desktop/truemarkets-org-api-key-*.json   # once per laptop
+jarvis markets status | quote SOL | intel | monitor
+jarvis markets strategies ; jarvis markets backtest <id>
+```
+
+The key file is copied to `.jarvis/truemarkets-key.json` (git-ignored, owner-only).
+Sign-in is True Markets' ES256 challenge, done in pure Python, so no extra package.
+
+**Recon only.** The client issues GETs against an allowlist of market-data paths and
+contains no order, transfer or wallet code. This key's account endpoints answer 401
+anyway.
+
+**Strategies are data, not code:** tickers, window, bar size, entry rules (all must
+hold), exit rules (any one), stop loss and take profit. A rule is `TERM OP TERM`, for
+example `sma(20) crosses_above sma(50)`, `rsi(14) < 30` or `price > high(20)`.
+Indicators are sma, ema, rsi, roc, zscore, high, low and vol. Backtests are long-only;
+a signal on a bar's close fills on the next bar, so there is no look-ahead. They report
+return vs buy-and-hold, Sharpe, max drawdown, trades, win rate, exposure and the live
+signal (BUY/SELL/HOLD/FLAT). Five templates are included; saved strategies live in
+`.jarvis/strategies.json`.
+
+Terminal keys: `/` command line (`BTC`, `ETH GP 30D`, `DES SOL`, `TOP`, `NEW`, `BT`,
+`TPL 3`, `HELP`), F1-F5 panes, ↑/↓ steps through the monitor.
+
 ## Unified desktop
 
 See [desktop setup and acceptance checks](docs/unified-desktop.md).
