@@ -37,8 +37,8 @@ STATIONS = [
               "Chrome. It asks before buying, posting or sending anything.",
      "modules": ["actions", "grokbot", "transfer", "storage", "clipsync"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
-     "plain": "The reply is spoken by Kokoro, a voice that runs on this laptop. ElevenLabs "
-              "is optional and costs credits; its agent runs live calls from the console.",
+     "plain": "The reply is spoken by ElevenLabs, falling back to Kokoro, a voice that "
+              "runs on this laptop. ElevenLabs' agent also runs live calls from the console.",
      "modules": ["speech", "voice", "agent"]},
     {"id": "log", "title": "Log", "verb": "records",
      "plain": "Everything is written down: the conversation in memory, agent runs in the "

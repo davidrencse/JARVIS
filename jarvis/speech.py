@@ -1,5 +1,5 @@
-"""Spoken replies. Default engine: Kokoro, a local 82M-parameter voice model — free,
-no credits, no network. ElevenLabs remains available as `voice.engine: "elevenlabs"`.
+"""Spoken replies. Engines: ElevenLabs (`voice.engine: "elevenlabs"`, falls back to
+Kokoro) or Kokoro alone, a local 82M-parameter voice model — free, no network.
 
 Kokoro on the Dell's CPU (measured 2026-10-20): ~0.25 s for "On it.", ~0.7 s for a
 typical sentence, about 4-5x faster than real time. The GPU build of onnxruntime and
@@ -95,6 +95,7 @@ class Voice:
         self.cache.mkdir(parents=True, exist_ok=True)
         self.usage_path = Path(state_dir).resolve() / "voice-usage.json"
         self.secrets = Path(state_dir).resolve() / "secrets.json"
+        self.last_error = None
 
     def credential(self, name):
         """Environment variable first, then .jarvis/secrets.json (written by voice setup)."""
@@ -123,10 +124,22 @@ class Voice:
         return self.budget - data.get(month, 0)
 
     def synth(self, text):
-        """(WAV path, source) for `text`; path is None when it can't be voiced."""
+        """(WAV path, source) for `text`; path is None when it can't be voiced.
+        ElevenLabs falls back to local Kokoro (no key yet, over budget, offline, out of
+        credits), so a reply is never lost or read by the robotic system voice."""
         if self.engine == "kokoro":
             return self._kokoro(text)
-        return self._elevenlabs(text)
+        try:
+            path, source = self._elevenlabs(text)
+        except Exception as exc:
+            path, source = None, "elevenlabs-error"
+            self.last_error = str(exc)
+        if path:
+            return path, source
+        try:
+            return self._kokoro(text)[0], f"kokoro ({source})"
+        except Exception:  # Kokoro isn't installed on this laptop either
+            return None, source
 
     def _kokoro(self, text):
         digest = hashlib.sha256(f"kokoro|{self.kokoro_voice}|{self.speed}|{text}".encode())

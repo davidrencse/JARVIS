@@ -428,7 +428,9 @@ Run the collector in your regular terminal for a fresh full snapshot.
 
 ## Voice output
 
-Default is **Kokoro**, a local voice model: free, offline, no credits. Files live in
+Default is **ElevenLabs** (set up below); whenever it can't speak (no key yet, over
+`monthly_char_budget`, offline, out of credits) the reply falls back to **Kokoro**, a
+local voice model: free, offline, no credits. Files live in
 `.jarvis/voice/kokoro/` (`kokoro-v1.0.onnx`, `voices-v1.0.bin`, from the
 kokoro-onnx `model-files-v1.0` release); package `pip install kokoro-onnx`.
 
@@ -437,9 +439,10 @@ jarvis voice demo            # hear bm_george, bm_lewis, bm_daniel, bm_fable
 jarvis voice use bm_lewis    # switch, then: jarvis voice stop; jarvis voice start
 ```
 
-## ElevenLabs (optional, paid)
+## ElevenLabs (paid)
 
-Set `"engine": "elevenlabs"` under `voice` in `jarvis.config.json` to use it instead.
+`"engine": "elevenlabs"` under `voice` in `jarvis.config.json`; set it to `"kokoro"`
+for local only.
 
 Run `python -m jarvis voice setup` once: paste the key at a hidden prompt, pick a
 voice from the list. Saved to `.jarvis/secrets.json` (git-ignored); environment

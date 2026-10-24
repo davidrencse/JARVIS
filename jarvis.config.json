@@ -130,7 +130,7 @@
     "apis": []
   },
   "voice": {
-    "engine": "kokoro",
+    "engine": "elevenlabs",
     "kokoro_voice": "bm_lewis",
     "kokoro_speed": 1.0,
     "model": "eleven_flash_v2_5",
