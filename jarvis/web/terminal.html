@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>JARVIS Markets</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="terminal.css">
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="index.html" title="Back to the JARVIS console">JARVIS<span>▸</span>MKTS</a>
+  <form class="cmd" id="cmd" autocomplete="off">
+    <label class="sr" for="cmd-in">Command</label>
+    <input id="cmd-in" spellcheck="false" placeholder="BTC GP 30D · DES SOL · TOP · NEW · BT · HELP">
+    <button type="submit">GO</button>
+  </form>
+  <div class="stat">
+    <span class="tag recon" title="Read-only: no order, transfer or wallet calls exist in this build">RECON ONLY</span>
+    <span id="feed" class="tag">TM —</span>
+    <span id="clock" class="clock">--:--:--</span>
+  </div>
+</header>
+<div class="tape" aria-label="Movers"><div class="tape-in" id="tape"></div></div>
+
+<main class="grid">
+  <section class="pane mon" aria-label="Monitor">
+    <header><b>1</b> MONITOR <span class="dim" id="mon-meta">top by mkt cap</span></header>
+    <div class="scroll"><table class="tbl" id="mon">
+      <thead><tr><th>#</th><th>TICKER</th><th class="r">LAST</th><th class="r">1H%</th><th class="r">24H%</th><th>24H RANGE</th><th class="r">MKT CAP</th><th>1D</th></tr></thead>
+      <tbody><tr><td colspan="8" class="dim">Loading…</td></tr></tbody>
+    </table></div>
+  </section>
+
+  <section class="pane chart" aria-label="Chart">
+    <header><b>2</b> <span id="sec-title">GP</span>
+      <nav class="win" id="win" aria-label="Window"></nav></header>
+    <div class="quote" id="quote"></div>
+    <div class="canvas-wrap"><canvas id="gp"></canvas><div class="hover" id="gp-hover" hidden></div></div>
+    <div class="des" id="des"></div>
+  </section>
+
+  <section class="pane intel" aria-label="Intel">
+    <header><b>3</b> INTEL <span class="dim" id="intel-meta"></span></header>
+    <div class="scroll" id="intel"></div>
+  </section>
+
+  <section class="pane lab" aria-label="Strategy lab">
+    <header><b>4</b> STRATEGY LAB <span class="dim">rules on True Markets history · research only, nothing is traded</span></header>
+    <div class="lab-grid">
+      <div class="lab-list scroll" id="strats"></div>
+      <form class="lab-edit" id="edit" autocomplete="off">
+        <div class="row2">
+          <label>NAME<input name="name" maxlength="60" required></label>
+          <label>TICKERS<input name="symbols" placeholder="BTC, ETH, SOL" required></label>
+        </div>
+        <div class="row4">
+          <label>WINDOW<select name="window"></select></label>
+          <label>BAR<select name="resolution"></select></label>
+          <label>STOP %<input name="stop_loss" type="number" min="0" max="90" step="0.5"></label>
+          <label>TAKE %<input name="take_profit" type="number" min="0" max="1000" step="0.5"></label>
+        </div>
+        <label>ENTRY · all must hold<textarea name="entry" rows="2" spellcheck="false" placeholder="sma(20) crosses_above sma(50)"></textarea></label>
+        <label>EXIT · any one<textarea name="exit" rows="2" spellcheck="false" placeholder="sma(20) crosses_below sma(50)"></textarea></label>
+        <p class="hint">TERM OP TERM · terms: price, number, sma ema rsi roc zscore high low vol(n) · ops: &gt; &lt; &gt;= &lt;= crosses_above crosses_below</p>
+        <div class="acts">
+          <button type="submit" class="go">BACKTEST</button>
+          <button type="button" id="save">SAVE</button>
+          <button type="button" id="del">DELETE</button>
+          <button type="button" id="new">NEW</button>
+          <span class="dim" id="edit-msg" role="status"></span>
+        </div>
+      </form>
+      <div class="lab-out">
+        <div class="eq-wrap"><canvas id="eq"></canvas></div>
+        <table class="tbl" id="bt"><tbody><tr><td class="dim">Pick a template or saved strategy, then BACKTEST.</td></tr></tbody></table>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="keys">
+  <span><b>F1</b> HELP</span><span><b>F2</b> MONITOR</span><span><b>F3</b> CHART</span><span><b>F4</b> INTEL</span><span><b>F5</b> LAB</span>
+  <span><b>/</b> COMMAND</span><span><b>↑↓</b> TICKER</span>
+  <span class="dim" id="foot">True Markets · market data only</span>
+</footer>
+
+<dialog class="help" id="help">
+  <h2>COMMANDS</h2>
+  <dl>
+    <dt>BTC</dt><dd>load a ticker in the chart (also: BTC GP)</dd>
+    <dt>ETH GP 30D</dt><dd>chart over a window: 1H 4H 1D 7D 30D 90D 180D 365D</dd>
+    <dt>DES SOL</dt><dd>security description</dd>
+    <dt>TOP · MOV</dt><dd>jump to intel: movers, breadth, volatility</dd>
+    <dt>STRAT · NEW</dt><dd>strategy lab · start a blank strategy</dd>
+    <dt>BT</dt><dd>backtest what's in the editor</dd>
+    <dt>TPL 3</dt><dd>load template number 3</dd>
+  </dl>
+  <p>Recon only: this terminal reads prices and history. It has no way to place, cancel or transfer anything.</p>
+  <form method="dialog"><button>CLOSE</button></form>
+</dialog>
+<script src="terminal.js"></script>
+</body>
+</html>
