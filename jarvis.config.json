@@ -20,8 +20,9 @@
   },
   "desktop": {
     "clipboard": {
-      "candidate": "CrossPaste",
-      "status": "not_paired"
+      "candidate": "jarvis clipboard (text + images over the SSH link)",
+      "status": "built_untested_on_dell",
+      "note": "2026-10-24: Zenbook (Wayland) half verified end to end; run jarvis clipboard start on the Dell"
     },
     "input": {
       "candidate": "Lan Mouse 0.11.0",
