@@ -459,11 +459,40 @@ the separate `chat` and `voice` pipelines provide conversational playback/listen
 The adapter's HTTP behavior is covered with mock responses.
 API contract: [ElevenLabs create speech](https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
 
+## ElevenLabs voice agent (live calls)
+
+The **Live** button in the console dock starts a real-time voice call with an
+[ElevenLabs agent](https://elevenlabs.io/docs/agents-platform/overview): ElevenLabs
+handles speech recognition, turn-taking, barge-in (talk over it to interrupt) and the
+voice. Anything beyond small talk goes back to JARVIS through the agent's `ask_jarvis`
+client tool, so memory, routing, vault and actions are unchanged. The API key stays on
+the server: the page gets a short-lived signed WebSocket URL from `/api/agent/session`.
+
+```bash
+jarvis voice setup          # once: ElevenLabs key + default voice -> .jarvis/secrets.json
+jarvis voice agent-setup    # once: creates the "JARVIS" agent, saves ELEVENLABS_AGENT_ID
+jarvis voice agent          # status
+```
+
+The key needs the ElevenLabs Agents and Voices permissions. To use an agent you made in
+the dashboard instead, set `ELEVENLABS_AGENT_ID` (or `voice.agent_id` in
+`jarvis.config.json`); it needs a client tool named `ask_jarvis` (string parameter
+`request`, wait for response) and **Security → Overrides → TTS voice** enabled.
+
+**Switching voices.** The voice picker next to the speaker button lists this account's
+ElevenLabs voices. A pick is saved as `ELEVENLABS_VOICE_ID`, applies to live calls
+(an active call reconnects with the new voice), and to read-aloud replies when
+`voice.engine` is `elevenlabs`. Live calls bill ElevenLabs agent minutes.
+
+Live-call audio goes to ElevenLabs, so the local voiceprint check doesn't apply to it;
+push-to-talk (**Voice**) and the always-on listener still run locally.
+
 ## Unified desktop
 
 See [desktop setup and acceptance checks](docs/unified-desktop.md).
 Clipboard, input sharing, video streaming, and display extension are separate
-connections. Lan Mouse 0.11.0 is installed on the Dell; JARVIS generates each
+connections. **Clipboard:** `jarvis clipboard start` on the Dell syncs text and images
+with the Zenbook over the existing SSH link (`autostart on` to keep it running). Lan Mouse 0.11.0 is installed on the Dell; JARVIS generates each
 side's config so each laptop trusts only the other's certificate fingerprint:
 
 ```powershell
