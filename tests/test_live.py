@@ -56,8 +56,10 @@ class BusTests(unittest.TestCase):
         turn.sentence("Hello.")
         turn.done({"reply": "Hello.", "tier": "simple", "memory": ["message:1", "reply:2"],
                    "streamed": True})
+        turn.step("brain", "route", "ChatGPT · talk", "x" * 400, "run")
         kinds = [k for k, _ in sent]
-        self.assertEqual(kinds, ["turn.start", "turn.sentence", "turn.done"])
+        self.assertEqual(kinds, ["turn.start", "turn.sentence", "turn.done", "turn.step"])
+        self.assertEqual(len(sent[3][1]["detail"]), 160)
         self.assertTrue(all(d["message"] == "message:1" and d["channel"] == "voice"
                             and d["job"] == "j1" for _, d in sent))
         self.assertEqual(sent[2][1]["reply_id"], "reply:2")
@@ -177,9 +179,15 @@ class ConsoleLiveTests(Temp):
         events = []
         while not sub.empty():
             events.append(sub.get_nowait())
-        self.assertEqual([e["kind"] for e in events],
+        self.assertEqual([e["kind"] for e in events if e["kind"] != "turn.step"],
                          ["turn.start", "turn.sentence", "turn.sentence", "turn.done"])
         self.assertTrue(all(e["data"]["job"] == job["id"] for e in events))
+        # The connection tree: recall and route under the request, the brain under the route.
+        steps = {e["data"]["id"]: e["data"] for e in events if e["kind"] == "turn.step"}
+        self.assertEqual(steps["recall"]["parent"], "root")
+        self.assertEqual(steps["route"]["label"], "Route · simple")
+        self.assertEqual((steps["brain"]["parent"], steps["brain"]["state"]), ("route", "done"))
+        self.assertEqual(steps["memory"]["parent"], "root")
         self.assertEqual(job["partial"], "It is Tuesday. Anything else?")
         self.assertEqual(console.history()[-1]["channel"], "console")
         self.assertEqual(console.history()[-1]["reply"]["body"], "It is Tuesday. Anything else?")
