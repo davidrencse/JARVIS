@@ -75,7 +75,7 @@ class Console:
         self._ears = self._stt = None
         self._voice_lock = threading.Lock()
         self.bus, self.watcher = Bus(), None
-        self._lane = self._speaker = self._agent = None
+        self._lane = self._speaker = self._agent = self._markets = None
         self._lane_lock = threading.Lock()
 
     # ---- live: event stream, warm brain, speech ---------------------------------------
@@ -143,6 +143,25 @@ class Console:
         from .speech import spoken
         reply = job["result"].get("reply", "")
         return {"reply": spoken(reply, 1200), "job": job["id"]}
+
+    # ---- markets: True Markets recon + strategy lab (read-only) ----------------------
+    def markets(self):
+        with self._lane_lock:
+            if self._markets is None:
+                from .markets import TrueMarkets
+                self._markets = TrueMarkets(self.state, self.config)
+            return self._markets
+
+    def strategies(self):
+        from .strategy import Book
+        return Book(self.state)
+
+    def backtest(self, body):
+        from .strategy import run
+        spec = body.get("spec") or (self.strategies().get(body["id"]) if body.get("id") else None)
+        if not spec:
+            raise ValueError("Send a strategy (spec) or a saved strategy id.")
+        return run(spec, self.markets())
 
     # ---- vault tasks -----------------------------------------------------------------
     def vault(self):
@@ -958,6 +977,17 @@ class Handler(BaseHTTPRequestHandler):
             "/api/route": lambda: c.route(query.get("text", ""), query.get("tier") or None),
             "/api/voice": lambda: c.daemon("status"),
             "/api/agent": lambda: c.agent().status(),
+            "/api/markets/status": lambda: c.markets().status(),
+            "/api/markets/monitor": lambda: c.markets().monitor(min(int(query.get("limit", 40)), 100)),
+            "/api/markets/intel": lambda: c.markets().intel(),
+            "/api/markets/universe": lambda: c.markets().universe(),
+            "/api/markets/quote": lambda: c.markets().quote(query.get("symbol", "").upper()),
+            "/api/markets/history": lambda: c.markets().history(
+                query.get("symbol", "").upper(), query.get("window", "1d"),
+                query.get("resolution", "1h")),
+            "/api/strategies": lambda: c.strategies().all(),
+            "/api/strategies/templates": lambda: __import__(
+                "jarvis.strategy", fromlist=["TEMPLATES"]).TEMPLATES,
             "/api/agent/voices": lambda: c.agent().voices(refresh=query.get("refresh") == "1"),
             "/api/grokbot": lambda: c.grokbot().status(),
             "/api/probe": lambda: c.prober.get(refresh=query.get("refresh") == "1"),
@@ -1043,6 +1073,12 @@ class Handler(BaseHTTPRequestHandler):
                                                           body.get("case") or None))
             if url.path == "/api/voice":
                 return self._send(HTTPStatus.OK, c.daemon(body.get("action")))
+            if url.path == "/api/strategies":
+                return self._send(HTTPStatus.OK, c.strategies().save(body))
+            if url.path == "/api/strategies/delete":
+                return self._send(HTTPStatus.OK, c.strategies().delete(str(body.get("id", ""))))
+            if url.path == "/api/strategies/backtest":
+                return self._send(HTTPStatus.OK, c.backtest(body))
             if url.path == "/api/agent/session":
                 return self._send(HTTPStatus.OK, c.agent().session())
             if url.path == "/api/agent/voice":

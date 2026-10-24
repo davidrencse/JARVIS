@@ -54,6 +54,10 @@ def main():
         cmd.add_argument("id")
         if name == "run":
             cmd.add_argument("--timeout", type=int, default=900)
+    mk = sub.add_parser("markets", help="True Markets recon: quotes, intel, strategies")
+    mk.add_argument("action", choices=("setup", "status", "quote", "intel", "monitor",
+                                       "strategies", "backtest"))
+    mk.add_argument("value", nargs="?", help="setup: key file; quote: ticker; backtest: id")
     cb = sub.add_parser("clipboard", help="Unified clipboard with the other laptop over SSH")
     cb.add_argument("action", choices=("start", "stop", "status", "run", "autostart", "serve"))
     cb.add_argument("value", nargs="?", help="autostart: on|off")
@@ -218,6 +222,29 @@ def main():
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(json.dumps(result, indent=2), encoding="utf-8")
             emit(result)
+        elif args.command == "markets":
+            from .markets import TrueMarkets, setup as markets_setup
+            from .strategy import Book, run as run_strategy
+            market = TrueMarkets(args.state, config)
+            if args.action == "setup":
+                if not args.value:
+                    raise ValueError("Usage: jarvis markets setup <truemarkets-key.json>")
+                emit(markets_setup(args.state, args.value))
+            elif args.action == "quote":
+                emit(market.quote((args.value or "BTC").upper()))
+            elif args.action == "intel":
+                emit(market.intel())
+            elif args.action == "monitor":
+                emit([{k: r[k] for k in r if k != "spark"} for r in market.monitor()["rows"]])
+            elif args.action == "strategies":
+                emit(Book(args.state).all())
+            elif args.action == "backtest":
+                result = run_strategy(Book(args.state).get(args.value or ""), market)
+                emit({"summary": result["summary"], "results": [
+                    {k: r.get(k) for k in ("symbol", "metrics", "signal", "error")}
+                    for r in result["results"]]})
+            else:
+                emit(market.status())
         elif args.command == "clipboard":
             from . import clipsync
             if args.action == "serve":  # the remote half, for manual testing over a pipe
