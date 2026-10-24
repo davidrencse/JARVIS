@@ -156,6 +156,35 @@ class Console:
         from .strategy import Book
         return Book(self.state)
 
+    def pipeline(self, refresh=False):
+        """Feed -> signals -> review -> execution (off), each stage with live counts."""
+        cached = getattr(self, "_pipeline", None)
+        if cached and not refresh and time.time() - cached["at"] < 60:
+            return cached
+        from .strategy import scan
+        market, t0 = self.markets(), time.time()
+        feed = {"ok": False, **market.status()}
+        try:
+            universe, monitor = market.universe(), market.monitor(40)
+            feed.update(ok=True, assets=len(universe), priced=len(monitor["rows"]),
+                        unpriced=len(monitor["unpriced"]),
+                        latency_ms=round((time.time() - t0) * 1000))
+        except Exception as exc:
+            feed["error"] = str(exc)
+        signals = {"ok": False}
+        if feed["ok"]:
+            try:
+                signals = {"ok": True, **scan(self.strategies().all(), market)}
+            except Exception as exc:
+                signals["error"] = str(exc)
+        if market.last_error and (not market.last_ok or market.last_error[0] > market.last_ok):
+            feed["stale"] = market.last_error[1]
+        self._pipeline = {"feed": feed, "signals": signals,
+                          "execution": {"enabled": False, "orders": 0,
+                                        "why": "Recon only: no order code is built in."},
+                          "seconds": round(time.time() - t0, 2), "at": time.time()}
+        return self._pipeline
+
     def backtest(self, body):
         from .strategy import run
         spec = body.get("spec") or (self.strategies().get(body["id"]) if body.get("id") else None)
@@ -980,6 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/markets/status": lambda: c.markets().status(),
             "/api/markets/monitor": lambda: c.markets().monitor(min(int(query.get("limit", 40)), 100)),
             "/api/markets/intel": lambda: c.markets().intel(),
+            "/api/markets/pipeline": lambda: c.pipeline(query.get("refresh") == "1"),
             "/api/markets/universe": lambda: c.markets().universe(),
             "/api/markets/quote": lambda: c.markets().quote(query.get("symbol", "").upper()),
             "/api/markets/history": lambda: c.markets().history(

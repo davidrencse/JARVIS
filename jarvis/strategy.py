@@ -258,6 +258,7 @@ def backtest(spec, prices, times=None):
                      "unrealized": round((prices[-1] / entry_px - 1) * 100, 2) if units else None},
         "signal": ("BUY" if pending == "buy" else "SELL" if pending == "sell" else
                    "HOLD" if units else "FLAT"),
+        "last": prices[-1],
         "trades": trades[-50:],
         "equity": _thin(equity), "hold": _thin([p / prices[0] for p in prices]),
         "times": _thin(times) if times else None,
@@ -335,3 +336,30 @@ def run(spec, market):
                    "trades": sum(r["metrics"]["trades"] for r in ok),
                    "signals": {r["symbol"]: r["signal"] for r in ok}}
     return {"strategy": spec, "summary": summary, "results": results, "at": time.time()}
+
+
+def scan(specs, market):
+    """Run every strategy now: per-symbol signals plus a backtest summary each."""
+    templates = not specs
+    specs = specs or [{**t, "symbols": ["BTC", "ETH", "SOL"], "id": f"tpl{i}"}
+                      for i, t in enumerate(TEMPLATES)]
+    from .markets import pool_map
+    runs = pool_map(lambda spec: run(spec, market), specs, workers=3)
+    signals = []
+    for r in runs:
+        for x in r["results"]:
+            if "signal" in x:
+                signals.append({"strategy": r["strategy"]["name"], "id": r["strategy"]["id"],
+                                "symbol": x["symbol"], "signal": x["signal"],
+                                "price": x["last"], "position": x["position"],
+                                "return": x["metrics"]["total_return"],
+                                "hold": x["metrics"]["buy_hold"]})
+    counts = {k: sum(1 for s in signals if s["signal"] == k)
+              for k in ("BUY", "SELL", "HOLD", "FLAT")}
+    board = sorted(({"id": r["strategy"]["id"], "name": r["strategy"]["name"],
+                     **(r["summary"] or {})} for r in runs if r["summary"]),
+                   key=lambda r: -r["total_return"])
+    return {"strategies": len(runs), "checks": len(signals), "counts": counts,
+            "actionable": [s for s in signals if s["signal"] in ("BUY", "SELL")],
+            "holding": [s for s in signals if s["signal"] == "HOLD"],
+            "leaderboard": board, "templates": templates, "at": time.time()}

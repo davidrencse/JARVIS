@@ -124,7 +124,7 @@ class TrueMarkets:
         self.key_path = Path(os.environ.get("TM_KEY_FILE") or self.state / KEY_NAME)
         self._token, self._expires = None, 0.0
         self._cache, self._lock = {}, threading.Lock()
-        self.calls = 0
+        self.calls, self.last_ok, self.last_error = 0, None, None
 
     # auth
     def configured(self):
@@ -190,13 +190,21 @@ class TrueMarkets:
             if hit and time.time() - hit[0] < ttl:
                 return hit[1]
         try:
-            data = self._http("GET", path, params, token=self.token())
-        except RuntimeError as exc:
-            if "HTTP 401" not in str(exc):
-                raise
-            with self._lock:
-                self._token = None
-            data = self._http("GET", path, params, token=self.token())
+            try:
+                data = self._http("GET", path, params, token=self.token())
+            except RuntimeError as exc:
+                if "HTTP 401" not in str(exc):
+                    raise
+                with self._lock:
+                    self._token = None
+                data = self._http("GET", path, params, token=self.token())
+        except (RuntimeError, OSError) as exc:
+            self.last_error = (time.time(), str(exc))
+            if hit and time.time() - hit[0] < 3600:  # a blip shouldn't blank the screen
+                return hit[1]
+            raise RuntimeError(str(exc) if isinstance(exc, RuntimeError) else
+                               f"Can't reach True Markets: {exc}") from None
+        self.last_ok = time.time()
         with self._lock:
             self._cache[key] = (time.time(), data)
             if len(self._cache) > 500:
@@ -265,7 +273,7 @@ class TrueMarkets:
                 "market_cap": cap, "asset": asset, "at": time.time()}
 
     def monitor(self, limit=40):
-        caps = self.caps(limit)
+        caps = self.caps(min(limit + 12, 100))  # a few top caps aren't priced on True Markets
         series = self.batch_history([c["symbol"] for c in caps], "1d", "1h")
         names = {a["symbol"]: a for a in self.universe()}
         rows = []
@@ -280,7 +288,8 @@ class TrueMarkets:
                                                          pts[-1]),
                          "chg_24h": _pct(pts[0], pts[-1]), "high": max(pts), "low": min(pts),
                          "vol": _vol(pts), "market_cap": c["market_cap"], "spark": pts})
-        return {"rows": rows, "at": time.time()}
+        skipped = [c["symbol"] for c in caps if not series.get(c["symbol"])]
+        return {"rows": rows[:limit], "unpriced": skipped, "at": time.time()}
 
     def intel(self, limit=60):
         rows = [r for r in self.monitor(limit)["rows"] if not r["stable"]]
