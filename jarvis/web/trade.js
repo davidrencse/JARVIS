@@ -24,7 +24,7 @@
   const cls = (v) => (v > 0 ? "up" : v < 0 ? "down" : "");
   const ago = (t) => { const s = Date.now() / 1000 - t; return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : s < 129600 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} d ago`; };
   function toast(msg) { const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => (t.hidden = true), 3600); }
-  const S = { rows: [], templates: [], style: 0, coins: new Set(["BTC", "ETH", "SOL"]), risk: 10, period: "365d|1d",
+  const S = { rows: [], templates: [], style: 0, coins: new Set(["BTC", "ETH", "SOL"]), risk: 10, period: "365d|1d", editing: null,
     entry: [], exit: [], result: null, paper: null, strategies: [], side: "buy", drawer: null };
 
   // ---------- canvas ----------
@@ -129,15 +129,34 @@
     renderCoins();
   });
   function syncSeg(sel, v) { for (const b of document.querySelectorAll(sel + " button")) b.setAttribute("aria-checked", String(b.dataset.v === String(v))); }
-  $("#risk").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { S.risk = +b.dataset.v; syncSeg("#risk", S.risk); } });
+  $("#risk").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { S.risk = +b.dataset.v; $("#b-stop").value = S.risk; syncSeg("#risk", S.risk); } });
+  $("#b-stop").addEventListener("input", () => { S.risk = Number($("#b-stop").value); syncSeg("#risk", S.risk); });
   $("#period").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) { S.period = b.dataset.v; syncSeg("#period", S.period); } });
+
+  function loadIntoBuilder(s, shared = false) {
+    S.editing = shared ? null : s.id;
+    S.coins = new Set(s.symbols || ["BTC", "ETH", "SOL"]);
+    S.period = `${s.window || "90d"}|${s.resolution || "4h"}`;
+    S.risk = Number(s.stop_loss || 0);
+    $("#b-stop").value = s.stop_loss || 0;
+    $("#b-take").value = s.take_profit || 0;
+    $("#b-fee").value = s.fee_bps ?? 10;
+    $("#b-name").value = s.name || "";
+    S.entry = (s.entry || []).map(parseRule); S.exit = (s.exit || []).map(parseRule);
+    S.style = "custom"; renderStyles(); renderRules(); renderCoins();
+    syncSeg("#risk", S.risk); syncSeg("#period", S.period);
+    $("#go").textContent = S.editing ? "Save changes" : "Save & paper trade";
+    $("#build").scrollIntoView({ behavior: reduce ? "auto" : "smooth" });
+    if (shared) toast("Shared strategy loaded. Review it, then save a copy.");
+  }
 
   function spec() {
     const [window_, res] = S.period.split("|"), own = S.style === "custom", t = own ? null : S.templates[S.style];
     const entry = own ? S.entry.map(ruleStr) : t.entry, exit = own ? S.exit.map(ruleStr) : t.exit;
     const name = $("#b-name").value.trim() || `${own ? "My rules" : t.title || t.name} · ${[...S.coins].join(" ")}`;
-    return { name, symbols: [...S.coins], window: window_, resolution: res, entry, exit, stop_loss: S.risk,
-      take_profit: own ? 0 : t.take_profit || 0, fee_bps: 10, notes: own ? "Built in the Markets page." : `From the “${t.name}” template.` };
+    return { ...(S.editing ? { id: S.editing } : {}), name, symbols: [...S.coins], window: window_, resolution: res, entry, exit,
+      stop_loss: Number($("#b-stop").value), take_profit: Number($("#b-take").value), fee_bps: Number($("#b-fee").value),
+      notes: own ? "Built in the Markets page." : `From the “${t.name}” template.` };
   }
   async function busy(btn, label, fn) {
     const was = btn.textContent; btn.disabled = true; btn.textContent = label;
@@ -149,6 +168,7 @@
   }));
   $("#go").addEventListener("click", () => busy($("#go"), "Starting…", async () => {
     const saved = await api("/api/strategies", spec());
+    if (S.editing) { await loadStrategies(); S.editing = null; $("#go").textContent = "Save & paper trade"; toast(`Updated “${saved.name}”.`); return; }
     const p = await api("/api/paper/start", { id: saved.id });
     renderPaper(p); await loadStrategies();
     const held = p.bots.find((b) => b.id === saved.id)?.holding || [];
@@ -190,7 +210,7 @@
         <div class="s-coins">${s.symbols.map((c) => `<span class="badge${bot?.holding?.includes(c) ? " HOLD" : " FLAT"}" title="${bot?.holding?.includes(c) ? "holding" : "waiting"}">${esc(c)}</span>`).join("")}</div>
         <div class="s-pnl num">${bot ? `<b class="${cls(bot.pnl)}">${signedUsd(bot.pnl)}</b><small>${on ? `on · ${usd(bot.budget)}` : "off"}</small>` : `<small>not traded yet</small>`}</div>
         <div class="s-acts"><button class="btn sm${on ? " ghost" : ""}" data-act="${on ? "stop" : "start"}">${on ? "Stop" : "Paper trade"}</button>
-          <button class="ph-btn" data-act="test">Test</button><button class="ph-btn ghost" data-act="delete" title="Delete">Delete</button></div></div>`;
+          <button class="ph-btn" data-act="edit">Edit</button><button class="ph-btn" data-act="share">Share</button><button class="ph-btn" data-act="test">Test</button><button class="ph-btn ghost" data-act="delete" title="Delete">Delete</button></div></div>`;
     }).join("");
   }
   $("#strats").addEventListener("click", async (e) => {
@@ -200,6 +220,14 @@
     await busy(b, "…", async () => {
       if (act === "start") { renderPaper(await api("/api/paper/start", { id })); toast(`“${s.name}” is paper trading.`); }
       else if (act === "stop") { renderPaper(await api("/api/paper/stop", { id })); toast(`Stopped “${s.name}” and sold what it held.`); }
+      else if (act === "edit") { loadIntoBuilder(s); }
+      else if (act === "share") {
+        const copy = { name: s.name, symbols: s.symbols, window: s.window, resolution: s.resolution, entry: s.entry, exit: s.exit, stop_loss: s.stop_loss, take_profit: s.take_profit, fee_bps: s.fee_bps, notes: s.notes };
+        const url = new URL(location.href); url.hash = "share=" + btoa(unescape(encodeURIComponent(JSON.stringify(copy)))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+        if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(url.href);
+        else { const input = document.createElement("textarea"); input.value = url.href; document.body.append(input); input.select(); document.execCommand("copy"); input.remove(); }
+        toast("Share link copied.");
+      }
       else if (act === "test") { const r = await api("/api/strategies/backtest", { id }); S.result = r; showResult(r, s); }
       else if (act === "delete") {
         if (S.paper?.bots.find((x) => x.id === id && x.on)) renderPaper(await api("/api/paper/stop", { id }));
@@ -208,6 +236,14 @@
     });
     renderStrategies();
   });
+  function loadShared() {
+    const m = /^#share=(.+)$/.exec(location.hash); if (!m) return;
+    try {
+      const raw = m[1].replace(/-/g, "+").replace(/_/g, "/");
+      loadIntoBuilder(JSON.parse(decodeURIComponent(escape(atob(raw + "=".repeat((4 - raw.length % 4) % 4))))), true);
+      history.replaceState(null, "", location.pathname + location.search + "#build");
+    } catch { toast("That strategy share link is invalid."); }
+  }
 
   // ---------- account, holdings, trades ----------
   function renderPaper(p) {
@@ -301,6 +337,7 @@
     loadPaper().catch((e) => toast(e.message));
     loadStrategies().catch(() => {});
     api("/api/strategies/templates").then((t) => { S.templates = t; renderStyles(); }).catch(() => {});
+    loadShared();
     try {
       const st = await api("/api/markets/status");
       if (!st.configured) { setLive(false, "No key"); $("#headline").textContent = "Connect True Markets for live prices: jarvis markets setup <your-key.json>"; renderCoins(); return; }
