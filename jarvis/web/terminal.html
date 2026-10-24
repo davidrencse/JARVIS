@@ -7,11 +7,38 @@
 <title>JARVIS Markets</title>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="preload" href="fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="jarvis.css">
 <link rel="stylesheet" href="terminal.css">
 </head>
 <body>
+<div class="jv-shell">
+<aside class="jv-side" aria-label="JARVIS">
+  <a class="jv-brand" href="index.html#console" aria-label="JARVIS console home">
+    <svg class="jv-mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg>
+    <span class="jv-word">JARVIS</span>
+  </a>
+  <nav class="jv-rail" aria-label="Views">
+    <a href="index.html#console" title="Console (1)"><svg class="jv-i"><use href="icons.svg?v=2#i-layout-grid"/></svg><span>Console</span></a>
+    <a href="index.html#graph" title="Knowledge graph (2)"><svg class="jv-i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Graph</span></a>
+    <a href="design.html" title="System design: how JARVIS works and what needs fixing (3)"><svg class="jv-i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
+    <a href="index.html#credits" title="Credits (4)"><svg class="jv-i"><use href="icons.svg?v=2#i-gauge"/></svg><span>Credits</span></a>
+    <a href="index.html#memory" title="Memory (5)"><svg class="jv-i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
+    <a href="knowledge.html" title="Knowledge engine: reader, librarian, checker"><svg class="jv-i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Wiki</span></a>
+    <a href="trade.html" aria-current="page" title="Markets: live market pulse, strategies and signals (practice mode)"><svg class="jv-i"><use href="icons.svg?v=2#i-activity"/></svg><span>Markets</span></a>
+    <a href="index.html#tasks" title="Tasks and plans (6)"><svg class="jv-i"><use href="icons.svg?v=2#i-list-checks"/></svg><span>Tasks</span></a>
+    <a href="index.html#run" title="Run: a plan on one screen (7)"><svg class="jv-i"><use href="icons.svg?v=2#i-activity"/></svg><span>Run</span></a>
+    <a href="index.html#files" title="Files across both laptops (8)"><svg class="jv-i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
+    <a href="index.html#devices" title="Devices (9)"><svg class="jv-i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
+  </nav>
+  <div class="jv-profile">
+    <span class="jv-avatar" aria-hidden="true">D</span>
+    <span class="jv-name">David</span>
+    <span class="jv-sub">Dell · Alt+1 overlay</span>
+  </div>
+</aside>
+<div class="jv-main term">
 <header class="bar">
-  <a class="brand" href="index.html" title="Back to the JARVIS console">JARVIS<span>▸</span>MKTS</a>
+  <h1 class="jv-title term-title">Pro terminal</h1>
   <form class="cmd" id="cmd" autocomplete="off">
     <label class="sr" for="cmd-in">Command</label>
     <input id="cmd-in" spellcheck="false" placeholder="BTC GP 30D · DES SOL · TOP · NEW · BT · HELP">
@@ -101,6 +128,8 @@
   <p>Recon only: this terminal reads prices and history. It has no way to place, cancel or transfer anything.</p>
   <form method="dialog"><button>CLOSE</button></form>
 </dialog>
+</div>
+</div>
 <script src="terminal.js"></script>
 </body>
 </html>

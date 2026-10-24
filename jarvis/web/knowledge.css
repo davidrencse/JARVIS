@@ -1,20 +1,19 @@
-@font-face { font-family: "Geist Mono"; src: url("fonts/geist-mono.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
 
 :root {
-  --bg: #09090a;
-  --panel: #0e0e10;
-  --line: #222226;
-  --line-soft: #18181b;
-  --text: #e9e6e3;
-  --dim: #7d7a78;
-  --faint: #4a4846;
+  --bg: var(--jv-bg);
+  --panel: var(--jv-card);
+  --line: var(--jv-line);
+  --line-soft: rgba(255, 255, 255, .045);
+  --text: var(--jv-ink);
+  --dim: var(--jv-ink-2);
+  --faint: var(--jv-faint);
   --red: #ff4b5c;
   --pink: #ff8f9b;
-  --gold: #f4c64e;
-  --green: #5fd38d;
-  --r: 6px;
-  --ease: cubic-bezier(.2, .7, .2, 1);
-  --mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --gold: var(--jv-warn);
+  --green: var(--jv-up);
+  --r: var(--jv-r-sm);
+  --ease: var(--jv-ease);
+  --mono: var(--jv-mono);
 }
 
 * { box-sizing: border-box; }
@@ -26,9 +25,7 @@ body {
 }
 ::selection { background: rgba(244,198,78,.28); }
 
-/* ---------- shell + sidebar: the console's own (porcelain.css, dark), kept identical ---------- */
-@font-face { font-family: "Urbanist"; src: url("fonts/urbanist.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
-.shell { display: grid; grid-template-columns: 216px minmax(0, 1fr); gap: 0 18px; padding-left: 20px; min-height: 100dvh; }
+/* ---------- layout (sidebar comes from sidebar.css) ---------- */
 .kmain { display: grid; grid-template-rows: auto auto minmax(420px, 1fr) auto auto; min-width: 0; }
 .sidebar {
   --s-ink: #f2f2f2; --s-ink-2: #a8a8a8; --s-ink-3: #8c8c8c; --s-line: rgba(255, 255, 255, .075);
@@ -59,8 +56,8 @@ h1, h2 { margin: 0; font-weight: 600; }
 .dim { color: var(--dim); }
 
 /* ---------- header ---------- */
-.top { display: flex; justify-content: space-between; align-items: flex-start; padding: 14px 18px 6px; }
-.top h1 { font-size: 17px; letter-spacing: .04em; }
+.top { display: flex; justify-content: space-between; align-items: flex-end; padding: 22px 18px 10px; }
+.top h1 { font-size: 26px; }
 .counts { margin: 3px 0 0; color: var(--dim); font-size: 10px; letter-spacing: .06em; }
 .clock { display: flex; gap: 14px; align-items: center; font-size: 10px; color: var(--text); }
 .rec { width: 6px; height: 6px; border-radius: 50%; background: var(--red); box-shadow: 0 0 8px var(--red); animation: blink 1.6s infinite; }
@@ -90,7 +87,7 @@ h1, h2 { margin: 0; font-weight: 600; }
 .graph-head { position: absolute; z-index: 1; top: 8px; left: 18px; right: 18px; display: flex; justify-content: space-between;
   font-size: 10px; color: var(--dim); letter-spacing: .06em; pointer-events: none; }
 .graph-head .layers { display: flex; gap: 6px; align-items: center; pointer-events: auto; }
-.graph-head .layers button { font: 600 9px var(--mono); letter-spacing: .08em; color: var(--dim); background: rgba(9,9,10,.6);
+.graph-head .layers button { font: 600 9px var(--mono); letter-spacing: .08em; color: var(--dim); background: rgba(18,18,18,.7);
   border: 1px solid var(--line); padding: 3px 8px; cursor: pointer; border-radius: 999px;
   backdrop-filter: blur(6px); transition: color .18s var(--ease), border-color .18s var(--ease), opacity .18s; }
 .graph-head .layers button[aria-pressed="false"] { opacity: .55; }
@@ -106,7 +103,7 @@ h1, h2 { margin: 0; font-weight: 600; }
 
 /* ---------- command ---------- */
 .command { display: flex; align-items: center; gap: 10px; margin: 0 18px; padding: 8px 12px;
-  border: 1px solid var(--line); background: var(--panel); border-radius: var(--r);
+  border: 1px solid var(--line); background: var(--panel); border-radius: 999px; padding-left: 18px;
   transition: border-color .2s var(--ease), box-shadow .2s var(--ease); }
 .command:focus-within { border-color: var(--faint); box-shadow: 0 0 0 3px rgba(244,198,78,.07); }
 .command label { color: var(--text); font-size: 14px; }
@@ -129,11 +126,11 @@ body.dropping::after { content: "DROP INTO RAW/ — READ ONLY"; position: fixed;
 .inspect .v.flag { -webkit-line-clamp: 2; margin-top: 3px; }
 
 /* ---------- panels ---------- */
-.panels { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; padding: 10px 18px 16px; }
+.panels { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding: 12px 18px 18px; }
 .panel { background: var(--panel); border: 1px solid var(--line); display: flex; flex-direction: column;
-  height: 178px; overflow: hidden; border-radius: var(--r);
+  height: 178px; overflow: hidden; border-radius: var(--jv-r);
   transition: border-color .25s var(--ease); animation: rise .5s var(--ease) both; }
-.panel:hover { border-color: #2e2e33; }
+.panel:hover { border-color: var(--jv-line-2); }
 .panel:nth-child(2) { animation-delay: .04s; } .panel:nth-child(3) { animation-delay: .08s; }
 .panel:nth-child(4) { animation-delay: .12s; } .panel:nth-child(5) { animation-delay: .16s; }
 .panel:nth-child(6) { animation-delay: .2s; } .panel:nth-child(7) { animation-delay: .24s; }
@@ -150,7 +147,7 @@ body.dropping::after { content: "DROP INTO RAW/ — READ ONLY"; position: fixed;
 
 .chat li { display: grid; grid-template-columns: 62px 1fr; gap: 6px; font-size: 9.5px; line-height: 1.35; padding: 1px 0; }
 .chat li b { font-weight: 600; letter-spacing: .05em; }
-.chat li span { color: #c9c6c3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat li span { color: #c9c9c9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who-you b { color: var(--text); } .who-reader b { color: #d9d9d9; }
 .who-librarian b { color: var(--red); } .who-checker b { color: var(--gold); } .who-jarvis b { color: var(--pink); }
 
@@ -186,7 +183,7 @@ body.dropping::after { content: "DROP INTO RAW/ — READ ONLY"; position: fixed;
 
 .matrix { display: grid; gap: 2px; padding: 2px 9px; flex: 1; align-content: start; }
 .matrix .lab { color: var(--dim); font-size: 8px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.matrix .c { height: 8px; background: #1b1b1f; border-radius: 1.5px; transition: background-color .3s; }
+.matrix .c { height: 8px; background: var(--jv-raise); border-radius: 1.5px; transition: background-color .3s; }
 .matrix .c1 { background: var(--red); opacity: .85; }
 .matrix .c2 { background: var(--gold); }
 
@@ -195,21 +192,8 @@ body.dropping::after { content: "DROP INTO RAW/ — READ ONLY"; position: fixed;
 .bars { flex: 1; display: flex; align-items: flex-end; gap: 2px; min-height: 40px; padding-top: 4px; }
 .bars i { flex: 1; background: var(--gold); opacity: .85; min-height: 1px; border-radius: 1px 1px 0 0; transition: height .4s var(--ease); }
 
-@media (max-width: 1180px) {
-  .shell { grid-template-columns: 84px minmax(0, 1fr); }
-  .sidebar { padding: 18px 10px; align-items: center; }
-  .sidebar .wordmark, .rail a span, .profile-name, .profile-sub { display: none; }
-  .rail a { justify-content: center; padding: 0; width: 52px; }
-  .avatar { width: 44px; height: 44px; font-size: 18px; }
-}
 @media (max-width: 900px) { .panels { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 640px) {
-  .shell { grid-template-columns: minmax(0, 1fr); padding: 0 0 78px; }
-  .sidebar { position: fixed; left: 10px; right: 10px; bottom: 10px; top: auto; height: auto; margin: 0; flex-direction: row;
-    padding: 6px; gap: 0; border-radius: 26px; z-index: 20; overflow: visible; }
-  .sidebar .brand, .profile { display: none; }
-  .rail { flex-direction: row; justify-content: space-around; width: 100%; }
-  .rail a { width: 44px; height: 44px; justify-content: center; padding: 0; }
   .panels { grid-template-columns: 1fr; padding: 10px 16px 16px; }
   .top { flex-wrap: wrap; gap: 6px 14px; }
   .top h1 { font-size: 14px; }

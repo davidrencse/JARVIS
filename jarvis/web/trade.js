@@ -299,8 +299,6 @@
     try { localStorage.setItem("trade-theme", light ? "light" : "dark"); } catch (e) {}
     drawHeat(false); if (S.result) showResult(S.result, spec()); if (S.drawer && !$("#drawer").hidden) openDrawer(S.drawer);
   });
-  $("#menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
-  $(".side").addEventListener("click", (e) => { if (e.target.closest("a")) document.body.classList.remove("nav-open"); });
   let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { drawHeat(false); if (S.result) showResult(S.result, spec()); }, 150); });
   (async () => {
     try {
