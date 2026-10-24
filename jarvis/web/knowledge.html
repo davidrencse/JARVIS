@@ -6,27 +6,36 @@
 <meta name="color-scheme" content="dark">
 <title>JARVIS Knowledge Engine</title>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="preload" href="fonts/urbanist.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="knowledge.css">
 </head>
 <body>
 <div class="shell">
-<aside class="side" aria-label="JARVIS">
-  <a class="brand" href="index.html#console" title="Back to the console"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg><span>JARVIS</span></a>
-  <nav class="nav" aria-label="Views">
-    <a href="index.html#console"><svg class="i"><use href="icons.svg?v=2#i-layout-grid"/></svg><span>Console</span></a>
-    <a href="index.html#graph"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Graph</span></a>
-    <a href="design.html"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
-    <a href="index.html#credits"><svg class="i"><use href="icons.svg?v=2#i-gauge"/></svg><span>Credits</span></a>
-    <a href="index.html#memory"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
-    <a href="knowledge.html" aria-current="page"><svg class="i"><use href="icons.svg?v=2#i-book-open"/></svg><span>Wiki</span></a>
-    <a href="trade.html"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Markets</span></a>
-    <a href="index.html#tasks"><svg class="i"><use href="icons.svg?v=2#i-list-checks"/></svg><span>Tasks</span></a>
-    <a href="index.html#run"><svg class="i"><use href="icons.svg?v=2#i-play"/></svg><span>Run</span></a>
-    <a href="index.html#files"><svg class="i"><use href="icons.svg?v=2#i-folder-search"/></svg><span>Files</span></a>
-    <a href="index.html#devices"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
-  </nav>
-</aside>
+  <aside class="sidebar glass" aria-label="JARVIS">
+    <a class="brand" href="index.html#console" aria-label="JARVIS console home">
+      <svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg>
+      <span class="wordmark">JARVIS</span>
+    </a>
+    <nav class="rail" aria-label="Views">
+      <a href="index.html#console" data-view="console" title="Console (1)"><svg class="i"><use href="icons.svg?v=2#i-layout-grid"/></svg><span>Console</span></a>
+      <a href="index.html#graph" data-view="graph" title="Knowledge graph (2)"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Graph</span></a>
+      <a href="design.html" data-page="design" title="System design: how JARVIS works and what needs fixing (3)"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
+      <a href="index.html#credits" data-view="credits" title="Credits (4)"><svg class="i"><use href="icons.svg?v=2#i-gauge"/></svg><span>Credits</span></a>
+      <a href="index.html#memory" data-view="memory" title="Memory (5)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
+      <a href="knowledge.html" data-page="knowledge" aria-current="page" title="Knowledge engine: reader, librarian, checker — opens its own page"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Wiki</span></a>
+      <a href="trade.html" data-page="trade" title="Markets: live market pulse, strategies and signals (practice mode) — opens its own page"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Markets</span></a>
+      <a href="index.html#tasks" data-view="tasks" title="Tasks and plans (6)"><svg class="i"><use href="icons.svg?v=2#i-list-checks"/></svg><span>Tasks</span></a>
+      <a href="index.html#run" data-view="run" title="Run: a plan on one screen (7)"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Run</span></a>
+      <a href="index.html#files" data-view="files" title="Files across both laptops (8)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
+      <a href="index.html#devices" data-view="devices" title="Devices (9)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
+    </nav>
+    <div class="profile">
+      <span class="avatar" aria-hidden="true">D</span>
+      <span class="profile-name">David</span>
+      <span class="profile-sub" id="profile-sub">Dell · Alt+1 overlay</span>
+    </div>
+  </aside>
 <div class="kmain">
 <header class="top">
   <div class="brand">
