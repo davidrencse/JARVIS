@@ -72,7 +72,8 @@ def main():
     lm.add_argument("--capture-backend", help="config: e.g. layer-shell on Hyprland")
     lm.add_argument("--output", help="config: write here instead of printing")
     dk = sub.add_parser("desktop", help="Open an app or link here (the other laptop calls this)")
-    dk.add_argument("action", choices=("open_app", "open_url", "list_apps", "open_page"))
+    dk.add_argument("action", choices=("open_app", "open_url", "list_apps", "open_page",
+                                       "close_app", "media", "volume"))
     dk.add_argument("value", nargs="?", default="")
     dk.add_argument("--b64", default=None, help="the value, base64 (how SSH callers pass it)")
     dk.add_argument("--device", default=None, help="run it on this configured laptop instead")
@@ -127,7 +128,6 @@ def main():
                                        "status", "autostart", "agent-setup", "agent"))
     vc.add_argument("text", nargs="?")
     vc.add_argument("--threshold", type=float, help="test/listen: override the learned cutoff")
-    vc.add_argument("--no-wake", action="store_true", help="listen: don't require 'Jarvis'")
     ui = sub.add_parser("ui", help="Local web console on 127.0.0.1")
     ui.add_argument("--port", type=int, default=7777)
     ui.add_argument("--open", action="store_true", help="open it in the default browser")
@@ -773,7 +773,7 @@ def cognition(args, config, base):
                     print(f"{'ACCEPT' if ok else 'reject'}  similarity {score}", file=sys.stderr)
         elif args.action == "listen":
             from .daemon import listen_loop
-            listen_loop(args.state, config, base, args.threshold, not args.no_wake)
+            listen_loop(args.state, config, base, args.threshold)
         else:
             from . import daemon
             if args.action == "autostart":

@@ -357,8 +357,14 @@ class Brain:
         return "act" if wants else "chat"
 
     def ask(self, text, recall=(), on_sentence=None):
-        lane = self.act if self.pick(text) == "act" else self.chat
-        return lane.ask(text, recall, on_sentence=on_sentence)
+        if self.pick(text) == "act":
+            return self.act.ask(text, recall, on_sentence=on_sentence)
+        # Talk has no tools; it answers HANDOFF when it sees an action the regexes missed.
+        speak = (lambda s: None if is_handoff(s) else on_sentence(s)) if on_sentence else None
+        reply = self.chat.ask(text, recall, on_sentence=speak)
+        if is_handoff(reply):
+            return self.act.ask(text, recall, on_sentence=on_sentence)
+        return reply
 
     def warm(self):
         self.chat.warm()
@@ -377,6 +383,18 @@ class Brain:
     def close(self):
         self.chat.close()
         self.act.close()
+
+
+HANDOFF = "[act]"
+# Only for a talk lane with an action lane behind it (Brain).
+TALK_HANDOFF = (" You have no tools in this conversation, but JARVIS can operate both of "
+                "David's laptops (the Dell and the Arch Linux ASUS): when he asks you to do "
+                "something on a computer or website (open, close, play, pause, volume, show a "
+                f"page...), reply with exactly {HANDOFF} and nothing else, and it will be done.")
+
+
+def is_handoff(text):
+    return str(text or "").strip().rstrip(".!").strip().lower() == HANDOFF
 
 
 VAULT_ONLY = ("You are JARVIS, David's personal assistant. Do what he asks with your "
@@ -414,8 +432,9 @@ def make_lane(config, base, state_dir=None):
         vault = vault_for(config, state)
     except (ValueError, OSError):
         vault = None  # vault folder missing: run without it
-    chat = ChatGPTLane(config, base, context=vault.world if vault else None)
     actions = config.get("actions", {}).get("enabled", True)
+    chat = ChatGPTLane(config, base, context=vault.world if vault else None,
+                       instructions=INSTRUCTIONS + (TALK_HANDOFF if actions else ""))
     if not actions and vault is None:
         return chat
     tools, instructions, extra = [], [], {}

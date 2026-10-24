@@ -50,7 +50,7 @@ class InstanceLock:
         self.handle.close()
 
 
-def listen_loop(state, config, base, threshold=None, require_wake=True):
+def listen_loop(state, config, base, threshold=None):
     from .assistant import ask, wake_word
     from .chatgpt import make_lane
     from concurrent.futures import ThreadPoolExecutor
@@ -99,9 +99,8 @@ def listen_loop(state, config, base, threshold=None, require_wake=True):
                     log(f"ignored another voice (similarity {score})")
                     emit(state, "voice.ignored", score=score)
                     continue
-                heard = text.result()
-                request = heard if not require_wake else wake_word(heard)
-                if not request:
+                request = wake_word(text.result())
+                if not request:  # not addressed to JARVIS: never logged or answered
                     continue
                 ears.learn()  # passed the voice check AND said "Jarvis": adapt to live audio
                 log(f"you ({score}): {request}")

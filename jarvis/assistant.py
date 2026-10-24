@@ -220,8 +220,9 @@ def _with_tools(lane, step, call):
         lane.on_tool = None
 
 
-def wake_word(text, words=("jarvis", "jervis", "travis")):
-    """Strip a leading wake word; None if absent. Whisper often mishears 'Jarvis'."""
-    match = re.match(r"^\W*(?:hey\s+|ok\s+|okay\s+)?(" + "|".join(words) + r")\b[\s,.!?:-]*(.*)",
-                     text, re.I | re.S)
+def wake_word(text, words=("jarvis", "jervis")):
+    """Strip a leading wake word; None if absent. "Jervis" is Whisper mishearing 'Jarvis';
+    'Travis' is a real name, and "Jarvis's ..." is talking about JARVIS, not to it."""
+    match = re.match(r"^\W*(?:hey\s+|ok\s+|okay\s+)?(" + "|".join(words) +
+                     r")\b(?!['’]s\b)[\s,.!?:-]*(.*)", text, re.I | re.S)
     return match.group(2).strip() if match else None

@@ -30,7 +30,8 @@ SHOW_MARKET = re.compile(
     r"how(?:'s|\s+is|\s+are))\s+"
     r"(?:the\s+|my\s+)?(?:crypto\s+)?(?:markets?|pro\s+terminal|markets?\s+terminal|"
     r"trading\s+terminal)\b(?:\s+(?:doing|looking))?(?:\s+(?:today|now|right\s+now))?"
-    r"(?:\s+(?:on|over\s+on)\s+(?:the\s+|my\s+)?(?P<device>[a-z]+)(?:\s+(?:laptop|pc))?)?"
+    r"(?:\s+(?:on|over\s+on)\s+(?:the\s+|my\s+)?(?P<device>[a-z]+(?:\s+linux)?)"
+    r"(?:\s+(?:laptop|pc|computer))?)?"
     r"(?:\s+(?:please|for\s+me))?\W*$", re.I)
 
 
@@ -107,8 +108,8 @@ def answer(text, config, state, remote=None, market=None):
         return None
     from .remote import Remote
     remote = remote or Remote(config, state)
-    device = (match.group("device") or "").lower() or None
-    if device and device not in remote.names() and device not in ("here", "this"):
+    device = remote.resolve(match.group("device"))  # "arch linux" -> zenbook
+    if device and device not in remote.names():
         return f"I don't know a laptop called {device}; I know {', '.join(remote.names())}."
     try:
         ok, text_ = remote.call(device, "open_page", "terminal")

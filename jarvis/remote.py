@@ -7,12 +7,17 @@ DesktopTools directly. The other laptop is reached the same way Grokbot prompts 
   open on David's screen, not in the SSH session.
 - Zenbook -> Dell: Windows OpenSSH sessions can't reach the desktop, so the Dell's JARVIS
   keeps `grokbot tunnel` running; its loopback relay takes /desktop calls with the token.
-Only the actions below travel (open_page: a console page, e.g. the Pro terminal, as a window); arguments go as base64 or JSON data, never as code.
+Only the actions below travel (open_page: a console page, e.g. the Pro terminal, as a window;
+close_app, media and volume: close an app's windows, play/pause/skip, speaker volume);
+arguments go as base64 or JSON data, never as code.
+A laptop can be named by its key, hostname, configured `aliases` ("arch", "asus"...) or
+"the other laptop".
 """
 
 import base64
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -20,26 +25,55 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ACTIONS = ("open_app", "open_url", "list_apps", "open_page")
+ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "close_app", "media", "volume")
+# The argument each action's tool takes.
+ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
+       "close_app": "name", "media": "command", "volume": "level"}
+# Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
+SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
+                "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
+                "DBUS_SESSION_BUS_ADDRESS")
 REMOTE_DIR = "~/projects/JARVIS"  # where the other laptop's checkout lives, by default
 FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+def systemd_env(env=None):
+    """The systemd user manager's environment, which the desktop session exports into
+    (Hyprland's DISPLAY, WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP...). {} if unavailable."""
+    try:
+        out = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True,
+                             text=True, timeout=5, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if out.returncode:
+        return {}
+    pairs = (line.split("=", 1) for line in out.stdout.splitlines() if "=" in line)
+    return {k: v for k, v in pairs if not v.startswith("$'")}  # skip shell-quoted values
+
+
 def session_env():
-    """Find the Wayland/Hyprland session from an SSH shell, so launched apps show up."""
+    """Find the Wayland/Hyprland session from an SSH shell, so launched apps show up.
+    Without the session's DISPLAY, X11 apps such as Chrome exit at once over SSH."""
     env = dict(os.environ)
     run = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
     env["XDG_RUNTIME_DIR"] = run
+    for key, value in systemd_env({**env, "XDG_RUNTIME_DIR": run}).items():
+        if key in SESSION_KEYS or key not in env:
+            env[key] = value
     if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
         hypr = Path(run, "hypr")
-        found = sorted(hypr.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True) \
-            if hypr.is_dir() else []
+        found = sorted(hypr.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)             if hypr.is_dir() else []
         if found:
             env["HYPRLAND_INSTANCE_SIGNATURE"] = found[0].name
     if not env.get("WAYLAND_DISPLAY"):
         sockets = sorted(p.name for p in Path(run).glob("wayland-?"))
         if sockets:
             env["WAYLAND_DISPLAY"] = sockets[0]
+    if not env.get("DISPLAY"):  # XWayland's socket is owned by the session's user
+        mine = sorted(p.name[1:] for p in Path("/tmp/.X11-unix").glob("X*")
+                      if p.name[1:].isdigit() and p.stat().st_uid == os.getuid())
+        if mine:
+            env["DISPLAY"] = f":{mine[0]}"
     if not env.get("DBUS_SESSION_BUS_ADDRESS") and Path(run, "bus").exists():
         env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={run}/bus"
     return env
@@ -49,7 +83,7 @@ def run_here(action, arg, tools=None):
     """(ok, text) for one action on this laptop."""
     if action not in ACTIONS:
         return False, f"Unknown desktop action {action}."
-    if os.name != "nt" and not os.environ.get("WAYLAND_DISPLAY"):
+    if os.name != "nt" and not (os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY")):
         os.environ.update(session_env())  # started over SSH: borrow the desktop session
     if action == "open_page":
         from .showcase import open_page
@@ -57,8 +91,7 @@ def run_here(action, arg, tools=None):
     if tools is None:
         from .actions import DesktopTools
         tools = DesktopTools()
-    key = "query" if action == "list_apps" else "name" if action == "open_app" else "url"
-    return tools.call(action, {key: arg})
+    return tools.call(action, {ARG[action]: arg})
 
 
 class Remote:
@@ -73,12 +106,40 @@ class Remote:
     def names(self):
         return sorted(self.machines)
 
+    def describe(self):
+        """The laptops for a tool description: "dell (Windows 11...), zenbook (...)"."""
+        parts = []
+        for key in self.names():
+            machine = self.machines[key]
+            extra = [machine["label"]] if machine.get("label") else []
+            if machine.get("aliases"):
+                extra.append("he may call it " + ", ".join(machine["aliases"]))
+            parts.append(f"{key} ({'; '.join(extra)})" if extra else key)
+        return ", ".join(parts)
+
+    def resolve(self, name):
+        """The configured laptop a spoken name means: its key, hostname or an alias
+        ("my arch linux laptop" -> zenbook), or "other" for the one this isn't.
+        None means this laptop; an unknown name comes back as it was."""
+        word = re.sub(r"^(?:the|my)\s+|\s+(?:laptop|pc|computer|machine)$", "",
+                      re.sub(r"\s+", " ", str(name or "").strip().lower()))
+        if word in ("", "here", "local", "this", "this one"):
+            return None
+        for key, machine in self.machines.items():
+            names = {key.lower(), str(machine.get("hostname", "")).lower(),
+                     *(str(a).lower() for a in machine.get("aliases", []))}
+            if word in names:
+                return key
+        if word in ("other", "other one") and len(self.machines) == 2:
+            return next((k for k in self.machines if k != self.here()), name)
+        return name
+
     def call(self, device, action, arg):
         """(ok, text): `action` on `device` (None or this laptop: run here)."""
         if action not in ACTIONS:
             return False, f"Unknown desktop action {action}."
-        here = self.here()
-        if not device or device in ("here", "local", here):
+        device = self.resolve(device)
+        if not device or device == self.here():
             return run_here(action, arg, self.tools)
         if device not in self.machines:
             return False, f"Unknown laptop {device!r}; known: {', '.join(self.names())}."

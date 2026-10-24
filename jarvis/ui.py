@@ -810,13 +810,23 @@ class Console:
         return job
 
     # ---- hearing -----------------------------------------------------------------
-    def transcribe(self, raw, verify=True):
-        """Float32 mono 16 kHz from the browser → (owner check) → local Whisper text."""
+    def transcribe(self, raw, verify=True, wake=False):
+        """Float32 mono 16 kHz from the browser → (owner check) → local Whisper text.
+        `wake` is the always-on mic: only speech that starts with "Jarvis" comes back;
+        anything else is dropped here, so the page never even sees the words."""
+        from . import daemon
+        from .assistant import wake_word
         from .listen import RATE, Transcriber, VoicePrint, _np
         np = _np()
         if len(raw) < RATE * 4 * 0.3 or len(raw) % 4:
             raise ValueError("That clip was too short to hear anything.")
         audio = np.frombuffer(raw, dtype="<f4").astype("float32")
+        seconds = round(len(audio) / RATE, 2)
+        # The background listener shares the mic and answers every "Jarvis, ..." itself;
+        # answering here too would run each request twice.
+        listener = daemon._pid(self.state) is not None
+        if wake and listener:
+            return {"text": "", "listener": True, "seconds": seconds}
         with self._voice_lock:
             if self._stt is None:
                 self._stt, self._ears = Transcriber(self.config), VoicePrint(self.state, self.config)
@@ -824,10 +834,14 @@ class Console:
             if verify and (self.state / "voice" / "voiceprint.json").is_file():
                 owner, score = self._ears.verify(audio)
             text = self._stt(audio) if owner else ""
-        from .assistant import wake_word
-        text = wake_word(text) or text  # push-to-talk needs no wake word; drop it if said
-        return {"text": text, "owner": owner, "score": score,
-                "device": getattr(self._stt, "device", None), "seconds": round(len(audio) / RATE, 2)}
+        request = wake_word(text)
+        heard = {"owner": owner, "score": score, "addressed": request is not None,
+                 "device": getattr(self._stt, "device", None), "seconds": seconds}
+        if request is not None and listener:
+            return {**heard, "text": "", "listener": True}
+        if request is None:  # push-to-talk needs no wake word; always-on does
+            request = "" if wake else text
+        return {**heard, "text": request}
 
     def send_file(self, stream, length, name, device=None):
         """Receive an uploaded file from the page and push it to the other laptop."""
@@ -1131,8 +1145,10 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b""
         try:
             if url.path == "/api/listen":
-                verify = parse_qs(url.query).get("verify", ["1"])[-1] != "0"
-                return self._send(HTTPStatus.OK, c.transcribe(raw, verify))
+                query = parse_qs(url.query)
+                verify = query.get("verify", ["1"])[-1] != "0"
+                wake = query.get("wake", ["0"])[-1] == "1"
+                return self._send(HTTPStatus.OK, c.transcribe(raw, verify, wake))
             body = json.loads(raw or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("Request body must be a JSON object.")
@@ -1220,7 +1236,8 @@ def app_window(url, size=(1480, 940), profile=None):
                      "--password-store=basic"] if profile else []
             subprocess.Popen([path, f"--app={url}", f"--window-size={size[0]},{size[1]}", *extra],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, close_fds=True)
+                             stderr=subprocess.DEVNULL, close_fds=True,
+                             start_new_session=os.name != "nt")  # outlive an SSH caller
             return path
     webbrowser.open(url)
     return None
