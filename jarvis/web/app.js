@@ -1021,6 +1021,11 @@
     onUser: (t) => { if (t) { trace([[`you · ${clip(t)}`, "done"]]); announce("You said: " + t); } },
     onAgent: (t) => { if (t) trace([[`jarvis · ${clip(t)}`, "done"]]); },
     onTool: (req, phase) => trace([[`asking JARVIS · ${clip(req, 60)}`, phase === "start" ? "active" : phase]]),
+    onVoice(r) {
+      if (r.current && voiceSel.querySelector(`option[value="${CSS.escape(r.current)}"]`)) voiceSel.value = voiceSel.dataset.value = r.current;
+      const extra = [r.speed != null && `speed ${r.speed}`, r.stability != null && `stability ${r.stability}`].filter(Boolean).join(", ");
+      toast(`Voice: ${String(r.name || "unchanged").split(" - ")[0]}${extra ? ` (${extra})` : ""}. Reconnecting…`);
+    },
     onError: (m) => toast(plainError(m)),
   });
   async function toggleCall() {
@@ -1050,7 +1055,7 @@
     try {
       const r = await api("/api/agent/voice", { voice_id: voiceSel.value });
       voiceSel.dataset.value = r.current;
-      if (agent.live) { toast(`Voice set to ${r.name}. Reconnecting the call…`); await agent.stop(); await toggleCall(); }
+      if (agent.live) { toast(`Voice set to ${r.name}. Reconnecting the call…`); await agent.reconnect("How's this?"); }
       else toast(`Voice set to ${r.name}.`);
     } catch (e) { if (before) voiceSel.value = before; toast(plainError(e.message)); }
   });

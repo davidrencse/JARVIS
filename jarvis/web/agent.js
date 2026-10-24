@@ -3,8 +3,11 @@
 // PCM, the agent's voice comes back as PCM and is queued gaplessly. Barge-in clears the
 // queue. When the agent calls its ask_jarvis tool, the request runs through the local
 // server like any typed ask and the reply goes back to the agent to speak.
+// ElevenLabs fixes the voice when a conversation starts, so change_voice saves the new
+// voice and reconnects in place (mic stays open), handing over the recent transcript.
 (function () {
   const CHUNK_SECONDS = 0.1;
+  const KEEP_LINES = 8;
 
   function rateOf(format, fallback) {
     const m = /^pcm_(\d+)$/.exec(format || "");
@@ -26,9 +29,9 @@
 
   class ElevenAgent {
     // hooks: api(path, body), onState(state), onLevel(0..1), onUser(text),
-    //        onAgent(text), onTool(request, phase), onError(message)
+    //        onAgent(text), onTool(request, phase), onVoice(result), onError(message)
     constructor(hooks) {
-      this.h = hooks; this.state = "idle"; this.sources = new Set();
+      this.h = hooks; this.state = "idle"; this.sources = new Set(); this.lines = [];
     }
     get live() { return this.state !== "idle"; }
     set(state) { this.state = state; this.h.onState?.(state); }
@@ -43,7 +46,7 @@
         this.ctx = new AudioContext();
         await this.ctx.audioWorklet.addModule("recorder-worklet.js");
         this.inRate = 16000; this.outRate = 16000; this.playAt = 0;
-        this.pending = []; this.pendingLen = 0;
+        this.pending = []; this.pendingLen = 0; this.lines = [];
         await this.open(session);
         const src = this.ctx.createMediaStreamSource(this.stream);
         this.node = new AudioWorkletNode(this.ctx, "jarvis-recorder");
@@ -62,8 +65,13 @@
         this.ws = ws;
         let ready = false;
         ws.onopen = () => {
-          const init = { type: "conversation_initiation_client_data" };
-          if (session.voice_id) init.conversation_config_override = { tts: { voice_id: session.voice_id } };
+          const init = { type: "conversation_initiation_client_data" }, tts = {};
+          if (session.voice_id) tts.voice_id = session.voice_id;
+          for (const k of ["speed", "stability"]) if (typeof session[k] === "number") tts[k] = session[k];
+          const override = {};
+          if (Object.keys(tts).length) override.tts = tts;
+          if (session.first_message) override.agent = { first_message: session.first_message };
+          if (Object.keys(override).length) init.conversation_config_override = override;
           ws.send(JSON.stringify(init));
         };
         ws.onmessage = (ev) => {
@@ -73,6 +81,7 @@
             this.inRate = rateOf(meta.user_input_audio_format, 16000);
             this.outRate = rateOf(meta.agent_output_audio_format, 16000);
             this.conversation = meta.conversation_id;
+            if (session.context) this.send({ type: "contextual_update", text: session.context });
             if (!ready) { ready = true; resolve(); }
             return;
           }
@@ -101,9 +110,11 @@
           this.flush();
           break;
         case "user_transcript":
+          this.remember("David", msg.user_transcription_event.user_transcript);
           this.h.onUser?.(msg.user_transcription_event.user_transcript);
           break;
         case "agent_response":
+          this.remember("JARVIS", msg.agent_response_event.agent_response);
           this.h.onAgent?.(msg.agent_response_event.agent_response);
           break;
         case "client_tool_call":
@@ -112,8 +123,15 @@
       }
     }
 
+    remember(who, text) {
+      if (!text) return;
+      this.lines.push(`${who}: ${text}`);
+      if (this.lines.length > KEEP_LINES) this.lines.shift();
+    }
+
     async tool(call) {
       const reply = (result, isError) => this.send({ type: "client_tool_result", tool_call_id: call.tool_call_id, result, is_error: !!isError });
+      if (call.tool_name === "change_voice") return this.changeVoice(call.parameters || {}, reply);
       if (call.tool_name !== "ask_jarvis") return reply(`Unknown tool ${call.tool_name}.`, true);
       const request = String(call.parameters?.request || "").trim();
       if (!request) return reply("No request was given.", true);
@@ -125,6 +143,41 @@
       } catch (e) {
         this.h.onTool?.(request, "fail");
         reply(`JARVIS couldn't do that: ${e.message}`, true);
+      }
+    }
+
+    async changeVoice(params, reply) {
+      const body = {};
+      if (params.voice) body.voice = String(params.voice);
+      for (const k of ["speed", "stability"]) if (params[k] != null && isFinite(params[k])) body[k] = Number(params[k]);
+      if (!Object.keys(body).length) return reply("Say which voice, speed or steadiness to change.", true);
+      let r;
+      try { r = await this.h.api("/api/agent/voice", body); }
+      catch (e) { return reply(`Couldn't change the voice: ${e.message}`, true); }
+      this.h.onVoice?.(r);
+      reply("Changed. The call is reconnecting in the new voice; say nothing more.");
+      await this.reconnect("How's this?");
+    }
+
+    // Swap the conversation for a fresh one (new voice settings), keeping mic and audio.
+    async reconnect(firstMessage) {
+      if (!this.live) return;
+      const old = this.ws; this.ws = null;
+      if (old && old.readyState <= WebSocket.OPEN) { try { old.close(1000); } catch (_) { /* closing anyway */ } }
+      this.flush(); this.pending = []; this.pendingLen = 0;
+      this.set("connecting");
+      try {
+        const session = await this.h.api("/api/agent/session", {});
+        if (!this.live) return;
+        if (firstMessage) session.first_message = firstMessage;
+        if (this.lines.length) session.context = "The call just reconnected to change your voice. "
+          + "Conversation so far:\n" + this.lines.join("\n");
+        await this.open(session);
+        if (this.live) this.set("listening");
+      } catch (e) {
+        if (!this.live) return;  // hung up while reconnecting
+        this.h.onError?.(e.message);
+        await this.stop();
       }
     }
 
