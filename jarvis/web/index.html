@@ -14,11 +14,10 @@
 <link rel="stylesheet" href="porcelain.css">
 <link rel="stylesheet" href="runview.css">
 <link rel="stylesheet" href="flow.css">
+<link rel="stylesheet" href="console.css">
 <script src="theme.js"></script>
 </head>
 <body>
-<canvas id="terrain" aria-hidden="true"></canvas>
-<div class="veil" aria-hidden="true"></div>
 
 <div class="shell">
   <aside class="sidebar glass" aria-label="JARVIS">
@@ -68,10 +67,8 @@
       <a class="icon-btn sm" id="case-export" href="#" title="Export this investigation as Markdown" aria-label="Export investigation" hidden><svg class="i i-sm"><use href="icons.svg?v=2#i-download"/></svg></a>
     </div>
     <div class="topbar-status" id="top-status"></div>
-    <div class="hdr-pill time-pill" id="time-pill" title="Local time and weather">
+    <div class="hdr-pill time-pill" id="time-pill" title="Local time">
       <svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-clock"/></svg><span id="clock-time">--:--</span><span id="clock-sec" class="sr">--</span>
-      <span class="sep" aria-hidden="true"></span>
-      <span id="wx-pill"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-sun"/></svg><span>—</span></span>
     </div>
     <form class="hdr-pill search-pill" id="hero-search" role="search">
       <button class="round-btn dark" type="submit" aria-label="Search memory"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-search"/></svg></button>
@@ -90,9 +87,26 @@
 
   <main class="stage" id="stage">
     <!-- CONSOLE -->
-    <section class="view" id="view-console" data-title="Console">
+    <section class="view cx" id="view-console" data-title="Console">
       <span id="clock-tz" class="sr"></span>
       <dl class="sr" id="clock-facts"></dl>
+      <div class="cx-main">
+      <section class="cx-hero" aria-label="Claude output, last 48 hours">
+        <header class="cx-rule"><h2>Claude output</h2><span>tokens per hour, last 48 hours</span>
+          <a class="cx-link" href="#credits">Credits</a></header>
+        <div class="cx-ridge">
+          <canvas id="cx-ridge" aria-hidden="true"></canvas>
+          <div class="cx-ridge-read">
+            <p class="cx-big" id="ridge-total">—</p>
+            <p class="cx-big-sub">tokens in the last 24 hours</p>
+            <dl class="cx-kv" id="ridge-facts"></dl>
+          </div>
+          <ol class="cx-hours" id="ridge-hours" aria-label="Output by hour, most recent first"></ol>
+          <span class="cx-tip" id="ridge-tip" hidden></span>
+          <div class="cx-axis" id="ridge-axis" aria-hidden="true"></div>
+        </div>
+      </section>
+
       <div class="signals" aria-label="Signals">
         <article class="tile" id="sig-agent">
           <header class="tile-h"><span class="t-idx">01</span><h2>Agent</h2><span class="t-flag" id="sig-agent-flag"></span></header>
@@ -100,13 +114,6 @@
           <canvas class="dm dm-face" id="dm-face" aria-hidden="true"></canvas>
           <canvas class="dm dm-wave" id="dm-wave" aria-hidden="true"></canvas>
           <dl class="t-stats" id="sig-agent-stats"></dl>
-        </article>
-        <article class="tile" id="sig-tokens">
-          <header class="tile-h"><span class="t-idx">02</span><h2>Claude</h2><span class="t-flag">24 h</span></header>
-          <p class="dot-num" id="sig-tok">—</p>
-          <p class="t-unit">output tokens</p>
-          <canvas class="dm dm-bars" id="dm-bars" role="img" aria-label="Claude output per hour, last 24 hours"></canvas>
-          <div class="t-foot"><dl class="t-stats" id="sig-tok-stats"></dl><span class="t-chip-delta" id="sig-tok-delta"></span></div>
         </article>
         <article class="tile" id="sig-limit">
           <header class="tile-h"><span class="t-idx">03</span><h2>Codex window</h2><span class="t-flag" id="sig-limit-flag"></span></header>
@@ -124,26 +131,12 @@
         </article>
       </div>
 
-      <div class="bento">
-        <article class="card timeline-card" id="w-timeline">
+      <div class="cx-grid">
+        <article class="card cx-w2 timeline-card" id="w-timeline">
           <header class="ph"><h2>Runs</h2><span class="ph-meta" id="timeline-meta"></span>
             <a class="round-btn sm" href="#tasks" aria-label="Open tasks"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
           <div class="timeline" id="timeline"><div class="skeleton" style="height:210px"></div></div>
         </article>
-
-        <article class="card trend-card" id="w-usage">
-          <header class="ph"><h2>Claude usage</h2>
-            <a class="round-btn sm" href="#credits" aria-label="Open credits"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
-          <div id="usage-body"><div class="skeleton" style="height:230px"></div></div>
-        </article>
-
-        <aside class="card ink assistant col-thread" aria-label="Assistant">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-audio-lines"/></svg></span><h2>Assistant</h2>
-            <button class="ph-action" id="thread-clear" type="button">Clear</button></header>
-          <ol class="thread" id="thread" role="log" aria-label="Conversation"></ol>
-          <div class="listener-log" id="listener-log"></div>
-          <div class="dock-home" id="dock-home"></div>
-        </aside>
 
         <article class="card files-card" id="w-recent">
           <header class="ph"><span class="ph-icon dark" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-database"/></svg></span><h2>Recent memory</h2>
@@ -151,17 +144,23 @@
           <ol class="pill-list" id="recent-list"><li class="skeleton" style="height:44px"></li></ol>
         </article>
 
-        <article class="card limits-card" id="w-limits">
-          <header class="ph limits-head"><h2>Limits</h2><span class="count-pill" id="limits-count">3</span>
-            <div class="stats" id="limit-stats"></div></header>
-          <div class="silk" id="silk">
-            <div class="silk-tiles" id="silk-tiles"></div>
-            <div class="silk-bars" id="silk-bars" aria-label="Claude output per hour, last 12 hours"></div>
-          </div>
+        <article class="card cx-w3 cx-machines">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-laptop-minimal"/></svg></span><h2>Machines and links</h2>
+            <span class="ph-meta" id="probe-checked">checking…</span>
+            <button class="ph-action" id="probe-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check now</button>
+            <a class="round-btn sm" href="#devices" aria-label="Open devices"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
+          <div class="link-status" id="link-status"><div class="skeleton" style="height:44px"></div></div>
+          <div class="machines" id="machines"></div>
         </article>
-      </div>
 
-      <div class="wallet-row">
+        <article class="card cx-w2 cx-credits">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-gauge"/></svg></span><h2>Credits</h2>
+            <span class="legend" id="credits-mini-legend"></span><span class="ph-meta" id="credits-checked"></span>
+            <a class="round-btn sm" href="#credits" aria-label="All providers"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a>
+          </header>
+          <div class="credit-rows" id="credit-rows"><div class="skeleton" style="height:180px"></div></div>
+        </article>
+
         <article class="card wallet" id="w-balance">
           <header class="wallet-h"><span class="mono-avatar" aria-hidden="true">D</span>
             <div><b>DeepSeek</b><span>API balance, live</span></div>
@@ -173,7 +172,8 @@
             <a class="pill-act" href="#credits"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-keyboard"/></svg> Balances</a>
           </div>
         </article>
-        <article class="card activity" id="w-activity">
+
+        <article class="card cx-w2 activity" id="w-activity">
           <div class="u-tabs" role="tablist" aria-label="Activity">
             <button role="tab" type="button" data-act-tab="requests" aria-selected="true">Requests</button>
             <button role="tab" type="button" data-act-tab="providers" aria-selected="false" tabindex="-1">Providers</button>
@@ -181,40 +181,8 @@
           </div>
           <table class="book" id="act-table"><tbody><tr><td class="muted">Loading…</td></tr></tbody></table>
         </article>
-      </div>
 
-      <div class="more-grid">
-        <article class="card" id="w-weather">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-cloud"/></svg></span><h2>Weather</h2>
-            <button class="ph-action" id="weather-place" type="button" title="Change location"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-map-pin"/></svg><span id="weather-place-name">Set location</span></button>
-          </header>
-          <div id="weather-body" class="weather-body"><div class="skeleton" style="height:220px"></div></div>
-          <form class="place-form" id="place-form" hidden>
-            <label class="sr" for="place-input">City</label>
-            <input id="place-input" class="field" type="search" placeholder="City, e.g. Toronto" autocomplete="off">
-            <ul class="place-results" id="place-results"></ul>
-            <button type="button" class="link-btn" id="place-geo"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-map-pin"/></svg>Use this laptop’s location</button>
-          </form>
-        </article>
-
-        <article class="card">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-laptop-minimal"/></svg></span><h2>Machines and links</h2>
-            <span class="ph-meta" id="probe-checked">checking…</span>
-            <button class="ph-action" id="probe-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check now</button>
-            <a class="round-btn sm" href="#devices" aria-label="Open devices"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
-          <div class="link-status" id="link-status"><div class="skeleton" style="height:44px"></div></div>
-          <div class="machines" id="machines"></div>
-        </article>
-
-        <article class="card">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-gauge"/></svg></span><h2>Credits</h2>
-            <span class="legend" id="credits-mini-legend"></span><span class="ph-meta" id="credits-checked"></span>
-            <a class="round-btn sm" href="#credits" aria-label="All providers"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a>
-          </header>
-          <div class="credit-rows" id="credit-rows"><div class="skeleton" style="height:180px"></div></div>
-        </article>
-
-        <article class="card">
+        <article class="card cx-w3">
           <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-waypoints"/></svg></span><h2>Memory graph</h2>
             <a class="round-btn sm" href="knowledge.html" aria-label="Open the knowledge engine"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
           <canvas class="mini-graph" id="mini-graph" role="img" aria-label="Memory graph preview"></canvas>
@@ -222,6 +190,15 @@
           <div class="router-mini"><span id="router-meta" class="ph-meta"></span><div id="router-body"></div></div>
         </article>
       </div>
+      </div>
+
+      <aside class="card assistant col-thread cx-side" aria-label="Assistant">
+          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-audio-lines"/></svg></span><h2>Assistant</h2>
+            <button class="ph-action" id="thread-clear" type="button">Clear</button></header>
+          <ol class="thread" id="thread" role="log" aria-label="Conversation"></ol>
+          <div class="listener-log" id="listener-log"></div>
+          <div class="dock-home" id="dock-home"></div>
+        </aside>
     </section>
 
     <!-- RUN: one plan on one screen -->
@@ -388,7 +365,18 @@
         <select class="field tier-select" id="tier-select" aria-label="How JARVIS should handle it">
           <option value="">Auto</option><option value="simple">Quick</option><option value="medium">Tools</option><option value="complex">Plan</option>
         </select>
-        <select class="field voice-select" id="voice-select" aria-label="JARVIS voice" hidden></select>
+        <button type="button" class="icon-btn" id="voice-btn" popovertarget="voice-panel" aria-label="JARVIS's voice" title="JARVIS's voice" hidden>
+          <svg class="i"><use href="icons.svg?v=2#i-audio-lines"/></svg>
+        </button>
+        <div class="voice-panel" id="voice-panel" popover>
+          <label class="vp-row"><span>Voice</span><select class="field" id="voice-select"></select></label>
+          <label class="vp-row"><span>Speed <output id="voice-speed-out" for="voice-speed"></output></span>
+            <input type="range" id="voice-speed" min="0.7" max="1.2" step="0.05" value="1"></label>
+          <label class="vp-row"><span>Stability <output id="voice-stability-out" for="voice-stability"></output></span>
+            <input type="range" id="voice-stability" min="0" max="1" step="0.05" value="0.5"></label>
+          <p class="vp-note" id="voice-note"></p>
+          <button type="button" class="vp-preview" id="voice-preview"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-play"/></svg>Preview on this laptop</button>
+        </div>
         <button type="button" class="icon-btn" id="speak-toggle" aria-pressed="false" aria-label="Read replies aloud" title="Read replies aloud on this laptop">
           <svg class="i"><use href="icons.svg?v=2#i-volume-x"/></svg>
         </button>
@@ -401,7 +389,7 @@
 <div class="toast" id="toast" role="status" hidden></div>
 <div class="sr" id="announce" role="status" aria-live="polite"></div>
 
-<script src="terrain.js"></script>
+<script src="console.js"></script>
 <script src="graph.js"></script>
 <script src="voice.js"></script>
 <script src="agent.js"></script>

@@ -135,107 +135,6 @@
   }
   tick(); setInterval(tick, 1000);
 
-  // ---------- weather (Open-Meteo, no key) ----------
-  const WX = {
-    0: ["Clear", "sun"], 1: ["Mostly clear", "sun"], 2: ["Partly cloudy", "cloud-sun"], 3: ["Overcast", "cloud"],
-    45: ["Fog", "cloud-fog"], 48: ["Freezing fog", "cloud-fog"], 51: ["Light drizzle", "cloud-drizzle"], 53: ["Drizzle", "cloud-drizzle"],
-    55: ["Heavy drizzle", "cloud-drizzle"], 56: ["Freezing drizzle", "cloud-drizzle"], 57: ["Freezing drizzle", "cloud-drizzle"],
-    61: ["Light rain", "cloud-rain"], 63: ["Rain", "cloud-rain"], 65: ["Heavy rain", "cloud-rain"], 66: ["Freezing rain", "cloud-rain"],
-    67: ["Freezing rain", "cloud-rain"], 71: ["Light snow", "cloud-snow"], 73: ["Snow", "cloud-snow"], 75: ["Heavy snow", "cloud-snow"],
-    77: ["Snow grains", "cloud-snow"], 80: ["Showers", "cloud-rain"], 81: ["Showers", "cloud-rain"], 82: ["Heavy showers", "cloud-rain"],
-    85: ["Snow showers", "cloud-snow"], 86: ["Snow showers", "cloud-snow"], 95: ["Thunderstorm", "cloud-lightning"],
-    96: ["Thunderstorm, hail", "cloud-lightning"], 99: ["Thunderstorm, hail", "cloud-lightning"],
-  };
-  const wx = (code, day = 1) => { const [label, ic] = WX[code] || ["—", "cloud"]; return [label, !day && ic === "sun" ? "moon" : ic]; };
-  let place = store.get("jarvis.place", null);
-  let units = store.get("jarvis.units", "metric");
-  async function loadWeather() {
-    const body = $("#weather-body");
-    if (!place) {
-      $("#weather-place-name").textContent = "Set location";
-      body.innerHTML = `<div class="empty" style="grid-column:1/-1"><b>Where are you?</b>Search a city or use this laptop’s location. Forecasts come from Open-Meteo; nothing else is sent.</div>`;
-      $("#place-form").hidden = false; return;
-    }
-    $("#weather-place-name").textContent = place.name;
-    const imperial = units === "imperial";
-    const q = new URLSearchParams({ latitude: place.lat, longitude: place.lon, timezone: "auto", forecast_days: "6",
-      current: "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,is_day,precipitation",
-      hourly: "temperature_2m,precipitation_probability",
-      daily: "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,precipitation_probability_max",
-      temperature_unit: imperial ? "fahrenheit" : "celsius", wind_speed_unit: imperial ? "mph" : "kmh" });
-    try {
-      const res = await fetch("https://api.open-meteo.com/v1/forecast?" + q);
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      renderWeather(await res.json(), imperial);
-    } catch (e) {
-      body.innerHTML = `<div class="empty" style="grid-column:1/-1"><b>Weather is unreachable.</b>${esc(e.message)}. It retries every 15 minutes.</div>`;
-    }
-  }
-  function renderWeather(d, imperial) {
-    if (window.JarvisDash) return JarvisDash.weather(d, imperial, wx, () => { units = units === "metric" ? "imperial" : "metric"; store.set("jarvis.units", units); loadWeather(); });
-    const c = d.current, [label, ic] = wx(c.weather_code, c.is_day);
-    const deg = imperial ? "°F" : "°C", wind = imperial ? "mph" : "km/h";
-    const now = Date.parse(c.time), hours = [];
-    for (let i = 0; i < d.hourly.time.length && hours.length < 24; i++) {
-      if (Date.parse(d.hourly.time[i]) >= now - 3600e3) hours.push([d.hourly.time[i], d.hourly.temperature_2m[i], d.hourly.precipitation_probability[i] ?? 0]);
-    }
-    const temps = hours.map((h) => h[1]), lo = Math.min(...temps), hi = Math.max(...temps);
-    const W = 300, H = 70, x = (i) => (i / (hours.length - 1)) * W, y = (t) => 8 + (1 - (t - lo) / ((hi - lo) || 1)) * (H - 26);
-    const line = hours.map((h, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(h[1]).toFixed(1)}`).join("");
-    const bars = hours.map((h, i) => h[2] > 0 ? `<rect x="${(x(i) - 3).toFixed(1)}" y="${(H - 12 - h[2] * 0.14).toFixed(1)}" width="6" height="${(h[2] * 0.14).toFixed(1)}" fill="var(--fill-2)"/>` : "").join("");
-    const ticks = hours.map((h, i) => i % 6 === 0 ? `<text x="${x(i).toFixed(1)}" y="${H + 8}" text-anchor="${i ? "middle" : "start"}">${h[0].slice(11, 16)}</text><text x="${x(i).toFixed(1)}" y="${(y(h[1]) - 6).toFixed(1)}" text-anchor="${i ? "middle" : "start"}" style="fill:var(--ink)">${Math.round(h[1])}°</text>` : "").join("");
-    const days = d.daily.time.slice(1, 6).map((t, i) => {
-      const [dl, di] = wx(d.daily.weather_code[i + 1]);
-      return `<div class="wx-day" title="${esc(dl)}"><b>${new Date(t + "T12:00").toLocaleDateString([], { weekday: "short" })}</b>${icon(di, "i")}<span class="mono">${Math.round(d.daily.temperature_2m_max[i + 1])}° <span>${Math.round(d.daily.temperature_2m_min[i + 1])}°</span></span></div>`;
-    }).join("");
-    $("#weather-body").innerHTML = `
-      <div class="wx-now">
-        <button class="wx-temp" type="button" id="wx-units" title="Switch to ${imperial ? "°C" : "°F"}" aria-label="${Math.round(c.temperature_2m)}${deg}. Switch to ${imperial ? "Celsius" : "Fahrenheit"}">${icon(ic, "i")}<span class="wx-deg">${Math.round(c.temperature_2m)}°</span></button>
-        <div class="wx-cond">${esc(label)}</div>
-        <div class="wx-sub">Feels ${Math.round(c.apparent_temperature)}${deg} · H ${Math.round(d.daily.temperature_2m_max[0])}° L ${Math.round(d.daily.temperature_2m_min[0])}°</div>
-      </div>
-      <div>
-        <svg class="wx-chart" viewBox="0 -4 ${W} ${H + 14}" preserveAspectRatio="none" role="img" aria-label="Temperature from ${Math.round(lo)} to ${Math.round(hi)} degrees over the next 24 hours">
-          ${bars}<path d="${line}" fill="none" stroke="var(--ink)" stroke-width="1.3" vector-effect="non-scaling-stroke"/>${ticks}
-        </svg>
-        <dl class="facts mono" style="margin-top:8px">
-          <dt>Wind</dt><dd>${Math.round(c.wind_speed_10m)} ${wind}</dd>
-          <dt>Humidity</dt><dd>${c.relative_humidity_2m}%</dd>
-          <dt>Rain chance</dt><dd>${d.daily.precipitation_probability_max[0] ?? 0}%</dd>
-          <dt>Sun</dt><dd>${d.daily.sunrise[0].slice(11, 16)} – ${d.daily.sunset[0].slice(11, 16)}</dd>
-        </dl>
-      </div>
-      <div class="wx-days">${days}</div>`;
-    $("#wx-units").addEventListener("click", () => { units = units === "metric" ? "imperial" : "metric"; store.set("jarvis.units", units); loadWeather(); });
-  }
-  $("#weather-place").addEventListener("click", () => { const f = $("#place-form"); f.hidden = !f.hidden; if (!f.hidden) $("#place-input").focus(); });
-  let placeTimer;
-  $("#place-input").addEventListener("input", (ev) => {
-    clearTimeout(placeTimer);
-    const q = ev.target.value.trim();
-    if (q.length < 2) { $("#place-results").innerHTML = ""; return; }
-    placeTimer = setTimeout(async () => {
-      try {
-        const res = await fetch("https://geocoding-api.open-meteo.com/v1/search?" + new URLSearchParams({ name: q, count: "5" }));
-        const data = await res.json();
-        $("#place-results").innerHTML = (data.results || []).map((r, i) =>
-          `<li><button type="button" data-i="${i}">${esc(r.name)}<small>${esc([r.admin1, r.country].filter(Boolean).join(", "))}</small></button></li>`).join("") || `<li class="muted" style="padding:6px 8px;font-size:12.5px">No match.</li>`;
-        $$("#place-results button").forEach((b) => b.addEventListener("click", () => {
-          const r = data.results[b.dataset.i]; setPlace({ name: r.name, lat: r.latitude, lon: r.longitude });
-        }));
-      } catch (e) { $("#place-results").innerHTML = `<li class="muted">Search failed: ${esc(e.message)}</li>`; }
-    }, 280);
-  });
-  $("#place-form").addEventListener("submit", (e) => { e.preventDefault(); $("#place-results button")?.click(); });
-  $("#place-geo").addEventListener("click", () => {
-    if (!navigator.geolocation) return toast("Location isn't available in this browser.");
-    navigator.geolocation.getCurrentPosition(
-      (p) => setPlace({ name: "Here", lat: +p.coords.latitude.toFixed(3), lon: +p.coords.longitude.toFixed(3) }),
-      (e) => toast("Couldn't get location: " + e.message + ". Search a city instead."), { timeout: 10000 });
-  });
-  function setPlace(p) { place = p; store.set("jarvis.place", p); $("#place-form").hidden = true; $("#place-input").value = ""; $("#place-results").innerHTML = ""; loadWeather(); }
-  loadWeather(); setInterval(loadWeather, 15 * 60 * 1000);
-
   // ---------- credits ----------
   const SRC_TEXT = { live: "Live from the provider", local: "Read from logs on this laptop", manual: "Entered by you", none: "Not set up", error: "Check failed" };
   const SRC_SHORT = { live: "live", local: "local logs", manual: "entered", none: "not set up", error: "failed" };
@@ -812,7 +711,7 @@
     rows.sort((a, b) => a.at - b.at);
     if (!rows.length) {
       el.innerHTML = `<li class="thread-empty"><h3>What should I work on?</h3>
-        <p>Type below, or click the mic (or hold Space when nothing is focused). Quick asks run one cheap model call; big jobs get a specialist plan you review first.</p>
+        <p>Type below, or just talk: JARVIS is always listening and sends when you pause or press Enter (the mic button turns that off). Quick asks run one cheap model call; big jobs get a specialist plan you review first.</p>
         <div class="suggest">${["What did I decide about the clipboard?", "Summarize what's in memory about Lan Mouse", "Plan a recon of my home lab's exposed services"].map((s) => `<button type="button">${esc(s)}</button>`).join("")}</div></li>`;
       $$(".suggest button", el).forEach((b) => b.addEventListener("click", () => { prompt.value = b.textContent; autosize(); prompt.focus(); }));
       return;
@@ -836,8 +735,9 @@
   const prompt = $("#prompt");
   function autosize() { prompt.style.height = "auto"; prompt.style.height = Math.min(160, prompt.scrollHeight) + "px"; }
   prompt.addEventListener("input", autosize);
+  let handsFree = store.get("jarvis.handsFree", true); // mic always listening; see microphone below
   const narrow = matchMedia("(max-width: 640px)");
-  const placeholder = () => (prompt.placeholder = narrow.matches ? "Ask JARVIS…" : state.case ? "Ask JARVIS (filed into this investigation)" : "Ask JARVIS, or hold Space to talk");
+  const placeholder = () => (prompt.placeholder = narrow.matches ? "Ask JARVIS…" : state.case ? "Ask JARVIS (filed into this investigation)" : handsFree ? "Ask JARVIS, or just talk" : "Ask JARVIS, or hold Space to talk");
   narrow.addEventListener("change", placeholder); placeholder();
   $("#case-select").addEventListener("change", placeholder);
   prompt.addEventListener("keydown", (e) => {
@@ -871,7 +771,12 @@
     send.title = on ? "Stop waiting for this answer (Esc)" : "Send (Enter)";
     send.querySelector("use").setAttribute("href", `icons.svg?v=2#i-${on ? "square" : "arrow-up"}`);
   }
-  $("#dock").addEventListener("submit", (e) => { e.preventDefault(); if (busy) { stopWaiting(); return; } ask(prompt.value); });
+  $("#dock").addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (busy) { stopWaiting(); return; }
+    if (!prompt.value.trim() && (mic.active || mic.starting)) return stopMic(); // Enter: send what it heard now
+    ask(prompt.value);
+  });
   const routeLabel = (r) => `${tierName(r.tier)}${r.handler ? " · " + r.handler : r.reasons?.length ? " · " + r.reasons.slice(0, 2).join(", ") : ""}`;
   // Resolves when the job ends: pushed by the live stream (turn.done/turn.error), with a
   // slow poll underneath in case the stream drops.
@@ -904,6 +809,7 @@
     text = (text || "").trim();
     if (!text) return;
     if (busy) return toast("JARVIS is still on the last request. Press Esc to stop waiting.");
+    if (!heard && (mic.active || mic.starting)) mic.stop(); // typed it instead; drop the half-heard clip
     setBusy(true); clearTimeout(previewTimer);
     prompt.value = ""; autosize(); prompt.blur(); // so Space talks again right away
     const pending = { who: "you", text, at: Date.now(), voice: !!heard, channel: "console", tier: state.tier || null };
@@ -951,44 +857,74 @@
       clearInterval(ticker); current = null;
       setBusy(false); renderThread();
       refreshOverview(); loadMini();
-      setTimeout(() => { if (!busy) trace([]); }, 9000);
+      setTimeout(() => { if (!busy) idleTrace(); }, 9000);
+      relisten();
     }
   }
 
   // ---------- microphone ----------
+  // Always-on by default: the mic idles until you talk, sends when you pause (or press
+  // Enter), then listens again once JARVIS has answered. The mic button turns it off/on.
   const micBtn = $("#mic");
   let firstListen = true, spaceAt = 0;
+  const LISTENING = [["listening · pause or Enter sends · Esc cancels", "active"]];
+  const idleTrace = () => trace(mic.active && handsFree ? LISTENING : []);
   const mic = new Mic({ wave: $("#mic-wave"), onLevel: (l) => (Terrain.level = l), onAutoStop: () => stopMic() });
-  async function startMic() {
+  function syncMicBtn() {
+    micBtn.setAttribute("aria-pressed", String(handsFree || mic.active));
+    micBtn.title = handsFree ? "Always listening: talk any time, pause or press Enter to send. Click to stop listening."
+      : "Talk: click to listen all the time, or hold Space when nothing is focused";
+  }
+  function relisten() {
+    setTimeout(() => { if (handsFree && !busy && !agent.live) startMic(true); }, 600);
+  }
+  async function startMic(auto) {
     if (mic.active || mic.starting || agent.live) return;
-    if (busy) return toast("Still answering the last request. Talk again in a moment, or press Esc to stop waiting.");
+    if (busy) return auto || toast("Still answering the last request. Talk again in a moment, or press Esc to stop waiting.");
     try {
-      await mic.start();
+      await mic.start({ wait: handsFree });
       if (!mic.active) return;
-      micBtn.setAttribute("aria-pressed", "true");
-      trace([["listening · stops when you pause · Esc cancels", "active"]]); announce("Listening."); Terrain.redraw();
-    } catch (e) { toast(e.name === "NotAllowedError" ? "Microphone permission was denied. Allow it for this page, then try again." : plainError(e.message)); }
+      syncMicBtn();
+      // Don't wipe an answer's trace when listening resumes; it clears to "listening" later.
+      if (!auto || !$("#trace").children.length) trace(handsFree ? LISTENING : [["listening · stops when you pause · Esc cancels", "active"]]);
+      if (!auto) announce("Listening.");
+      Terrain.redraw();
+    } catch (e) {
+      if (handsFree) { handsFree = false; store.set("jarvis.handsFree", false); syncMicBtn(); }
+      toast(e.name === "NotAllowedError" ? "Microphone permission was denied. Allow it for this page, then try again." : plainError(e.message));
+    }
   }
   async function stopMic(cancel) {
     if (!mic.active && !mic.starting) return;
     cancel = cancel || mic.starting;
-    micBtn.setAttribute("aria-pressed", "false");
     const clip = await mic.stop();
-    if (cancel) { trace([["cancelled", "fail"]]); setTimeout(() => trace([]), 2000); return; }
-    if (!clip || !clip.audio) { trace([["didn't hear speech · check the mic input level", "fail"]]); setTimeout(() => trace([]), 3500); return; }
+    syncMicBtn();
+    const fail = (label, ms) => { trace([[label, "fail"]]); setTimeout(() => { if (!busy) idleTrace(); }, ms); relisten(); };
+    if (cancel) return fail("cancelled", 2000);
+    if (!clip || !clip.audio) return fail("didn't hear speech · check the mic input level", 3500);
     micBtn.classList.add("busy");
     trace([[firstListen ? "transcribing · loading Whisper on the GPU, first time only" : "checking it's you · transcribing", "active"]]);
     try {
       const r = await api("/api/listen", new Uint8Array(clip.audio.buffer), true);
       firstListen = false;
-      if (!r.owner) { trace([[`ignored · voice match ${r.score} is below your cutoff`, "fail"]]); toast("That didn't sound like you, so JARVIS ignored it. Re-run `jarvis voice enroll` if this keeps happening."); return; }
-      if (!r.text) { trace([["heard you, but no words came through", "fail"]]); return; }
+      if (!r.owner) {
+        // Always-on hears JARVIS's own voice and the room; only a push-to-talk miss is worth a toast.
+        if (!handsFree) toast("That didn't sound like you, so JARVIS ignored it. Re-run `jarvis voice enroll` if this keeps happening.");
+        return fail(`ignored · voice match ${r.score} is below your cutoff`, 2500);
+      }
+      if (!r.text) return fail("heard you, but no words came through", 2500);
       prompt.value = r.text; autosize();
       await ask(r.text, r);
     } catch (e) { trace([["transcription failed", "fail"]]); toast(plainError(e.message)); }
-    finally { micBtn.classList.remove("busy"); }
+    finally { micBtn.classList.remove("busy"); relisten(); }
   }
-  micBtn.addEventListener("click", () => (mic.active || mic.starting ? stopMic() : startMic()));
+  micBtn.addEventListener("click", () => {
+    handsFree = !handsFree; store.set("jarvis.handsFree", handsFree);
+    if (handsFree) { announce("Always listening."); startMic(); }
+    else { if (mic.active || mic.starting) stopMic(true); announce("Stopped listening."); }
+    syncMicBtn(); placeholder();
+  });
+  syncMicBtn();
   // Space talks only when focus is on the page itself, so it never hijacks a link, summary or control.
   const pageFocused = () => { const a = document.activeElement; return !a || a === document.body || a === $("#stage") || a.classList?.contains("view"); };
   addEventListener("keydown", (e) => {
@@ -1000,6 +936,7 @@
     }
     if (typing() || e.metaKey || e.altKey) return;
     if (e.code === "Space" && !e.repeat && pageFocused()) { e.preventDefault(); spaceAt = Date.now(); startMic(); }
+    else if (e.key === "Enter" && (mic.active || mic.starting) && pageFocused()) { e.preventDefault(); stopMic(); }
     else if (!e.ctrlKey && /^[1-9]$/.test(e.key) && pageFocused()) location.hash = VIEWS[+e.key - 1];
     else if (e.key === "/" || (e.key.toLowerCase() === "k" && e.ctrlKey)) { e.preventDefault(); prompt.focus(); }
   });
@@ -1007,7 +944,8 @@
   addEventListener("keyup", (e) => { if (e.code === "Space" && (mic.active || mic.starting) && Date.now() - spaceAt > 400) stopMic(); });
 
   // ---------- live: ElevenLabs agent call (its speech in/out, JARVIS answers) ----------
-  const callBtn = $("#agent-call"), voiceSel = $("#voice-select");
+  const callBtn = $("#agent-call"), voiceSel = $("#voice-select"), voiceBtn = $("#voice-btn");
+  const tune = { speed: $("#voice-speed"), stability: $("#voice-stability") };
   const CALL_TITLE = { idle: "Live call: talk back and forth with JARVIS (ElevenLabs voice agent)",
     connecting: "Connecting to the ElevenLabs agent…", listening: "On a live call: just talk. Click or Esc to hang up.",
     speaking: "JARVIS is speaking; talk over it to interrupt. Click or Esc to hang up." };
@@ -1017,7 +955,7 @@
     onState(s) {
       callBtn.dataset.state = s; callBtn.setAttribute("aria-pressed", String(s !== "idle")); callBtn.title = CALL_TITLE[s];
       if (s === "connecting") trace([["connecting to the voice agent", "active"]]);
-      if (s === "idle") { trace([["call ended", "done"]]); setTimeout(() => { if (!agent.live && !busy) trace([]); }, 3000); }
+      if (s === "idle") { trace([["call ended", "done"]]); setTimeout(() => { if (!agent.live && !busy) idleTrace(); }, 3000); relisten(); }
     },
     onLevel: (l) => (Terrain.level = l),
     onUser: (t) => { if (t) { trace([[`you · ${clip(t)}`, "done"]]); announce("You said: " + t); } },
@@ -1037,29 +975,56 @@
     catch (e) { trace([]); toast(e.name === "NotAllowedError" ? "Microphone permission was denied. Allow it for this page, then try again." : plainError(e.message)); }
   }
   callBtn.addEventListener("click", toggleCall);
+  if (handsFree) startMic(true); // always-on: listen from page load
   addEventListener("keydown", (e) => { if (e.key === "Escape" && agent.live) { e.preventDefault(); agent.stop(); } });
+  const showTune = (k) => { $(`#voice-${k}-out`).textContent = Number(tune[k].value).toFixed(2); };
   async function loadVoices() {
     let status;
     try { status = await api("/api/agent"); } catch (e) { return; }
     callBtn.hidden = !status.configured;
     if (!status.has_key) return;
+    for (const k of ["speed", "stability"]) {
+      const [lo, hi] = status.ranges?.[k] || [tune[k].min, tune[k].max];
+      Object.assign(tune[k], { min: lo, max: hi });
+      if (status.tuning?.[k] != null) tune[k].value = status.tuning[k];
+      showTune(k);
+    }
+    $("#voice-note").textContent = status.tts_engine === "elevenlabs"
+      ? "Used for live calls and every reply JARVIS reads aloud, here and from the listener."
+      : "Used for live calls. Read-aloud replies use the local Kokoro voice.";
     try {
       const { current, voices } = await api("/api/agent/voices");
       voiceSel.innerHTML = (current && !voices.some((v) => v.voice_id === current) ? `<option value="${esc(current)}">Current voice</option>` : "") +
         voices.map((v) => `<option value="${esc(v.voice_id)}" title="${esc(v.about)}">${esc(v.name)}</option>`).join("");
       if (current) voiceSel.value = current;
-      voiceSel.title = "JARVIS's ElevenLabs voice: live calls" + (status.tts_engine === "elevenlabs" ? " and read-aloud replies" : " (read-aloud uses the local Kokoro voice)");
-      voiceSel.hidden = !voices.length;
-    } catch (e) { voiceSel.hidden = true; }
+      voiceBtn.hidden = !voices.length;
+    } catch (e) { voiceBtn.hidden = true; }
+  }
+  async function saveVoice(body, said) {
+    const r = await api("/api/agent/voice", body);
+    if (agent.live) { toast(`${said(r)}. Reconnecting the call…`); await agent.reconnect("How's this?"); }
+    else toast(`${said(r)}.`);
+    return r;
   }
   voiceSel.addEventListener("change", async () => {
     const before = voiceSel.dataset.value;
+    try { voiceSel.dataset.value = (await saveVoice({ voice_id: voiceSel.value }, (r) => `Voice set to ${r.name}`)).current; }
+    catch (e) { if (before) voiceSel.value = before; toast(plainError(e.message)); }
+  });
+  for (const k of ["speed", "stability"]) {
+    tune[k].addEventListener("input", () => showTune(k));
+    tune[k].addEventListener("change", async () => {
+      try { await saveVoice({ [k]: Number(tune[k].value) }, () => `${k === "speed" ? "Speed" : "Stability"} set to ${Number(tune[k].value).toFixed(2)}`); }
+      catch (e) { toast(plainError(e.message)); }
+    });
+  }
+  $("#voice-preview").addEventListener("click", async (e) => {
+    const b = e.currentTarget; b.disabled = true;
     try {
-      const r = await api("/api/agent/voice", { voice_id: voiceSel.value });
-      voiceSel.dataset.value = r.current;
-      if (agent.live) { toast(`Voice set to ${r.name}. Reconnecting the call…`); await agent.reconnect("How's this?"); }
-      else toast(`Voice set to ${r.name}.`);
-    } catch (e) { if (before) voiceSel.value = before; toast(plainError(e.message)); }
+      const r = await api("/api/agent/voice/preview", {});
+      if (!String(r.source).startsWith("elevenlabs") && r.source !== "cache") toast(`Played with ${r.source}, not ElevenLabs.`);
+    } catch (err) { toast(plainError(err.message)); }
+    setTimeout(() => { b.disabled = false; }, 1500);
   });
   loadVoices().then(() => { voiceSel.dataset.value = voiceSel.value; });
 

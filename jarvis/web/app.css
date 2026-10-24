@@ -182,25 +182,6 @@ button.chip:hover { background: var(--hover); color: var(--ink); }
 .clock-sec { font-size: 15px; color: var(--ink-3); padding-top: 4px; }
 .clock-date { margin: 12px 0 14px; font-size: 15px; font-weight: 500; letter-spacing: -.01em; }
 
-.weather-body { display: grid; grid-template-columns: auto 1fr; gap: 4px 22px; align-items: start; }
-.wx-now { display: grid; gap: 2px; }
-.wx-temp { display: flex; align-items: flex-start; gap: 10px; }
-.wx-temp .i { width: 30px; height: 30px; stroke-width: 1.3; margin-top: 6px; }
-.wx-deg { font: 300 54px/.92 var(--mono); letter-spacing: -.04em; }
-.wx-cond { font-size: 15px; font-weight: 500; margin-top: 10px; }
-.wx-sub { font-size: 12px; color: var(--ink-2); }
-.wx-chart { width: 100%; height: 86px; display: block; overflow: visible; }
-.wx-chart text { font: 10px var(--mono); fill: var(--ink-3); }
-.wx-days { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
-.wx-day { display: grid; justify-items: start; gap: 4px; font-size: 12px; }
-.wx-day b { font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
-.wx-day .mono { font-size: 12px; }
-.wx-day .mono span { color: var(--ink-3); }
-.place-form { margin-top: 12px; display: grid; gap: 8px; }
-.place-results { list-style: none; margin: 0; padding: 0; display: grid; }
-.place-results button { width: 100%; text-align: left; padding: 7px 8px; border-radius: var(--r-sm); font-size: 13px; }
-.place-results button:hover, .place-results button:focus-visible { background: var(--hover); }
-.place-results small { color: var(--ink-3); margin-left: 6px; }
 .link-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); justify-self: start; min-height: 26px; }
 .link-btn:hover { color: var(--ink); }
 
@@ -464,9 +445,7 @@ select.field { width: auto; }
   .topbar { min-width: 0; }
   #live-chip { padding: 0 8px; }
   #live-chip .chip-label { display: none; }
-  .clock-time, .wx-deg { font-size: 44px; }
-  .weather-body { grid-template-columns: 1fr; }
-  .wx-days { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+  .clock-time { font-size: 44px; }
   .graph-toolbar { right: 12px; flex-wrap: wrap; }
   .search-field input { width: 100%; }
   .mic[aria-pressed="true"] { width: 96px; }
@@ -592,3 +571,15 @@ select.field { width: auto; }
 .files-status.pending { color: var(--ink-3); }
 .files-status.bad { color: #e5736b; }
 .files-help { font-size: 12.5px; margin: 0; }
+
+/* JARVIS's voice: picker, tuning and preview, opened from the dock */
+.voice-panel { inset: auto 16px 96px auto; margin: 0; width: min(300px, calc(100vw - 32px)); padding: 12px; display: none; gap: 10px; color: var(--ink); background: var(--glass-strong); backdrop-filter: blur(18px); border: 1px solid var(--line-2); border-radius: var(--r); box-shadow: var(--shadow); }
+.voice-panel:popover-open { display: grid; }
+.vp-row { display: grid; gap: 5px; font-size: 12px; color: var(--ink-2); }
+.vp-row > span { display: flex; justify-content: space-between; }
+.vp-row output { font-family: var(--mono); color: var(--ink); }
+.vp-row input[type="range"] { width: 100%; accent-color: var(--fill); }
+.vp-note { margin: 0; font-size: 11px; line-height: 1.4; color: var(--ink-3); }
+.vp-preview { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 30px; border: 1px solid var(--line-ctl); border-radius: var(--r-sm); font-size: 12px; color: var(--ink); transition: background var(--t); }
+.vp-preview:hover { background: var(--hover); }
+.vp-preview:disabled { opacity: .5; }

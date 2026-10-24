@@ -19,7 +19,7 @@
 
   const CHANNEL = { console: "Console", voice: "Voice", cli: "Terminal" };
   const LINGER = 8000;          // ms the finished tree stays up when not pinned
-  const W = 156, H = 40, GX = 26, GY = 6;   // node box and gaps, px (flow.css matches)
+  const W = 232, H = 30, IND = 22, GY = 8;   // node box, indent per depth, row gap, px (flow.css matches)
 
   const turns = new Map();       // message id -> turn
   let shown = null, pinned = store.get("jarvis.flow.pin", false), hidden = false, fadeTimer = 0, tick = 0;
@@ -40,6 +40,7 @@
       <button type="button" class="flow-btn flow-close" title="Hide until the next request" aria-label="Hide">×</button>
     </header>
     <p class="flow-ask"></p>
+    <i class="flow-reg tl">+</i><i class="flow-reg tr">+</i><i class="flow-reg bl">+</i><i class="flow-reg br">+</i>
     <div class="flow-body"><div class="flow-canvas"><svg class="flow-edges" aria-hidden="true"></svg></div></div>`;
   document.body.appendChild(panel);
   const $ = (s) => panel.querySelector(s);
@@ -102,7 +103,7 @@
     sync();
   });
 
-  // ---------- layout: columns by depth, rows by leaf order ----------
+  // ---------- layout: staircase, one row per node in tree order, indented by depth ----------
   function layout(t) {
     const kids = new Map();
     for (const n of t.nodes.values()) {
@@ -116,20 +117,19 @@
     let row = 0, depth = 0;
     (function place(n, d) {
       depth = Math.max(depth, d);
-      const ch = kids.get(n.id) || [];
-      if (!ch.length) { pos.set(n.id, { x: d, y: row++ }); return; }
-      ch.forEach((c) => place(c, d + 1));
-      const ys = ch.map((c) => pos.get(c.id).y);
-      pos.set(n.id, { x: d, y: (Math.min(...ys) + Math.max(...ys)) / 2 });
+      pos.set(n.id, { x: d, y: row++ });
+      (kids.get(n.id) || []).forEach((c) => place(c, d + 1));
     })(t.nodes.get("root"), 0);
     return { pos, rows: Math.max(row, 1), cols: depth + 1 };
   }
+
+  const GLYPH = { run: "", done: "", fail: "×", wait: "" }, WORD = { run: "running…", done: "done.", fail: "failed", wait: "queued" };
 
   function draw() {
     const t = turns.get(shown);
     if (!t) return;
     const { pos, rows, cols } = layout(t);
-    const width = cols * W + (cols - 1) * GX, height = rows * H + (rows - 1) * GY;
+    const width = (cols - 1) * IND + W, height = rows * H + (rows - 1) * GY;
     // Shrink to fit the panel's width (down to 70%), then scroll.
     const room = $(".flow-body").clientWidth - 28;
     const k = room > 0 ? Math.max(0.7, Math.min(1, room / width)) : 1;
@@ -139,15 +139,15 @@
     canvas.style.marginRight = k < 1 ? `${-width * (1 - k)}px` : "";
     svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
     svg.setAttribute("width", width); svg.setAttribute("height", height);
-    const at = (id) => { const p = pos.get(id); return { x: p.x * (W + GX), y: p.y * (H + GY) }; };
+    const at = (id) => { const p = pos.get(id); return { x: p.x * IND, y: p.y * (H + GY) }; };
 
     let edges = "";
     for (const n of t.nodes.values()) {
       if (n.id === "root" || !pos.has(n.id)) continue;
       const parent = t.nodes.has(n.parent) ? n.parent : "root";
       const a = at(parent), b = at(n.id);
-      const x1 = a.x + W, y1 = a.y + H / 2, x2 = b.x, y2 = b.y + H / 2, mx = (x1 + x2) / 2;
-      edges += `<path class="flow-edge" data-state="${esc(n.state)}" d="M${x1} ${y1} C${mx} ${y1} ${mx} ${y2} ${x2} ${y2}"/>`;
+      const rx = a.x + 14, y1 = a.y + H, x2 = b.x, y2 = b.y + H / 2;   // dotted rail down, leader across
+      edges += `<path class="flow-edge" data-state="${esc(n.state)}" d="M${rx} ${y1} V${y2} H${x2}"/>`;
     }
     svg.innerHTML = edges;
 
@@ -160,7 +160,7 @@
       if (!el) {
         el = document.createElement("div");
         el.className = "flow-node"; el.dataset.id = n.id;
-        el.innerHTML = `<span class="flow-node-label"><i></i><span></span></span><span class="flow-node-detail"></span>`;
+        el.innerHTML = `<b class="fn-ico"></b><span class="fn-label"></span><span class="fn-detail"></span><sup class="fn-no"></sup><span class="fn-st"><em></em><i class="fn-glyph"></i></span>`;
         canvas.appendChild(el);
       }
       els.delete(n.id);
@@ -168,8 +168,11 @@
       el.dataset.state = n.state;
       el.style.transform = `translate(${p.x}px, ${p.y}px)`;
       el.title = [n.label, n.detail].filter(Boolean).join("\n");
-      el.querySelector(".flow-node-label span").textContent = n.label || n.id;
-      el.querySelector(".flow-node-detail").textContent = n.detail || "";
+      el.querySelector(".fn-label").textContent = n.label || n.id;
+      el.querySelector(".fn-detail").textContent = n.detail || "";
+      el.querySelector(".fn-no").textContent = n.id === "root" ? "" : n.order;
+      el.querySelector(".fn-st em").textContent = WORD[n.state] || "";
+      el.querySelector(".fn-glyph").textContent = GLYPH[n.state] || "";
     }
     for (const el of els.values()) el.remove();
     // Keep the newest working node in view.

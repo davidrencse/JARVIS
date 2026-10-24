@@ -111,6 +111,7 @@
   // when the logs reach back that far (they keep a week, so 7D has nothing to compare).
   let usageDays = 1;
   async function loadUsage() {
+    if (!$("#usage-body")) return; // the console's ridge (console.js) shows usage now
     const span = usageDays * 24, ask = Math.min(span * 2, 168);
     try { usage = await J.api("/api/usage?hours=" + ask); } catch (e) {
       $("#usage-body").innerHTML = `<div class="empty"><b>Usage isn't readable right now.</b>${esc(e.message)}</div>`; return;
@@ -153,7 +154,7 @@
     bars();
   }
   function bars() {
-    if (!usage) return;
+    if (!usage || !$("#silk-bars")) return;
     const last = usage.output.slice(-12), max = Math.max(...last, 1);
     const hour = (i) => new Date((usage.start + (usage.hours - 12 + i) * 3600) * 1000).toLocaleTimeString([], { hour: "numeric" });
     $("#silk-bars").innerHTML = `<h3>Claude by hour</h3><div class="bars">${last.map((v, i) =>
@@ -167,6 +168,7 @@
   const until = (iso) => { const s = Math.max(0, (Date.parse(iso) - Date.now()) / 1000);
     return s < 3600 ? Math.max(1, Math.round(s / 60)) + " min" : s < 86400 ? Math.round(s / 3600) + " h" : Math.round(s / 86400) + " d"; };
   function limits() {
+    if (!$("#limit-stats")) return;
     const codex = credits?.find((r) => r.id === "codex");
     const current = (codex?.meters || []).filter((m) => Number.isFinite(m.pct) &&
       (!m.resets_at || Date.parse(m.resets_at) > Date.now()));
@@ -203,6 +205,7 @@
   // Silk for the black panel: soft folds shaded once on a small canvas, then reused as
   // a background image. Drawn, not downloaded, and redrawn only on theme change.
   function silk() {
+    if (!$("#silk")) return;
     const w = 360, h = 180, c = document.createElement("canvas"); c.width = w; c.height = h;
     const g = c.getContext("2d"), img = g.createImageData(w, h);
     const dark = document.documentElement.dataset.theme !== "light";
@@ -289,29 +292,6 @@
     rangePill(); timeline();
   }));
   setInterval(timeline, 60000);
-
-  // ---------- weather: header pill + card (called by app.js) ----------
-  window.JarvisDash = {
-    weather(d, imperial, wx, toggleUnits) {
-      const c = d.current, [label, ic] = wx(c.weather_code, c.is_day), deg = imperial ? "°F" : "°C";
-      $("#wx-pill").innerHTML = `${icon(ic)}<span>${Math.round(c.temperature_2m)}°</span><span class="wx-label">${esc(label)}</span>`;
-      const now = Date.parse(c.time), hours = [];
-      for (let i = 0; i < d.hourly.time.length && hours.length < 24; i++)
-        if (Date.parse(d.hourly.time[i]) >= now - 3600e3) hours.push([d.hourly.time[i], d.hourly.temperature_2m[i], d.hourly.precipitation_probability[i] ?? 0]);
-      const temps = hours.map((x) => x[1]), hi = Math.max(...temps), lo = Math.min(...temps), hiI = temps.indexOf(hi);
-      const labels = [0, 6, 12, 18, 23].filter((i) => hours[i]).map((i) => [i, hours[i][0].slice(11, 16)]);
-      const days = d.daily.time.slice(1, 5).map((t, i) => { const [dl, di] = wx(d.daily.weather_code[i + 1]);
-        return `<div class="c-stat" title="${esc(dl)}"><b>${Math.round(d.daily.temperature_2m_max[i + 1])}°<small> ${Math.round(d.daily.temperature_2m_min[i + 1])}°</small></b><span>${icon(di)} ${new Date(t + "T12:00").toLocaleDateString([], { weekday: "short" })}</span></div>`; }).join("");
-      $("#weather-body").innerHTML = `
-        <div class="c-head"><button class="c-big as-btn" type="button" id="wx-units" title="Switch to ${imperial ? "°C" : "°F"}">${icon(ic, "i wx-ic")}<span>${Math.round(c.temperature_2m)}<small>${deg}</small></span></button>
-          <span class="pill-tag">${esc(label)}</span></div>
-        <p class="c-sub">Feels ${Math.round(c.apparent_temperature)}${deg}, wind ${Math.round(c.wind_speed_10m)} ${imperial ? "mph" : "km/h"}, humidity ${c.relative_humidity_2m}%, sunset ${d.daily.sunset[0].slice(11, 16)}</p>
-        <div class="c-chart">${lineChart({ values: temps, ghost: hours.map((x) => lo + (hi - lo) * x[2] / 100), labels, marker: hiI, unit: "°",
-          ariaLabel: `Temperature over the next 24 hours, high ${Math.round(hi)}${deg}; faint line is rain chance` })}</div>
-        <div class="c-stats">${days}</div>`;
-      $("#wx-units").addEventListener("click", toggleUnits);
-    },
-  };
 
   // ---------- agent runs board (the second tab) ----------
   const COLUMNS = [

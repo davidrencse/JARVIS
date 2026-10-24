@@ -1,101 +1,96 @@
-/* Shared look for the pages that are not the console (Wiki, Markets, Pro terminal, System).
-   Tokens are the console's dark porcelain values (porcelain.css); each page maps its own variables
-   onto them, so colour, type and radius match everywhere. The sidebar is the console's rail.
-   Classes are jv-* so they never meet a page's own .brand/.nav/.shell. Keep in step with porcelain.css. */
-@font-face { font-family: "Urbanist"; src: url("fonts/urbanist.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
+/* Shared look for the pages that are not the console (Knowledge, System, Markets, Pro terminal).
+   Same black skin as the console (console.css): pure black, hairline rules, 2px corners, Geist for
+   text and Geist Mono for labels and numbers. Each page maps its own variables onto these jv-* tokens,
+   so colour, type and radius match everywhere. The sidebar is the console's rail.
+   Classes are jv-* so they never meet a page's own .brand/.nav/.shell. Keep in step with console.css. */
+@font-face { font-family: "Geist"; src: url("fonts/geist.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
 @font-face { font-family: "Geist Mono"; src: url("fonts/geist-mono.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
 
 :root {
-  --jv-bg: #0a0a0a;
-  --jv-card: #121212;
-  --jv-card-2: #181818;
-  --jv-raise: #1f1f1f;
-  --jv-line: rgba(255, 255, 255, .075);
-  --jv-line-2: rgba(255, 255, 255, .13);
-  --jv-ink: #f2f2f2;
+  --jv-bg: #000;
+  --jv-card: #000;
+  --jv-card-2: #000;
+  --jv-raise: #111;
+  --jv-line: rgba(255, 255, 255, .11);
+  --jv-line-2: rgba(255, 255, 255, .22);
+  --jv-ink: #ededed;
   --jv-ink-2: #a8a8a8;
-  --jv-ink-3: #8c8c8c;
-  --jv-faint: #555555;
-  --jv-inv-bg: #f2f2f2;
-  --jv-inv-ink: #0a0a0a;
+  --jv-ink-3: #8a8a8a;
+  --jv-faint: #555;
+  --jv-inv-bg: #ededed;
+  --jv-inv-ink: #000;
   --jv-up: #5fd38d;
   --jv-down: #ff6b6b;
   --jv-warn: #f4c64e;
-  --jv-r: 20px;
-  --jv-r-sm: 12px;
+  --jv-r: 2px;
+  --jv-r-sm: 2px;
   --jv-ease: cubic-bezier(.2, .7, .2, 1);
-  --jv-sans: "Urbanist", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --jv-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
   --jv-mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
 }
 :root[data-theme="light"] {
-  --jv-bg: #e7e7e9;
-  --jv-card: #ffffff;
-  --jv-card-2: #f6f6f7;
-  --jv-raise: #ededef;
-  --jv-line: rgba(12, 12, 14, .08);
-  --jv-line-2: rgba(12, 12, 14, .14);
-  --jv-ink: #0c0c0e;
-  --jv-ink-2: #47474e;
-  --jv-ink-3: #66666e;
-  --jv-faint: #a0a0a6;
-  --jv-inv-bg: #0c0c0e;
-  --jv-inv-ink: #ffffff;
+  --jv-bg: #fff;
+  --jv-card: #fff;
+  --jv-card-2: #fff;
+  --jv-raise: #f2f2f2;
+  --jv-line: rgba(0, 0, 0, .1);
+  --jv-line-2: rgba(0, 0, 0, .2);
+  --jv-ink: #0a0a0a;
+  --jv-ink-2: #4a4a4a;
+  --jv-ink-3: #6b6b6b;
+  --jv-faint: #a0a0a0;
+  --jv-inv-bg: #0a0a0a;
+  --jv-inv-ink: #fff;
   --jv-up: #2f7a45;
   --jv-down: #c0392f;
   --jv-warn: #9a6400;
 }
+html, body { background: var(--jv-bg); }
 
 /* the page title on every page reads like the console's */
-.jv-title { font: 600 26px/1.1 var(--jv-sans) !important; letter-spacing: -.015em !important; text-transform: none; color: var(--jv-ink); }
+.jv-title { font: 500 22px/1.1 var(--jv-sans) !important; letter-spacing: -.01em !important; text-transform: none; color: var(--jv-ink); }
 
-.jv-shell { display: grid; grid-template-columns: 216px minmax(0, 1fr); gap: 0 18px; padding-left: 20px; min-height: 100vh; min-height: 100dvh; }
+.jv-shell { display: grid; grid-template-columns: 196px minmax(0, 1fr); gap: 0 28px; min-height: 100vh; min-height: 100dvh; }
 .jv-main { min-width: 0; }
 .jv-side {
-  --s-ink: #f2f2f2; --s-ink-2: #a8a8a8; --s-ink-3: #8c8c8c; --s-line: rgba(255, 255, 255, .075);
-  --s-card: #121212; --s-hover: rgba(255, 255, 255, .05); --s-inv-bg: #f2f2f2; --s-inv-ink: #0a0a0a;
-  --s-avatar: radial-gradient(circle at 30% 25%, #ffffff, #c9c9cf 70%);
-  --s-sans: "Urbanist", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-  position: sticky; top: 18px; z-index: 20; height: calc(100vh - 36px); height: calc(100dvh - 36px); margin: 18px 0;
-  display: flex; flex-direction: column; gap: 26px; padding: 22px 14px 18px; box-sizing: border-box;
-  background: var(--s-card); border: 1px solid var(--s-line); border-radius: 28px; color: var(--s-ink);
-  font: 400 15px/1.4 var(--s-sans); letter-spacing: 0; text-transform: none; min-height: 0; overflow: auto;
-}
-:root[data-theme="light"] .jv-side {
-  --s-ink: #0c0c0e; --s-ink-2: #47474e; --s-ink-3: #66666e; --s-line: rgba(12, 12, 14, .08);
-  --s-card: rgba(255, 255, 255, .86); --s-hover: rgba(12, 12, 14, .05); --s-inv-bg: #0c0c0e; --s-inv-ink: #ffffff;
-  --s-avatar: radial-gradient(circle at 30% 25%, #5a5a63, #0c0c0e 70%);
-  box-shadow: 0 1px 0 rgba(255, 255, 255, .9) inset, 0 24px 48px -28px rgba(20, 20, 30, .28);
+  position: sticky; top: 0; z-index: 20; height: 100vh; height: 100dvh; margin: 0;
+  display: flex; flex-direction: column; gap: 28px; padding: 22px 14px 18px 20px; box-sizing: border-box;
+  background: var(--jv-bg); border-right: 1px solid var(--jv-line); color: var(--jv-ink);
+  font: 400 14px/1.4 var(--jv-sans); letter-spacing: 0; text-transform: none; min-height: 0; overflow: auto;
 }
 .jv-side a { color: inherit; text-decoration: none; }
-.jv-brand { display: flex; align-items: center; gap: 10px; padding: 0 8px; }
-.jv-mark { width: 26px; height: 26px; flex: none; fill: var(--s-ink); }
-.jv-word { font: 700 18px/1 var(--s-sans); letter-spacing: .01em; }
-.jv-rail { position: relative; display: flex; flex-direction: column; gap: 4px; }
-.jv-rail a { position: relative; display: flex; align-items: center; gap: 12px; width: 100%; height: 46px; padding: 0 16px; box-sizing: border-box;
-  border-radius: 999px; color: var(--s-ink-2); font: 600 15px var(--s-sans); transition: color 200ms, background-color 200ms; }
-.jv-i { display: block; width: 19px; height: 19px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
-.jv-rail a:hover { background: var(--s-hover); color: var(--s-ink); }
-.jv-rail a[aria-current="page"] { color: var(--s-inv-ink); background: var(--s-inv-bg); box-shadow: 0 10px 20px -12px rgba(0, 0, 0, .55); }
-.jv-rail a:focus-visible { outline: 2px solid var(--s-ink-3); outline-offset: 2px; }
-.jv-profile { margin-top: auto; display: grid; justify-items: center; gap: 6px; text-align: center; padding-top: 18px; border-top: 1px solid var(--s-line); }
-.jv-avatar { width: 54px; height: 54px; border-radius: 50%; display: grid; place-items: center; font: 650 22px var(--s-sans);
-  color: var(--s-inv-ink); background: var(--s-avatar); box-shadow: 0 8px 18px -8px rgba(0, 0, 0, .5); }
-.jv-name { font: 650 15px var(--s-sans); }
-.jv-sub { font: 500 12.5px var(--s-sans); color: var(--s-ink-3); }
+.jv-brand { display: flex; align-items: center; gap: 10px; padding: 0 10px; }
+.jv-mark { width: 18px; height: 18px; flex: none; fill: var(--jv-ink); }
+.jv-word { font: 500 13px/1 var(--jv-mono); letter-spacing: .2em; }
+.jv-rail { position: relative; display: flex; flex-direction: column; gap: 0; }
+.jv-rail a { position: relative; display: flex; align-items: center; gap: 12px; width: 100%; height: 34px; padding: 0 10px; box-sizing: border-box;
+  border-left: 1px solid transparent; color: var(--jv-ink-2); font: 400 13px var(--jv-sans); transition: color 150ms; }
+.jv-i { display: block; width: 15px; height: 15px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.jv-rail a:hover { color: var(--jv-ink); }
+.jv-rail a[aria-current="page"] { color: var(--jv-ink); border-left-color: var(--jv-ink); }
+.jv-rail a:focus-visible { outline: 1px solid var(--jv-ink); outline-offset: 2px; }
+.jv-profile { margin-top: auto; display: grid; grid-template-columns: 28px 1fr; column-gap: 10px; align-items: center; padding-top: 14px; border-top: 1px solid var(--jv-line); }
+.jv-avatar { width: 28px; height: 28px; grid-row: 1 / 3; border-radius: 50%; display: grid; place-items: center; font: 500 12px var(--jv-mono);
+  color: var(--jv-ink); border: 1px solid var(--jv-line-2); }
+.jv-name { font: 500 13px var(--jv-sans); }
+.jv-sub { font: 400 11.5px var(--jv-mono); color: var(--jv-ink-3); }
 
 @media (max-width: 1180px) {
-  .jv-shell { grid-template-columns: 84px minmax(0, 1fr); }
-  .jv-side { padding: 18px 10px; align-items: center; }
+  .jv-shell { grid-template-columns: 64px minmax(0, 1fr); gap: 0 20px; }
+  .jv-side { padding: 20px 0; align-items: center; }
   .jv-word, .jv-rail a span, .jv-name, .jv-sub { display: none; }
-  .jv-rail a { justify-content: center; padding: 0; width: 52px; }
-  .jv-avatar { width: 44px; height: 44px; font-size: 18px; }
+  .jv-rail a { justify-content: center; padding: 0; width: 40px; height: 40px; border-left: 0; border-radius: 2px; }
+  .jv-rail a[aria-current="page"] { background: var(--jv-inv-bg); color: var(--jv-inv-ink); }
+  .jv-profile { grid-template-columns: 30px; }
+  .jv-avatar { width: 30px; height: 30px; }
 }
 @media (max-width: 640px) {
   .jv-shell { grid-template-columns: minmax(0, 1fr); padding: 0 0 78px; }
   .jv-side { position: fixed; left: 10px; right: 10px; bottom: 10px; top: auto; height: auto; margin: 0; flex-direction: row;
-    padding: 6px; gap: 0; border-radius: 26px; overflow: visible; }
+    padding: 6px; gap: 0; border: 1px solid var(--jv-line-2); border-radius: 2px; overflow: visible; }
   .jv-brand, .jv-profile { display: none; }
   .jv-rail { flex-direction: row; justify-content: space-around; width: 100%; }
-  .jv-rail a { width: 44px; height: 44px; justify-content: center; padding: 0; }
+  .jv-rail a { width: 44px; height: 44px; justify-content: center; padding: 0; border-left: 0; border-radius: 2px; }
+  .jv-rail a[aria-current="page"] { background: var(--jv-inv-bg); color: var(--jv-inv-ink); }
 }
 @media (prefers-reduced-motion: reduce) { .jv-rail a { transition: none; } }

@@ -185,7 +185,6 @@ body { font: 450 15px/1.45 var(--sans); letter-spacing: 0; }
 .c-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .c-big { display: inline-flex; align-items: baseline; gap: 6px; font: 350 48px/1 var(--sans); letter-spacing: -.03em; color: var(--ink); font-variant-numeric: tabular-nums; }
 .c-big.as-btn { cursor: pointer; }
-.c-big .wx-ic { width: 26px; height: 26px; align-self: center; stroke-width: 1.4; margin-right: 4px; }
 .pill-tag { display: inline-flex; align-items: center; gap: 6px; height: 32px; padding: 0 14px; border-radius: 999px; border: 1px solid var(--line-2); font: 550 13px var(--sans); color: var(--ink); white-space: nowrap; }
 .c-sub { margin: 10px 0 6px; font: 500 13.5px var(--sans); color: var(--ink-2); max-width: 60ch; }
 .line-chart { width: 100%; height: auto; display: block; overflow: visible; }
@@ -372,8 +371,6 @@ body { font: 450 15px/1.45 var(--sans); letter-spacing: 0; }
   .rail-pill, .tabs-pill, .drawer { transition: none; }
 }
 
-/* the weather card reuses #weather-body; drop the old two-column grid */
-#weather-body.weather-body { display: block; }
 
 /* credits rows stack their meters when the card is narrow */
 .credit-rows { container-type: inline-size; }
