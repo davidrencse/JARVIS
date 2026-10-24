@@ -42,6 +42,7 @@ function harness({ failMic = false } = {}) {
       state.calls.push([p, body]);
       if (p === "/api/agent/session") return { signed_url: "wss://api.elevenlabs.io/v1/convai/conversation?token=t", voice_id: "uk1" };
       if (p === "/api/agent/ask") return { reply: "Your next class is at ten." };
+      if (p === "/api/agent/voice") return { current: "f1", name: "Lily - Velvety Actress", speed: body.speed };
       throw new Error("unexpected " + p);
     },
     onState: (s) => state.states.push(s), onTool: (r, phase) => state.tools.push([r, phase]),
@@ -129,6 +130,44 @@ const scenarios = {
     await tick();
     assert.equal(ok.state.tracks[0].stopped, 1);
     assert.equal(ok.agent.live, false);
+  },
+
+  async change_voice() {
+    const env = harness(), { state, agent } = env;
+    let voiced;
+    agent.h.onVoice = (r) => (voiced = r);
+    const ws = await connect(env);
+    ws.server({ type: "user_transcript", user_transcription_event: { user_transcript: "use Lily, a bit faster" } });
+    ws.server({ type: "client_tool_call", client_tool_call: { tool_name: "change_voice", tool_call_id: "v1",
+      parameters: { voice: "Lily", speed: 1.1 } } });
+    await tick(); await tick();
+    assert.equal(JSON.stringify(state.calls.find((c) => c[0] === "/api/agent/voice")),
+      JSON.stringify(["/api/agent/voice", { voice: "Lily", speed: 1.1 }]));
+    assert.equal(voiced.current, "f1");
+    assert.equal(ws.sent.find((m) => m.tool_call_id === "v1").is_error, false);
+    assert.equal(ws.closed, 1000);
+    await tick(); await tick();
+    // a fresh conversation in the same call: mic and audio context are kept
+    const fresh = state.sockets[1];
+    assert.ok(fresh, "must reconnect");
+    assert.equal(fresh.sent[0].conversation_config_override.agent.first_message, "How's this?");
+    fresh.server({ type: "conversation_initiation_metadata", conversation_initiation_metadata_event: {
+      conversation_id: "c2", user_input_audio_format: "pcm_16000", agent_output_audio_format: "pcm_16000" } });
+    await tick(); await tick();
+    const update = fresh.sent.find((m) => m.type === "contextual_update");
+    assert.match(update.text, /David: use Lily, a bit faster/);
+    assert.equal(agent.state, "listening");
+    assert.equal(state.tracks[0].stopped, 0);
+    assert.equal(state.contexts.length, 1);
+    // the old socket closing late must not end the call
+    ws.onclose?.({ code: 1000 });
+    assert.equal(agent.live, true);
+    // nothing to change is an error back to the agent, no reconnect
+    fresh.server({ type: "client_tool_call", client_tool_call: { tool_name: "change_voice", tool_call_id: "v2", parameters: {} } });
+    await tick();
+    assert.equal(fresh.sent.at(-1).is_error, true);
+    assert.equal(state.sockets.length, 2);
+    await agent.stop();
   },
 };
 

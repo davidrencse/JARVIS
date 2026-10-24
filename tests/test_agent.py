@@ -11,7 +11,7 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-from jarvis.agent import TOOL, Agent
+from jarvis.agent import TOOL, VOICE_TOOL, Agent
 
 NODE = shutil.which("node")
 SCRIPT = Path(__file__).with_name("web_agent_test.cjs")
@@ -76,6 +76,50 @@ class AgentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 agent.set_voice(bad)
 
+    def voices(self, agent):
+        listing = reply({"voices": [
+            {"voice_id": "uk1", "name": "Daniel - Steady Broadcaster",
+             "labels": {"gender": "male", "accent": "british"}},
+            {"voice_id": "f1", "name": "Lily - Velvety Actress",
+             "labels": {"gender": "female", "accent": "british"}},
+            {"voice_id": "us1", "name": "Brian - Deep, Resonant",
+             "labels": {"gender": "male", "accent": "american"}}]})
+        with patch("jarvis.speech.urllib.request.urlopen", return_value=listing):
+            agent.voices()
+
+    def test_voice_by_name_or_description_with_tuning(self):
+        agent = Agent(self.state)
+        self.voices(agent)
+        self.assertEqual(agent.set_voice(voice="lily")["current"], "f1")
+        self.assertEqual(agent.find_voice("a british female")["voice_id"], "f1")
+        self.assertEqual(agent.find_voice("deep male voice")["voice_id"], "us1")
+        with self.assertRaisesRegex(ValueError, "Try one of"):
+            agent.find_voice("robot")
+        # tuning alone keeps the voice; values are clamped to ElevenLabs' ranges
+        result = agent.set_voice(speed=5, stability=0.3)
+        self.assertEqual((result["current"], result["speed"], result["stability"]), ("f1", 1.2, 0.3))
+        with self.assertRaises(ValueError):
+            agent.set_voice(speed="fast")
+        agent = Agent(self.state, {"voice": {"agent_id": "agent_123"}})
+        signed = "wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_123&token=t"
+        with patch("jarvis.agent.urllib.request.urlopen",
+                   return_value=reply({"signed_url": signed})):
+            session = agent.session()
+        self.assertEqual((session["voice_id"], session["speed"], session["stability"]),
+                         ("f1", 1.2, 0.3))
+
+    def test_sync_updates_tools_and_overrides(self):
+        agent = Agent(self.state, {"voice": {"agent_id": "agent_123"}})
+        with patch("jarvis.agent.urllib.request.urlopen", return_value=reply({})) as net:
+            self.assertTrue(agent.sync()["synced"])
+        request = net.call_args.args[0]
+        self.assertEqual((request.method, request.full_url.rsplit("/", 1)[-1]), ("PATCH", "agent_123"))
+        body = json.loads(request.data)
+        names = [t["name"] for t in body["conversation_config"]["agent"]["prompt"]["tools"]]
+        self.assertEqual(names, [TOOL, VOICE_TOOL])
+        override = body["platform_settings"]["overrides"]["conversation_config_override"]
+        self.assertTrue(override["tts"]["speed"] and override["agent"]["first_message"])
+
     def test_create_registers_tool_and_voice_override(self):
         agent = Agent(self.state)
         agent.set_voice("uk1")
@@ -132,6 +176,9 @@ class BrowserAgentTests(unittest.TestCase):
 
     def test_failed_start_releases_microphone(self):
         self.check_scenario("start_failure")
+
+    def test_change_voice_reconnects_with_context(self):
+        self.check_scenario("change_voice")
 
 
 if __name__ == "__main__":
