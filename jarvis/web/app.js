@@ -719,8 +719,52 @@
         <ul class="drop-log mono" id="drop-log" aria-live="polite"></ul></article>` +
       `<article class="panel ticks"><header class="ph">${icon("activity")}<h2>Personal agents</h2></header>
         <dl class="facts mono">${Object.entries(o.agents).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(words(v.integration))} · ${esc(linkState(v.status)[0])}</dd>`).join("")}</dl>
-        <p class="muted" style="font-size:12.5px;margin-top:12px">Muse, Grokbot and Jev get a JARVIS adapter once their interface (CLI, local API or extension) is known.</p></article>`;
-    wireDropzone();
+        <p class="muted" style="font-size:12.5px;margin-top:12px">Grokbot is driven through its window (below). Muse and Jev get a JARVIS adapter once their interface is known.</p></article>` +
+      `<article class="panel ticks"><header class="ph">${icon("radio")}<h2>Command Grokbot &amp; JARVIS</h2><span class="ph-meta mono" id="gb-state">checking…</span></header>
+        <form class="gb-form" id="gb-form" autocomplete="off">
+          <select class="field" id="gb-mode" aria-label="Who does it">
+            <option value="grokbot">Grokbot: do it</option><option value="grokbot-browser">Grokbot: in its browser</option>
+            <option value="jarvis-browser">JARVIS: in its browser</option><option value="browser">Open JARVIS browser at…</option>
+            <option value="terminal">Open terminal, run…</option></select>
+          <select class="field" id="gb-device" aria-label="Which laptop's Grokbot"></select>
+          <textarea class="field" id="gb-text" rows="2" placeholder="What to do (Ctrl+Enter sends). /terminal htop · /browser github.com · /jarvis … · /grok …"></textarea>
+          <button class="btn" type="submit">Send</button></form>
+        <ul class="drop-log mono" id="gb-log" aria-live="polite"></ul>
+        <p class="muted" style="font-size:12px;margin-top:12px">Grokbot has no API: JARVIS focuses its window, pastes and presses Enter, then hands focus and clipboard back. The other laptop's Grokbot is typed to over SSH. Terminal and browser open on this laptop.</p></article>`;
+    wireDropzone(); wireGrokbot();
+  }
+
+  // ---------- Grokbot, terminal and browser commands ----------
+  async function wireGrokbot() {
+    const form = $("#gb-form"); if (!form) return;
+    const text = $("#gb-text"), mode = $("#gb-mode"), dev = $("#gb-device"), log = $("#gb-log"), st = $("#gb-state");
+    // Terminal and browser always open here; only Grokbot prompts can go to the other laptop.
+    const sync = () => { dev.disabled = !mode.value.startsWith("grokbot"); };
+    mode.addEventListener("change", sync);
+    mode.value = store.get("jarvis.gbmode", "grokbot");
+    mode.addEventListener("change", () => store.set("jarvis.gbmode", mode.value));
+    dev.addEventListener("change", () => store.set("jarvis.gbdevice", dev.value));
+    const line = (msg, cls) => { const li = document.createElement("li"); li.className = cls || ""; li.textContent = msg; log.prepend(li); return li; };
+    api("/api/grokbot").then((g) => {
+      st.textContent = !g.installed ? "not installed" : [g.window ? "window open" : "not running", g.daemon ? "daemon up" : "daemon down", g.can_send ? null : "can't type here"].filter(Boolean).join(" · ");
+      st.title = g.why_not || `terminal: ${g.terminal || "none"} · browser: ${g.browser || "none"} · computer use ${g.computer_use ? "on" : "off"}`;
+      dev.innerHTML = (g.devices || []).map((d) => `<option value="${esc(d.id)}" ${d.ok ? "" : "disabled"} title="${esc(d.why_not || "")}">Grokbot on ${esc(d.id)}${d.here ? " (this laptop)" : d.ok ? "" : " — no route"}</option>`).join("");
+      dev.value = (g.devices || []).find((d) => d.id === store.get("jarvis.gbdevice", ""))?.ok ? store.get("jarvis.gbdevice", "") : (g.here || "");
+      sync();
+    }).catch((e) => { st.textContent = e.message; });
+    text.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); form.requestSubmit(); } });
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const li = line(`${mode.selectedOptions[0].text} ${text.value.trim()}`.trim() + " …", "pending");
+      try {
+        const r = await api("/api/grokbot", { text: text.value, mode: mode.value, device: dev.value || undefined });
+        li.textContent = r.mode === "terminal" ? `Terminal (${r.terminal})${r.command ? ": " + r.command : ""}`
+          : r.mode === "browser" ? `JARVIS browser${r.url ? ": " + r.url : ""}`
+          : r.mode === "jarvis-browser" ? `JARVIS is on it (reply in the console)`
+          : `Typed to Grokbot on ${r.device}${r.workspace ? " (workspace " + r.workspace + ")" : ""}`;
+        li.className = "ok"; announce(li.textContent); text.value = "";
+      } catch (err) { li.textContent = err.message; li.className = "bad"; }
+    });
   }
 
   // Files go over the existing SSH link: a drag can't cross between Windows and Wayland.
