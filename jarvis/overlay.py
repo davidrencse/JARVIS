@@ -319,6 +319,8 @@ def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=Fal
     if hasattr(console, "start_live"):
         console = console.start_live()
     console.overlay = overlay
+    from .grokbot import autostart_tunnel
+    autostart_tunnel(config, state)  # lets the other laptop reach this one
     handler = type("OverlayHandler", (Handler,), {
         "console": console, "hosts": ("127.0.0.1", "localhost", "::1")})
     server = ConsoleServer(("127.0.0.1", port), handler)

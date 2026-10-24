@@ -1214,6 +1214,8 @@ def serve(config, base, state, port=7777, open_browser=False, app=False):
         app_window(url)
         return 0
     console = Console(config, base, state).start_live()
+    from .grokbot import autostart_tunnel
+    autostart_tunnel(config, state)  # Windows: lets the other laptop reach this one
     handler = type("BoundHandler", (Handler,), {
         "console": console, "hosts": ("127.0.0.1", "localhost", "::1")})
     server = ConsoleServer(("127.0.0.1", port), handler)

@@ -82,10 +82,22 @@ def is_action(text):
 class DesktopTools:
     """Codex dynamic tools: specs() for thread/start, call() when ChatGPT uses one."""
 
-    def __init__(self, cache_seconds=600):
+    def __init__(self, cache_seconds=600, remote=None):
+        """remote: a remote.Remote, which adds a `device` argument for the other laptop."""
         self._apps, self._loaded, self.cache_seconds = [], 0.0, cache_seconds
+        self.remote = remote
 
     def specs(self):
+        specs = self._specs()
+        if self.remote and len(self.remote.names()) > 1:
+            names = self.remote.names()
+            for spec in specs:
+                spec["description"] += (f" Optional device: which laptop ({', '.join(names)}); "
+                                        f"leave it out for this one ({self.remote.here() or 'here'}).")
+                spec["inputSchema"]["properties"]["device"] = {"type": "string", "enum": names}
+        return specs
+
+    def _specs(self):
         return [
             {"type": "function", "name": "open_app",
              "description": "Open an installed application by name, e.g. "
@@ -105,6 +117,10 @@ class DesktopTools:
 
     def call(self, name, args):
         """Returns (success, text) — text goes back to ChatGPT."""
+        device = args.get("device")
+        if device and self.remote:
+            arg = args.get("name") or args.get("query") or args.get("url") or ""
+            return self.remote.call(str(device), name, str(arg))
         try:
             if name == "open_app":
                 return self.open_app(str(args.get("name", "")))

@@ -143,17 +143,28 @@ try {
 [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
 [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
 '@
   $p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and
         ($_.ProcessName -like 'grok*bot*' -or $_.MainWindowTitle -eq 'Grok Bot') } | Select-Object -First 1
   if (-not $p) { throw 'Grok Bot is not open on this laptop.' }
   $h = $p.MainWindowHandle; $prev = [JarvisGrok.W]::GetForegroundWindow()
   if ([JarvisGrok.W]::IsIconic($h)) { [JarvisGrok.W]::ShowWindow($h, 9) | Out-Null }
+  # Windows may refuse the foreground; an Alt tap usually unlocks it. Never paste unless
+  # Grok Bot really is in front: the keys would land in whatever window is.
+  $shell = New-Object -ComObject WScript.Shell
+  for ($i = 0; $i -lt 5 -and [JarvisGrok.W]::GetForegroundWindow() -ne $h; $i++) {
+    $shell.SendKeys('%')
+    [JarvisGrok.W]::BringWindowToTop($h) | Out-Null
+    [JarvisGrok.W]::SetForegroundWindow($h) | Out-Null
+    Start-Sleep -Milliseconds 250
+  }
+  if ([JarvisGrok.W]::GetForegroundWindow() -ne $h) {
+    throw "Couldn't bring Grok Bot to the front, so nothing was typed."
+  }
   $old = $null; try { $old = Get-Clipboard -Raw } catch {}
   Set-Clipboard -Value ([IO.File]::ReadAllText($PromptFile))
-  (New-Object -ComObject WScript.Shell).SendKeys('%')  # an Alt tap lets us take the foreground
-  [JarvisGrok.W]::SetForegroundWindow($h) | Out-Null
-  Start-Sleep -Milliseconds 400
+  Start-Sleep -Milliseconds 150
   [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 150
   [System.Windows.Forms.SendKeys]::SendWait('{ENTER}'); Start-Sleep -Milliseconds 300
   if ($prev -ne [IntPtr]::Zero -and $prev -ne $h) { [JarvisGrok.W]::SetForegroundWindow($prev) | Out-Null }
@@ -452,22 +463,33 @@ class Grokbot:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         print(f"Relay for {here}'s Grokbot on 127.0.0.1:{relay_port}; forwarding to "
               f"{to} 127.0.0.1:{remote_port}. Ctrl+C stops.", flush=True)
+        targets = [ssh["target"], *ssh.get("fallback_targets", [])]
+        target = targets[0]
         try:
             while True:
-                # Fresh token file each connect, so a restarted end always matches.
-                put = subprocess.run(
-                    [*base, ssh["target"], f"umask 077; mkdir -p .config/jarvis && cat > {note}"],
-                    input=json.dumps({"port": remote_port, "token": token, "from": here}).encode(),
-                    capture_output=True, timeout=20, creationflags=flags)
-                if put.returncode:
-                    print(f"Couldn't reach {to}: {put.stderr.decode('utf-8', 'replace').strip()[-200:]}",
-                          flush=True)
+                # Fresh token file each connect, so a restarted end always matches. The
+                # other laptop's address moves (Wi-Fi, Tailscale): take the first that answers.
+                put = None
+                for target in targets:
+                    try:
+                        put = subprocess.run(
+                            [*base, target, f"umask 077; mkdir -p .config/jarvis && cat > {note}"],
+                            input=json.dumps({"port": remote_port, "token": token,
+                                              "from": here}).encode(),
+                            capture_output=True, timeout=20, creationflags=flags)
+                    except subprocess.TimeoutExpired:
+                        continue
+                    if put.returncode != 255:  # 255: ssh itself couldn't connect
+                        break
+                if put is None or put.returncode:
+                    why = put.stderr.decode("utf-8", "replace").strip()[-200:] if put else "timed out"
+                    print(f"Couldn't reach {to}: {why}", flush=True)
                 else:
                     print(f"Connected to {to}.", flush=True)
                     subprocess.run([*base, "-N", "-o", "ExitOnForwardFailure=yes",
                                     "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
                                     "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{relay_port}",
-                                    ssh["target"]], creationflags=flags)
+                                    target], creationflags=flags)
                     print(f"Tunnel to {to} closed.", flush=True)
                 if once:
                     return
@@ -476,8 +498,11 @@ class Grokbot:
             pass
         finally:
             relay.shutdown()
-            subprocess.run([*base, ssh["target"], f"rm -f {note}"], capture_output=True,
-                           timeout=10, creationflags=flags)
+            try:
+                subprocess.run([*base, target, f"rm -f {note}"], capture_output=True,
+                               timeout=10, creationflags=flags)
+            except subprocess.SubprocessError:
+                pass
 
     def _windows(self, prompt):
         with tempfile.TemporaryDirectory(prefix="jarvis-grokbot-") as tmp:
@@ -564,6 +589,27 @@ class Grokbot:
         if mode == "jarvis-browser":
             return {"mode": mode, "ask": f"Use the browser to do this: {arg}"}
         return {"mode": mode, **self.send(arg, browser=mode == "grokbot-browser", device=device)}
+
+
+def autostart_tunnel(config, state_dir):
+    """On Windows, keep the reverse tunnel up from the console, so the other laptop can
+    reach this one's Grokbot and desktop without anyone running `grokbot tunnel` by hand.
+    Quietly does nothing elsewhere, when there's no SSH device, or when a tunnel already
+    holds the relay port. Off with personal_agents.grokbot.tunnel_autostart: false."""
+    bot = Grokbot(config, state_dir)
+    if not WINDOWS or bot.config.get("tunnel_autostart") is False or not bot.here() or \
+            not any(d.get("transport") == "ssh" for d in bot.machines.values()):
+        return None
+
+    def run():
+        try:
+            bot.tunnel()
+        except Exception as exc:  # e.g. a hand-started tunnel owns the port
+            print(f"Grokbot tunnel not started: {exc}", flush=True)
+
+    thread = threading.Thread(target=run, daemon=True, name="grokbot-tunnel")
+    thread.start()
+    return thread
 
 
 class GrokTools:
@@ -660,13 +706,17 @@ def relay_server(bot, token, port=RELAY_PORT):
 
         def do_POST(self):
             given = self.headers.get("X-JARVIS-Token") or ""
-            if self.path != "/send" or not secrets.compare_digest(given, token):
+            if self.path not in ("/send", "/desktop") or not secrets.compare_digest(given, token):
                 return self._reply(HTTPStatus.FORBIDDEN, {"error": "Refused."})
             try:
                 length = int(self.headers.get("Content-Length") or 0)
                 if not 0 < length <= MAX_PROMPT * 4 + 64:
                     raise ValueError("Bad length.")
                 body = _loads(self.rfile.read(length))
+                if self.path == "/desktop":  # open an app or link on this laptop
+                    from .remote import run_here
+                    ok, text = run_here(str(body.get("action", "")), str(body.get("arg", "")))
+                    return self._reply(HTTPStatus.OK, {"ok": ok, "text": text})
                 result = bot.send(str(body.get("prompt", "")))
                 self._reply(HTTPStatus.OK, result)
             except (ValueError, LookupError, RuntimeError, OSError,

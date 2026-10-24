@@ -71,6 +71,11 @@ def main():
     lm.add_argument("--position", help="config: side of this screen the peer sits on")
     lm.add_argument("--capture-backend", help="config: e.g. layer-shell on Hyprland")
     lm.add_argument("--output", help="config: write here instead of printing")
+    dk = sub.add_parser("desktop", help="Open an app or link here (the other laptop calls this)")
+    dk.add_argument("action", choices=("open_app", "open_url", "list_apps"))
+    dk.add_argument("value", nargs="?", default="")
+    dk.add_argument("--b64", default=None, help="the value, base64 (how SSH callers pass it)")
+    dk.add_argument("--device", default=None, help="run it on this configured laptop instead")
     gb = sub.add_parser("grokbot", help="Grokbot, a terminal or the JARVIS browser (Devices view)")
     gb.add_argument("action", choices=("status", "send", "browser-task", "task", "terminal",
                                        "browser", "tunnel"))
@@ -283,6 +288,13 @@ def main():
                     emit({"written": str(out)})
                 else:
                     print(text, end="")
+        elif args.command == "desktop":
+            import base64 as b64
+            from .remote import Remote
+            value = b64.b64decode(args.b64).decode("utf-8") if args.b64 else args.value
+            ok, text = Remote(config, args.state).call(args.device, args.action, value)
+            print(json.dumps({"ok": ok, "text": text}))
+            return 0 if ok else 1
         elif args.command == "grokbot":
             from .grokbot import Grokbot
             bot = Grokbot(config, args.state)

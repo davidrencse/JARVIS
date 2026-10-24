@@ -430,7 +430,8 @@ def make_lane(config, base, state_dir=None):
     if actions:
         from .actions import (BROWSER_ENGINES, INSTRUCTIONS as ACT, DesktopTools,
                               approve_browser, browser_mcp)
-        tools.append(DesktopTools())
+        from .remote import Remote
+        tools.append(DesktopTools(remote=Remote(config, state)))
         instructions.append(ACT)
         browser = config.get("actions", {})
         extra = {"approve": approve_browser,
