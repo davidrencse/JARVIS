@@ -406,16 +406,41 @@ def _log_line(path):
     return log
 
 
-def connect(device, board, log):
+def _pinned_host(device, state):
+    """ssh options that check the peer against its pinned host key, whatever its address.
+
+    The peer's IP changes with DHCP and networks; keying known_hosts by a fixed alias
+    keeps StrictHostKeyChecking on without a fresh "unknown host" after every move."""
+    key = device.get("host_key")
+    if not key or not state:
+        return []
+    alias = "jarvis-" + device.get("hostname", "peer")
+    path = os.path.join(state, "known_hosts")
+    with open(path, "w", encoding="utf-8") as out:
+        out.write(f"{alias} {key.strip()}\n")
+    return ["-o", f"HostKeyAlias={alias}", "-o", f"UserKnownHostsFile={path}"]
+
+
+def _targets(device):
+    """The configured target first, then any fallbacks (another network, Tailscale)."""
+    seen = []
+    for target in [device.get("target"), *device.get("fallback_targets", [])]:
+        if target and target not in seen:
+            seen.append(target)
+    return seen
+
+
+def connect(device, board, log, target=None, state=None):
     """One SSH session to the peer; returns when it drops."""
     from .transfer import _check_target, _ssh_args
-    _check_target(device.get("target"))
+    target = target or device.get("target")
+    _check_target(target)
     ssh = shutil.which("ssh")
     if not ssh:
         raise RuntimeError("The OpenSSH client isn't installed.")
-    args = [*_ssh_args(ssh, device.get("identity_file")), "-T",
+    args = [*_ssh_args(ssh, device.get("identity_file")), *_pinned_host(device, state), "-T",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
-            device["target"], BOOTSTRAP]
+            target, BOOTSTRAP]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, creationflags=flags)
@@ -432,7 +457,7 @@ def connect(device, board, log):
         if not status.get("ready"):
             raise RuntimeError("The other laptop can't share its clipboard: "
                                + str(status.get("error")))
-        log(f"linked with {device['target']}")
+        log(f"linked with {target}")
         Sync(board, proc.stdout, proc.stdin, log).run()
     finally:
         proc.kill()
@@ -446,15 +471,19 @@ def run(config, state, device_name=None):
     os.makedirs(os.path.join(state, "logs"), exist_ok=True)
     log = _log_line(os.path.join(state, "logs", "clipboard.log"))
     device, board, wait = ssh_device(config, device_name), local_clipboard(), 2
+    targets, turn = _targets(device), 0
     with open(os.path.join(state, "clipboard.pid"), "w") as pid:
         pid.write(str(os.getpid()))
     while True:
-        started = time.time()
+        started, target = time.time(), targets[turn % len(targets)]
         try:
-            connect(device, board, log)
+            connect(device, board, log, target, state)
             log("link dropped")
         except Exception as exc:
-            log(f"not linked: {exc}")
+            log(f"not linked via {target}: {exc}")
+            turn += 1
+        if turn % len(targets) and time.time() - started < 60:
+            continue  # try the next address straight away
         wait = 2 if time.time() - started > 60 else min(wait * 2, 60)
         time.sleep(wait)
 
