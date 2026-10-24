@@ -165,6 +165,17 @@ class SendTests(unittest.TestCase):
         self.assertEqual(seen["prompt"], "hello dell")
         self.assertEqual(out["device"], "dell")
 
+    def test_windows_send_timeout_is_a_request_timeout(self):
+        route = {"local": True, "os": "windows", "device": "dell"}
+        with patch.object(self.bot, "route", return_value=route), \
+                patch.object(self.bot, "can_type", return_value=(True, "")), \
+                patch.object(self.bot, "_windows", side_effect=grokbot.subprocess.TimeoutExpired(
+                    "powershell.exe", 0.1)) as send:
+            with self.assertRaisesRegex(TimeoutError, "timed out while sending"):
+                self.bot.send("hello", timeout=0.1)
+        self.assertLessEqual(send.call_args.args[1], 0.1)
+        send.assert_called_once()
+
     def test_background_keys_carry_only_key_names(self):
         mapper = re.search(r"python3 -c '\n(.*?)\n' \"\$A\"\)", grokbot.LINUX_SCRIPT, re.S)
 
@@ -304,7 +315,7 @@ class HandoffTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.bot = Grokbot({}, self.tmp.name)
         self.sent = []
-        self.bot.send = lambda prompt, browser=False, device=None: (
+        self.bot.send = lambda prompt, browser=False, device=None, timeout=30: (
             self.sent.append(prompt) or {"sent": prompt, "device": "zenbook"})
 
     def answer(self, prompt, text):
@@ -352,27 +363,61 @@ class HandoffTests(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "handoff g[0-9a-f]{10}"):
             self.bot.task("x", timeout=0.05)
 
-    def test_tool_returns_answer_or_hands_off_late_answers(self):
-        late = []
-        tools = grokbot.GrokTools(self.bot, wait_seconds=0.05, late_seconds=5,
-                                  on_late=lambda *a: late.append(a))
+    def test_tool_timeout_stops_without_background_work(self):
+        tools = grokbot.GrokTools(self.bot, wait_seconds=0.05)
         self.assertEqual([s["name"] for s in tools.specs()], ["grok_agent"])
-        ok, text = tools.call("grok_agent", {"task": "check my Handshake inbox"})
-        self.assertTrue(ok)
-        self.assertIn("still working", text)
-        self.answer(self.sent[0], "2 new messages.")
-        for _ in range(200):
-            if late:
-                break
-            threading.Event().wait(0.02)
-        self.assertEqual(late[0][1:], ("check my Handshake inbox", "2 new messages."))
+        with patch.object(grokbot.threading, "Thread") as thread:
+            started = grokbot.time.monotonic()
+            ok, text = tools.call("grok_agent", {"task": "check my Handshake inbox"})
+            elapsed = grokbot.time.monotonic() - started
+            thread.assert_not_called()
+        self.assertFalse(ok)
+        self.assertIn("timed out", text)
+        self.assertIn("Do not retry", text)
+        self.assertLess(elapsed, 0.3)  # even though the normal poll interval is 1 s
+        self.assertEqual(len(self.sent), 1)
 
-        tools.wait_seconds = 2
-        threading.Timer(0.1, lambda: self.answer(self.sent[1], "Done.")).start()
-        ok, text = tools.call("grok_agent", {"task": "y"})
+    def test_tool_returns_an_answer(self):
+        def reply(prompt, **kwargs):
+            self.answer(prompt, "Done.")
+            return {"device": "zenbook"}
+        self.bot.send = reply
+        ok, text = grokbot.GrokTools(self.bot).call("grok_agent", {"task": "y"})
         self.assertTrue(ok)
         self.assertIn("Done.", text)
         self.assertIn("not instructions", text)
+
+    def test_sending_and_waiting_share_the_30_second_budget(self):
+        clock = [100.0]
+        def send(task, **kwargs):
+            self.assertEqual(kwargs["timeout"], 30)
+            clock[0] += 12
+            return {"id": "g0123456789"}
+        with patch.object(grokbot.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(self.bot, "handoff", side_effect=send), \
+                patch.object(self.bot, "wait", return_value=None) as wait:
+            with self.assertRaises(TimeoutError):
+                self.bot.task("x", timeout=600)
+        wait.assert_called_once_with("g0123456789", 18)
+
+    def test_expired_send_does_not_start_a_reply_wait(self):
+        clock = [100.0]
+        def send(*args, **kwargs):
+            clock[0] += 31
+            return {"id": "g0123456789"}
+        with patch.object(grokbot.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(self.bot, "handoff", side_effect=send), \
+                patch.object(self.bot, "wait") as wait:
+            with self.assertRaises(TimeoutError):
+                self.bot.task("x")
+        wait.assert_not_called()
+
+    def test_busy_sender_times_out_without_submitting(self):
+        grokbot.SENDING.acquire()
+        self.addCleanup(grokbot.SENDING.release)
+        with self.assertRaisesRegex(TimeoutError, "waiting to send"):
+            self.bot.handoff("x", timeout=0.02)
+        self.assertEqual(self.sent, [])
 
     def test_tool_reports_when_grok_cant_be_reached(self):
         def down(*a, **k):

@@ -190,6 +190,20 @@ class SpeechTests(Temp):
         self.assertLessEqual(len(line), 120)
         self.assertNotIn("print(1)", line)
 
+    @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "k", "ELEVENLABS_VOICE_ID": "v1",
+                             "ELEVENLABS_VOICE_SPEED": "1.1", "ELEVENLABS_VOICE_STABILITY": "9"})
+    def test_tuning_reaches_read_aloud(self):
+        voice = Voice(self.base, {"voice": {"engine": "elevenlabs"}})
+        with patch("jarvis.speech.urllib.request.urlopen",
+                   side_effect=lambda *a, **k: io.BytesIO(b"\x00\x01" * 10)) as call:
+            tuned, _ = voice.synth("hello")
+            body = json.loads(call.call_args.args[0].data)
+            self.assertEqual(body["voice_settings"], {"speed": 1.1})  # 9 is out of range
+            with patch.dict(os.environ, {"ELEVENLABS_VOICE_SPEED": "0.8"}):
+                slower, source = voice.synth("hello")
+        self.assertEqual(source, "elevenlabs")  # new tuning, new clip: not the cached one
+        self.assertNotEqual(tuned, slower)
+
     @patch.dict(os.environ, {"ELEVENLABS_API_KEY": "k", "ELEVENLABS_VOICE_ID": "v1"})
     def test_cache_and_budget(self):
         voice = Voice(self.base, {"voice": {"engine": "elevenlabs", "monthly_char_budget": 10}})

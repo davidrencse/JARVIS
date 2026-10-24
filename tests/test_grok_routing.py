@@ -1,4 +1,7 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from jarvis.assistant import decide
 from jarvis.router import grok_first
@@ -27,6 +30,25 @@ class GrokRoutingTest(unittest.TestCase):
 
     def test_explicit_tier_wins(self):
         self.assertEqual(decide("read my email", GROK, tier="simple")["tier"], "simple")
+
+
+    def test_timeout_ends_the_turn_with_a_failed_step(self):
+        from jarvis.assistant import ask
+        from jarvis.grokbot import Grokbot
+        from jarvis.memory import Memory
+        from jarvis.store import Store
+        steps = []
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(Grokbot, "task", side_effect=TimeoutError("timed out")) as task, \
+                patch("jarvis.grokbot.threading.Thread") as thread:
+            base = Path(folder)
+            result = ask("ask grok to find flights", Store(base), Memory(base),
+                         GROK, base, on_step=lambda *args: steps.append(args))
+        task.assert_called_once_with("ask grok to find flights", timeout=30)
+        thread.assert_not_called()
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("timed out", result["reply"])
+        self.assertTrue(any(s[0] == "adapter" and s[-1] == "fail" for s in steps))
 
 
 if __name__ == "__main__":

@@ -52,11 +52,11 @@ function harness() {
   return { state, mic, stream, context };
 }
 
-function pageHarness() {
+function pageHarness({ handsFree = false } = {}) {
   const env = harness(), { context } = env;
   const button = { handlers: {}, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; },
     addEventListener(k, v) { this.handlers[k] = v; } };
-  const page = { handlers: {}, announcements: [], now: 0 };
+  const page = { handlers: {}, announcements: [], now: 0, stored: {} };
   Object.assign(context, {
     Mic: context.window.Mic, $: (selector) => selector === "#mic" ? button : null,
     Terrain: { redraw() {} }, busy: false, trace() {}, toast() {}, agent: { live: false },
@@ -64,7 +64,9 @@ function pageHarness() {
     plainError: (text) => text, typing: () => false, OVERLAY: false,
     addEventListener: (name, callback) => { page.handlers[name] = callback; },
     setTimeout() {}, Date: { now: () => page.now },
+    handsFree, placeholder() {}, store: { set: (k, v) => { page.stored[k] = v; } },
   });
+  context.document.activeElement = null;
   const code = fs.readFileSync(path.join(__dirname, "../jarvis/web/app.js"), "utf8");
   const microphone = code.split("// ---------- microphone ----------")[1].split("// ---------- live:")[0];
   assert.ok(microphone, "microphone UI section must be found");
@@ -158,23 +160,50 @@ const scenarios = {
     await mic.stop(); released(state);
   },
   async ui_cancels_startup_and_preserves_quick_tap() {
-    for (const cancellation of ["escape", "click", "long-space"]) {
+    for (const cancellation of ["escape", "long-space"]) {
       const { state, stream, page, button } = pageHarness(); state.permission = deferred();
-      const pending = button.handlers.click();
+      const pending = page.handlers.keydown(page.event());
       assert.equal(state.requests, 1);
       if (cancellation === "escape") await page.handlers.keydown(page.event({ key: "Escape" }));
-      if (cancellation === "click") await button.handlers.click();
       if (cancellation === "long-space") { page.now = 500; page.handlers.keyup(page.event()); }
-      state.permission.resolve(stream()); await pending;
+      state.permission.resolve(stream()); await pending; await new Promise(setImmediate);
       assert.deepEqual(page.announcements, []); assert.equal(button.attrs["aria-pressed"], "false");
       released(state);
     }
     const { state, stream, page, button } = pageHarness(); state.permission = deferred();
-    const pending = button.handlers.click(); page.now = 100; page.handlers.keyup(page.event());
-    state.permission.resolve(stream()); await pending;
+    const pending = page.handlers.keydown(page.event()); page.now = 100; page.handlers.keyup(page.event());
+    state.permission.resolve(stream()); await pending; await new Promise(setImmediate);
     assert.deepEqual(page.announcements, ["Listening."]);
     assert.equal(button.attrs["aria-pressed"], "true");
     await page.handlers.keydown(page.event({ key: "Escape" })); released(state);
+  },
+  async mic_button_toggles_always_listening() {
+    const { state, stream, page, button } = pageHarness(); state.permission = deferred();
+    const pending = button.handlers.click();
+    assert.equal(state.requests, 1); assert.equal(page.stored["jarvis.handsFree"], true);
+    assert.equal(button.attrs["aria-pressed"], "true");
+    state.permission.resolve(stream()); await pending; await new Promise(setImmediate);
+    assert.equal(state.contexts.length, 1); assert.equal(state.streams[0].track.stopped, 0);
+    button.handlers.click(); await new Promise(setImmediate);
+    assert.equal(page.stored["jarvis.handsFree"], false); assert.equal(button.attrs["aria-pressed"], "false");
+    released(state);
+  },
+  async enter_sends_what_it_heard() {
+    const { state, page } = pageHarness({ handsFree: true });
+    page.handlers.keydown(page.event()); await new Promise(setImmediate);
+    assert.equal(state.streams[0].track.stopped, 0);
+    page.handlers.keydown(page.event({ code: "Enter", key: "Enter" })); await new Promise(setImmediate);
+    released(state);
+  },
+  async waiting_keeps_only_a_preroll() {
+    const { state, mic } = harness(); await mic.start({ wait: true });
+    let stops = 0; mic.onAutoStop = () => stops++;
+    for (let i = 0; i < 40; i++) mic.frame(new Float32Array(4800)); // 4 s of silence
+    assert.ok(mic.samples <= 0.4 * 48000 + 4800); assert.equal(stops, 0);
+    for (let i = 0; i < 10; i++) mic.frame(new Float32Array(4800).fill(0.25)); // 1 s of speech
+    for (let i = 0; i < 13; i++) mic.frame(new Float32Array(4800)); // then a pause
+    assert.equal(stops, 1);
+    const clip = await mic.stop(); assert.ok(clip.audio.length > 16000); released(state);
   },
 };
 
