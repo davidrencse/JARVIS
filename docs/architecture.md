@@ -133,7 +133,7 @@ ported: JARVIS already has the heap, events and the orchestrator for those roles
 | Capture | energy VAD on 30 ms frames, noise-floor calibrated | free |
 | Is it David? | sherpa-onnx ERes2Net embedding (26 MB, CPU), cosine vs enrolled profile, cutoff learned from his own clips; runs before transcription. CAM++ failed on this mic (strangers outscored him) | free |
 | Speech → text | faster-whisper `large-v3-turbo` on the RTX 4060, CPU `small.en` fallback | free |
-| Wake word | transcript must start with "Jarvis" (also accepts Whisper's "Jervis"/"Travis") | free |
+| Wake word | transcript must start with "Jarvis" (also accepts Whisper's "Jervis"); applies to the background listener and the console's always-on mic, which defers to the listener when it runs | free |
 | Thinking | routed CLI run on subscription | no API spend |
 | Text → speech | **Kokoro** 82M (local, CPU fp32, ~0.7 s/sentence, voice `bm_george`), sentences streamed from Claude and synthesized while the previous one plays, phrase cache. ElevenLabs optional via `voice.engine` | free |
 
