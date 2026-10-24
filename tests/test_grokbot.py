@@ -275,6 +275,19 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("Ask David before buying", prompt)
         self.assertTrue(Path(out["path"]).parent.is_dir())
 
+    def test_windows_handoff_names_the_windows_laptop(self):
+        with patch.object(grokbot, "WINDOWS", True), \
+                patch.object(grokbot.socket, "gethostname", return_value="WinLaptop"):
+            self.bot.handoff("x")
+        self.assertIn("Windows laptop 'WinLaptop'", self.sent[0])
+
+    def test_windows_script_checks_focus_before_it_pastes(self):
+        script = grokbot.WINDOWS_TYPE
+        check = script.index("GetForegroundWindow() -ne $h) {")
+        self.assertLess(check, script.index("Set-Clipboard -Value ([IO.File]"))
+        self.assertLess(check, script.index("SendWait('^v')"))
+        self.assertIn("nothing was typed", script)
+
     def test_wait_reads_then_removes_the_answer(self):
         out = self.bot.handoff("x")
         self.assertIsNone(self.bot.wait(out["id"], timeout=0.05, poll=0.01))
