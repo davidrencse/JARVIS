@@ -11,6 +11,16 @@ from .router import classify, grok_first, pick_adapter
 from .runner import run_task
 from .vault import recall as vault_recall
 
+def market_answer(text, config, state):
+    """"Check the market": opens the Pro terminal (here or on the named laptop) and
+    says how the market is doing (showcase.py). None for anything else."""
+    try:
+        from .showcase import answer
+        return answer(text, config, state)
+    except Exception:
+        return None
+
+
 def vault_answer(text, config, state):
     """Briefings, today's agenda and what's due, read from the vault (briefing.py).
     None when there's no vault, the question isn't one of those, or anything fails."""
@@ -77,10 +87,11 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
     reply, detail = None, {}
 
     if route["tier"] == "simple" and not write and (
-            quick := instant_answer(text) or vault_answer(text, config, memory.path.parent)):
-        reply = quick  # the local clock or the vault: no network, no model
+            quick := instant_answer(text) or market_answer(text, config, memory.path.parent)
+            or vault_answer(text, config, memory.path.parent)):
+        reply = quick  # the local clock, the market window or the vault: no model
         detail = {"lane": "instant", "streamed": on_sentence is not None}
-        step("instant", "route", "Instant", "clock or vault, no model")
+        step("instant", "route", "Instant", "clock, market or vault, no model")
         if on_sentence:
             on_sentence(quick)
 

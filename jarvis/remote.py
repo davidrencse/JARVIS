@@ -7,7 +7,7 @@ DesktopTools directly. The other laptop is reached the same way Grokbot prompts 
   open on David's screen, not in the SSH session.
 - Zenbook -> Dell: Windows OpenSSH sessions can't reach the desktop, so the Dell's JARVIS
   keeps `grokbot tunnel` running; its loopback relay takes /desktop calls with the token.
-Only the three actions below travel; arguments go as base64 or JSON data, never as code.
+Only the actions below travel (open_page: a console page, e.g. the Pro terminal, as a window); arguments go as base64 or JSON data, never as code.
 """
 
 import base64
@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ACTIONS = ("open_app", "open_url", "list_apps")
+ACTIONS = ("open_app", "open_url", "list_apps", "open_page")
 REMOTE_DIR = "~/projects/JARVIS"  # where the other laptop's checkout lives, by default
 FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -49,11 +49,14 @@ def run_here(action, arg, tools=None):
     """(ok, text) for one action on this laptop."""
     if action not in ACTIONS:
         return False, f"Unknown desktop action {action}."
+    if os.name != "nt" and not os.environ.get("WAYLAND_DISPLAY"):
+        os.environ.update(session_env())  # started over SSH: borrow the desktop session
+    if action == "open_page":
+        from .showcase import open_page
+        return open_page(arg)
     if tools is None:
         from .actions import DesktopTools
         tools = DesktopTools()
-    if os.name != "nt" and not os.environ.get("WAYLAND_DISPLAY"):
-        os.environ.update(session_env())  # started over SSH: borrow the desktop session
     key = "query" if action == "list_apps" else "name" if action == "open_app" else "url"
     return tools.call(action, {key: arg})
 
