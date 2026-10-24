@@ -15,6 +15,9 @@ class FakeRemote:
     def here(self):
         return self._here
 
+    def resolve(self, name):
+        return (name or "").lower() or None
+
     def call(self, device, action, arg):
         self.calls.append((device, action, arg))
         return self.ok, "Opened the Pro terminal." if self.ok else "the tunnel from dell is down"

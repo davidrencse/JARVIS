@@ -181,6 +181,9 @@ class AssistantTests(Temp):
         self.assertEqual(wake_word("Hey Jarvis, what's on my calendar?"), "what's on my calendar?")
         self.assertEqual(wake_word("jervis open the plan"), "open the plan")
         self.assertIsNone(wake_word("I was telling Sam about jarvis"))
+        self.assertIsNone(wake_word("Travis, did you see the game?"))  # a real name
+        self.assertIsNone(wake_word("Jarvis's voice is too quiet"))  # about it, not to it
+        self.assertIsNone(wake_word("Good. Thank you. Thank you."))
 
 
 class SpeechTests(Temp):

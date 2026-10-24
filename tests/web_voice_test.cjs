@@ -52,12 +52,14 @@ function harness() {
   return { state, mic, stream, context };
 }
 
-function pageHarness({ handsFree = false } = {}) {
+function pageHarness({ handsFree = false, listen = {} } = {}) {
   const env = harness(), { context } = env;
   const button = { handlers: {}, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; },
-    addEventListener(k, v) { this.handlers[k] = v; } };
-  const page = { handlers: {}, announcements: [], now: 0, stored: {} };
+    addEventListener(k, v) { this.handlers[k] = v; }, classList: { add() {}, remove() {} } };
+  const page = { handlers: {}, announcements: [], now: 0, stored: {}, calls: [], asked: [] };
   Object.assign(context, {
+    api: async (path) => { page.calls.push(path); return listen; },
+    ask: async (text) => { page.asked.push(text); }, prompt: { value: "" }, autosize() {},
     Mic: context.window.Mic, $: (selector) => selector === "#mic" ? button : null,
     Terrain: { redraw() {} }, busy: false, trace() {}, toast() {}, agent: { live: false },
     announce: (text) => page.announcements.push(text),
@@ -73,6 +75,17 @@ function pageHarness({ handsFree = false } = {}) {
   vm.runInNewContext(microphone, context);
   page.event = (overrides = {}) => ({ preventDefault() {}, code: "Space", key: " ", ...overrides });
   return { ...env, page, button };
+}
+
+// Space starts the mic, half a second of speech after the room's quiet, Enter sends it.
+async function spoke(options) {
+  const env = pageHarness(options), { state, page } = env;
+  page.handlers.keydown(page.event()); await new Promise(setImmediate);
+  const frame = (level) => state.nodes[0].port.onmessage({ data: new Float32Array(4800).fill(level) });
+  for (let i = 0; i < 4; i++) frame(0);
+  for (let i = 0; i < 5; i++) frame(0.25);
+  page.handlers.keydown(page.event({ code: "Enter", key: "Enter" })); await new Promise(setImmediate);
+  return env;
 }
 
 function released(state) {
@@ -193,6 +206,22 @@ const scenarios = {
     page.handlers.keydown(page.event()); await new Promise(setImmediate);
     assert.equal(state.streams[0].track.stopped, 0);
     page.handlers.keydown(page.event({ code: "Enter", key: "Enter" })); await new Promise(setImmediate);
+    released(state);
+  },
+  async always_on_sends_only_requests_that_start_with_jarvis() {
+    for (const [listen, asked] of [
+      [{ owner: true, addressed: false, text: "" }, []], // chatter: dropped by the server
+      [{ owner: true, addressed: true, text: "open up Spotify." }, ["open up Spotify."]],
+      [{ listener: true }, []], // the background listener answers it instead
+    ]) {
+      const { state, page } = await spoke({ handsFree: true, listen });
+      assert.deepEqual(page.calls, ["/api/listen?wake=1"]); assert.deepEqual(page.asked, asked);
+      released(state);
+    }
+  },
+  async push_to_talk_needs_no_wake_word() {
+    const { state, page } = await spoke({ listen: { owner: true, addressed: false, text: "open up Spotify." } });
+    assert.deepEqual(page.calls, ["/api/listen"]); assert.deepEqual(page.asked, ["open up Spotify."]);
     released(state);
   },
   async waiting_keeps_only_a_preroll() {

@@ -8,7 +8,7 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from jarvis import credits as credits_mod
 from jarvis.credits import Credits, claude_usage_rows, codex_rate_limits
@@ -223,6 +223,43 @@ class InvestigationTests(Temp):
         self.assertEqual([s["state"] for s in view["steps"]], ["finished", "pending"])
         self.assertEqual(view["steps"][0]["acceptance"], ["cites sources"])
         self.assertEqual(view["steps"][0]["answer"], "found it")
+
+
+class ListenTests(Temp):
+    """The console mic: always-on clips count only when they start with "Jarvis"."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import numpy
+        except ImportError:
+            self.skipTest("needs the [voice] extra: pip install numpy")
+        self.c = Console(CONFIG, ROOT, self.base)
+        self.c._ears, self.c._stt = MagicMock(), MagicMock(device="cpu")
+        self.clip = numpy.zeros(16000, dtype="<f4").tobytes()
+
+    def hear(self, said, wake, listener=None):
+        self.c._stt.side_effect = lambda audio: said
+        with patch("jarvis.daemon._pid", return_value=listener):
+            return self.c.transcribe(self.clip, wake=wake)
+
+    def test_always_on_drops_anything_not_addressed_to_jarvis(self):
+        r = self.hear("Good. Thank you. Thank you.", wake=True)
+        self.assertEqual((r["text"], r["addressed"]), ("", False))
+        r = self.hear("Jarvis, open up Spotify.", wake=True)
+        self.assertEqual((r["text"], r["addressed"]), ("open up Spotify.", True))
+
+    def test_push_to_talk_needs_no_wake_word(self):
+        self.assertEqual(self.hear("open up Spotify.", wake=False)["text"], "open up Spotify.")
+
+    def test_background_listener_answers_instead_so_nothing_runs_twice(self):
+        r = self.hear("Jarvis, open up Spotify.", wake=True, listener=4242)
+        self.assertEqual((r["text"], r["listener"]), ("", True))
+        self.c._stt.assert_not_called()  # it heard the same words; no second Whisper pass
+        r = self.hear("Jarvis, open up Spotify.", wake=False, listener=4242)
+        self.assertEqual((r["text"], r["listener"], r["addressed"]), ("", True, True))
+        r = self.hear("open up Spotify.", wake=False, listener=4242)  # push-to-talk only
+        self.assertEqual(r["text"], "open up Spotify.")
 
 
 class HttpTests(Temp):
