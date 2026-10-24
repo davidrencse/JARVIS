@@ -29,27 +29,8 @@
   function toast(msg) { const t = $("#toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast.t); toast.t = setTimeout(() => (t.hidden = true), 3200); }
   const S = { rows: [], intel: null, pipe: null, templates: [], style: 0, coins: new Set(["BTC", "ETH", "SOL"]), risk: 10, period: "365d|1d", result: null, drawer: null };
 
-  // ---------- background: slow drifting constellation ----------
-  (function background() {
-    const c = $("#bg"), g = c.getContext("2d"); let pts = [], w, h;
-    function size() { const dpr = Math.min(devicePixelRatio || 1, 2); w = innerWidth; h = innerHeight; c.width = w * dpr; c.height = h * dpr; g.setTransform(dpr, 0, 0, dpr, 0, 0);
-      pts = Array.from({ length: Math.round((w * h) / 26000) }, () => ({ x: Math.random() * w, y: Math.random() * h, vx: (Math.random() - .5) * .18, vy: (Math.random() - .5) * .18 })); }
-    function frame() {
-      if (!document.hidden) {
-        g.clearRect(0, 0, w, h);
-        for (const p of pts) { p.x = (p.x + p.vx + w) % w; p.y = (p.y + p.vy + h) % h; }
-        for (let i = 0; i < pts.length; i++) for (let j = i + 1; j < pts.length; j++) {
-          const a = pts[i], b = pts[j], d = Math.hypot(a.x - b.x, a.y - b.y);
-          if (d < 130) { g.strokeStyle = `rgba(124,140,255,${(1 - d / 130) * .18})`; g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke(); }
-        }
-        g.fillStyle = "rgba(57,208,255,.5)"; for (const p of pts) g.fillRect(p.x, p.y, 1.4, 1.4);
-      }
-      if (!reduce) requestAnimationFrame(frame);
-    }
-    size(); addEventListener("resize", size); frame();
-  })();
-
   // ---------- canvas helpers ----------
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   function prep(el) {
     const dpr = Math.min(devicePixelRatio || 1, 2), w = el.clientWidth, h = el.clientHeight;
     el.width = Math.round(w * dpr); el.height = Math.round(h * dpr);
@@ -60,18 +41,18 @@
     const all = series.flatMap((s) => s.values); if (!all.length) return;
     let lo = Math.min(...all), hi = Math.max(...all); if (lo === hi) { lo -= 1; hi += 1; }
     const X = (i, n) => pad.l + (i / Math.max(1, n - 1)) * (w - pad.l - pad.r), Y = (v) => pad.t + (1 - (v - lo) / (hi - lo)) * (h - pad.t - pad.b);
-    if (opts.base != null && opts.base > lo && opts.base < hi) { g.strokeStyle = "rgba(148,163,196,.18)"; g.setLineDash([4, 6]); g.beginPath(); g.moveTo(pad.l, Y(opts.base)); g.lineTo(w - pad.r, Y(opts.base)); g.stroke(); g.setLineDash([]); }
+    if (opts.base != null && opts.base > lo && opts.base < hi) { g.strokeStyle = css("--line-2"); g.setLineDash([4, 6]); g.beginPath(); g.moveTo(pad.l, Y(opts.base)); g.lineTo(w - pad.r, Y(opts.base)); g.stroke(); g.setLineDash([]); }
     const t0 = performance.now(), dur = reduce || opts.instant ? 0 : 1100;
     function draw(now) {
       const k = dur ? Math.max(0, Math.min(1, (now - t0) / dur)) : 1, ease = 1 - Math.pow(1 - k, 3);
       g.clearRect(0, pad.t - 2, w, h); // keep it simple: redraw all series to the eased length
-      if (opts.base != null && opts.base > lo && opts.base < hi) { g.strokeStyle = "rgba(148,163,196,.18)"; g.setLineDash([4, 6]); g.beginPath(); g.moveTo(pad.l, Y(opts.base)); g.lineTo(w - pad.r, Y(opts.base)); g.stroke(); g.setLineDash([]); }
+      if (opts.base != null && opts.base > lo && opts.base < hi) { g.strokeStyle = css("--line-2"); g.setLineDash([4, 6]); g.beginPath(); g.moveTo(pad.l, Y(opts.base)); g.lineTo(w - pad.r, Y(opts.base)); g.stroke(); g.setLineDash([]); }
       for (const s of series) {
         const n = s.values.length, upto = Math.max(2, Math.round(n * ease));
         g.beginPath(); s.values.slice(0, upto).forEach((v, i) => (i ? g.lineTo(X(i, n), Y(v)) : g.moveTo(X(i, n), Y(v))));
-        g.strokeStyle = s.color; g.lineWidth = s.width || 2; g.lineJoin = "round"; g.stroke();
+        g.strokeStyle = s.color; g.lineWidth = s.width || 2; g.lineJoin = "round"; g.setLineDash(s.dash || []); g.stroke(); g.setLineDash([]);
         if (s.fill) { g.lineTo(X(upto - 1, n), h - pad.b); g.lineTo(X(0, n), h - pad.b); g.closePath(); const gr = g.createLinearGradient(0, pad.t, 0, h); gr.addColorStop(0, s.fill); gr.addColorStop(1, "transparent"); g.fillStyle = gr; g.fill(); }
-        if (s.dot && upto === n) { const x = X(n - 1, n), y = Y(s.values[n - 1]); g.fillStyle = s.color; g.beginPath(); g.arc(x, y, 4, 0, 7); g.fill(); g.strokeStyle = "rgba(255,255,255,.25)"; g.lineWidth = 6; g.beginPath(); g.arc(x, y, 7, 0, 7); g.stroke(); }
+        if (s.dot && upto === n) { const x = X(n - 1, n), y = Y(s.values[n - 1]); g.fillStyle = s.color; g.beginPath(); g.arc(x, y, 4, 0, 7); g.fill(); g.strokeStyle = css("--line-2"); g.lineWidth = 6; g.beginPath(); g.arc(x, y, 7, 0, 7); g.stroke(); }
       }
       if (k < 1) requestAnimationFrame(draw);
     }
@@ -85,16 +66,25 @@
     S.rows = mon.rows; S.intel = intel;
     const move = intel.cap_weighted_24h ?? 0, b = intel.breadth;
     const word = move > 2 ? "rallying" : move > 0.3 ? "up" : move < -2 ? "selling off" : move < -0.3 ? "down" : "flat";
-    $("#headline").innerHTML = `Crypto is <span class="${cls(move)}">${word}</span> today, <span class="${cls(move)}">${signed(move)}</span>`;
+    $("#headline").textContent = `Crypto is ${word} today`;
     $("#subline").textContent = `${b.up} of ${b.n} big coins are up. Bitcoin is ${intel.btc_dominance == null ? "—" : Math.round(intel.btc_dominance)}% of the value tracked.`;
+    $("#k-move").textContent = signed(move); $("#k-move").className = cls(move);
+    $("#k-move-f").innerHTML = `value-weighted · <span>${esc(word)}</span>`;
+    $("#k-breadth").textContent = `${b.up}/${b.n}`;
+    $("#k-breadth-f").textContent = `${b.n - b.up} down today`;
+    $("#k-cap").textContent = big(intel.tracked_cap);
+    // mini bars: the 14 biggest coins' moves, today's movers in full ink
+    const movers = S.rows.filter((r) => !r.stable).slice(0, 14), mx = Math.max(1, ...movers.map((r) => Math.abs(r.chg_24h || 0)));
+    $("#k-bars").innerHTML = movers.map((r) => `<i class="${Math.abs(r.chg_24h || 0) >= mx * .6 ? "hi" : ""}" style="height:${Math.max(8, Math.abs(r.chg_24h || 0) / mx * 100)}%" title="${esc(r.symbol)} ${signed(r.chg_24h)}"></i>`).join("");
+    $("#k-breadth-bars").innerHTML = movers.map((r) => `<i class="${r.chg_24h > 0 ? "hi" : ""}" style="height:${r.chg_24h > 0 ? 100 : 35}%"></i>`).join("");
     // mood 0..100 from breadth (60%) and the cap-weighted move (40%)
     const mood = Math.max(0, Math.min(100, (b.n ? (b.up / b.n) * 60 : 30) + (Math.max(-5, Math.min(5, move)) + 5) * 4));
-    $("#needle").style.transform = `rotate(${-90 + mood * 1.8}deg)`;
+    $("#needle").style.left = `calc(${mood}% - 1px)`;
     $("#mood").textContent = mood < 20 ? "Fearful" : mood < 40 ? "Nervous" : mood < 60 ? "Neutral" : mood < 80 ? "Confident" : "Greedy";
     const top = intel.gainers[0], worst = intel.losers[0];
-    $("#facts").innerHTML = `<dt>Best today</dt><dd>${esc(top?.symbol)} <span class="${cls(top?.chg_24h)}">${signed(top?.chg_24h)}</span></dd>
-      <dt>Worst today</dt><dd>${esc(worst?.symbol)} <span class="${cls(worst?.chg_24h)}">${signed(worst?.chg_24h)}</span></dd>
-      <dt>Value tracked</dt><dd>${big(intel.tracked_cap)}</dd>`;
+    $("#facts").innerHTML = `<dt>Best</dt><dd>${esc(top?.symbol)} <span class="${cls(top?.chg_24h)}">${signed(top?.chg_24h)}</span></dd>
+      <dt>Worst</dt><dd>${esc(worst?.symbol)} <span class="${cls(worst?.chg_24h)}">${signed(worst?.chg_24h)}</span></dd>
+      `;
     drawHeat(true);
     renderCoins();
     setLive(true);
@@ -116,10 +106,10 @@
     }
     return out;
   }
+  // Shade by size of the move, not its direction: the sign is in the coloured label.
   function heatColor(chg) {
-    const t = Math.max(-1, Math.min(1, (chg ?? 0) / 8));
-    const base = [30, 38, 56], to = t >= 0 ? [22, 190, 134] : [222, 64, 90], k = Math.abs(t) * .85 + .1;
-    return `rgb(${base.map((b, i) => Math.round(b + (to[i] - b) * k)).join(",")})`;
+    const k = Math.min(1, Math.abs(chg ?? 0) / 8) * .8 + .08, lo = css("--heat-lo").split(",").map(Number), hi = css("--heat-hi").split(",").map(Number);
+    return `rgb(${lo.map((b, i) => Math.round(b + (hi[i] - b) * k)).join(",")})`;
   }
   let tiles = [];
   function drawHeat(animate) {
@@ -136,12 +126,13 @@
         const k = dur ? Math.max(0, Math.min(1, (now - t0 - i * 14) / (dur - 300))) : 1, e = 1 - Math.pow(1 - k, 3);
         const cw = t.w * e, ch = t.h * e, cx = t.x + (t.w - cw) / 2, cy = t.y + (t.h - ch) / 2;
         g.fillStyle = heatColor(t.r.chg_24h); g.globalAlpha = .25 + .75 * e;
-        g.beginPath(); g.roundRect ? g.roundRect(cx + 1.5, cy + 1.5, Math.max(0, cw - 3), Math.max(0, ch - 3), 7) : g.rect(cx + 1.5, cy + 1.5, cw - 3, ch - 3); g.fill();
+        g.beginPath(); g.roundRect ? g.roundRect(cx + 1.5, cy + 1.5, Math.max(0, cw - 3), Math.max(0, ch - 3), 4) : g.rect(cx + 1.5, cy + 1.5, cw - 3, ch - 3); g.fill();
         g.globalAlpha = e;
         if (t.w > 34 && t.h > 22) {
-          const fs = Math.max(10, Math.min(26, Math.sqrt(t.w * t.h) / 5.5, (t.w - 12) / (t.r.symbol.length * .62)));
-          g.fillStyle = "rgba(255,255,255,.95)"; g.font = `650 ${fs}px Geist, sans-serif`; g.fillText(t.r.symbol, t.x + 8, t.y + 6 + fs);
-          if (t.h > fs * 2.4) { g.font = `500 ${Math.max(10.5, fs * .62)}px "Geist Mono", monospace`; g.fillStyle = "rgba(255,255,255,.78)"; g.fillText(signed(t.r.chg_24h), t.x + 8, t.y + 10 + fs * 1.85); }
+          let fs = Math.min(26, Math.sqrt(t.w * t.h) / 5.5); g.font = `650 ${fs}px Geist, sans-serif`;
+          while (fs > 8 && g.measureText(t.r.symbol).width > t.w - 14) g.font = `650 ${--fs}px Geist, sans-serif`;
+          g.fillStyle = css("--ink"); g.fillText(t.r.symbol, t.x + 8, t.y + 6 + fs);
+          if (t.h > fs * 2.4 && t.w > 44) { g.font = `500 ${Math.max(10.5, fs * .62)}px "Geist Mono", monospace`; g.fillStyle = css(t.r.chg_24h > 0 ? "--up" : t.r.chg_24h < 0 ? "--down" : "--ink-2"); g.fillText(signed(t.r.chg_24h), t.x + 8, t.y + 10 + fs * 1.85); }
         }
         g.globalAlpha = 1;
       });
@@ -188,40 +179,26 @@
         <span class="note" style="margin-left:auto">${price(c.price)}</span></div>`).join("")
       + `<p class="note">Signals are suggestions for you to look at. Practice mode: JARVIS won't trade on them.</p>`
       : `<p class="note">${s.ok ? "No strategy is asking for action right now. JARVIS rechecks every minute." : esc(f.error || s.error || "Loading…")}</p>`;
-    drawFlow(); renderStrategies();
+    renderStrategies();
     if (f.stale) toast("Showing the last good data; True Markets didn't answer just now.");
   }
-  function drawFlow() {
-    const svg = $("#flow-lines"), box = $("#flow").getBoundingClientRect(), nodes = [...document.querySelectorAll(".node")];
-    const centre = (n) => { const r = n.getBoundingClientRect(); return { x: r.left - box.left + r.width / 2, y: r.top - box.top + r.height / 2, r }; };
-    let html = "";
-    for (let i = 0; i < nodes.length - 1; i++) {
-      const a = centre(nodes[i]), b = centre(nodes[i + 1]);
-      const sameRow = Math.abs(a.y - b.y) < 10;
-      const d = sameRow ? `M${a.x + a.r.width / 2} ${a.y} L${b.x - b.r.width / 2} ${b.y}` : `M${a.x} ${a.y + a.r.height / 2} C${a.x} ${(a.y + b.y) / 2} ${b.x} ${(a.y + b.y) / 2} ${b.x} ${b.y - b.r.height / 2}`;
-      const cut = i === nodes.length - 2;
-      html += `<path id="fp${i}" d="${d}" class="${cut ? "cut" : ""}"/>`;
-      if (!cut && !reduce) html += `<circle r="3.5"><animateMotion dur="${1.6 + i * .2}s" repeatCount="indefinite"><mpath href="#fp${i}"/></animateMotion></circle>`;
-    }
-    svg.innerHTML = html;
-  }
-
   // ---------- strategy cards ----------
   function renderStrategies() {
     const s = S.pipe?.signals; if (!s?.ok) return;
     const bySym = {}; for (const x of [...s.actionable, ...s.holding]) (bySym[x.id] ||= []).push(x);
-    $("#strats").innerHTML = (s.templates ? `<p class="note" style="grid-column:1/-1;color:var(--ink-3);margin:0">These are JARVIS's starter ideas on BTC, ETH and SOL. Save your own below and they'll replace these.</p>` : "") +
-      s.leaderboard.map((b) => {
-        const max = Math.max(Math.abs(b.total_return), Math.abs(b.buy_hold), 1);
-        const bar = (v) => `<span class="track"><i style="left:${v < 0 ? 50 - (Math.abs(v) / max) * 50 : 50}%;width:${(Math.abs(v) / max) * 50}%;background:${v < 0 ? "var(--down)" : "var(--up)"}"></i></span>`;
-        const chips = (bySym[b.id] || []).map((x) => `<span class="badge ${x.signal}">${esc(x.symbol)} ${x.signal}</span>`).join("") || `<span class="badge FLAT">waiting for a signal</span>`;
-        return `<article class="strat"><h4>${esc(friendly(b.name).title)}</h4>
-          <div class="ret ${cls(b.total_return)}">${signed(b.total_return)}</div>
-          <div class="cmp">$1,000 → <b>${usd(1000 * (1 + b.total_return / 100))}</b> · holding: ${usd(1000 * (1 + b.buy_hold / 100))}</div>
-          <div class="bars"><div>strategy${bar(b.total_return)}<b>${signed(b.total_return, 0)}</b></div><div>holding${bar(b.buy_hold)}<b>${signed(b.buy_hold, 0)}</b></div></div>
-          <div class="cmp">worst dip ${b.max_drawdown?.toFixed(0)}% · ${b.trades} trades</div>
-          <div class="chips">${chips}</div></article>`;
-      }).join("");
+    const rows = s.leaderboard.map((b) => {
+      const max = Math.max(Math.abs(b.total_return), Math.abs(b.buy_hold), 1), w = (v) => `width:${Math.abs(v) / max * 100}%`;
+      const chips = (bySym[b.id] || []).map((x) => `<span class="badge ${x.signal}">${esc(x.symbol)} ${x.signal}</span>`).join("") || `<span class="badge FLAT">waiting</span>`;
+      return `<tr><td><b>${esc(friendly(b.name).title)}</b></td>
+        <td class="num ret ${cls(b.total_return)}">${signed(b.total_return)}</td>
+        <td class="num">${usd(1000 * (1 + b.total_return / 100))}</td>
+        <td class="num muted">${usd(1000 * (1 + b.buy_hold / 100))}</td>
+        <td><div class="vs" title="strategy vs holding"><span><i style="${w(b.total_return)}"></i></span><span class="h"><i style="${w(b.buy_hold)}"></i></span></div></td>
+        <td class="num">${b.max_drawdown?.toFixed(0)}%</td><td class="num">${b.trades}</td>
+        <td><div class="chips">${chips}</div></td></tr>`;
+    }).join("");
+    $("#strats").innerHTML = (s.templates ? `<p class="note">Starter ideas on BTC, ETH and SOL, tested over the last year. Save your own below and they'll replace these.</p>` : "") +
+      `<table class="st"><thead><tr><th>Strategy</th><th class="num">Return</th><th class="num">$1,000 →</th><th class="num">Holding</th><th>vs holding</th><th class="num">Worst dip</th><th class="num">Trades</th><th>Now</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   // ---------- builder ----------
@@ -235,7 +212,7 @@
   const friendly = (name) => FRIENDLY[name] || { title: name, desc: "", glyph: "M2 20 L58 12" };
   function renderStyles() {
     $("#styles").innerHTML = S.templates.map((t, i) => { const f = friendly(t.name);
-      return `<button class="style" role="radio" data-i="${i}" aria-checked="${i === S.style}"><svg viewBox="0 0 60 34" preserveAspectRatio="none" aria-hidden="true"><path d="${f.glyph}" fill="none" stroke="var(--accent-2)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg><b>${esc(f.title)}</b><small>${esc(f.desc)}</small></button>`; }).join("");
+      return `<button class="style" role="radio" data-i="${i}" aria-checked="${i === S.style}"><svg viewBox="0 0 60 34" preserveAspectRatio="none" aria-hidden="true"><path d="${f.glyph}" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><b>${esc(f.title)}</b><small>${esc(f.desc)}</small></button>`; }).join("");
   }
   $("#styles").addEventListener("click", (e) => { const b = e.target.closest(".style"); if (!b) return; S.style = +b.dataset.i; renderStyles();
     const t = S.templates[S.style]; S.period = t.window === "365d" || t.window === "180d" ? "365d|1d" : t.window === "30d" ? "30d|1h" : "90d|4h"; syncSeg("#period", S.period); });
@@ -283,7 +260,7 @@
     // equal-weight portfolio curve vs holding
     const n = Math.min(...ok.map((x) => x.equity.length));
     const avg = (key) => Array.from({ length: n }, (_, i) => ok.reduce((a, x) => a + x[key][i], 0) / ok.length * 1000);
-    lineChart($("#res-chart"), [{ values: avg("hold"), color: "rgba(148,163,196,.6)", width: 1.6 }, { values: avg("equity"), color: "#39d0ff", width: 2.4, fill: "rgba(57,208,255,.18)", dot: true }], { base: 1000 });
+    lineChart($("#res-chart"), [{ values: avg("hold"), color: css("--ink-3"), width: 1.5, dash: [5, 5] }, { values: avg("equity"), color: css("--ink"), width: 2, dot: true }], { base: 1000 });
     $("#result").scrollIntoView({ behavior: reduce ? "auto" : "smooth", block: "nearest" });
   }
   $("#res-save").addEventListener("click", async () => {
@@ -304,7 +281,7 @@
       $("#drawer-body").innerHTML = `<h3>${esc(q.asset?.name || sym)}</h3><div class="px">${price(q.last)}</div><div class="${cls(chg)}">${signed(chg)} over ${win}</div>
         <p style="color:var(--ink-3);font-size:13.5px">Value ${big(q.market_cap)} · ${esc(q.asset?.chain || "")}${q.asset?.website ? ` · <a href="${esc(q.asset.website)}" target="_blank" rel="noopener noreferrer">website</a>` : ""}</p>`;
       $("#d-des").textContent = (q.asset?.description || "").slice(0, 600);
-      lineChart($("#d-chart"), [{ values: vals, color: chg >= 0 ? "#2ee6a6" : "#ff5d73", width: 2.2, fill: chg >= 0 ? "rgba(46,230,166,.18)" : "rgba(255,93,115,.18)", dot: true }]);
+      lineChart($("#d-chart"), [{ values: vals, color: css("--ink"), width: 2, dot: true }]);
     } catch (e) { $("#drawer-body").innerHTML = `<h3>${esc(sym)}</h3><p class="down">${esc(e.message)}</p>`; }
   }
   $("#d-win").addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) openDrawer(S.drawer, b.dataset.w); });
@@ -312,8 +289,19 @@
   addEventListener("keydown", (e) => { if (e.key === "Escape") $("#drawer").hidden = true; });
 
   // ---------- boot ----------
-  function setLive(ok, msg) { const l = $("#live"); l.className = "pill " + (ok ? "ok" : "bad"); l.lastChild.textContent = ok ? "Live data" : (msg || "Offline"); }
-  let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { drawHeat(false); drawFlow(); if (S.result) showResult(S.result, spec()); }, 150); });
+  function setLive(ok, msg) {
+    const l = $("#live"); l.className = "status " + (ok ? "ok" : "bad"); l.lastChild.textContent = ok ? "Live" : (msg || "Offline");
+    if (ok) $("#updated").textContent = "Updated " + new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+  $("#theme").addEventListener("click", () => {
+    const light = document.documentElement.dataset.theme !== "light";
+    if (light) document.documentElement.dataset.theme = "light"; else delete document.documentElement.dataset.theme;
+    try { localStorage.setItem("trade-theme", light ? "light" : "dark"); } catch (e) {}
+    drawHeat(false); if (S.result) showResult(S.result, spec()); if (S.drawer && !$("#drawer").hidden) openDrawer(S.drawer);
+  });
+  $("#menu").addEventListener("click", () => document.body.classList.toggle("nav-open"));
+  $(".side").addEventListener("click", (e) => { if (e.target.closest("a")) document.body.classList.remove("nav-open"); });
+  let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(() => { drawHeat(false); if (S.result) showResult(S.result, spec()); }, 150); });
   (async () => {
     try {
       const st = await api("/api/markets/status");

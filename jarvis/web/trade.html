@@ -3,106 +3,140 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="color-scheme" content="dark">
-<title>JARVIS Trading</title>
+<meta name="color-scheme" content="dark light">
+<title>JARVIS Markets</title>
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="preload" href="fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="trade.css">
+<script>try { if (localStorage.getItem("trade-theme") === "light") document.documentElement.dataset.theme = "light"; } catch (e) {}</script>
 </head>
 <body>
-<canvas id="bg" aria-hidden="true"></canvas>
-<header class="top">
-  <a class="brand" href="index.html" title="Back to the JARVIS console"><span class="logo" aria-hidden="true"></span>JARVIS <b>Trading</b></a>
-  <div class="top-r">
-    <span class="pill safe" title="This page reads market data and tests ideas. It cannot buy, sell or move money."><i></i>Practice<span class="long"> mode · no real trades</span></span>
-    <span class="pill" id="live"><i></i>Connecting</span>
-    <a class="pill link" href="terminal.html" title="Dense Bloomberg-style terminal with every number">Pro terminal →</a>
+<div class="shell">
+  <aside class="side" aria-label="JARVIS">
+    <a class="brand" href="index.html#console"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg></span><span><small>JARVIS</small>Console</span></a>
+    <nav class="nav" aria-label="Views">
+      <p class="nav-h">Main menu</p>
+      <a href="index.html#console"><svg class="i"><use href="icons.svg?v=2#i-layout-grid"/></svg>Console</a>
+      <a href="index.html#graph"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg>Graph</a>
+      <a href="design.html"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg>System</a>
+      <a href="index.html#credits"><svg class="i"><use href="icons.svg?v=2#i-gauge"/></svg>Credits</a>
+      <a href="index.html#memory"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg>Memory</a>
+      <a href="knowledge.html"><svg class="i"><use href="icons.svg?v=2#i-book-open"/></svg>Wiki</a>
+      <a href="index.html#tasks"><svg class="i"><use href="icons.svg?v=2#i-list-checks"/></svg>Tasks</a>
+      <a href="index.html#run"><svg class="i"><use href="icons.svg?v=2#i-play"/></svg>Run</a>
+      <a href="index.html#files"><svg class="i"><use href="icons.svg?v=2#i-folder-search"/></svg>Files</a>
+      <a href="index.html#devices"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg>Devices</a>
+      <p class="nav-h">Markets</p>
+      <a href="trade.html" aria-current="page"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg>Overview</a>
+      <a href="#strategies"><svg class="i"><use href="icons.svg?v=2#i-flag"/></svg>Strategies</a>
+      <a href="#build"><svg class="i"><use href="icons.svg?v=2#i-plus"/></svg>New strategy</a>
+      <a href="terminal.html"><svg class="i"><use href="icons.svg?v=2#i-terminal"/></svg>Pro terminal</a>
+    </nav>
+    <div class="side-foot" title="This page reads market data and tests ideas. It cannot buy, sell or move money.">
+      <b>Practice mode</b><span>Real trading is off. JARVIS can't place orders from here.</span>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="top">
+      <button class="icon-btn menu" id="menu" aria-label="Open menu"><svg class="i"><use href="icons.svg?v=2#i-layout-grid"/></svg></button>
+      <div class="crumbs"><a href="index.html#console">Console</a><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-chevron-right"/></svg><b>Markets</b></div>
+      <div class="top-r">
+        <span class="status" id="live"><i></i>Connecting</span>
+        <span class="updated" id="updated"></span>
+        <button class="icon-btn" id="theme" aria-label="Switch light or dark"><svg class="i"><use href="icons.svg?v=2#i-contrast"/></svg></button>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <div class="title-row">
+        <div><h1 id="headline">Reading the market…</h1><p class="sub" id="subline">&nbsp;</p></div>
+        <div class="title-acts"><span class="chip">Practice mode</span><a class="btn" href="#build">+ New strategy</a></div>
+      </div>
+
+      <!-- KPIs -->
+      <section class="kpis" aria-label="Market summary">
+        <div class="kpi"><div class="kpi-b"><div><p class="lbl">Market 24h</p><b id="k-move">—</b></div><div class="mini" id="k-bars" aria-hidden="true"></div></div><p class="kpi-f" id="k-move-f">&nbsp;</p></div>
+        <div class="kpi"><div class="kpi-b"><div><p class="lbl">Coins up</p><b id="k-breadth">—</b></div><div class="mini" id="k-breadth-bars" aria-hidden="true"></div></div><p class="kpi-f" id="k-breadth-f">&nbsp;</p></div>
+        <div class="kpi"><div class="kpi-b"><div><p class="lbl">Market mood</p><b id="mood">—</b></div><div class="meter" aria-hidden="true"><i id="needle"></i></div></div><p class="kpi-f">fearful <span>·</span> greedy</p></div>
+        <div class="kpi"><div class="kpi-b"><div><p class="lbl">Value tracked</p><b id="k-cap">—</b></div></div><dl class="kpi-f facts" id="facts"></dl></div>
+      </section>
+
+      <!-- Map + pipeline -->
+      <section class="grid2">
+        <div class="panel">
+          <div class="ph"><span>Market map</span><span class="ph-r">size = value · shade = move today</span></div>
+          <div class="pb"><div class="heat"><canvas id="heat"></canvas><div class="tip" id="tip" hidden></div></div></div>
+        </div>
+        <div class="panel" aria-label="How JARVIS works">
+          <div class="ph"><span>Signal pipeline</span></div>
+          <div class="pb">
+            <ol class="flow" id="flow">
+              <li class="node" data-n="0"><span>Market data</span><em id="n0">—</em><small>True Markets, live</small></li>
+              <li class="node" data-n="1"><span>Strategies</span><em id="n1">—</em><small>watching your coins</small></li>
+              <li class="node" data-n="2"><span>Signals</span><em id="n2">—</em><small>buy · sell · hold</small></li>
+              <li class="node gate" data-n="3"><span>You decide</span><em id="n3">—</em><small>nothing happens without you</small></li>
+              <li class="node off" data-n="4"><span>Real trading</span><em>Off</em><small>practice mode</small></li>
+            </ol>
+            <p class="funnel" id="funnel"></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="ph"><span>Open positions &amp; signals</span></div>
+        <div class="review" id="review"></div>
+      </section>
+
+      <!-- Strategies -->
+      <section class="panel" id="strategies">
+        <div class="ph"><span>Strategies · how each idea would have done</span><a class="ph-btn" href="#build" id="to-build">+ New</a></div>
+        <div class="strats" id="strats"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
+      </section>
+
+      <!-- Builder -->
+      <section class="panel build" id="build">
+        <div class="ph"><span>Try an idea · three taps</span></div>
+        <div class="pb">
+          <div class="steps">
+            <div class="step"><h3><span>01</span>Pick a style</h3><div class="styles" id="styles"></div></div>
+            <div class="step"><h3><span>02</span>Pick coins</h3><div class="coins" id="coins"></div></div>
+            <div class="step"><h3><span>03</span>How careful?</h3>
+              <div class="seg" id="risk" role="radiogroup" aria-label="Risk">
+                <button role="radio" data-v="5" aria-checked="false">Careful<small>exit −5%</small></button>
+                <button role="radio" data-v="10" aria-checked="true">Balanced<small>exit −10%</small></button>
+                <button role="radio" data-v="20" aria-checked="false">Bold<small>exit −20%</small></button>
+              </div>
+              <h3 class="mt"><span>04</span>Test over</h3>
+              <div class="seg" id="period" role="radiogroup" aria-label="Test period">
+                <button role="radio" data-v="30d|1h" aria-checked="false">1 month</button>
+                <button role="radio" data-v="90d|4h" aria-checked="false">3 months</button>
+                <button role="radio" data-v="365d|1d" aria-checked="true">1 year</button>
+              </div>
+              <button class="btn big" id="test">Test it</button>
+            </div>
+          </div>
+          <div class="result" id="result" hidden>
+            <div class="res-l">
+              <p class="lbl" id="res-title">Result</p>
+              <p class="money"><span id="res-from">$1,000</span> → <b id="res-to">$1,000</b></p>
+              <p class="sub" id="res-vs"></p>
+              <div class="res-rows" id="res-rows"></div>
+              <div class="res-acts">
+                <input id="res-name" maxlength="60" aria-label="Strategy name">
+                <button class="btn" id="res-save">Save strategy</button>
+              </div>
+              <details class="adv"><summary>See the exact rules</summary><pre id="res-rules"></pre><p>Edit rules freely in the <a href="terminal.html">Pro terminal</a>.</p></details>
+            </div>
+            <div class="res-r"><canvas id="res-chart"></canvas><div class="res-legend"><span><i class="a"></i>this strategy</span><span><i class="b"></i>just holding</span></div></div>
+          </div>
+        </div>
+      </section>
+
+      <p class="foot">Data from True Markets · Practice mode: JARVIS can't place orders from here · Past results don't promise future ones.</p>
+    </main>
   </div>
-</header>
-
-<main class="wrap">
-  <!-- 1. Pulse -->
-  <section class="pulse card">
-    <div class="pulse-l">
-      <p class="eyebrow">Market pulse</p>
-      <h1 id="headline">Reading the market…</h1>
-      <p class="sub" id="subline">&nbsp;</p>
-      <div class="gauge-wrap">
-        <svg class="gauge" viewBox="0 0 200 120" aria-hidden="true">
-          <defs><linearGradient id="gg" x1="0" x2="1"><stop offset="0" stop-color="#ff5d73"/><stop offset=".5" stop-color="#ffc857"/><stop offset="1" stop-color="#2ee6a6"/></linearGradient></defs>
-          <path d="M20 100 A80 80 0 0 1 180 100" fill="none" stroke="#1d2433" stroke-width="16" stroke-linecap="round"/>
-          <path d="M20 100 A80 80 0 0 1 180 100" fill="none" stroke="url(#gg)" stroke-width="16" stroke-linecap="round" opacity=".9"/>
-          <g id="needle" style="transform-origin:100px 100px"><line x1="100" y1="100" x2="100" y2="34" stroke="#fff" stroke-width="3" stroke-linecap="round"/><circle cx="100" cy="100" r="7" fill="#fff"/></g>
-        </svg>
-        <div class="gauge-label"><b id="mood">—</b><span>market mood</span></div>
-      </div>
-      <dl class="facts" id="facts"></dl>
-    </div>
-    <div class="pulse-r">
-      <div class="heat-head"><span>Biggest coins · size = value · colour = today</span><span class="legend"><i class="dn"></i>down<i class="up"></i>up</span></div>
-      <div class="heat"><canvas id="heat"></canvas><div class="tip" id="tip" hidden></div></div>
-    </div>
-  </section>
-
-  <!-- 2. Pipeline -->
-  <section class="card flow-card" aria-label="How JARVIS works">
-    <div class="sec-head"><div><p class="eyebrow">How it works</p><h2>From market data to a decision you make</h2></div><span class="funnel" id="funnel"></span></div>
-    <div class="flow" id="flow">
-      <svg class="flow-lines" id="flow-lines" aria-hidden="true"></svg>
-      <div class="node" data-n="0"><span class="ic">◉</span><b>Market data</b><em id="n0">—</em><small>True Markets, live</small></div>
-      <div class="node" data-n="1"><span class="ic">⚙</span><b>Strategies</b><em id="n1">—</em><small>watching your coins</small></div>
-      <div class="node" data-n="2"><span class="ic">⚡</span><b>Signals</b><em id="n2">—</em><small>buy · sell · hold</small></div>
-      <div class="node gate" data-n="3"><span class="ic">✋</span><b>You decide</b><em id="n3">—</em><small>nothing happens without you</small></div>
-      <div class="node off" data-n="4"><span class="ic">⏻</span><b>Real trading</b><em>Off</em><small>practice mode</small></div>
-    </div>
-    <div class="review" id="review"></div>
-  </section>
-
-  <!-- 3. Strategies -->
-  <section class="card">
-    <div class="sec-head"><div><p class="eyebrow">Your strategies</p><h2>How each idea would have done</h2></div><button class="btn" id="to-build">+ New strategy</button></div>
-    <div class="strats" id="strats"><div class="skel"></div><div class="skel"></div><div class="skel"></div></div>
-  </section>
-
-  <!-- 4. Builder -->
-  <section class="card build" id="build">
-    <div class="sec-head"><div><p class="eyebrow">Try an idea</p><h2>Build a strategy in three taps</h2></div></div>
-    <div class="steps">
-      <div class="step"><h3><span>1</span>Pick a style</h3><div class="styles" id="styles"></div></div>
-      <div class="step"><h3><span>2</span>Pick coins</h3><div class="coins" id="coins"></div></div>
-      <div class="step"><h3><span>3</span>How careful?</h3>
-        <div class="seg" id="risk" role="radiogroup" aria-label="Risk">
-          <button role="radio" data-v="5" aria-checked="false">Careful<small>exit at −5%</small></button>
-          <button role="radio" data-v="10" aria-checked="true">Balanced<small>exit at −10%</small></button>
-          <button role="radio" data-v="20" aria-checked="false">Bold<small>exit at −20%</small></button>
-        </div>
-        <h3 class="mt"><span>⏱</span>Test over</h3>
-        <div class="seg" id="period" role="radiogroup" aria-label="Test period">
-          <button role="radio" data-v="30d|1h" aria-checked="false">1 month</button>
-          <button role="radio" data-v="90d|4h" aria-checked="false">3 months</button>
-          <button role="radio" data-v="365d|1d" aria-checked="true">1 year</button>
-        </div>
-        <button class="btn big" id="test">Test it</button>
-      </div>
-    </div>
-    <div class="result" id="result" hidden>
-      <div class="res-l">
-        <p class="eyebrow" id="res-title">Result</p>
-        <p class="money"><span id="res-from">$1,000</span> → <b id="res-to">$1,000</b></p>
-        <p class="sub" id="res-vs"></p>
-        <div class="res-rows" id="res-rows"></div>
-        <div class="res-acts">
-          <input id="res-name" maxlength="60" aria-label="Strategy name">
-          <button class="btn" id="res-save">Save strategy</button>
-        </div>
-        <details class="adv"><summary>See the exact rules</summary><pre id="res-rules"></pre><p>Edit rules freely in the <a href="terminal.html">Pro terminal</a>.</p></details>
-      </div>
-      <div class="res-r"><canvas id="res-chart"></canvas><div class="res-legend"><span><i class="a"></i>this strategy</span><span><i class="b"></i>just holding</span></div></div>
-    </div>
-  </section>
-
-  <p class="foot">Data from True Markets · Practice mode: JARVIS can't place orders from here · Past results don't promise future ones.</p>
-</main>
+</div>
 
 <aside class="drawer" id="drawer" hidden aria-label="Coin details">
   <button class="x" id="drawer-x" aria-label="Close">×</button>
