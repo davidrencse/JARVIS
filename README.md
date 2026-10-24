@@ -490,9 +490,18 @@ ElevenLabs voices. A pick is saved as `ELEVENLABS_VOICE_ID`, applies to live cal
 Live-call audio goes to ElevenLabs, so the local voiceprint check doesn't apply to it;
 push-to-talk (**Voice**) and the always-on listener still run locally.
 
-## Markets terminal (True Markets recon)
+## Markets (True Markets recon)
 
-**Markets** in the console nav opens `terminal.html`: a Bloomberg-style terminal over
+**Markets** in the console nav opens `trade.html`, the simple view: a plain-English
+market pulse with a mood gauge and a market-cap heatmap (click a coin for its chart),
+the pipeline drawn live (market data → strategies → signals → you decide → real
+trading **off**, with a funnel line), each strategy's result as "$1,000 → $X vs
+holding", and a three-tap builder (style, coins, how careful) with an animated result.
+`/api/markets/pipeline` serves the pipeline (cached 60 s; templates on BTC/ETH/SOL run
+until you save your own). If True Markets blips, the last good data (up to an hour
+old) is shown instead of an error.
+
+**Pro terminal** (`terminal.html`, linked from that page) is the Bloomberg-style view over
 [True Markets](https://truemarkets.co) data. Monitor (top assets by market cap, 1h/24h
 change, range, sparkline), chart with windows from 1H to 365D, security description,
 intel (movers, breadth, BTC dominance, volatility) and a **strategy lab**.
