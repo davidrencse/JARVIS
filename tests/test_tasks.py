@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from jarvis.tasks import TaskTools, Tasks, next_dates, parse_date, parse_line
@@ -191,7 +191,8 @@ class WriteTests(TaskCase):
 
     def test_tools(self):
         tools = TaskTools(self.tasks)
-        ok, text = tools.call("task_add", {"text": "Email the TA", "due": "2026-10-24",
+        ok, text = tools.call("task_add", {"text": "Email the TA",
+                                           "due": (date.today() + timedelta(days=2)).isoformat(),
                                            "priority": "", "note": ""})
         self.assertTrue(ok, text)
         ok, text = tools.call("task_list", {"view": "agenda", "query": ""})

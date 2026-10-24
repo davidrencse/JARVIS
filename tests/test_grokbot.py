@@ -82,6 +82,10 @@ class SendTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.bot = Grokbot(CONFIG, self.tmp.name)
+        # A live reverse tunnel on this laptop must not count as a route in these tests.
+        tunnels = patch.object(grokbot, "TUNNEL_DIR", Path(self.tmp.name))
+        tunnels.start()
+        self.addCleanup(tunnels.stop)
 
     def tearDown(self):
         self.tmp.cleanup()

@@ -74,9 +74,15 @@ class BriefingTests(Case):
             def ask(self, *a, **k):
                 raise AssertionError("the brain should not be asked")
 
+        class Thursday(datetime):  # the briefing reads the clock itself here
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 22, 8, 15)
+
         config = {"vault": {"path": str(self.root)}}
-        result = ask("brief me", Store(self.state), Memory(self.state), config, self.root,
-                     lane=Brain())
+        with patch("jarvis.briefing.datetime", Thursday):
+            result = ask("brief me", Store(self.state), Memory(self.state), config, self.root,
+                         lane=Brain())
         self.assertEqual(result["lane"], "instant")
         self.assertIn("Academic Planning", result["reply"])
 

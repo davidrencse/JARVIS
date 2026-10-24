@@ -11,7 +11,10 @@ from unittest.mock import patch
 from jarvis import transfer
 from jarvis.storage import REMOTE_SCRIPT, Storage
 
-from . import test_storage as fixtures
+try:
+    from . import test_storage as fixtures
+except ImportError:  # run by unittest discover -s tests, without the package
+    import test_storage as fixtures
 
 
 class CopyCollisionTests(fixtures.Temp):
