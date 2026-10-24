@@ -711,7 +711,7 @@
     rows.sort((a, b) => a.at - b.at);
     if (!rows.length) {
       el.innerHTML = `<li class="thread-empty"><h3>What should I work on?</h3>
-        <p>Type below, or just talk: JARVIS is always listening and sends when you pause or press Enter (the mic button turns that off). Quick asks run one cheap model call; big jobs get a specialist plan you review first.</p>
+        <p>Type below, or say “Jarvis, …”: the mic is always on, but only requests that start with “Jarvis” are sent (the mic button turns it off). Quick asks run one cheap model call; big jobs get a specialist plan you review first.</p>
         <div class="suggest">${["What did I decide about the clipboard?", "Summarize what's in memory about Lan Mouse", "Plan a recon of my home lab's exposed services"].map((s) => `<button type="button">${esc(s)}</button>`).join("")}</div></li>`;
       $$(".suggest button", el).forEach((b) => b.addEventListener("click", () => { prompt.value = b.textContent; autosize(); prompt.focus(); }));
       return;
@@ -737,7 +737,7 @@
   prompt.addEventListener("input", autosize);
   let handsFree = store.get("jarvis.handsFree", true); // mic always listening; see microphone below
   const narrow = matchMedia("(max-width: 640px)");
-  const placeholder = () => (prompt.placeholder = narrow.matches ? "Ask JARVIS…" : state.case ? "Ask JARVIS (filed into this investigation)" : handsFree ? "Ask JARVIS, or just talk" : "Ask JARVIS, or hold Space to talk");
+  const placeholder = () => (prompt.placeholder = narrow.matches ? "Ask JARVIS…" : state.case ? "Ask JARVIS (filed into this investigation)" : handsFree ? "Ask JARVIS, or say “Jarvis, …”" : "Ask JARVIS, or hold Space to talk");
   narrow.addEventListener("change", placeholder); placeholder();
   $("#case-select").addEventListener("change", placeholder);
   prompt.addEventListener("keydown", (e) => {
@@ -863,16 +863,17 @@
   }
 
   // ---------- microphone ----------
-  // Always-on by default: the mic idles until you talk, sends when you pause (or press
-  // Enter), then listens again once JARVIS has answered. The mic button turns it off/on.
+  // Always-on by default: the mic idles until you talk and checks each pause (or Enter),
+  // but only a request that starts with "Jarvis" is sent; the server drops everything
+  // else. Push-to-talk (Space, or with always-on off) needs no wake word.
   const micBtn = $("#mic");
   let firstListen = true, spaceAt = 0;
-  const LISTENING = [["listening · pause or Enter sends · Esc cancels", "active"]];
+  const LISTENING = [["listening for “Jarvis, …” · Esc cancels", "active"]];
   const idleTrace = () => trace(mic.active && handsFree ? LISTENING : []);
   const mic = new Mic({ wave: $("#mic-wave"), onLevel: (l) => (Terrain.level = l), onAutoStop: () => stopMic() });
   function syncMicBtn() {
     micBtn.setAttribute("aria-pressed", String(handsFree || mic.active));
-    micBtn.title = handsFree ? "Always listening: talk any time, pause or press Enter to send. Click to stop listening."
+    micBtn.title = handsFree ? "Always listening, but only acts on requests that start with “Jarvis”. Click to stop listening."
       : "Talk: click to listen all the time, or hold Space when nothing is focused";
   }
   function relisten() {
@@ -897,22 +898,26 @@
   async function stopMic(cancel) {
     if (!mic.active && !mic.starting) return;
     cancel = cancel || mic.starting;
+    const ambient = mic.wait; // an always-on clip: it only counts if it starts with "Jarvis"
     const clip = await mic.stop();
     syncMicBtn();
-    const fail = (label, ms) => { trace([[label, "fail"]]); setTimeout(() => { if (!busy) idleTrace(); }, ms); relisten(); };
+    const fail = (label, ms, s = "fail") => { trace([[label, s]]); setTimeout(() => { if (!busy) idleTrace(); }, ms); relisten(); };
     if (cancel) return fail("cancelled", 2000);
     if (!clip || !clip.audio) return fail("didn't hear speech · check the mic input level", 3500);
     micBtn.classList.add("busy");
     trace([[firstListen ? "transcribing · loading Whisper on the GPU, first time only" : "checking it's you · transcribing", "active"]]);
     try {
-      const r = await api("/api/listen", new Uint8Array(clip.audio.buffer), true);
-      firstListen = false;
+      const r = await api("/api/listen" + (ambient ? "?wake=1" : ""), new Uint8Array(clip.audio.buffer), true);
+      if (r.device) firstListen = false;
+      // The background listener heard it too and answers "Jarvis, …" itself.
+      if (r.listener) return r.addressed ? fail("the background listener is answering that", 2500, "done") : idleTrace();
       if (!r.owner) {
         // Always-on hears JARVIS's own voice and the room; only a push-to-talk miss is worth a toast.
         if (!handsFree) toast("That didn't sound like you, so JARVIS ignored it. Re-run `jarvis voice enroll` if this keeps happening.");
         return fail(`ignored · voice match ${r.score} is below your cutoff`, 2500);
       }
-      if (!r.text) return fail("heard you, but no words came through", 2500);
+      if (ambient && !r.addressed) return fail("ignored · didn't start with “Jarvis”", 2500);
+      if (!r.text) return fail(r.addressed ? "heard “Jarvis” but no request after it" : "heard you, but no words came through", 2500);
       prompt.value = r.text; autosize();
       await ask(r.text, r);
     } catch (e) { trace([["transcription failed", "fail"]]); toast(plainError(e.message)); }
