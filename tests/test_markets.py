@@ -138,5 +138,67 @@ class StrategyTests(unittest.TestCase):
             validate({**template, "symbols": ["BTC"]})
 
 
+class FakeMarket:
+    """History that rises then falls, so trend strategies have something to say."""
+    def history(self, symbol, window, resolution):
+        if symbol == "BAD":
+            raise RuntimeError("unknown symbol")
+        prices = [100 + i for i in range(60)] + [160 - 2 * i for i in range(20)]
+        return [{"t": f"2026-01-01T{i % 24:02d}:00:00Z", "price": float(p)}
+                for i, p in enumerate(prices)]
+
+
+class PipelineTests(unittest.TestCase):
+    def test_scan_runs_templates_when_nothing_is_saved(self):
+        result = strategy.scan([], FakeMarket())
+        self.assertTrue(result["templates"])
+        self.assertEqual(result["strategies"], len(strategy.TEMPLATES))
+        self.assertEqual(result["checks"], 3 * len(strategy.TEMPLATES))
+        self.assertEqual(sum(result["counts"].values()), result["checks"])
+        self.assertEqual([b["total_return"] for b in result["leaderboard"]],
+                         sorted((b["total_return"] for b in result["leaderboard"]), reverse=True))
+
+    def test_scan_survives_a_failing_symbol(self):
+        spec = {"id": "s1", "name": "Mine", "symbols": ["BTC", "BAD"],
+                "entry": ["price > sma(5)"], "exit": ["price < sma(5)"]}
+        result = strategy.scan([spec], FakeMarket())
+        self.assertFalse(result["templates"])
+        self.assertEqual(result["checks"], 1)  # BAD is reported as an error, not a crash
+
+    def test_stale_cache_covers_a_network_blip(self):
+        with tempfile.TemporaryDirectory() as temp:
+            tm = TrueMarkets(temp)
+            tm._token, tm._expires = "tok", 9e12
+            with patch("jarvis.markets.urllib.request.urlopen", return_value=reply({"x": 1})):
+                self.assertEqual(tm.get("/v1/defi/market/prices", {"symbol": "BTC"}), {"x": 1})
+            key = next(iter(tm._cache))
+            tm._cache[key] = (__import__("time").time() - 120, {"x": 1})
+            with patch("jarvis.markets.urllib.request.urlopen", side_effect=OSError("offline")):
+                self.assertEqual(tm.get("/v1/defi/market/prices", {"symbol": "BTC"}, ttl=30),
+                                 {"x": 1})
+                self.assertIn("offline", tm.last_error[1])
+                with self.assertRaisesRegex(RuntimeError, "Can't reach"):
+                    tm.get("/v1/defi/market/prices", {"symbol": "ETH"})
+
+    def test_console_pipeline_reports_every_stage(self):
+        from jarvis.ui import Console
+        with tempfile.TemporaryDirectory() as temp:
+            console = Console({}, temp, Path(temp) / "state")
+            market = console.markets()
+            with patch.object(market, "universe", return_value=[{}] * 7), \
+                    patch.object(market, "monitor", return_value={"rows": [{}] * 3,
+                                                                  "unpriced": ["X"]}), \
+                    patch("jarvis.strategy.scan", return_value={
+                        "strategies": 5, "checks": 15, "counts": {}, "actionable": [],
+                        "holding": [], "leaderboard": [], "templates": True}):
+                p = console.pipeline()
+            self.assertEqual((p["feed"]["assets"], p["feed"]["priced"], p["feed"]["unpriced"]),
+                             (7, 3, 1))
+            self.assertTrue(p["signals"]["ok"])
+            self.assertEqual(p["execution"], {"enabled": False, "orders": 0,
+                                              "why": "Recon only: no order code is built in."})
+            self.assertIs(console.pipeline(), p)  # cached for a minute
+
+
 if __name__ == "__main__":
     unittest.main()
