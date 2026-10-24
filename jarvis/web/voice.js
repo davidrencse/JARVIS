@@ -1,8 +1,9 @@
-// Push-to-talk capture. Audio never leaves the laptop: it is resampled to 16 kHz
+// Microphone capture, push-to-talk or always-on (`start({ wait: true })` idles until
+// you speak and ends the clip when you pause). Audio never leaves the laptop: it is resampled to 16 kHz
 // mono float32 and posted to the local server, which checks the voiceprint and runs
 // Whisper on the GPU, exactly like the always-on listener.
 (function () {
-  const TARGET = 16000, MAX_SECONDS = 30, SILENCE_END = 1.2;
+  const TARGET = 16000, MAX_SECONDS = 30, SILENCE_END = 1.2, PREROLL = 0.4;
 
   class Mic {
     constructor({ wave, onLevel, onAutoStop }) {
@@ -11,8 +12,9 @@
       this._session = null;
     }
     get starting() { return Boolean(this._session && !this.active); }
-    async start() {
+    async start({ wait = false } = {}) {
       if (this.active) return;
+      this.wait = wait;
       if (this._session) return this._session.ready;
       if (!navigator.mediaDevices?.getUserMedia) throw new Error("This browser can't use the microphone here.");
       const session = {};
@@ -26,6 +28,11 @@
           audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
         if (this._session !== session) return await this._release(session);
         session.ctx = new AudioContext();
+        // Opened without a click (always-on at page load), audio stays suspended until the first gesture.
+        if (session.ctx.state === "suspended") {
+          const wake = () => session.ctx?.resume().catch(() => {});
+          for (const ev of ["pointerdown", "keydown"]) addEventListener(ev, wake, { once: true, capture: true });
+        }
         await session.ctx.audioWorklet.addModule("recorder-worklet.js");
         if (this._session !== session) return await this._release(session);
         session.source = session.ctx.createMediaStreamSource(session.stream);
@@ -34,7 +41,7 @@
         session.source.connect(session.node); session.source.connect(analyser);
         this.stream = session.stream; this.ctx = session.ctx;
         this.node = session.node; this.analyser = analyser;
-        this.chunks = []; this.samples = 0; this.voiced = 0; this.quiet = 0; this.floor = 0.004;
+        this.chunks = []; this.samples = 0; this.total = 0; this.voiced = 0; this.quiet = 0; this.floor = 0.004;
         this.node.port.onmessage = (ev) => this.frame(ev.data);
         this.active = true; this.t0 = performance.now();
         this.paint();
@@ -60,11 +67,20 @@
       if (!this.active) return;
       this.chunks.push(data); this.samples += data.length;
       let sum = 0; for (let i = 0; i < data.length; i++) sum += data[i] * data[i];
-      const rms = Math.sqrt(sum / data.length), dt = data.length / this.ctx.sampleRate;
-      const elapsed = this.samples / this.ctx.sampleRate;
-      if (elapsed < 0.35) this.floor = Math.max(this.floor, rms * 0.9);
+      const rate = this.ctx.sampleRate, rms = Math.sqrt(sum / data.length), dt = data.length / rate;
+      this.total += dt;
+      if (this.total < 0.35) this.floor = Math.max(this.floor, rms * 0.9);
       const speaking = rms > Math.max(this.floor * 3, 0.012);
       if (speaking) { this.voiced += dt; this.quiet = 0; } else this.quiet += dt;
+      if (this.wait && this.voiced < 0.3 && this.quiet > SILENCE_END) {
+        // Nothing said yet: follow the room's noise and keep only a short pre-roll,
+        // so waiting costs no memory and never runs into the time limit.
+        if (!speaking) this.floor = this.floor * 0.98 + rms * 0.02;
+        const keep = PREROLL * rate; let n = 0, i = this.chunks.length;
+        while (i > 0 && n < keep) n += this.chunks[--i].length;
+        this.chunks = this.chunks.slice(i); this.samples = n; this.voiced = 0;
+      }
+      const elapsed = this.samples / rate;
       this.level = Math.min(1, rms * 9);
       this.onLevel(this.level);
       if ((this.voiced > 0.3 && this.quiet > SILENCE_END) || elapsed > MAX_SECONDS) this.onAutoStop();

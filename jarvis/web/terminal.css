@@ -11,7 +11,7 @@
   --amber-dim: var(--jv-line-2);
   --up: var(--jv-up);
   --down: var(--jv-down);
-  --blue: #8ab4ff;
+  --blue: var(--jv-ink);
   --sel: var(--jv-raise);
   --mono: var(--jv-mono);
 }
@@ -31,7 +31,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* ---------- top bar ---------- */
 .bar { display: flex; align-items: center; gap: 14px; padding: 14px 10px 10px 0; background: none; }
 .term-title { margin: 0; white-space: nowrap; }
-.cmd { flex: 1; display: flex; max-width: 720px; border-radius: 999px; overflow: hidden; border: 1px solid var(--amber-dim); background: var(--jv-card-2); }
+.cmd { flex: 1; display: flex; max-width: 720px; border-radius: 2px; overflow: hidden; border: 1px solid var(--amber-dim); background: var(--jv-card-2); }
 .cmd input { flex: 1; min-width: 0; border: 0; background: none; padding: 6px 10px; color: var(--amber); text-transform: uppercase; outline: none; letter-spacing: .04em; }
 .cmd input::placeholder { color: var(--ink-3); text-transform: none; }
 .cmd button { border: 0; background: var(--amber); color: var(--jv-inv-ink); font-weight: 700; padding: 0 14px; cursor: pointer; }
@@ -44,7 +44,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .clock { color: var(--ink); min-width: 9ch; text-align: right; }
 
 /* ---------- ticker tape ---------- */
-.tape { overflow: hidden; margin-right: 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--jv-bg); height: 22px; }
+.tape { overflow: hidden; margin-right: 10px; border: 1px solid var(--line); border-radius: 2px; background: var(--jv-bg); height: 22px; }
 .tape-in { display: inline-flex; gap: 26px; padding: 3px 0; white-space: nowrap; animation: tape 80s linear infinite; }
 .tape:hover .tape-in { animation-play-state: paused; }
 .tape-in span b { color: var(--amber); margin-right: 6px; font-weight: 600; }

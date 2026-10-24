@@ -133,8 +133,9 @@
     if (document.hidden || $("#view-console")?.hidden) return;
     face($("#dm-face"), agent.mood, t);
     wave($("#dm-wave"), agent.mood === "thinking" ? 0.9 : agent.mood === "listening" ? 0.35 + (window.Terrain?.level || 0) : 0, t);
-    // Moves only while something is happening; idle draws one still frame.
-    if (!reduce.matches && (agent.mood === "thinking" || agent.mood === "listening")) raf = requestAnimationFrame(animate);
+    // Moves only while something is happening; idle draws one still frame. The listener is
+    // on most of the day, so the motion runs at ~15 fps rather than every frame.
+    if (!reduce.matches && (agent.mood === "thinking" || agent.mood === "listening")) raf = setTimeout(() => requestAnimationFrame(animate), 66);
   }
   const kick = () => { if (!raf) raf = requestAnimationFrame(animate); };
   on("live", kick); on("view", kick); addEventListener("resize", kick);
@@ -142,6 +143,7 @@
 
   // ---------- 02 Claude tokens ----------
   async function loadTokens() {
+    if (!$("#sig-tok")) return; // shown by the console's ridge now
     let u; try { u = await J.api("/api/usage?hours=48"); } catch (e) { $("#sig-tok").textContent = "—"; return; }
     const cur = u.output.slice(24), prev = u.output.slice(0, 24);
     const total = cur.reduce((a, b) => a + b, 0), before = prev.reduce((a, b) => a + b, 0);
