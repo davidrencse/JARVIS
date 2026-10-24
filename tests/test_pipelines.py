@@ -317,10 +317,10 @@ class CreditsResilienceTests(Temp):
         import urllib.error
         from jarvis import credits as mod
         err = urllib.error.HTTPError("https://api.deepseek.com/x", 401, "no", {}, None)
-        with patch.object(mod.urllib.request, "urlopen", side_effect=err):
+        with patch.object(mod._OPENER, "open", side_effect=err):
             with self.assertRaisesRegex(RuntimeError, "HTTP 401.*check the key"):
                 mod._get_json("https://api.deepseek.com/x", {})
-        with patch.object(mod.urllib.request, "urlopen", side_effect=OSError("offline")):
+        with patch.object(mod._OPENER, "open", side_effect=OSError("offline")):
             with self.assertRaisesRegex(RuntimeError, "Couldn't reach api.deepseek.com"):
                 mod._get_json("https://api.deepseek.com/x", {})
 
