@@ -763,6 +763,19 @@ class Console:
         target = transfer.ssh_device(self.config, device or None)
         return transfer.inbox(target.get("target"), target.get("identity_file"))
 
+    def grokbot(self):
+        from .grokbot import Grokbot
+        return Grokbot(self.config, self.state)
+
+    def grokbot_command(self, body):
+        """Devices view: a command for Grokbot, a terminal, or a browser."""
+        result = self.grokbot().command(str(body.get("text", "")), body.get("mode") or None,
+                                        body.get("device") or None)
+        if "ask" in result:  # JARVIS's own browser runs through the brain's browser tools
+            result["job"] = self.submit(result.pop("ask"))
+        self.bus.publish("grokbot.command", {k: v for k, v in result.items() if k != "job"})
+        return result
+
     def daemon(self, action):
         from . import daemon
         if action not in ("start", "stop", "status"):
@@ -920,6 +933,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/memory/item": lambda: c.memory.get(query.get("id", "")),
             "/api/route": lambda: c.route(query.get("text", ""), query.get("tier") or None),
             "/api/voice": lambda: c.daemon("status"),
+            "/api/grokbot": lambda: c.grokbot().status(),
             "/api/probe": lambda: c.prober.get(refresh=query.get("refresh") == "1"),
             "/api/usage": lambda: c.credits.claude_hourly(int(query.get("hours", 24))),
             "/api/inbox": lambda: c.inbox(query.get("device")),
@@ -1003,6 +1017,8 @@ class Handler(BaseHTTPRequestHandler):
                                                           body.get("case") or None))
             if url.path == "/api/voice":
                 return self._send(HTTPStatus.OK, c.daemon(body.get("action")))
+            if url.path == "/api/grokbot":
+                return self._send(HTTPStatus.OK, c.grokbot_command(body))
             if url.path == "/api/fs/copy":
                 return self._send(HTTPStatus.OK, c.fs_copy(body))
             if url.path == "/api/overlay":

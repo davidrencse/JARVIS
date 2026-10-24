@@ -1,0 +1,548 @@
+"""Grokbot and JARVIS's own windows, commanded from the Devices (remote desktop) view.
+
+Grokbot (xAI's "Grok Bot" desktop agent, an Electron app) has no local prompt API,
+CLI or deep link for sending a task: its grokbot:// links only import bot templates
+and finish MCP sign-ins, and its local-exec daemon takes work from xAI's servers.
+So JARVIS types to it the way David would: focus its window, paste the prompt into
+the composer, press Enter, then hand focus and the clipboard back.
+
+- Arch/Hyprland: LINUX_SCRIPT (hyprctl, wl-copy, wtype), piped to `bash -s` here or
+  over the configured SSH key, so the Dell's JARVIS can type to the Zenbook's
+  Grokbot too. Over SSH it finds the Hyprland session itself.
+- Windows: WINDOWS_TYPE (user32 focus + SendKeys), when JARVIS runs on that laptop.
+- Arch -> Windows: OpenSSH sessions on Windows can't reach the desktop, so the Dell
+  runs `python -m jarvis grokbot tunnel`: a relay on its loopback that only types to
+  its own Grokbot, reverse-forwarded over its SSH key to this laptop's loopback. Each
+  run makes a fresh token and leaves it (mode 600) in ~/.config/jarvis/ on the other
+  end, which is how that end finds the tunnel and proves it's David's user.
+Scripts are fixed; the prompt travels as base64 data, never as code.
+
+Its own state lives in ~/.grokbot. JARVIS reads only the daemon heartbeat
+(local-exec-daemon.json) and the computer-use switch; never the credential file.
+
+The other commands open things for David to watch: a terminal window, optionally
+running a command he typed, and the JARVIS Chrome profile (.jarvis/browser-profile,
+the one the Playwright browser tools sign in with).
+"""
+
+import base64
+import json
+import os
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import tempfile
+import secrets
+import threading
+import time
+import urllib.error
+import urllib.request
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOME = Path.home()
+WINDOWS = os.name == "nt"
+DATA = HOME / ".grokbot"
+APP_PATHS = ("grok-bot", str(HOME / "Desktop/grok-bot-local/opt/Grok Bot/grok-bot"),
+             "/opt/Grok Bot/grok-bot")
+WINDOW_CLASS = "grok-bot"
+TERMINALS = ("kitty", "ghostty", "alacritty", "foot", "wezterm", "konsole", "gnome-terminal")
+BROWSERS = ("google-chrome-stable", "google-chrome", "chromium", "chrome")
+MAX_PROMPT = 8000
+TUNNEL_DIR = HOME / ".config" / "jarvis"   # where a reverse tunnel leaves its port + token
+RELAY_PORT, TUNNEL_PORT = 7779, 7778          # relay on the Windows side; its forward here
+URL = re.compile(r"https?://[^\s\"'<>]+")
+BARE_URL = re.compile(r"[\w-]+(\.[\w-]+)+(/[^\s\"'<>]*)?")
+# What each Devices-view mode does. `jarvis-browser` goes through the brain and its
+# browser tools; the rest are handled here.
+MODES = ("grokbot", "grokbot-browser", "jarvis-browser", "browser", "terminal")
+SLASH = {"/grok": "grokbot", "/grokbot": "grokbot", "/gb": "grokbot-browser",
+         "/jarvis": "jarvis-browser", "/browser": "browser", "/open": "browser",
+         "/terminal": "terminal", "/term": "terminal"}
+
+# Runs with B64=<prompt in base64> prepended. Prints key=value lines.
+LINUX_SCRIPT = r"""
+set -u
+P=$(printf %s "$B64" | base64 -d)
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+if [ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+  HYPRLAND_INSTANCE_SIGNATURE=$(ls -t "$XDG_RUNTIME_DIR/hypr" 2>/dev/null | head -n1)
+  export HYPRLAND_INSTANCE_SIGNATURE
+fi
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+  WAYLAND_DISPLAY=$(cd "$XDG_RUNTIME_DIR" 2>/dev/null && ls -d wayland-? 2>/dev/null | head -n1)
+  export WAYLAND_DISPLAY
+fi
+[ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] || { echo "error=No Hyprland session is running there."; exit 3; }
+for t in hyprctl wl-copy wl-paste wtype python3; do
+  command -v "$t" >/dev/null || { echo "error=$t is not installed there."; exit 3; }
+done
+field() { python3 -c 'import json,sys
+d=json.load(sys.stdin); k=sys.argv[1]
+if isinstance(d,list): d=next((c for c in d if c.get("class")=="grok-bot"),{})
+d=d or {}
+print(d.get(k,"") if k!="workspace" else (d.get(k) or {}).get("name",""))' "$1"; }
+win() { hyprctl clients -j 2>/dev/null | field "$1"; }
+A=$(win address)
+if [ -z "$A" ]; then
+  APP=$(command -v grok-bot || true)
+  [ -n "$APP" ] || APP="$HOME/Desktop/grok-bot-local/opt/Grok Bot/grok-bot"
+  [ -x "$APP" ] || { echo "error=Grok Bot isn't installed there."; exit 4; }
+  setsid "$APP" >/dev/null 2>&1 < /dev/null &
+  for i in $(seq 40); do sleep 0.25; A=$(win address); [ -n "$A" ] && break; done
+  sleep 1.5
+fi
+[ -n "$A" ] || { echo "error=Grok Bot started but its window never appeared."; exit 4; }
+PREV=$(hyprctl activewindow -j 2>/dev/null | field address)
+OLD=$(timeout 2 wl-paste -n -t text/plain 2>/dev/null || true)
+hyprctl dispatch focuswindow "address:$A" >/dev/null
+sleep 0.35
+printf %s "$P" | wl-copy >/dev/null 2>&1
+wtype -M ctrl v -m ctrl
+sleep 0.15
+wtype -k Return
+sleep 0.3
+if [ -n "$PREV" ] && [ "$PREV" != "$A" ]; then hyprctl dispatch focuswindow "address:$PREV" >/dev/null; fi
+if [ -n "$OLD" ]; then printf %s "$OLD" | wl-copy >/dev/null 2>&1; fi
+echo "ok=1"
+echo "workspace=$(win workspace)"
+"""
+
+# Runs in this Windows desktop session; reads the prompt file passed as its argument.
+WINDOWS_TYPE = r"""
+param([string]$PromptFile)
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -Namespace JarvisGrok -Name W -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+'@
+  $p = Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and
+        ($_.ProcessName -like 'grok*bot*' -or $_.MainWindowTitle -eq 'Grok Bot') } | Select-Object -First 1
+  if (-not $p) { throw 'Grok Bot is not open on this laptop.' }
+  $h = $p.MainWindowHandle; $prev = [JarvisGrok.W]::GetForegroundWindow()
+  if ([JarvisGrok.W]::IsIconic($h)) { [JarvisGrok.W]::ShowWindow($h, 9) | Out-Null }
+  $old = $null; try { $old = Get-Clipboard -Raw } catch {}
+  Set-Clipboard -Value ([IO.File]::ReadAllText($PromptFile))
+  (New-Object -ComObject WScript.Shell).SendKeys('%')  # an Alt tap lets us take the foreground
+  [JarvisGrok.W]::SetForegroundWindow($h) | Out-Null
+  Start-Sleep -Milliseconds 400
+  [System.Windows.Forms.SendKeys]::SendWait('^v'); Start-Sleep -Milliseconds 150
+  [System.Windows.Forms.SendKeys]::SendWait('{ENTER}'); Start-Sleep -Milliseconds 300
+  if ($prev -ne [IntPtr]::Zero -and $prev -ne $h) { [JarvisGrok.W]::SetForegroundWindow($prev) | Out-Null }
+  if ($old) { Set-Clipboard -Value $old }
+  'ok=1'
+} catch { "error=$($_.Exception.Message)" }
+"""
+
+
+def _kv(text):
+    return dict(line.split("=", 1) for line in (text or "").splitlines() if "=" in line)
+
+
+def _same_host(a, b):
+    norm = lambda h: re.sub(r"[^a-z0-9]", "", (h or "").lower())
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
+def _quiet(command, **kw):
+    return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True, **kw)
+
+
+def _json(path):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def parse(text, mode=None):
+    """A Devices-view command line -> (mode, argument). A leading /word picks the mode;
+    otherwise the selected mode, defaulting to Grokbot."""
+    text = (text or "").strip()
+    head, _, rest = text.partition(" ")
+    if head.lower() in SLASH:
+        return SLASH[head.lower()], rest.strip()
+    mode = mode or "grokbot"
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {', '.join(MODES)}.")
+    return mode, text
+
+
+class Grokbot:
+    def __init__(self, config, state_dir):
+        self.config = config.get("personal_agents", {}).get("grokbot", {})
+        self.machines = config.get("devices", {})
+        self.state = Path(state_dir)
+
+    # -- which laptop ------------------------------------------------------------------
+    def here(self):
+        """The configured device this process runs on (by hostname), else None."""
+        name = socket.gethostname()
+        return next((k for k, d in self.machines.items() if _same_host(d.get("hostname"), name)),
+                    None)
+
+    def route(self, device=None):
+        """How to reach the Grokbot on `device`: {"device", "os", "local", "target"...}.
+        Raises with what's missing when there's no way to type there."""
+        here = self.here()
+        device = device or here or "local"
+        info = (self.config.get("devices") or {}).get(device, {})
+        local = device in ("local", here)
+        os_name = ("windows" if WINDOWS else "linux") if local else info.get("os")
+        out = {"device": device, "os": os_name, "local": local}
+        if local:
+            return out
+        # Before the device check: seen from Arch, the Dell isn't a routable device.
+        tunnel = _json(TUNNEL_DIR / f"grokbot-{device}.json")
+        if tunnel and tunnel.get("port") and tunnel.get("token"):
+            return {**out, "tunnel": int(tunnel["port"]), "token": tunnel["token"]}
+        if device not in self.machines:
+            if device in (self.config.get("devices") or {}):
+                raise LookupError(f"No route from this laptop to {device}. On {device}, run "
+                                  "python -m jarvis grokbot tunnel.")
+            raise LookupError(f"Unknown device {device!r}.")
+        machine = self.machines[device]
+        # Its ssh entry here, or a reverse route listed under personal_agents.grokbot.
+        ssh = machine if machine.get("transport") == "ssh" else info.get("ssh") or {}
+        if not ssh.get("target"):
+            raise LookupError(f"No route from this laptop to {device}. On {device}, run "
+                              "python -m jarvis grokbot tunnel, or add personal_agents."
+                              f"grokbot.devices.{device}.ssh {{target, identity_file}}.")
+        if os_name != "linux":
+            raise LookupError(f"Start the tunnel on {device}: python -m jarvis grokbot tunnel "
+                              "(Windows SSH sessions can't reach its desktop).")
+        return {**out, "target": ssh["target"], "identity_file": ssh.get("identity_file")}
+
+    def devices(self):
+        """Every laptop with a Grokbot entry, and whether this one can type to it."""
+        names = dict.fromkeys([*(self.config.get("devices") or {}), *self.machines])
+        out = []
+        for name in names:
+            try:
+                r = self.route(name)
+                live = _listening(r["tunnel"]) if "tunnel" in r else True
+                out.append({"id": name, "here": r["local"], "os": r["os"], "ok": live,
+                            "via": "tunnel" if "tunnel" in r else "here" if r["local"] else "ssh",
+                            **({} if live else {"why_not": f"The tunnel from {name} is down; "
+                                                "restart python -m jarvis grokbot tunnel there."})})
+            except LookupError as exc:
+                out.append({"id": name, "here": False, "ok": False, "why_not": str(exc)})
+        return out
+
+    # -- discovery (this laptop) ----------------------------------------------------------
+    def app(self):
+        for name in (self.config.get("path"), *APP_PATHS):
+            if not name:
+                continue
+            path = shutil.which(name) if "/" not in name else name
+            if path and Path(path).is_file():
+                return path
+        return None
+
+    def window(self):
+        """Hyprland client for the Grok Bot window, or None."""
+        if not shutil.which("hyprctl") or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            return None
+        try:
+            out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True,
+                                 timeout=5).stdout
+            return next((c for c in json.loads(out or "[]") if c.get("class") == WINDOW_CLASS),
+                        None)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+
+    def can_type(self):
+        if WINDOWS:
+            return True, ""
+        if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            return False, "Typing to Grokbot here needs the Hyprland session."
+        missing = [t for t in ("hyprctl", "wl-copy", "wl-paste", "wtype") if not shutil.which(t)]
+        if missing:
+            return False, f"Typing to Grokbot needs {', '.join(missing)} on PATH."
+        return True, ""
+
+    def status(self):
+        daemon = _json(DATA / "local-exec-daemon.json") or {}
+        gate = _json(DATA / "local-computer-use-gate.json") or {}
+        win = self.window()
+        ok, why = self.can_type()
+        return {"here": self.here(), "installed": self.app() is not None, "app": self.app(),
+                "window": bool(win), "workspace": (win or {}).get("workspace", {}).get("name"),
+                "daemon": _alive(daemon.get("pid")), "computer_use": bool(gate.get("isOn")),
+                "can_send": ok, "why_not": why or None, "devices": self.devices(),
+                "terminal": self.terminal(), "browser": self.browser()}
+
+    # -- typing to Grokbot -----------------------------------------------------------------
+    def send(self, prompt, browser=False, device=None):
+        """Paste `prompt` into the Grok Bot composer on `device` and submit it."""
+        prompt = (prompt or "").strip()
+        if not prompt:
+            raise ValueError("Type something for Grokbot to do.")
+        if len(prompt) > MAX_PROMPT:
+            raise ValueError(f"Keep Grokbot prompts under {MAX_PROMPT} characters.")
+        if browser:
+            prompt = f"Use your browser for this: {prompt}"
+        route = self.route(device)
+        if route["local"]:
+            ok, why = self.can_type()
+            if not ok:
+                raise ValueError(why)
+        if "tunnel" in route:
+            return {**self._via_tunnel(prompt, route), "sent": prompt}
+        out = self._windows(prompt) if route["os"] == "windows" else self._linux(prompt, route)
+        res = _kv(out)
+        if res.get("ok") != "1":
+            raise RuntimeError(res.get("error") or (out or "").strip()[-200:]
+                               or f"Grokbot on {route['device']} didn't confirm.")
+        return {"sent": prompt, "to": "grokbot", "device": route["device"],
+                "workspace": res.get("workspace") or None}
+
+    def _linux(self, prompt, route):
+        script = f"B64={base64.b64encode(prompt.encode()).decode()}\n{LINUX_SCRIPT}".encode()
+        if route["local"]:
+            argv = ["bash", "-s"]
+        else:
+            if not shutil.which("ssh"):
+                raise LookupError("OpenSSH client is not installed.")
+            argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                    "-o", "ConnectTimeout=5"]
+            if route.get("identity_file"):
+                argv += ["-i", str(Path(route["identity_file"]).expanduser()),
+                         "-o", "IdentitiesOnly=yes"]
+            argv += [route["target"], "bash -s"]
+        try:
+            # Bytes, not text: Windows text mode would turn \n into \r\n for bash.
+            done = subprocess.run(argv, input=script, capture_output=True, timeout=30,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(f"Grokbot on {route['device']} didn't answer within 30 s.")
+        out = done.stdout.decode("utf-8", "replace")
+        if done.returncode and "error=" not in out:
+            tail = done.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
+            raise RuntimeError(f"Couldn't reach {route['device']}: {tail[0][:200]}")
+        return out
+
+    @staticmethod
+    def _via_tunnel(prompt, route):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{route['tunnel']}/send", data=json.dumps({"prompt": prompt}).encode(),
+            headers={"Content-Type": "application/json", "X-JARVIS-Token": route["token"]})
+        try:
+            with urllib.request.urlopen(req, timeout=40) as res:
+                return json.loads(res.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            body = _loads(exc.read())
+            raise RuntimeError(body.get("error") or f"{route['device']} refused ({exc.code}).")
+        except (urllib.error.URLError, OSError):
+            raise ConnectionError(f"The tunnel from {route['device']} is down; restart "
+                                  f"python -m jarvis grokbot tunnel there.")
+
+    # -- the Windows end of the reverse tunnel ----------------------------------------------
+    def tunnel(self, to=None, relay_port=RELAY_PORT, remote_port=TUNNEL_PORT, once=False):
+        """Run on the laptop whose Grokbot the other one should reach (the Dell). Blocks;
+        Ctrl+C stops it and withdraws the token."""
+        here = self.here()
+        if not here:
+            raise LookupError("This laptop's hostname isn't in jarvis.config.json devices.")
+        to = to or next((k for k, d in self.machines.items() if d.get("transport") == "ssh"), None)
+        ssh = self.machines.get(to) or {}
+        if ssh.get("transport") != "ssh" or not ssh.get("target"):
+            raise LookupError("No SSH device to tunnel to; pass --to <device>.")
+        binary = shutil.which("ssh")
+        if not binary:
+            raise LookupError("OpenSSH client is not installed.")
+        token = secrets.token_urlsafe(32)
+        relay = relay_server(self, token, relay_port)
+        threading.Thread(target=relay.serve_forever, daemon=True).start()
+        base = [binary, "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+                "-o", "ConnectTimeout=5"]
+        if ssh.get("identity_file"):
+            base += ["-i", str(Path(ssh["identity_file"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+        note = f".config/jarvis/grokbot-{here}.json"
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        print(f"Relay for {here}'s Grokbot on 127.0.0.1:{relay_port}; forwarding to "
+              f"{to} 127.0.0.1:{remote_port}. Ctrl+C stops.", flush=True)
+        try:
+            while True:
+                # Fresh token file each connect, so a restarted end always matches.
+                put = subprocess.run(
+                    [*base, ssh["target"], f"umask 077; mkdir -p .config/jarvis && cat > {note}"],
+                    input=json.dumps({"port": remote_port, "token": token, "from": here}).encode(),
+                    capture_output=True, timeout=20, creationflags=flags)
+                if put.returncode:
+                    print(f"Couldn't reach {to}: {put.stderr.decode('utf-8', 'replace').strip()[-200:]}",
+                          flush=True)
+                else:
+                    print(f"Connected to {to}.", flush=True)
+                    subprocess.run([*base, "-N", "-o", "ExitOnForwardFailure=yes",
+                                    "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
+                                    "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{relay_port}",
+                                    ssh["target"]], creationflags=flags)
+                    print(f"Tunnel to {to} closed.", flush=True)
+                if once:
+                    return
+                time.sleep(5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            relay.shutdown()
+            subprocess.run([*base, ssh["target"], f"rm -f {note}"], capture_output=True,
+                           timeout=10, creationflags=flags)
+
+    def _windows(self, prompt):
+        with tempfile.TemporaryDirectory(prefix="jarvis-grokbot-") as tmp:
+            script, text = Path(tmp) / "type.ps1", Path(tmp) / "prompt.txt"
+            script.write_text(WINDOWS_TYPE, encoding="utf-8-sig")
+            text.write_text(prompt, encoding="utf-8")
+            done = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
+                                   "-ExecutionPolicy", "Bypass", "-File", str(script),
+                                   "-PromptFile", str(text)],
+                                  capture_output=True, text=True, timeout=30,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return done.stdout
+
+    # -- JARVIS's own windows ----------------------------------------------------------
+    def terminal(self):
+        for name in (self.config.get("terminal"), *TERMINALS):
+            if name and shutil.which(name):
+                return name
+        return "wt" if WINDOWS and shutil.which("wt") else None
+
+    def open_terminal(self, command="", cwd=None):
+        """A visible terminal window titled JARVIS; with `command`, it runs there and the
+        window stays open afterwards so David sees the result."""
+        cwd = str(Path(cwd).expanduser()) if cwd else str(HOME)
+        if not Path(cwd).is_dir():
+            raise ValueError(f"No such folder: {cwd}")
+        term = self.terminal()
+        if not term:
+            raise LookupError("No terminal emulator found on PATH.")
+        command = (command or "").strip()
+        if WINDOWS:
+            argv = ["wt", "-d", cwd] + (["cmd", "/k", command] if command else [])
+            _quiet(argv)
+            return {"terminal": "wt", "command": command or None, "cwd": cwd}
+        shell = os.environ.get("SHELL") or "/bin/bash"
+        # Run the command, then drop into an interactive shell in the same window.
+        inner = [shell, "-c", f"{command}; exec {shlex.quote(shell)} -i"] if command else [shell, "-i"]
+        argv = {"kitty": ["kitty", "--title", "JARVIS", "--directory", cwd, *inner],
+                "ghostty": ["ghostty", "--title=JARVIS", f"--working-directory={cwd}", "-e", *inner],
+                "alacritty": ["alacritty", "--title", "JARVIS", "--working-directory", cwd,
+                              "-e", *inner],
+                "foot": ["foot", "--title", "JARVIS", "--working-directory", cwd, *inner],
+                "wezterm": ["wezterm", "start", "--cwd", cwd, "--", *inner],
+                "konsole": ["konsole", "--workdir", cwd, "-e", *inner],
+                "gnome-terminal": ["gnome-terminal", "--title", "JARVIS",
+                                   f"--working-directory={cwd}", "--", *inner]}.get(term)
+        if not argv:
+            argv = [term, "-e", *inner]
+        _quiet(argv, cwd=cwd)
+        return {"terminal": term, "command": command or None, "cwd": cwd}
+
+    def browser(self):
+        for name in BROWSERS:
+            if shutil.which(name):
+                return name
+        return None
+
+    def open_browser(self, url=""):
+        """The JARVIS Chrome profile, so sign-ins match what its browser tools use."""
+        url = (url or "").strip()
+        if url and not URL.fullmatch(url):
+            if not BARE_URL.fullmatch(url):
+                raise ValueError("Give an http(s) link or a domain, e.g. github.com.")
+            url = "https://" + url
+        exe = self.browser()
+        if not exe:
+            raise LookupError("Chrome or Chromium isn't on PATH.")
+        profile = (self.state / "browser-profile").resolve()
+        profile.mkdir(parents=True, exist_ok=True)
+        _quiet([exe, f"--user-data-dir={profile}", "--new-window", *([url] if url else [])])
+        return {"browser": exe, "url": url or None, "profile": str(profile)}
+
+    # -- one entry point for the Devices view --------------------------------------------
+    def command(self, text, mode=None, device=None):
+        """Returns {"mode", ...result}. `jarvis-browser` comes back as {"ask": prompt}
+        for the caller to submit to the brain, which owns the browser tools."""
+        mode, arg = parse(text, mode)
+        if mode == "terminal":
+            return {"mode": mode, **self.open_terminal(arg)}
+        if mode == "browser":
+            return {"mode": mode, **self.open_browser(arg)}
+        if not arg:
+            raise ValueError("Type something to do.")
+        if mode == "jarvis-browser":
+            return {"mode": mode, "ask": f"Use the browser to do this: {arg}"}
+        return {"mode": mode, **self.send(arg, browser=mode == "grokbot-browser", device=device)}
+
+
+def _loads(raw):
+    try:
+        value = json.loads(raw or b"{}")
+        return value if isinstance(value, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _listening(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
+        return True
+    except OSError:
+        return False
+
+
+def relay_server(bot, token, port=RELAY_PORT):
+    """Loopback HTTP relay with one endpoint: POST /send {"prompt"} types to this laptop's
+    Grokbot. Needs the run's token; nothing else of JARVIS is reachable through it."""
+    class Relay(BaseHTTPRequestHandler):
+        server_version = "JARVIS-relay"
+
+        def log_message(self, *_):
+            pass
+
+        def _reply(self, status, body):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            self._reply(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+
+        def do_POST(self):
+            given = self.headers.get("X-JARVIS-Token") or ""
+            if self.path != "/send" or not secrets.compare_digest(given, token):
+                return self._reply(HTTPStatus.FORBIDDEN, {"error": "Refused."})
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+                if not 0 < length <= MAX_PROMPT * 4 + 64:
+                    raise ValueError("Bad length.")
+                body = _loads(self.rfile.read(length))
+                result = bot.send(str(body.get("prompt", "")))
+                self._reply(HTTPStatus.OK, result)
+            except (ValueError, LookupError, RuntimeError, OSError,
+                    subprocess.SubprocessError) as exc:
+                self._reply(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), Relay)
+    server.daemon_threads = True
+    return server

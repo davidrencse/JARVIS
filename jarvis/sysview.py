@@ -35,7 +35,7 @@ STATIONS = [
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "transfer", "storage"]},
+     "modules": ["actions", "grokbot", "transfer", "storage"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by Kokoro, a voice that runs on this laptop. ElevenLabs "
               "is optional and costs credits.",
