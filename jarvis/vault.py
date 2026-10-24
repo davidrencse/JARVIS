@@ -89,6 +89,14 @@ def is_vault_request(text):
 
 
 # -- small text helpers ---------------------------------------------------------------
+def _iso_date(text):
+    """A YYYY-MM-DD string as a date, or None when it isn't a real day (2026-02-30)."""
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _stem(word):
     for suffix in ("ing", "es", "ed", "s"):
         if len(word) > len(suffix) + 3 and word.endswith(suffix):
@@ -291,11 +299,17 @@ class Vault:
                          for r in db.execute("SELECT path, mtime, size FROM notes")}
                 seen = set()
                 for rel, full in self.markdown():
-                    stat = full.stat()
+                    try:
+                        stat = full.stat()
+                    except OSError:  # a dangling symlink, or deleted since the walk
+                        continue
                     seen.add(rel)
                     if known.get(rel) == (stat.st_mtime, stat.st_size):
                         continue
-                    self._index(db, rel, full, stat)
+                    try:
+                        self._index(db, rel, full, stat)
+                    except OSError:
+                        seen.discard(rel)
                 for rel in set(known) - seen:
                     db.execute("DELETE FROM notes WHERE path=?", (rel,))
             self._refreshed = time.monotonic()
@@ -531,7 +545,7 @@ class Vault:
             heading = re.match(r"^#{2,4}\s+(.*)$", line)
             if heading:
                 found = DATE.search(heading.group(1))
-                day = date.fromisoformat(found.group(0)) if found else None
+                day = _iso_date(found.group(0)) if found else None
                 continue
             item = re.match(r"^\s*-\s+(.*)$", line)
             if not item:
@@ -540,7 +554,9 @@ class Vault:
             text = re.sub(r"\s*(?:—\s*)?https?://\S+", "", text)  # nobody reads out a Zoom link
             lead = DATE.match(text)
             if lead and day is None:
-                when, kind = date.fromisoformat(lead.group(0)), "deadline"
+                when, kind = _iso_date(lead.group(0)), "deadline"
+                if when is None:  # a typo like 2026-02-30 drops the line, not the whole brief
+                    continue
                 text = text[lead.end():].strip()
             elif day is not None:
                 when, kind = day, "event"

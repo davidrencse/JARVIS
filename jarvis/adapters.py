@@ -13,6 +13,15 @@ import urllib.parse
 import urllib.request
 
 
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib keeps the bearer token on redirect; never let it follow to another origin.
+        old, new = urllib.parse.urlparse(req.full_url), urllib.parse.urlparse(newurl)
+        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def call_api(adapter, query, context=()):
     url = adapter.get("url", "")
     parsed = urllib.parse.urlparse(url)
@@ -29,7 +38,8 @@ def call_api(adapter, query, context=()):
         url, data=json.dumps({"query": query, "context": list(context)}).encode(),
         headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=int(adapter.get("timeout", 120))) as resp:
+        opener = urllib.request.build_opener(_SameOriginRedirect())
+        with opener.open(request, timeout=int(adapter.get("timeout", 120))) as resp:
             data = json.loads(resp.read(5_000_000))
     except urllib.error.HTTPError as exc:
         exc.close()  # the error object holds the response; drop its socket now

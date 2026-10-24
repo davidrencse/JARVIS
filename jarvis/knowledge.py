@@ -526,6 +526,7 @@ class KnowledgeBase:
         self.state, self.on_event, self._today = state, on_event, today
         self._local = threading.RLock()
         self._depth = 0
+        self._sha = {}  # raw file -> (mtime, size, sha256): snapshot() runs on every refresh
 
     def today(self):
         return self._today or date.today()
@@ -1232,19 +1233,20 @@ class KnowledgeBase:
             raise ValueError("Ask something.")
         self.event("you", "ask", "", question)
         with self.lock():
-            pages = self.pages()
-            hits = self.retrieve(question, pages=pages)
-            if not hits:
-                answer = "Nothing in the wiki covers that yet. Give the reader a source about it."
-                self.event("librarian", "answer", "", answer, cited=[])
-                return {"answer": answer, "claims": [], "filed": None}
-            llm = llm if llm is not None else self.settings.get("llm", "none")
-            answer = self._llm_answer(question, hits) if llm == "claude" else None
-            answer = answer or self._extractive(hits)
-            filed = self._file_answer(question, answer, hits, pages) if file and len(hits) >= 2 else None
-            self.event("librarian", "answer", f"wiki/{filed}.md" if filed else "", answer,
-                       cited=[h["id"] for h in hits], filed=filed)
-            return {"answer": answer, "claims": hits, "filed": filed}
+            hits = self.retrieve(question, pages=self.pages())
+        if not hits:
+            answer = "Nothing in the wiki covers that yet. Give the reader a source about it."
+            self.event("librarian", "answer", "", answer, cited=[])
+            return {"answer": answer, "claims": [], "filed": None}
+        # The model call can take two minutes; other writers must not wait on it.
+        llm = llm if llm is not None else self.settings.get("llm", "none")
+        answer = self._llm_answer(question, hits) if llm == "claude" else None
+        answer = answer or self._extractive(hits)
+        with self.lock():
+            filed = self._file_answer(question, answer, hits, self.pages()) if file and len(hits) >= 2 else None
+        self.event("librarian", "answer", f"wiki/{filed}.md" if filed else "", answer,
+                   cited=[h["id"] for h in hits], filed=filed)
+        return {"answer": answer, "claims": hits, "filed": filed}
 
     @staticmethod
     def _extractive(hits):
@@ -1326,6 +1328,19 @@ class KnowledgeBase:
                     edges.append({"src": f"p:{slug}", "dst": f"p:{other}", "rel": "related"})
         return {"nodes": nodes, "edges": edges}
 
+    def _raw_sha(self, path):
+        """sha256 of a raw file, re-hashed only when its mtime or size moves; None if missing."""
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        cached = self._sha.get(path)
+        if cached and cached[:2] == (stat.st_mtime, stat.st_size):
+            return cached[2]
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        self._sha[path] = (stat.st_mtime, stat.st_size, digest)
+        return digest
+
     def snapshot(self):
         """Everything the knowledge console's panels show, in one read."""
         pages, metas, log = self.pages(), self.sources(), self.log(120)
@@ -1334,7 +1349,7 @@ class KnowledgeBase:
         verify = []
         for meta in metas:
             path = self.raw / meta["file"]
-            ok = path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == meta["sha256"]
+            ok = self._raw_sha(path) == meta["sha256"]
             verify.append({"id": meta["id"], "file": meta["file"], "title": meta["title"],
                            "sha": meta["sha256"][:12], "kind": meta["kind"], "added": meta["added"],
                            "bytes": meta["bytes"], "ok": ok,

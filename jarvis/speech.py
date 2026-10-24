@@ -262,9 +262,8 @@ def save_secrets(state_dir, **values):
     except (OSError, ValueError):
         data = {}
     data.update(values)
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    from .credits import owner_only
-    owner_only(path)
+    from .credits import write_private
+    write_private(path, json.dumps(data, indent=2))
     return path
 
 

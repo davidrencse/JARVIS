@@ -158,18 +158,17 @@ class Watcher:
 
     def _loop(self):
         while not self.stopped.wait(self.interval):
-            try:
-                self.poll()
-            except Exception:  # a locked DB or a half-written file: try again next tick
-                pass
+            self.poll(quiet=True)
 
-    def poll(self):
-        self._poll_feed()
-        self._poll_memory()
-        self._poll_tasks()
-        self._poll_plans()
-        self._poll_voice()
-        self._poll_vault()
+    def poll(self, quiet=False):
+        # Each source on its own: a locked memory DB must not starve tasks, plans and the rest.
+        for poller in (self._poll_feed, self._poll_memory, self._poll_tasks,
+                       self._poll_plans, self._poll_voice, self._poll_vault):
+            try:
+                poller()
+            except Exception:  # a locked DB or a half-written file: try again next tick
+                if not quiet:
+                    raise
 
     def _vault_stamp(self):
         """(notes, newest mtime) over the vault's Markdown: changes when any note does."""

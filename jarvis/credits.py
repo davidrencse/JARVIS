@@ -66,11 +66,23 @@ def _iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else None
 
 
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # urllib forwards Authorization and key headers on redirect; only follow to the same origin.
+        old, new = urllib.parse.urlparse(req.full_url), urllib.parse.urlparse(newurl)
+        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SameOriginRedirect())
+
+
 def _get_json(url, headers):
     request = urllib.request.Request(url, headers={"Accept": "application/json",
                                                    "User-Agent": "jarvis-console", **headers})
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with _OPENER.open(request, timeout=TIMEOUT) as response:
             return json.loads(response.read(2_000_000))
     except urllib.error.HTTPError as exc:
         exc.close()  # the error object holds the response; drop its socket now
@@ -155,6 +167,21 @@ def owner_only(path):
         os.chmod(path, 0o600)
     except OSError:  # a filesystem without POSIX modes (FAT, some network shares)
         pass
+
+
+def write_private(path, text):
+    """Write a secrets file atomically, created 0600 so the key is never world-readable."""
+    path = Path(path)
+    partial = path.with_suffix(".part")
+    try:
+        partial.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
+        out.write(text)
+    owner_only(partial)  # in case the umask or filesystem ignored the mode above
+    partial.replace(path)
 
 
 def _credential_path(provider):
@@ -664,10 +691,7 @@ def save_key(state_dir, provider, config=None, secret=None):
         data = {}
     data[keys[0]] = key
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_suffix(".part")
-    partial.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    owner_only(partial)  # set the mode before the name is live, never after
-    partial.replace(path)
+    write_private(path, json.dumps(data, indent=2))
     out = {"saved": keys[0], "file": str(path), "key": f"…{key[-4:]}", "status": reading["status"]}
     if reading.get("headline"):
         h = reading["headline"]
