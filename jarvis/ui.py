@@ -1166,12 +1166,16 @@ APP_BROWSERS = (  # Chromium browsers with --app: a window with no tabs or addre
     "vivaldi-stable")
 
 
-def app_window(url, size=(1480, 940)):
-    """Open `url` as a standalone app window; a plain browser tab if no browser can."""
+def app_window(url, size=(1480, 940), profile=None):
+    """Open `url` as a standalone app window; a plain browser tab if no browser can.
+    `profile` gives the window its own browser profile: sharing the everyday one let a
+    keyring prompt, crash-restore or stuck instance swallow the window on a cold start."""
     for name in APP_BROWSERS:
         path = os.path.expandvars(name) if "\\" in name else shutil.which(name)
         if path and Path(path).is_file():
-            subprocess.Popen([path, f"--app={url}", f"--window-size={size[0]},{size[1]}"],
+            extra = [f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check",
+                     "--password-store=basic"] if profile else []
+            subprocess.Popen([path, f"--app={url}", f"--window-size={size[0]},{size[1]}", *extra],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, close_fds=True)
             return path
@@ -1185,6 +1189,15 @@ def listening(port, host="127.0.0.1"):
         return True
     except OSError:
         return False
+
+
+def ensure_window(url, bus, wait=20):
+    """If no app window has connected after `wait` seconds, open a normal browser tab
+    rather than leave a server running with nothing on screen."""
+    time.sleep(wait)
+    if not bus.subs:
+        print("No app window connected; opening the console in the default browser.", flush=True)
+        webbrowser.open(url)
 
 
 def close_with_window(server, bus, grace=12, tick=1.0):
@@ -1211,9 +1224,10 @@ class ConsoleServer(ThreadingHTTPServer):
 
 def serve(config, base, state, port=7777, open_browser=False, app=False):
     url = f"http://127.0.0.1:{port}/"
+    profile = Path(state).resolve() / "app-window"
     if app and listening(port):
         print(f"JARVIS console is already running on {url}; opening its window.", flush=True)
-        app_window(url)
+        app_window(url, profile=profile)
         return 0
     console = Console(config, base, state).start_live()
     from .grokbot import autostart_tunnel
@@ -1223,9 +1237,10 @@ def serve(config, base, state, port=7777, open_browser=False, app=False):
     server = ConsoleServer(("127.0.0.1", port), handler)
     print(f"JARVIS console on {url}  (Ctrl+C to stop)", flush=True)
     if app:
-        app_window(url)
+        app_window(url, profile=profile)
         threading.Thread(target=close_with_window, args=(server, console.bus),
                          daemon=True).start()
+        threading.Thread(target=ensure_window, args=(url, console.bus), daemon=True).start()
     elif open_browser:
         webbrowser.open(url)
     try:
