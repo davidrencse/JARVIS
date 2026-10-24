@@ -19,6 +19,9 @@ WEB = re.compile(
     r"gmail|inbox|discord|telegram|notion|canvas|brightspace|website|web ?page|browser|log ?in|"
     r"sign ?in|my account|scan (?:my|the)|check (?:my|the) (?:dm|messages|feed|notifications))\b",
     re.I)
+# Integrations that never return an answer to JARVIS: window_automation only types the
+# prompt into the agent's own window (Devices view), so it can't serve a medium reply.
+NO_REPLY = (None, "unconfigured", "window_automation")
 
 
 def classify(text, override=None):
@@ -46,7 +49,7 @@ def pick_adapter(text, config):
             return {"kind": "api", **adapter}
     for name in config.get("adapters", {}).get("browser_agents", []):
         agent = config.get("personal_agents", {}).get(name, {})
-        if agent.get("integration") not in (None, "unconfigured"):
+        if agent.get("integration") not in NO_REPLY:
             return {"kind": "browser_agent", "name": name, **agent}
     # Fallback that works today: a read-only Claude run with web search/fetch.
     return {"kind": "cli_web", "name": "claude-web"}
