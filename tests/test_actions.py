@@ -24,7 +24,8 @@ class RoutingTests(unittest.TestCase):
     def test_actions_vs_questions(self):
         for q in ("open chrome", "Jarvis, can you open Spotify?", "search youtube for lofi",
                   "go to github.com", "use the browser to check the weather",
-                  "summarize https://example.com/post", "launch notepad"):
+                  "summarize https://example.com/post", "launch notepad",
+                  "ask grok to check hacker news", "have Grok Bot find me flights"):
             self.assertTrue(is_action(q), q)
         for q in ("what is the capital of Peru?", "tell me a joke",
                   "what is a good browser for privacy?", "how do I open a jar file"):

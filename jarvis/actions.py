@@ -63,6 +63,8 @@ INSTRUCTIONS = (
 # Mentions of the browser or a link anywhere also mean "go do it", not "tell me".
 BROWSERISH = re.compile(r"\b(?:in|with|using|use)\s+(?:the\s+|my\s+|a\s+)?(?:browser|chrome)\b|"
                         r"https?://|\bwww\.", re.I)
+# Naming Grok means "hand it to Grok Bot": only the action brain has grok_agent.
+GROKISH = re.compile(r"\bgrok(?:\s*bot)?\b", re.I)
 
 
 # What people say vs. what the desktop calls it.
@@ -74,7 +76,7 @@ ALIASES = {"vs code": "visual studio code", "vscode": "visual studio code", "cod
 
 def is_action(text):
     text = text.replace("\u2019", "'")  # curly apostrophes from Whisper
-    return bool(ACTION.match(text) or BROWSERISH.search(text))
+    return bool(ACTION.match(text) or BROWSERISH.search(text) or GROKISH.search(text))
 
 
 class DesktopTools:

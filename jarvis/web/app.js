@@ -1142,6 +1142,8 @@
     "voice.ready"() { soonOverview(); },
     "voice.heard"() { soonOverview(); },
     "voice.ignored"() { soonOverview(); },
+    // Grok Bot finished a handoff after the brain's turn had already ended.
+    "grok.reply"(d) { toast(`Grok finished: ${String(d.answer || "").slice(0, 220)}`); soonHistory(); },
   };
   function connectLive() {
     if (!window.EventSource) return;
