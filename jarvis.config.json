@@ -58,7 +58,15 @@
     },
     "grokbot": {
       "status": "user_reports_installed_on_both_laptops",
-      "integration": "unconfigured"
+      "integration": "window_automation",
+      "devices": {
+        "dell": {
+          "os": "windows"
+        },
+        "zenbook": {
+          "os": "linux"
+        }
+      }
     },
     "jev": {
       "status": "planned",
