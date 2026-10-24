@@ -19,6 +19,7 @@
   --mono: "Geist Mono", ui-monospace, Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: radial-gradient(1200px 600px at 80% -10%, #1a1f4a 0%, transparent 60%), radial-gradient(900px 500px at -10% 30%, #0c2a3a 0%, transparent 55%), var(--bg); color: var(--ink); font: 15px/1.5 var(--sans); min-height: 100vh; }
 #bg { position: fixed; inset: 0; width: 100%; height: 100%; z-index: 0; pointer-events: none; opacity: .55; }
 button, input { font: inherit; color: inherit; }
@@ -93,7 +94,7 @@ h2 { margin: 0; font-size: 21px; font-weight: 600; letter-spacing: -.01em; }
 .review .note { color: var(--ink-3); font-size: 13.5px; }
 
 /* ---------- strategy cards ---------- */
-.strats { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+.strats { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; }
 .strat { background: var(--card-2); border: 1px solid var(--line); border-radius: 16px; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
 .strat h4 { margin: 0; font-size: 15.5px; font-weight: 600; }
 .strat .ret { font-size: 26px; font-weight: 700; font-family: var(--mono); letter-spacing: -.03em; }
@@ -162,7 +163,7 @@ h2 { margin: 0; font-size: 21px; font-weight: 600; letter-spacing: -.01em; }
   .flow { grid-template-columns: 1fr 1fr; } .flow .node.off { grid-column: span 2; }
 }
 @media (max-width: 560px) {
-  .top { padding: 12px 16px; } .top .pill.safe { display: none; }
+  .top { padding: 12px 16px; } .top .pill.safe .long { display: none; }
   .wrap { padding: 16px; } .card { padding: 16px; }
   .flow { grid-template-columns: 1fr; } .flow .node.off { grid-column: auto; }
   .pulse-r { min-height: 300px; }

@@ -86,14 +86,14 @@
     const move = intel.cap_weighted_24h ?? 0, b = intel.breadth;
     const word = move > 2 ? "rallying" : move > 0.3 ? "up" : move < -2 ? "selling off" : move < -0.3 ? "down" : "flat";
     $("#headline").innerHTML = `Crypto is <span class="${cls(move)}">${word}</span> today, <span class="${cls(move)}">${signed(move)}</span>`;
-    $("#subline").textContent = `${b.up} of ${b.n} big coins are up. Bitcoin is ${intel.btc_dominance ?? "—"}% of the value tracked.`;
+    $("#subline").textContent = `${b.up} of ${b.n} big coins are up. Bitcoin is ${intel.btc_dominance == null ? "—" : Math.round(intel.btc_dominance)}% of the value tracked.`;
     // mood 0..100 from breadth (60%) and the cap-weighted move (40%)
     const mood = Math.max(0, Math.min(100, (b.n ? (b.up / b.n) * 60 : 30) + (Math.max(-5, Math.min(5, move)) + 5) * 4));
     $("#needle").style.transform = `rotate(${-90 + mood * 1.8}deg)`;
     $("#mood").textContent = mood < 20 ? "Fearful" : mood < 40 ? "Nervous" : mood < 60 ? "Neutral" : mood < 80 ? "Confident" : "Greedy";
     const top = intel.gainers[0], worst = intel.losers[0];
-    $("#facts").innerHTML = `<dt>Best today</dt><dd><span class="up">${esc(top?.symbol)}</span> ${signed(top?.chg_24h)}</dd>
-      <dt>Worst today</dt><dd><span class="down">${esc(worst?.symbol)}</span> ${signed(worst?.chg_24h)}</dd>
+    $("#facts").innerHTML = `<dt>Best today</dt><dd>${esc(top?.symbol)} <span class="${cls(top?.chg_24h)}">${signed(top?.chg_24h)}</span></dd>
+      <dt>Worst today</dt><dd>${esc(worst?.symbol)} <span class="${cls(worst?.chg_24h)}">${signed(worst?.chg_24h)}</span></dd>
       <dt>Value tracked</dt><dd>${big(intel.tracked_cap)}</dd>`;
     drawHeat(true);
     renderCoins();
@@ -124,7 +124,10 @@
   let tiles = [];
   function drawHeat(animate) {
     const el = $("#heat"), { g, w, h } = prep(el);
-    const items = S.rows.filter((r) => r.market_cap).map((r) => ({ v: Math.sqrt(r.market_cap), r })); // sqrt so small caps stay visible
+    // Stablecoins don't move, so they only crowd out real coins. sqrt so small caps stay visible;
+    // sorted biggest first (squarify needs it) and capped so every tile is big enough to label.
+    const items = S.rows.filter((r) => r.market_cap && !r.stable).sort((a, b) => b.market_cap - a.market_cap)
+      .slice(0, w < 600 ? 16 : 28).map((r) => ({ v: Math.sqrt(r.market_cap), r }));
     tiles = squarify(items, 0, 0, w, h);
     const t0 = performance.now(), dur = animate && !reduce ? 900 : 0;
     function draw(now) {
@@ -135,10 +138,10 @@
         g.fillStyle = heatColor(t.r.chg_24h); g.globalAlpha = .25 + .75 * e;
         g.beginPath(); g.roundRect ? g.roundRect(cx + 1.5, cy + 1.5, Math.max(0, cw - 3), Math.max(0, ch - 3), 7) : g.rect(cx + 1.5, cy + 1.5, cw - 3, ch - 3); g.fill();
         g.globalAlpha = e;
-        if (t.w > 46 && t.h > 30) {
-          const fs = Math.max(11, Math.min(26, Math.sqrt(t.w * t.h) / 5.5));
-          g.fillStyle = "rgba(255,255,255,.95)"; g.font = `650 ${fs}px Geist, sans-serif`; g.fillText(t.r.symbol, t.x + 10, t.y + 8 + fs);
-          if (t.h > fs * 2.4) { g.font = `500 ${Math.max(10.5, fs * .62)}px "Geist Mono", monospace`; g.fillStyle = "rgba(255,255,255,.78)"; g.fillText(signed(t.r.chg_24h), t.x + 10, t.y + 12 + fs * 1.85); }
+        if (t.w > 34 && t.h > 22) {
+          const fs = Math.max(10, Math.min(26, Math.sqrt(t.w * t.h) / 5.5, (t.w - 12) / (t.r.symbol.length * .62)));
+          g.fillStyle = "rgba(255,255,255,.95)"; g.font = `650 ${fs}px Geist, sans-serif`; g.fillText(t.r.symbol, t.x + 8, t.y + 6 + fs);
+          if (t.h > fs * 2.4) { g.font = `500 ${Math.max(10.5, fs * .62)}px "Geist Mono", monospace`; g.fillStyle = "rgba(255,255,255,.78)"; g.fillText(signed(t.r.chg_24h), t.x + 8, t.y + 10 + fs * 1.85); }
         }
         g.globalAlpha = 1;
       });
