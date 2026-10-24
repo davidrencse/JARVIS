@@ -586,7 +586,9 @@ def cognition(args, config, base):
         from .assistant import decide
         route = decide(args.text, config, conversational=True)
         if route["tier"] == "medium":
-            route["adapter"] = pick_adapter(args.text, config)
+            from .router import grok_first
+            route["adapter"] = ({"kind": "browser_agent", "name": "grokbot"}
+                                if grok_first(args.text, config) else pick_adapter(args.text, config))
         emit(route)
     elif args.command == "ask":
         from .chatgpt import make_lane

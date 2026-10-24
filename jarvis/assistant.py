@@ -1,12 +1,13 @@
 """One entry point for text and voice: route the request, do the work, remember it."""
 
 import re
+import threading
 
 from .adapters import call_api
 from .instant import answer as instant_answer
 from .knowledge import recall as kb_recall
 from .orchestrator import Orchestrator
-from .router import classify, pick_adapter
+from .router import classify, grok_first, pick_adapter
 from .runner import run_task
 from .vault import recall as vault_recall
 
@@ -30,6 +31,8 @@ CONVERSATIONAL = ("Reply as JARVIS to the owner, David. Lead with the answer in 
 
 def decide(text, config, tier=None, conversational=False, write=False):
     """The tier a request will run on. Shared by ask() and the console's preview."""
+    if tier is None and not write and grok_first(text, config) and not instant_answer(text):
+        return {"tier": "medium", "reasons": ["Grok Bot orchestrates account and web work"]}
     if (tier is None and conversational and not write
             and not config.get("routing", {}).get("auto_escalate")):
         # Conversation is the main pipeline: everything goes to the brain (ChatGPT).
@@ -107,7 +110,9 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
                  "done" if reply else "fail")
 
     elif route["tier"] == "medium":
-        adapter = pick_adapter(text, config)
+        adapter = ({"kind": "browser_agent", "name": "grokbot",
+                    **config.get("personal_agents", {}).get("grokbot", {})}
+                   if grok_first(text, config) else pick_adapter(text, config))
         detail = {"adapter": adapter.get("name"), "kind": adapter["kind"]}
         label = f"{adapter.get('name')} · {adapter['kind'].replace('_', ' ')}"
         step("adapter", "route", label, "", "run")
@@ -122,13 +127,20 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
             sent = bot.handoff(text)
             step("adapter", "route", "Grok Bot · agent browser",
                  f"handoff {sent['id']} · waiting for Grok", "run")
-            reply = bot.wait(sent["id"], timeout)
-            if reply is None:
-                step("adapter", "route", "Grok Bot · agent browser", "no answer yet", "fail")
-                raise TimeoutError(f"Grok hasn't answered within {timeout} s (handoff "
-                                   f"{sent['id']}); it may still be working.")
             detail["grok"] = sent["id"]
-            step("adapter", "route", "Grok Bot · agent browser", f"answered · {sent['id']}")
+            reply = bot.wait(sent["id"], min(timeout, routing.get("grok_wait", 180)))
+            if reply is None:  # keep watching; the answer is posted to JARVIS when it lands
+                from .chatgpt import grok_tools
+                late = grok_tools(config, memory.path.parent)
+                late.late_seconds = routing.get("grok_late", 1800)
+                threading.Thread(target=late._late, args=(sent["id"], text), daemon=True).start()
+                reply = ("That's with Grok now. It's still working, and its answer will show "
+                         "up here when it's done.")
+                step("adapter", "route", "Grok Bot · agent browser",
+                     f"still working · {sent['id']}", "run")
+            else:
+                reply = f"Grok says: {reply}"
+                step("adapter", "route", "Grok Bot · agent browser", f"answered · {sent['id']}")
         elif adapter["kind"] == "browser_agent":
             raise RuntimeError(f"{adapter['name']} has no JARVIS interface yet; "
                                "see docs/architecture.md (medium tier).")

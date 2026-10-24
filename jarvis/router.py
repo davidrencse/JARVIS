@@ -17,7 +17,9 @@ COMPLEX = re.compile(
 WEB = re.compile(
     r"https?://|\bwww\.|\b(instagram|twitter|x\.com|tiktok|linkedin|reddit|facebook|youtube|"
     r"gmail|inbox|discord|telegram|notion|canvas|brightspace|website|web ?page|browser|log ?in|"
-    r"sign ?in|my account|scan (?:my|the)|check (?:my|the) (?:dm|messages|feed|notifications))\b",
+    r"sign ?in|my account|scan (?:my|the)|check (?:my|the) (?:dm|messages|feed|notifications)|"
+    r"e-?mails?|mail|outlook|calendar|grok(?:\s*bot)?|"
+    r"(?:my|the) (?:dms?|messages|texts|orders?|notifications|subscriptions?|bank|bills?))\b",
     re.I)
 # Integrations that can't take a task and hand an answer back.
 NO_REPLY = (None, "unconfigured")
@@ -38,6 +40,20 @@ def classify(text, override=None):
     if WEB.search(text):
         return {"tier": "medium", "reasons": ["needs a website or logged-in account"]}
     return {"tier": "simple", "reasons": ["single self-contained request"]}
+
+
+def grok_first(text, config):
+    """Grok Bot is the orchestrator for work that needs David's accounts or the web:
+    such requests go straight to it instead of waiting on the brain to pick a tool.
+    routing.orchestrator: "grokbot" (default) or "brain"; routing.grok_scope: "accounts"
+    (default: email, logged-in sites, the web, anything naming Grok) or "all"."""
+    routing = config.get("routing", {})
+    agent = config.get("personal_agents", {}).get("grokbot", {})
+    if (routing.get("orchestrator", "grokbot") != "grokbot"
+            or agent.get("integration") != "window_automation"
+            or not config.get("actions", {}).get("grokbot", True)):
+        return False
+    return routing.get("grok_scope", "accounts") == "all" or bool(WEB.search(text))
 
 
 def pick_adapter(text, config):
