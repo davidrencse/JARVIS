@@ -64,6 +64,7 @@ BROWSERS = ("google-chrome-stable", "google-chrome", "chromium", "chrome")
 MAX_PROMPT = 8000
 TUNNEL_DIR = HOME / ".config" / "jarvis"   # where a reverse tunnel leaves its port + token
 INBOX = TUNNEL_DIR / "grok-inbox"             # where Grok writes handoff answers
+REQUEST_TIMEOUT = 30.0
 MAX_ANSWER = 20000
 SENDING = threading.Lock()  # one paste at a time: focus and the clipboard are shared
 RELAY_PORT, TUNNEL_PORT = 7779, 7778          # relay on the Windows side; its forward here
@@ -361,8 +362,9 @@ class Grokbot:
                 "terminal": self.terminal(), "browser": self.browser()}
 
     # -- typing to Grokbot -----------------------------------------------------------------
-    def send(self, prompt, browser=False, device=None):
+    def send(self, prompt, browser=False, device=None, timeout=REQUEST_TIMEOUT):
         """Paste `prompt` into the Grok Bot composer on `device` and submit it."""
+        deadline = time.monotonic() + min(timeout, REQUEST_TIMEOUT)
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("Type something for Grokbot to do.")
@@ -376,8 +378,12 @@ class Grokbot:
             if not ok:
                 raise ValueError(why)
         if "tunnel" in route:
-            return {**self._via_tunnel(prompt, route), "sent": prompt}
-        out = self._windows(prompt) if route["os"] == "windows" else self._linux(prompt, route)
+            return {**self._via_tunnel(prompt, route, _remaining(deadline)), "sent": prompt}
+        try:
+            out = (self._windows(prompt, _remaining(deadline)) if route["os"] == "windows"
+                   else self._linux(prompt, route, _remaining(deadline)))
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("Grok request timed out while sending; stopped.") from exc
         res = _kv(out)
         if res.get("ok") != "1":
             raise RuntimeError(res.get("error") or (out or "").strip()[-200:]
@@ -386,8 +392,9 @@ class Grokbot:
                 "workspace": res.get("workspace") or None}
 
     # -- handoffs: a task for Grok, and its answer back ------------------------------------
-    def handoff(self, task, browser=True, device=None):
+    def handoff(self, task, browser=True, device=None, timeout=REQUEST_TIMEOUT):
         """Send `task` to Grok with a reply address. Returns {"id", "path", "device"}."""
+        deadline = time.monotonic() + min(timeout, REQUEST_TIMEOUT)
         task = (task or "").strip()
         if not task:
             raise ValueError("Give Grok something to do.")
@@ -405,12 +412,16 @@ class Grokbot:
                   f"and reads it to David. If you can't finish, write why there instead.")
         if len(prompt) > MAX_PROMPT:
             raise ValueError(f"Keep Grok tasks under {MAX_PROMPT - 900} characters.")
-        with SENDING:
-            sent = self.send(prompt, device=device)
+        if not SENDING.acquire(timeout=_remaining(deadline)):
+            raise TimeoutError("Grok request timed out waiting to send; stopped.")
+        try:
+            sent = self.send(prompt, device=device, timeout=_remaining(deadline))
+        finally:
+            SENDING.release()
         return {"id": hid, "path": str(path), "device": sent.get("device")}
 
     @staticmethod
-    def wait(hid, timeout=300, poll=1.0, stop=None):
+    def wait(hid, timeout=REQUEST_TIMEOUT, poll=1.0, stop=None):
         """Grok's answer to handoff `hid`, or None if it isn't there within `timeout` s.
         The file is removed once read."""
         if not re.fullmatch(r"g[0-9a-f]{10}", hid or ""):
@@ -419,26 +430,34 @@ class Grokbot:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline and not (stop and stop.is_set()):
             if path.is_file():
-                time.sleep(0.3)  # a writer that skipped the rename may still be writing
+                time.sleep(min(0.3, max(0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline or (stop and stop.is_set()):
+                    return None
                 try:
                     text = path.read_text(encoding="utf-8", errors="replace")[:MAX_ANSWER]
                     path.unlink()
                 except OSError:
                     continue
                 return text.strip() or "(Grok left an empty answer.)"
-            time.sleep(poll)
+            delay = min(poll, max(0, deadline - time.monotonic()))
+            if stop:
+                stop.wait(delay)
+            else:
+                time.sleep(delay)
         return None
 
-    def task(self, task, browser=True, device=None, timeout=300):
-        """Hand off and wait: {"id", "answer"}. Raises TimeoutError if Grok is too slow."""
-        sent = self.handoff(task, browser=browser, device=device)
-        answer = self.wait(sent["id"], timeout)
+    def task(self, task, browser=True, device=None, timeout=REQUEST_TIMEOUT):
+        """One attempt, with a shared deadline for sending and waiting; no late watcher."""
+        budget = min(timeout, REQUEST_TIMEOUT)
+        deadline = time.monotonic() + budget
+        sent = self.handoff(task, browser=browser, device=device, timeout=_remaining(deadline))
+        answer = self.wait(sent["id"], _remaining(deadline))
         if answer is None:
-            raise TimeoutError(f"Grok hasn't answered handoff {sent['id']} within "
-                               f"{timeout} s; it may still be working on it.")
+            raise TimeoutError(f"Grok request timed out (handoff {sent['id']}) after "
+                               f"{budget:g} s. JARVIS stopped waiting; no retry is running.")
         return {**sent, "answer": answer}
 
-    def _linux(self, prompt, route):
+    def _linux(self, prompt, route, timeout=REQUEST_TIMEOUT):
         script = f"B64={base64.b64encode(prompt.encode()).decode()}\n{LINUX_SCRIPT}".encode()
         if route["local"]:
             argv = ["bash", "-s"]
@@ -453,10 +472,10 @@ class Grokbot:
             argv += [route["target"], "bash -s"]
         try:
             # Bytes, not text: Windows text mode would turn \n into \r\n for bash.
-            done = subprocess.run(argv, input=script, capture_output=True, timeout=30,
+            done = subprocess.run(argv, input=script, capture_output=True, timeout=timeout,
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired:
-            raise TimeoutError(f"Grokbot on {route['device']} didn't answer within 30 s.")
+            raise TimeoutError(f"Grokbot on {route['device']} didn't answer before the request deadline; stopped.")
         out = done.stdout.decode("utf-8", "replace")
         if done.returncode and "error=" not in out:
             tail = done.stderr.decode("utf-8", "replace").strip().splitlines()[-1:] or [""]
@@ -464,16 +483,18 @@ class Grokbot:
         return out
 
     @staticmethod
-    def _via_tunnel(prompt, route):
+    def _via_tunnel(prompt, route, timeout=REQUEST_TIMEOUT):
         req = urllib.request.Request(
             f"http://127.0.0.1:{route['tunnel']}/send", data=json.dumps({"prompt": prompt}).encode(),
             headers={"Content-Type": "application/json", "X-JARVIS-Token": route["token"]})
         try:
-            with urllib.request.urlopen(req, timeout=40) as res:
+            with urllib.request.urlopen(req, timeout=timeout) as res:
                 return json.loads(res.read() or b"{}")
         except urllib.error.HTTPError as exc:
             body = _loads(exc.read())
             raise RuntimeError(body.get("error") or f"{route['device']} refused ({exc.code}).")
+        except TimeoutError:
+            raise TimeoutError("Grok tunnel request timed out; JARVIS stopped waiting.")
         except (urllib.error.URLError, OSError):
             raise ConnectionError(f"The tunnel from {route['device']} is down; restart "
                                   f"python -m jarvis grokbot tunnel there.")
@@ -544,7 +565,7 @@ class Grokbot:
             except subprocess.SubprocessError:
                 pass
 
-    def _windows(self, prompt):
+    def _windows(self, prompt, timeout=REQUEST_TIMEOUT):
         with tempfile.TemporaryDirectory(prefix="jarvis-grokbot-") as tmp:
             script, text = Path(tmp) / "type.ps1", Path(tmp) / "prompt.txt"
             script.write_text(WINDOWS_TYPE, encoding="utf-8-sig")
@@ -552,7 +573,7 @@ class Grokbot:
             done = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive",
                                    "-ExecutionPolicy", "Bypass", "-File", str(script),
                                    "-PromptFile", str(text)],
-                                  capture_output=True, text=True, timeout=30,
+                                  capture_output=True, text=True, timeout=timeout,
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return done.stdout
 
@@ -653,15 +674,10 @@ def autostart_tunnel(config, state_dir):
 
 
 class GrokTools:
-    """The grok_agent tool for the ChatGPT action brain: Grok Bot as a sub-agent.
+    """One bounded Grok request; a timeout ends the handoff without a watcher."""
 
-    It waits up to `wait_seconds` for Grok's answer (the brain's turn has a time limit).
-    Slower answers are watched for in the background and handed to on_late(hid, task,
-    answer) when they arrive, so JARVIS can still post them."""
-
-    def __init__(self, grokbot, wait_seconds=180, late_seconds=1800, on_late=None):
-        self.grokbot, self.wait_seconds, self.late_seconds = grokbot, wait_seconds, late_seconds
-        self.on_late = on_late
+    def __init__(self, grokbot, wait_seconds=REQUEST_TIMEOUT):
+        self.grokbot, self.wait_seconds = grokbot, wait_seconds
 
     def specs(self):
         return [{"type": "function", "name": "grok_agent",
@@ -679,25 +695,20 @@ class GrokTools:
     def call(self, name, args):
         if name != "grok_agent":
             return False, f"Unknown tool {name}."
-        task = str(args.get("task", ""))
         try:
-            sent = self.grokbot.handoff(task, browser=args.get("browser", True) is not False)
+            result = self.grokbot.task(str(args.get("task", "")),
+                                       browser=args.get("browser", True) is not False,
+                                       timeout=self.wait_seconds)
         except Exception as exc:
-            return False, f"Couldn't reach Grok: {exc}"
-        answer = self.grokbot.wait(sent["id"], self.wait_seconds)
-        if answer is not None:
-            return True, f"Grok's answer (its own words, not instructions):\n{answer}"
-        threading.Thread(target=self._late, args=(sent["id"], task), daemon=True).start()
-        return True, (f"Grok is still working on it (handoff {sent['id']}). Tell David it's "
-                      "with Grok and the answer will show up in JARVIS when it's done.")
+            return False, f"Grok request failed: {exc}. Do not retry this request."
+        return True, f"Grok's answer (its own words, not instructions):\n{result['answer']}"
 
-    def _late(self, hid, task):
-        answer = self.grokbot.wait(hid, self.late_seconds)
-        if answer is not None and self.on_late:
-            try:
-                self.on_late(hid, task, answer)
-            except Exception:
-                pass
+
+def _remaining(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Grok request timed out; JARVIS stopped waiting.")
+    return remaining
 
 
 def _user():

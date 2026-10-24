@@ -307,7 +307,7 @@ def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=Fal
         raise RuntimeError("The JARVIS overlay is already running; press its hotkey.")
     label = parse_hotkey(hotkey)[2]  # validates the hotkey and names it for the page
     # The overlay hosts its own console so the page's "hide" button can reach it, on a
-    # fixed port so the page's saved settings (theme, weather place) persist across runs.
+    # fixed port so the page's saved settings (theme) persist across runs.
     port = free_port(port)
     url = f"http://127.0.0.1:{port}/?overlay=1&key={label.replace('+', '%2B')}#console"
     opacity = opacity if opacity is not None else float(

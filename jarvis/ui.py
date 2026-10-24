@@ -84,6 +84,8 @@ class Console:
         vault = self.vault()
         self.watcher = Watcher(self.bus, self.state, self.memory, self.store,
                                vault=vault.root if vault else None).start()
+        from .paper import ensure_ticker
+        ensure_ticker(self.state, self.config, self.markets())  # paper strategies keep trading
         if warm:
             def warm_up():
                 try:
@@ -120,6 +122,12 @@ class Console:
                 from .speech import SpeechQueue, Voice
                 self._speaker = SpeechQueue(Voice(self.state, self.config))
             return self._speaker
+
+    def voice_preview(self):
+        """Say a sample line on this laptop in the voice and tuning now saved."""
+        from .speech import Voice
+        return Voice(self.state, self.config).say(
+            "Good evening. This is how I'll sound from now on.", wait=False)
 
     # ---- ElevenLabs agent: the live voice front end --------------------------------
     def agent(self):
@@ -184,6 +192,36 @@ class Console:
                                         "why": "Recon only: no order code is built in."},
                           "seconds": round(time.time() - t0, 2), "at": time.time()}
         return self._pipeline
+
+    def paper(self):
+        from .paper import Paper
+        return Paper(self.state)
+
+    def paper_summary(self, refresh=False):
+        """The practice account; a refresh re-runs the running strategies on live prices."""
+        paper = self.paper()
+        if refresh and self.markets().configured():
+            paper.tick(self.markets(), force=True)
+        return paper.summary()
+
+    def paper_action(self, action, body):
+        from .paper import ensure_ticker
+        paper, market = self.paper(), self.markets()
+        if action == "start":
+            spec = paper.start(str(body.get("id", "")), body.get("budget"))
+            ensure_ticker(self.state, self.config, market)
+            if market.configured():
+                paper.tick(market, force=True)
+            return {"started": spec["id"], **paper.summary()}
+        if action == "stop":
+            paper.stop(str(body.get("id", "")))
+        elif action == "order":
+            paper.order(body.get("symbol"), body.get("side"), body.get("usd"), market)
+        elif action == "reset":
+            paper.reset()
+        else:
+            raise LookupError(f"Unknown paper action {action}.")
+        return paper.summary()
 
     def backtest(self, body):
         from .strategy import run
@@ -1016,6 +1054,7 @@ class Handler(BaseHTTPRequestHandler):
                 query.get("symbol", "").upper(), query.get("window", "1d"),
                 query.get("resolution", "1h")),
             "/api/strategies": lambda: c.strategies().all(),
+            "/api/paper": lambda: c.paper_summary(query.get("refresh") == "1"),
             "/api/strategies/templates": lambda: __import__(
                 "jarvis.strategy", fromlist=["TEMPLATES"]).TEMPLATES,
             "/api/agent/voices": lambda: c.agent().voices(refresh=query.get("refresh") == "1"),
@@ -1107,6 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.strategies().save(body))
             if url.path == "/api/strategies/delete":
                 return self._send(HTTPStatus.OK, c.strategies().delete(str(body.get("id", ""))))
+            if url.path.startswith("/api/paper/"):
+                return self._send(HTTPStatus.OK, c.paper_action(url.path.rsplit("/", 1)[1], body))
             if url.path == "/api/strategies/backtest":
                 return self._send(HTTPStatus.OK, c.backtest(body))
             if url.path == "/api/agent/session":
@@ -1115,6 +1156,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.agent().set_voice(
                     body.get("voice_id"), body.get("voice"), body.get("speed"),
                     body.get("stability")))
+            if url.path == "/api/agent/voice/preview":
+                return self._send(HTTPStatus.OK, c.voice_preview())
             if url.path == "/api/agent/ask":
                 return self._send(HTTPStatus.OK, c.agent_ask(body.get("text")))
             if url.path == "/api/grokbot":

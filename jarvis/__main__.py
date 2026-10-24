@@ -82,7 +82,7 @@ def main():
     gb.add_argument("text", nargs="?", default="", help="prompt, command or URL")
     gb.add_argument("--device", default=None, help="send: which laptop's Grokbot (default: this one)")
     gb.add_argument("--to", default=None, help="tunnel: SSH device to forward to (default: the first)")
-    gb.add_argument("--wait", type=int, default=600, help="task: seconds to wait for Grok's answer")
+    gb.add_argument("--wait", type=int, default=30, help="task: request timeout in seconds (max 30)")
     for name, helptext in (("send", "Send a file to the other laptop's JARVIS-Drop folder"),
                            ("fetch", "Pull a file from the other laptop's JARVIS-Drop folder"),
                            ("inbox", "List files waiting in the other laptop's JARVIS-Drop")):

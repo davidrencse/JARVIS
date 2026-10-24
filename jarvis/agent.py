@@ -102,7 +102,8 @@ class Agent:
                                    and self.agent_id()),
                 "has_key": bool(self.voice.credential("ELEVENLABS_API_KEY")),
                 "agent_id": self.agent_id(), "voice_id": self.voice_id(),
-                "tts_engine": self.voice.engine}
+                "tts_engine": self.voice.engine, "tuning": self.tuning(),
+                "ranges": {"speed": SPEED, "stability": STABILITY}}
 
     def session(self):
         """A signed WebSocket URL (valid ~15 min) plus the voice to ask for."""

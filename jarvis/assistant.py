@@ -1,7 +1,6 @@
 """One entry point for text and voice: route the request, do the work, remember it."""
 
 import re
-import threading
 
 from .adapters import call_api
 from .instant import answer as instant_answer
@@ -16,6 +15,16 @@ def market_answer(text, config, state):
     says how the market is doing (showcase.py). None for anything else."""
     try:
         from .showcase import answer
+        return answer(text, config, state)
+    except Exception:
+        return None
+
+
+def paper_answer(text, config, state):
+    """Paper trading by voice: start/stop strategies, practice orders, the account
+    (paper.py). None for anything else, or for strategy talk the brain should read."""
+    try:
+        from .paper import answer
         return answer(text, config, state)
     except Exception:
         return None
@@ -88,10 +97,11 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
 
     if route["tier"] == "simple" and not write and (
             quick := instant_answer(text) or market_answer(text, config, memory.path.parent)
+            or paper_answer(text, config, memory.path.parent)
             or vault_answer(text, config, memory.path.parent)):
-        reply = quick  # the local clock, the market window or the vault: no model
+        reply = quick  # the clock, the market, paper trading or the vault: no model
         detail = {"lane": "instant", "streamed": on_sentence is not None}
-        step("instant", "route", "Instant", "clock, market or vault, no model")
+        step("instant", "route", "Instant", "clock, market, paper trading or vault, no model")
         if on_sentence:
             on_sentence(quick)
 
@@ -135,23 +145,16 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
             from .grokbot import Grokbot
             step("adapter", "route", "Grok Bot · agent browser", "typing the task", "run")
             bot = Grokbot(config, memory.path.parent)
-            sent = bot.handoff(text)
-            step("adapter", "route", "Grok Bot · agent browser",
-                 f"handoff {sent['id']} · waiting for Grok", "run")
-            detail["grok"] = sent["id"]
-            reply = bot.wait(sent["id"], min(timeout, routing.get("grok_wait", 180)))
-            if reply is None:  # keep watching; the answer is posted to JARVIS when it lands
-                from .chatgpt import grok_tools
-                late = grok_tools(config, memory.path.parent)
-                late.late_seconds = routing.get("grok_late", 1800)
-                threading.Thread(target=late._late, args=(sent["id"], text), daemon=True).start()
-                reply = ("That's with Grok now. It's still working, and its answer will show "
-                         "up here when it's done.")
-                step("adapter", "route", "Grok Bot · agent browser",
-                     f"still working · {sent['id']}", "run")
+            try:
+                result = bot.task(text, timeout=min(timeout, routing.get("grok_wait", 30)))
+            except (TimeoutError, RuntimeError, ValueError, LookupError, OSError) as exc:
+                reply = f"Grok request failed: {exc}"
+                detail["state"] = "failed"
+                step("adapter", "route", "Grok Bot · agent browser", str(exc), "fail")
             else:
-                reply = f"Grok says: {reply}"
-                step("adapter", "route", "Grok Bot · agent browser", f"answered · {sent['id']}")
+                detail["grok"] = result["id"]
+                reply = f"Grok says: {result['answer']}"
+                step("adapter", "route", "Grok Bot · agent browser", f"answered · {result['id']}")
         elif adapter["kind"] == "browser_agent":
             raise RuntimeError(f"{adapter['name']} has no JARVIS interface yet; "
                                "see docs/architecture.md (medium tier).")

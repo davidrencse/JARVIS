@@ -106,6 +106,20 @@ class Voice:
         except (OSError, ValueError):
             return None
 
+    def voice_settings(self):
+        """Speed and stability picked in the console, shared with the live agent; only the
+        ones that were set, so ElevenLabs keeps the voice's own defaults otherwise."""
+        out = {}
+        for key, name, (lo, hi) in (("speed", "ELEVENLABS_VOICE_SPEED", (0.7, 1.2)),
+                                    ("stability", "ELEVENLABS_VOICE_STABILITY", (0.0, 1.0))):
+            try:
+                value = float(self.credential(name))
+            except (TypeError, ValueError):
+                continue
+            if lo <= value <= hi:
+                out[key] = value
+        return out
+
     def usage(self):
         month = datetime.now(timezone.utc).strftime("%Y-%m")
         try:
@@ -158,7 +172,10 @@ class Voice:
         voice = self.credential("ELEVENLABS_VOICE_ID")
         if not key or not voice or not re.fullmatch(r"[A-Za-z0-9_-]+", voice):
             return None, "no-credentials"
-        digest = hashlib.sha256(f"{voice}|{self.model}|{self.rate}|{text}".encode()).hexdigest()
+        settings = self.voice_settings()
+        # Untuned clips keep their old cache key, so the cached ones still count.
+        tag = "".join(f"{k}={v}|" for k, v in sorted(settings.items()))
+        digest = hashlib.sha256(f"{tag}{voice}|{self.model}|{self.rate}|{text}".encode()).hexdigest()
         path = self.cache / f"{digest[:24]}.wav"
         if path.is_file():
             return path, "cache"
@@ -166,7 +183,8 @@ class Voice:
             return None, "over-budget"
         request = urllib.request.Request(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice}?output_format=pcm_{self.rate}",
-            data=json.dumps({"text": text, "model_id": self.model}).encode(),
+            data=json.dumps({"text": text, "model_id": self.model,
+                             **({"voice_settings": settings} if settings else {})}).encode(),
             headers={"xi-api-key": key, "Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(request, timeout=60) as response:

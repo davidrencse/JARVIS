@@ -349,8 +349,9 @@ class Brain:
         """'act' (tools) or 'chat': which conversation ask(text) will use."""
         if self.wants is None:
             from .actions import is_action
+            from .paper import is_trading_request
             from .vault import is_vault_request
-            wants = is_action(text) or is_vault_request(text)
+            wants = is_action(text) or is_vault_request(text) or is_trading_request(text)
         else:
             wants = self.wants(text)
         return "act" if wants else "chat"
@@ -396,18 +397,9 @@ def grok_ready(config):
 
 
 def grok_tools(config, state):
-    """grok_agent, with late answers saved as JARVIS replies and announced live."""
-    from .events import emit
+    """A single Grok request, bounded to 30 seconds with no late-answer watcher."""
     from .grokbot import Grokbot, GrokTools
-    from .memory import Memory
-
-    def late(hid, task, answer):
-        Memory(state).add("reply", f"Grok finished: {answer}", source="grokbot",
-                          tags=["outbound", "grokbot"], meta={"grok": hid, "task": task[:300]},
-                          importance=0.5)
-        emit(state, "grok.reply", id=hid, task=task[:300], answer=answer[:2000])
-
-    return GrokTools(Grokbot(config, state), on_late=late)
+    return GrokTools(Grokbot(config, state))
 
 
 def make_lane(config, base, state_dir=None):
@@ -442,6 +434,10 @@ def make_lane(config, base, state_dir=None):
     if actions and grok_ready(config):
         tools.append(grok_tools(config, state))
         instructions.append(GROK_INSTRUCTIONS)
+    if actions and config.get("actions", {}).get("paper_trading", True):
+        from .paper import TRADING_INSTRUCTIONS, TradingTools
+        tools.append(TradingTools(config, state))
+        instructions.append(TRADING_INSTRUCTIONS)
     if vault is not None:
         from .memory import Memory
         from .tasks import TASK_INSTRUCTIONS, TaskTools, tasks_for
