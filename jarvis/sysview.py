@@ -35,11 +35,11 @@ STATIONS = [
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "grokbot", "transfer", "storage"]},
+     "modules": ["actions", "grokbot", "transfer", "storage", "clipsync"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by Kokoro, a voice that runs on this laptop. ElevenLabs "
-              "is optional and costs credits.",
-     "modules": ["speech", "voice"]},
+              "is optional and costs credits; its agent runs live calls from the console.",
+     "modules": ["speech", "voice", "agent"]},
     {"id": "log", "title": "Log", "verb": "records",
      "plain": "Everything is written down: the conversation in memory, agent runs in the "
               "task ledger, and live events to this console.",
