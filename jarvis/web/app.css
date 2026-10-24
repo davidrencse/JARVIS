@@ -462,7 +462,6 @@ select.field { width: auto; }
   .case-switch select { max-width: 92px; }
   .wordmark { display: none; }
   .topbar { min-width: 0; }
-  #hands-free { padding: 0 8px; }
   #live-chip { padding: 0 8px; }
   #live-chip .chip-label { display: none; }
   .clock-time, .wx-deg { font-size: 44px; }

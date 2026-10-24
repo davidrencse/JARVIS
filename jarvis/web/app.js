@@ -374,7 +374,6 @@
       `<span class="chip">${icon("audio-lines")} ${o.voice.voiceprint ? "voiceprint enrolled" : "no voiceprint"}</span>`,
     ].join("");
     lastOverview = Date.now();
-    renderListener(o);
     $("#listener-log").innerHTML = (o.voice.recent || []).filter((l) => !/ignored another voice/.test(l)).slice(-5).map((l) => {
       const m = l.match(/^(\S+ \S+)\s+(.*)$/); const text = m ? m[2] : l;
       return `<div title="${esc(l)}"><b>${esc(m ? m[1].slice(11, 16) : "")}</b> ${esc(text)}</div>`;
@@ -385,14 +384,6 @@
     if (!$("#view-devices").hidden) renderDevices();
     if (!$("#view-tasks").hidden) loadTasks();
     loaded.console = true;
-  }
-  function renderListener(o) {
-    const hf = $("#hands-free"), was = hf.classList.contains("on"), on = !!o.voice.listening;
-    hf.classList.toggle("on", on);
-    hf.querySelector(".chip-label").textContent = on ? "Listening" : "Listener off";
-    hf.setAttribute("aria-pressed", on);
-    hf.title = on ? "Always-on listener is running. Say “Jarvis, …”. Click to stop it." : "Start the always-on listener (say “Jarvis, …”).";
-    if (was !== on && loaded.console) announce(on ? "Listener on." : "Listener off.");
   }
   function renderRouter(o) {
     const counts = { simple: 0, medium: 0, complex: 0 };
@@ -474,14 +465,6 @@
     $("#heap-facts").innerHTML = `<dt>Items</dt><dd>${o.memory.items}</dd><dt>Links</dt><dd>${o.memory.links}</dd>` +
       Object.entries(o.memory.kinds).slice(0, 4).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${v}</dd>`).join("");
   }
-  $("#hands-free").addEventListener("click", async () => {
-    const on = state.overview?.voice?.listening, chip = $("#hands-free");
-    chip.querySelector(".chip-label").textContent = on ? "Stopping…" : "Starting…"; chip.disabled = true;
-    try { await api("/api/voice", { action: on ? "stop" : "start" }); toast(on ? "Listener stopped." : "Listener is on. Say “Jarvis, …”."); }
-    catch (e) { toast(plainError(e.message)); }
-    chip.disabled = false; refreshOverview();
-  });
-
   // ---------- graphs ----------
   const graphs = [];
   const mini = new ForceGraph($("#mini-graph"), { mini: true }); graphs.push(mini);
@@ -1132,7 +1115,7 @@
     "task.event"() { soonOverview(); },
     "plan.updated"(d) { soonOverview(); if (openPlanId === d.id && !$("#view-tasks").hidden) openPlan(d.id, true); },
     "voice.state"(d) {
-      if (state.overview) { state.overview.voice.listening = d.listening; renderListener(state.overview); }
+      if (state.overview) state.overview.voice.listening = d.listening;
       // A listener killed mid-answer never sends turn.done.
       if (!d.listening) for (const t of live.turns.values()) if (t.channel === "voice" && !t.done)
         Object.assign(t, { done: true, error: true, reply: "The listener stopped before it finished answering." });
