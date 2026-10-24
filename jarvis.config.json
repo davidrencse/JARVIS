@@ -7,6 +7,8 @@
       "transport": "local",
       "status": "verified",
       "hostname": "WinLaptop",
+      "label": "Dell G15, Windows 11",
+      "aliases": ["windows", "windows laptop", "g15", "dell g15"],
       "lan_ip": "172.1.43.16"
     },
     "zenbook": {
@@ -17,7 +19,9 @@
       "identity_file": "~/.ssh/jarvis_ed25519",
       "host_fingerprint": "SHA256:Up97wSPjhl95DuIoI6bTvYd53OZDfAZ92jnpEQ53QPM",
       "status": "ssh_verified_inventory_collected",
-      "hostname": "archmain"
+      "hostname": "archmain",
+      "label": "ASUS Zenbook, Arch Linux with Hyprland",
+      "aliases": ["arch", "arch linux", "archlinux", "asus", "linux", "linux laptop", "zen book"]
     }
   },
   "desktop": {
