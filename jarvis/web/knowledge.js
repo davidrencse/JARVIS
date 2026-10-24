@@ -1,10 +1,10 @@
 /* JARVIS knowledge engine console: raw/ -> wiki/ as a turning cluster graph.
-   Pages are lit spheres, their claims a cloud of red points around them, raw sources
+   Pages are lit spheres, their claims a cloud of pale points around them, raw sources
    gold. Reader/librarian/checker events from the server pulse the node they touched. */
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const COLORS = { red: "#ff4b5c", pink: "#ff8f9b", gold: "#f4c64e", dim: "#7d7a78", text: "#e9e6e3" };
+const COLORS = { red: "#9ec5ff", pink: "#cfe0ff", gold: "#f4c64e", dim: "#8c8c8c", text: "#f2f2f2" };  // red/pink: the blue accent
 const TAGS = { ingest: "LOCKED", duplicate: "DUPLICATE", create: "NEW", patch: "PATCH",
   conflict: "CONFLICT", flag: "CONFLICT", answer: "SAVED", audit: "AUDIT", commit: "COMMIT",
   resolve: "RESOLVED", merge: "MERGED" };
@@ -47,10 +47,10 @@ async function api(path, body) {
    The wiki (pages, their claim clouds, raw sources) is the core; the Obsidian vault
    orbits it, one cluster per folder. A note the reader has synced is tied to the wiki
    page it became and to its raw source, so you can watch your notes feed the wiki. */
-const FOLDERS = { notes: "#ff8f9b", projects: "#ffffff", courses: "#ff4b5c", leetcode: "#f4c64e",
-  reference: "#e0a96d", people: "#ffd6da", daily: "#8a3440", templates: "#5a5552", archive: "#4a4644" };
-const folderColor = (f) => FOLDERS[f] || "#cfc8c4";
-const LINK_STYLE = { has: "rgba(255,75,92,0.08)", related: "rgba(255,143,155,0.22)", link: "rgba(255,214,218,0.13)",
+const FOLDERS = { notes: "#9ec5ff", projects: "#ffffff", courses: "#b8a9ff", leetcode: "#f4c64e",
+  reference: "#e0c39a", people: "#cfe0ff", daily: "#4a5262", templates: "#5a5a5f", archive: "#444448" };
+const folderColor = (f) => FOLDERS[f] || "#c8cdd6";
+const LINK_STYLE = { has: "rgba(200,210,230,0.07)", related: "rgba(158,197,255,0.2)", link: "rgba(220,228,240,0.12)",
   mirrors: "rgba(244,198,78,0.42)", cites: "rgba(244,198,78,0.05)", ingested: "rgba(244,198,78,0.22)" };
 
 function layout(graph, vault) {
@@ -244,13 +244,13 @@ function claimColor(n) {
   if (n.flag === "unconfirmed") return "#6b6866";
   if (n.flag === "superseded") return "#34312f";
   const h = hash(n.id) % 3;
-  return h === 0 ? "#ff4b5c" : h === 1 ? "#ff7884" : "#c93a4b";
+  return h === 0 ? "#d6dbe4" : h === 1 ? "#aab3c2" : "#8a93a3";
 }
 function nodeColor(n) {
   if (n.kind === "note") return folderColor(n.folder);
   if (n.kind === "source") return COLORS.gold;
   if (n.kind === "claim") return claimColor(n);
-  return n.status === "review" ? COLORS.gold : n.kind === "answer" ? "#ffffff" : "#ffd6da";
+  return n.status === "review" ? COLORS.gold : n.kind === "answer" ? "#ffffff" : "#e6e9ee";
 }
 function radius(n) {
   if (n.kind === "claim") return Math.max(0.8, 1.9 * n.persp);
@@ -261,11 +261,11 @@ function radius(n) {
 
 function draw(now) {
   project();
-  // ground: near-black with a faint warm core
+  // ground: the card colour with a faint cool core
   ctx.globalCompositeOperation = "source-over";
-  ctx.fillStyle = "#09090a"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#121212"; ctx.fillRect(0, 0, W, H);
   const core = ctx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.6);
-  core.addColorStop(0, "rgba(90,24,32,0.22)"); core.addColorStop(1, "rgba(9,9,10,0)");
+  core.addColorStop(0, "rgba(120,140,180,0.10)"); core.addColorStop(1, "rgba(18,18,18,0)");
   ctx.fillStyle = core; ctx.fillRect(0, 0, W, H);
   for (const s of view.stars) {
     ctx.fillStyle = `rgba(233,230,227,${(0.08 + s.b * 0.22) * Math.min(1, s.persp)})`;
@@ -304,7 +304,7 @@ function draw(now) {
       const x = a.sx + (b.sx - a.sx) * s.t, y = a.sy + (b.sy - a.sy) * s.t;
       const tx = a.sx + (b.sx - a.sx) * Math.max(0, s.t - 0.12), ty = a.sy + (b.sy - a.sy) * Math.max(0, s.t - 0.12);
       const hot = rel === "mirrors" || rel === "ingested";
-      ctx.strokeStyle = hot ? "rgba(244,198,78,0.55)" : "rgba(255,143,155,0.45)"; ctx.lineWidth = 1.1;
+      ctx.strokeStyle = hot ? "rgba(244,198,78,0.55)" : "rgba(158,197,255,0.45)"; ctx.lineWidth = 1.1;
       ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(x, y); ctx.stroke();
       ctx.drawImage(glow(hot ? COLORS.gold : COLORS.pink, 3), x - 6, y - 6, 12, 12);
     }
@@ -325,7 +325,7 @@ function draw(now) {
     const r = radius(n);
     if (n.kind === "page" || n.kind === "answer") {
       const g = ctx.createRadialGradient(n.sx - r * 0.35, n.sy - r * 0.35, r * 0.1, n.sx, n.sy, r);
-      g.addColorStop(0, "#ffffff"); g.addColorStop(0.45, nodeColor(n)); g.addColorStop(1, n.status === "unconfirmed" ? "#3a3a3d" : "#7a2832");
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.45, nodeColor(n)); g.addColorStop(1, n.status === "unconfirmed" ? "#3a3a3d" : "#3d4452");
       ctx.fillStyle = g;
     } else ctx.fillStyle = nodeColor(n);
     ctx.beginPath(); ctx.arc(n.sx, n.sy, r, 0, Math.PI * 2); ctx.fill();
@@ -357,7 +357,7 @@ function draw(now) {
     const age = (now - p.t) / 1000, warn = p.tag === "CONFLICT";
     for (let k = 0; k < 3; k++) {
       const r = 10 + ((age * 26 + k * 14) % 44);
-      ctx.strokeStyle = warn ? `rgba(244,198,78,${0.55 - r / 100})` : `rgba(255,75,92,${0.55 - r / 100})`;
+      ctx.strokeStyle = warn ? `rgba(244,198,78,${0.55 - r / 100})` : `rgba(158,197,255,${0.55 - r / 100})`;
       ctx.lineWidth = 1.2; ctx.beginPath(); ctx.arc(n.sx, n.sy, r, 0, Math.PI * 2); ctx.stroke();
     }
     ctx.font = "600 11.5px 'Geist Mono', monospace"; ctx.fillStyle = COLORS.gold;
@@ -372,7 +372,7 @@ const clip = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + "…"
 
 function label(n, text, note) {
   const w = ctx.measureText(text).width + 8;
-  ctx.fillStyle = "rgba(9,9,10,0.82)"; ctx.fillRect(n.sx + 8, n.sy - 7, w, 14);
+  ctx.fillStyle = "rgba(18,18,18,0.85)"; ctx.fillRect(n.sx + 8, n.sy - 7, w, 14);
   ctx.strokeStyle = note ? hexA(folderColor(n.folder), 0.45) : "rgba(255,255,255,0.12)"; ctx.strokeRect(n.sx + 8, n.sy - 7, w, 14);
   ctx.fillStyle = COLORS.text; ctx.fillText(text, n.sx + 12, n.sy + 3);
 }
@@ -437,7 +437,10 @@ function frame(now) {
   view.zoom += (view.zoomTo - view.zoom) * (reduced ? 1 : 0.18);
   if (W && view.nodes.length) draw(now);
   else if (W) { ctx.clearRect(0, 0, W, H); ctx.fillStyle = COLORS.dim; ctx.textAlign = "center";
-    ctx.font = "11px 'Geist Mono', monospace"; ctx.fillText("Empty. Type sync to read your Obsidian vault, or ingest https://…", W / 2, H / 2); }
+    ctx.font = "500 15px Urbanist, sans-serif";
+    const lines = W < 560 ? ["Nothing here yet.", "Type sync to read your Obsidian vault,", "or ingest https://…"]
+      : ["Nothing here yet. Type sync to read your Obsidian vault, or ingest https://…"];
+    lines.forEach((t, i) => ctx.fillText(t, W / 2, H / 2 + (i - (lines.length - 1) / 2) * 22)); }
   frames++;
   if (now - fpsAt > 1000) { $("fps").textContent = `${frames}FPS`; frames = 0; fpsAt = now; }
   const deg = (((view.az * 180) / Math.PI + 180) % 360) - 180;
@@ -514,7 +517,7 @@ function renderChat() {
     if (prev && ["patch", "create"].includes(e.action) && prev.e.bot === e.bot && prev.e.action === e.action && prev.e.message === e.message) prev.n++;
     else rows.push({ e, n: 0 });
   }
-  $("chat").innerHTML = rows.slice(-9).map(({ e, n }) => `<li class="who-${esc(e.bot)}"><b>${who(e.bot)}</b><span title="${esc(e.message)}">${esc(e.target ? e.target + (n ? ` +${n} more` : "") + " · " : "")}${esc(e.message)}</span></li>`).join("");
+  $("chat").innerHTML = rows.slice(-12).map(({ e, n }) => `<li class="who-${esc(e.bot)}"><b>${who(e.bot)}</b><span title="${esc(e.message)}">${esc(e.target ? e.target + (n ? ` +${n} more` : "") + " · " : "")}${esc(e.message)}</span></li>`).join("");
   const log = view.snap.log;
   const last = log[log.length - 1];
   $("chat-foot").textContent = last ? `${last.at.slice(11)} · ${last.bot} :: ${last.action}` : "quiet";
@@ -523,7 +526,7 @@ function renderChat() {
 function renderQueue() {
   const writes = view.snap.writes || [];
   const list = writes.length ? writes : view.snap.pages.slice(0, 12).map((p) => p.slug);
-  $("queue").innerHTML = list.slice(0, 11).map((slug, i) => `<li><span class="n">${pad(i + 1, 2)}</span><span>wiki/${esc(slug)}.md</span><span class="bar"></span><span class="ok">OK</span></li>`).join("");
+  $("queue").innerHTML = list.slice(0, 9).map((slug, i) => `<li><span class="n">${pad(i + 1, 2)}</span><span>wiki/${esc(slug)}.md</span><span class="bar"></span><span class="ok">OK</span></li>`).join("");
   $("queue-count").textContent = `${list.length} DOC`;
   $("queue-foot").textContent = `${pad(writes.length, 2)}/${pad(writes.length, 2)} ATOMIC WRITES`;
 }
@@ -621,7 +624,7 @@ function renderIndex() {
   const all = pages.concat(view.layers.vault ? view.notes : []); if (!all.length) return;
   const ext = all.reduce((m, p) => Math.max(m, Math.abs(p.x), Math.abs(p.z)), 1);
   const pt = (p) => [box.width / 2 + (p.x / ext) * box.width * 0.45, box.height / 2 + (p.z / ext) * box.height * 0.45];
-  mctx.strokeStyle = "rgba(255,143,155,0.25)"; mctx.lineWidth = 0.6; mctx.beginPath();
+  mctx.strokeStyle = "rgba(158,197,255,0.25)"; mctx.lineWidth = 0.6; mctx.beginPath();
   for (const [a, b, r] of view.edges) if (r === "related") { const [x1, y1] = pt(a), [x2, y2] = pt(b); mctx.moveTo(x1, y1); mctx.lineTo(x2, y2); }
   mctx.stroke();
   if (view.layers.vault) for (const n of view.notes) {
@@ -641,7 +644,7 @@ function renderIndex() {
 
 function renderRaw() {
   const src = view.snap.sources;
-  $("raw").innerHTML = src.slice(-7).reverse().map((x) => `<tr><td title="${esc(x.title)}">${esc(x.file)}</td><td class="sha">${esc(x.sha.slice(0, 10))}</td><td class="${x.ok && x.readonly ? "ro" : "bad"}">${x.ok ? (x.readonly ? "RO" : "RW") : "!!"}</td></tr>`).join("");
+  $("raw").innerHTML = src.slice(-8).reverse().map((x) => `<tr><td title="${esc(x.title)}">${esc(x.file)}</td><td class="sha">${esc(x.sha.slice(0, 10))}</td><td class="${x.ok && x.readonly ? "ro" : "bad"}">${x.ok ? (x.readonly ? "RO" : "RW") : "!!"}</td></tr>`).join("");
   const bad = src.filter((x) => !x.ok).length;
   $("raw-mut").textContent = `${bad} MUTATIONS`;
   $("raw-verify").textContent = src.length ? (bad ? `VERIFY FAIL ${bad}` : `VERIFY OK ${pad(src.length)}`) : "VERIFY —";
