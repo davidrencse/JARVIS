@@ -59,7 +59,7 @@ function pageHarness() {
   const page = { handlers: {}, announcements: [], now: 0 };
   Object.assign(context, {
     Mic: context.window.Mic, $: (selector) => selector === "#mic" ? button : null,
-    Terrain: { redraw() {} }, busy: false, trace() {}, toast() {},
+    Terrain: { redraw() {} }, busy: false, trace() {}, toast() {}, agent: { live: false },
     announce: (text) => page.announcements.push(text),
     plainError: (text) => text, typing: () => false, OVERLAY: false,
     addEventListener: (name, callback) => { page.handlers[name] = callback; },
