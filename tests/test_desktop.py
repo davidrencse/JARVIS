@@ -23,6 +23,7 @@ class DesktopTests(unittest.TestCase):
         self.assertIn(f'"{FP}" = "archmain"', text)
         self.assertIn('position = "right"', text)
         self.assertIn('ips = [ "172.1.42.215" ]', text)
+        self.assertIn('release_bind = [ "KeyLeftCtrl", "KeyLeftShift", "KeyLeftMeta", "KeyLeftAlt" ]', text)
         self.assertNotIn("capture_backend", text)
         text = lan_mouse_config("dell", ["1.2.3.4"], "left", FP, capture_backend="layer-shell")
         self.assertTrue(text.splitlines()[1] == 'capture_backend = "layer-shell"')

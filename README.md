@@ -474,7 +474,15 @@ python -m jarvis lanmouse config --peer-name archmain --peer-ip 172.1.42.215 `
 ```
 
 Only the certificate block is hashed; the private key in `lan-mouse.pem` never
-leaves its laptop. Release the captured mouse with Ctrl+Shift+Super+Alt.
+leaves its laptop. The generated release binding is Left Ctrl + Left Shift +
+Left Super (Lan Mouse calls this `KeyLeftMeta`) + Left Alt. On the Arch laptop,
+press that chord to return control to the Dell; moving off the Dell's left edge
+also returns control to Arch.
+
+The Dell once appeared to lock when `L` was pressed, likely because its internal
+keyboard emitted a hidden Windows key press with `L`. If it recurs, tap the
+Windows key once; if it persists, check Dell SupportAssist warranty coverage
+for the internal keyboard.
 
 Status: paired and verified in both directions (ASUS sits left of the Dell).
 Both daemons start at login: the Dell via `JARVIS Lan Mouse.vbs` in the Startup
