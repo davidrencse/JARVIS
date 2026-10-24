@@ -254,7 +254,7 @@ C:\Users\jdoe\MiniConda3\python.exe -m jarvis ui --open   # plain server + brows
 
 A local web console over the same `.jarvis/` state: prompt bar with tier choice,
 push-to-talk (hold Space; audio goes only to this laptop's voiceprint check and
-Whisper), the always-on listener toggle, date and Open-Meteo weather, provider
+Whisper), the always-on listener toggle, date, provider
 credits, a force-directed knowledge graph (memory heap plus the module graph read
 from real imports), a system-design diagram, memory search, the task ledger, and
 devices. Use the MiniConda interpreter; the PATH `python` lacks the voice packages.
