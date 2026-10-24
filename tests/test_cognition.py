@@ -498,6 +498,24 @@ class ListenTests(unittest.TestCase):
         # Speaking during calibration doesn't push the threshold above the speech.
         self.assertLess(speech_threshold([0.002] * 12 + [0.08] * 4), 0.01)
 
+    def test_collect_starts_on_speech_and_ends_on_silence(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("numpy not installed")
+        from jarvis.listen import _collect
+        # 1 = speech block, 0 = not; each block carries its index so the cut is visible.
+        marks = [0] * 10 + [1, 0, 1] + [0] * 5 + [1] * 20 + [0] * 30
+        blocks = iter(np.full(10, i, dtype="float32") for i in range(len(marks)))
+        out = _collect(lambda: next(blocks), lambda b: bool(marks[int(b[0])]), 10,
+                       max_seconds=60, max_silence=10 * 10 / 16000, wait_seconds=60,
+                       min_voiced=0, onset=3, preroll=2)
+        kept = sorted({int(v) for v in out})
+        self.assertEqual((kept[0], kept[-1]), (16, 37))  # 2 blocks of preroll, no tail
+        noise = iter(np.zeros(10, dtype="float32") for _ in range(10_000))
+        self.assertIsNone(_collect(lambda: next(noise), lambda b: False, 10, 60, 0.1,
+                                   wait_seconds=0.05, min_voiced=0, onset=3))
+
     def test_enrollment_pinned_and_wake_word_learning(self):
         try:
             import numpy as np

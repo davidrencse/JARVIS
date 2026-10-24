@@ -1,7 +1,7 @@
 """Hearing: microphone → is it David? → text. Everything runs locally, so it costs nothing.
 
-- Utterance capture: energy-based voice activity detection on 30 ms frames,
-  calibrated against the room's noise floor.
+- Utterance capture: Silero voice activity detection (bundled with faster-whisper) on
+  32 ms blocks; without it, a loudness threshold calibrated against the room's noise.
 - Speaker check: sherpa-onnx ERes2Net speaker embedding (≈26 MB ONNX model, CPU),
   cosine similarity against an enrolled voiceprint. Runs before transcription so
   other voices never reach the model or the agents.
@@ -89,40 +89,90 @@ def speech_threshold(floor_rms):
     return max(0.004, min(floor * 3.0, floor * 1.6 + 0.01))
 
 
+def _vad_model():
+    """faster-whisper's bundled Silero VAD, loaded once; None if it isn't installed."""
+    global _VAD
+    if _VAD is None:
+        try:
+            from faster_whisper.vad import get_vad_model
+            _VAD = get_vad_model()
+        except Exception:
+            _VAD = False
+    return _VAD or None
+
+
+_VAD = None
+VAD_CHUNK = 512  # 32 ms: the block size Silero VAD scores
+
+
+class _SpeechGate:
+    """Is this block speech? Scores the newest block with ~1 s of context, so fans,
+    keyboards and room hum don't count the way they do for a loudness threshold."""
+
+    def __init__(self, model, context=32, cutoff=0.5):
+        self.model, self.cutoff, self.recent = model, cutoff, []
+        self.context = context
+
+    def __call__(self, block):
+        np = _np()
+        self.recent = (self.recent + [block])[-self.context:]
+        return float(self.model(np.concatenate(self.recent)).reshape(-1)[-1]) > self.cutoff
+
+
+def _collect(read, is_speech, block, max_seconds, max_silence, wait_seconds, min_voiced,
+             onset, preroll=0):
+    """One utterance from blocks of `block` samples: starts after `onset` speech blocks in
+    a row (keeping `preroll` blocks before them), ends after `max_silence` seconds without
+    speech. None if nobody spoke, or there was too little speech to be a sentence."""
+    np = _np()
+    recent, run, heard, quiet, voiced, waited = [], 0, [], 0, 0, 0
+    while True:
+        chunk = read()
+        speech = is_speech(chunk)
+        if not heard:
+            waited += 1
+            if waited * block > wait_seconds * RATE:
+                return None
+            recent = (recent + [chunk])[-(onset + preroll):]
+            run = run + 1 if speech else 0
+            if run >= onset:
+                heard, voiced = recent, onset
+            continue
+        heard.append(chunk)
+        voiced += speech
+        quiet = 0 if speech else quiet + 1
+        if quiet * block > max_silence * RATE or len(heard) * block > max_seconds * RATE:
+            if voiced * block < min_voiced * RATE:
+                return None  # too little actual speech: a cough, a tap, a word fragment
+            # Drop trailing silence so it doesn't dilute the speaker embedding.
+            return np.concatenate(heard[:len(heard) - quiet] or heard)
+
+
 def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_seconds=30,
                      min_voiced=0.4):
-    """Block until one spoken utterance ends; return float32 mono 16 kHz audio or None."""
+    """Block until one spoken utterance ends; return float32 mono 16 kHz audio or None.
+    Uses Silero VAD when faster-whisper is installed, else a loudness threshold."""
     np = _np()
     try:
         import sounddevice as sd
     except ImportError:
         raise RuntimeError(INSTALL_HINT) from None
-    onset = 5  # 150 ms of continuous sound starts an utterance; a click or tap doesn't
-    with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME,
+    vad = _vad_model()
+    block = VAD_CHUNK if vad else FRAME
+    with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=block,
                         device=_input_device(sd)) as mic:
-        floor_rms = [float(np.sqrt(np.mean(mic.read(FRAME)[0][:, 0] ** 2)))
-                     for _ in range(int(calibrate * RATE / FRAME))]
+        def read():
+            return mic.read(block)[0][:, 0]
+        if vad:
+            # 3 blocks (~100 ms) start it; the VAD lags a little, so keep 200 ms before.
+            return _collect(read, _SpeechGate(vad), block, max_seconds, max_silence,
+                            wait_seconds, min_voiced, onset=3, preroll=6)
+        floor_rms = [float(np.sqrt(np.mean(read() ** 2)))
+                     for _ in range(int(calibrate * RATE / block))]
         threshold = speech_threshold(floor_rms)
-        pending, heard, quiet, voiced, waited = [], [], 0, 0, 0
-        while True:
-            block = mic.read(FRAME)[0][:, 0]
-            loud = float(np.sqrt(np.mean(block ** 2))) > threshold
-            if not heard:
-                waited += 1
-                if waited * FRAME > wait_seconds * RATE:
-                    return None
-                pending = pending + [block] if loud else []
-                if len(pending) >= onset:
-                    heard, voiced = pending, onset
-                continue
-            heard.append(block)
-            voiced += loud
-            quiet = 0 if loud else quiet + 1
-            if quiet * FRAME > max_silence * RATE or len(heard) * FRAME > max_seconds * RATE:
-                if voiced * FRAME < min_voiced * RATE:
-                    return None  # too little actual speech: a cough, a tap, a word fragment
-                # Drop trailing silence so it doesn't dilute the speaker embedding.
-                return np.concatenate(heard[:len(heard) - quiet] or heard)
+        # 5 frames (150 ms) of continuous sound start an utterance; a click or tap doesn't.
+        return _collect(read, lambda b: float(np.sqrt(np.mean(b ** 2))) > threshold, block,
+                        max_seconds, max_silence, wait_seconds, min_voiced, onset=5)
 
 
 def save_wav(path, audio):

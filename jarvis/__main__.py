@@ -743,7 +743,7 @@ def cognition(args, config, base):
             for i, phrase in enumerate(ENROLL_PHRASES, 1):
                 for _ in range(3):
                     print(f"[{i}/{len(ENROLL_PHRASES)}]  \"{phrase}\"", file=sys.stderr)
-                    audio = record_utterance(max_seconds=12, min_voiced=0.7)
+                    audio = record_utterance(max_seconds=12, min_voiced=0.5)
                     if audio is not None:
                         break
                     print("   didn't catch enough speech, say it again a bit louder",
