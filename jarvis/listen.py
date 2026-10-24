@@ -80,6 +80,15 @@ def _input_device(sd):
     return next((n for n in ("pipewire", "pulse") if n in names), None)
 
 
+def speech_threshold(floor_rms):
+    """Loudness a frame needs to count as speech, from the RMS of quiet-room frames.
+    The 20th percentile ignores a cough or the user starting early; in a noisy room
+    (fans, other voices) 3x the floor sits above normal speech, so cap the margin."""
+    np = _np()
+    floor = float(np.percentile(np.asarray(floor_rms, dtype="float64"), 20))
+    return max(0.004, min(floor * 3.0, floor * 1.6 + 0.01))
+
+
 def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_seconds=30,
                      min_voiced=0.4):
     """Block until one spoken utterance ends; return float32 mono 16 kHz audio or None."""
@@ -91,9 +100,9 @@ def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_second
     onset = 5  # 150 ms of continuous sound starts an utterance; a click or tap doesn't
     with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=FRAME,
                         device=_input_device(sd)) as mic:
-        floor_frames = [mic.read(FRAME)[0][:, 0] for _ in range(int(calibrate * RATE / FRAME))]
-        floor = float(np.sqrt(np.mean(np.concatenate(floor_frames) ** 2)))
-        threshold = max(floor * 3.0, 0.004)
+        floor_rms = [float(np.sqrt(np.mean(mic.read(FRAME)[0][:, 0] ** 2)))
+                     for _ in range(int(calibrate * RATE / FRAME))]
+        threshold = speech_threshold(floor_rms)
         pending, heard, quiet, voiced, waited = [], [], 0, 0, 0
         while True:
             block = mic.read(FRAME)[0][:, 0]

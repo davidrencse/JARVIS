@@ -482,6 +482,22 @@ class ListenTests(unittest.TestCase):
         segs = segment(audio, noise_floor=0.001)
         self.assertEqual(len(segs), 1)  # the 0.1 s blip is below min_speech
         self.assertAlmostEqual(segs[0][0] / RATE, 1.0, delta=0.05)
+
+    def test_speech_threshold_in_quiet_and_noisy_rooms(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("numpy not installed")
+        from jarvis.listen import speech_threshold
+        self.assertAlmostEqual(speech_threshold([0.002] * 16), 0.006)  # quiet: 3x floor
+        self.assertEqual(speech_threshold([0.0] * 16), 0.004)
+        # A fan at ~0.02 RMS with bursts to 0.04: normal speech (~0.07) must still count.
+        noisy = speech_threshold([0.02, 0.025, 0.03, 0.04, 0.02, 0.018, 0.035, 0.022] * 2)
+        self.assertGreater(noisy, 0.035)
+        self.assertLess(noisy, 0.05)
+        # Speaking during calibration doesn't push the threshold above the speech.
+        self.assertLess(speech_threshold([0.002] * 12 + [0.08] * 4), 0.01)
+
     def test_enrollment_pinned_and_wake_word_learning(self):
         try:
             import numpy as np

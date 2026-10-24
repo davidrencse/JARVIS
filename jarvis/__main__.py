@@ -749,8 +749,9 @@ def cognition(args, config, base):
                     print("   didn't catch enough speech, say it again a bit louder",
                           file=sys.stderr)
                 else:
-                    raise RuntimeError("Couldn't hear speech. Check Windows' input device "
-                                       "(Settings > Sound > Input) and mic volume.")
+                    raise RuntimeError("Couldn't hear speech. Check the input device and mic "
+                                       "volume (" + ("Settings > Sound > Input" if os.name == "nt"
+                                                     else "wpctl status; pavucontrol") + ").")
                 print(f"   got it ({len(audio) / RATE:.1f}s)", file=sys.stderr)
                 save_wav(ears.dir / "enroll" / f"{i:02d}.wav", audio)
                 clips.append(audio)
