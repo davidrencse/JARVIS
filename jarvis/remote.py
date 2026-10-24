@@ -25,10 +25,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "close_app", "media", "volume")
+ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media", "volume")
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
-       "close_app": "name", "media": "command", "volume": "level"}
+       "focus_window": "name", "close_app": "name", "media": "command", "volume": "level"}
 # Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
 SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",

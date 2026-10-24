@@ -83,10 +83,11 @@ def _input_device(sd):
 def speech_threshold(floor_rms):
     """Loudness a frame needs to count as speech, from the RMS of quiet-room frames.
     The 20th percentile ignores a cough or the user starting early; in a noisy room
-    (fans, other voices) 3x the floor sits above normal speech, so cap the margin."""
+    (fans, other voices) a conservative floor multiple can miss quieter speech. Keep a
+    small absolute margin while limiting the multiplier so normal mic-level speech starts."""
     np = _np()
     floor = float(np.percentile(np.asarray(floor_rms, dtype="float64"), 20))
-    return max(0.004, min(floor * 3.0, floor * 1.6 + 0.01))
+    return max(0.002, min(floor * 2.0, floor * 1.2 + 0.008))
 
 
 def _vad_model():
@@ -109,7 +110,7 @@ class _SpeechGate:
     """Is this block speech? Scores the newest block with ~1 s of context, so fans,
     keyboards and room hum don't count the way they do for a loudness threshold."""
 
-    def __init__(self, model, context=32, cutoff=0.5):
+    def __init__(self, model, context=32, cutoff=0.35):
         self.model, self.cutoff, self.recent = model, cutoff, []
         self.context = context
 
@@ -131,7 +132,7 @@ def _collect(read, is_speech, block, max_seconds, max_silence, wait_seconds, min
         speech = is_speech(chunk)
         if not heard:
             waited += 1
-            if waited * block > wait_seconds * RATE:
+            if wait_seconds is not None and waited * block > wait_seconds * RATE:
                 return None
             recent = (recent + [chunk])[-(onset + preroll):]
             run = run + 1 if speech else 0
@@ -148,7 +149,7 @@ def _collect(read, is_speech, block, max_seconds, max_silence, wait_seconds, min
             return np.concatenate(heard[:len(heard) - quiet] or heard)
 
 
-def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_seconds=30,
+def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_seconds=None,
                      min_voiced=0.4):
     """Block until one spoken utterance ends; return float32 mono 16 kHz audio or None.
     Uses Silero VAD when faster-whisper is installed, else a loudness threshold."""
@@ -164,15 +165,16 @@ def record_utterance(max_seconds=20, max_silence=0.6, calibrate=0.5, wait_second
         def read():
             return mic.read(block)[0][:, 0]
         if vad:
-            # 3 blocks (~100 ms) start it; the VAD lags a little, so keep 200 ms before.
+            # Lower VAD cutoff catches quieter speech; 2 blocks (~64 ms) start it, with
+            # 200 ms of preroll to retain the beginning of the utterance.
             return _collect(read, _SpeechGate(vad), block, max_seconds, max_silence,
-                            wait_seconds, min_voiced, onset=3, preroll=6)
+                            wait_seconds, min_voiced, onset=2, preroll=6)
         floor_rms = [float(np.sqrt(np.mean(read() ** 2)))
                      for _ in range(int(calibrate * RATE / block))]
         threshold = speech_threshold(floor_rms)
-        # 5 frames (150 ms) of continuous sound start an utterance; a click or tap doesn't.
+        # 3 frames (90 ms) of continuous sound start an utterance; min_voiced filters blips.
         return _collect(read, lambda b: float(np.sqrt(np.mean(b ** 2))) > threshold, block,
-                        max_seconds, max_silence, wait_seconds, min_voiced, onset=5)
+                        max_seconds, max_silence, wait_seconds, min_voiced, onset=3)
 
 
 def save_wav(path, audio):
