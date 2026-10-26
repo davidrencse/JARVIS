@@ -9,8 +9,10 @@ measured improvements, verification and prioritized follow-up work. Downloaded
 [architecture skills](skills/README.md) are available as project-local references.
 
 The follow-up [pipeline hardening report](docs/pipeline-hardening-phase2.md),
+[plan ownership update](docs/pipeline-hardening-2026-10-26.md),
 [feature coverage matrix](docs/feature-validation.md), and
 [provider quota report](docs/provider-limits.md) record the latest changes and checks.
+Grokbot handoffs use a [model preflight with ten checks](docs/grokbot-preflight.md).
 
 ## Talk to it
 
@@ -489,47 +491,6 @@ ElevenLabs voices. A pick is saved as `ELEVENLABS_VOICE_ID`, applies to live cal
 
 Live-call audio goes to ElevenLabs, so the local voiceprint check doesn't apply to it;
 push-to-talk (**Voice**) and the always-on listener still run locally.
-
-## Markets (True Markets recon)
-
-**Markets** in the console nav opens `trade.html`, the simple view: a plain-English
-market pulse with a mood gauge and a market-cap heatmap (click a coin for its chart),
-the pipeline drawn live (market data → strategies → signals → you decide → real
-trading **off**, with a funnel line), each strategy's result as "$1,000 → $X vs
-holding", and a three-tap builder (style, coins, how careful) with an animated result.
-`/api/markets/pipeline` serves the pipeline (cached 60 s; templates on BTC/ETH/SOL run
-until you save your own). If True Markets blips, the last good data (up to an hour
-old) is shown instead of an error.
-
-**Pro terminal** (`terminal.html`, linked from that page) is the Bloomberg-style view over
-[True Markets](https://truemarkets.co) data. Monitor (top assets by market cap, 1h/24h
-change, range, sparkline), chart with windows from 1H to 365D, security description,
-intel (movers, breadth, BTC dominance, volatility) and a **strategy lab**.
-
-```bash
-jarvis markets setup ~/Desktop/truemarkets-org-api-key-*.json   # once per laptop
-jarvis markets status | quote SOL | intel | monitor
-jarvis markets strategies ; jarvis markets backtest <id>
-```
-
-The key file is copied to `.jarvis/truemarkets-key.json` (git-ignored, owner-only).
-Sign-in is True Markets' ES256 challenge, done in pure Python, so no extra package.
-
-**Recon only.** The client issues GETs against an allowlist of market-data paths and
-contains no order, transfer or wallet code. This key's account endpoints answer 401
-anyway.
-
-**Strategies are data, not code:** tickers, window, bar size, entry rules (all must
-hold), exit rules (any one), stop loss and take profit. A rule is `TERM OP TERM`, for
-example `sma(20) crosses_above sma(50)`, `rsi(14) < 30` or `price > high(20)`.
-Indicators are sma, ema, rsi, roc, zscore, high, low and vol. Backtests are long-only;
-a signal on a bar's close fills on the next bar, so there is no look-ahead. They report
-return vs buy-and-hold, Sharpe, max drawdown, trades, win rate, exposure and the live
-signal (BUY/SELL/HOLD/FLAT). Five templates are included; saved strategies live in
-`.jarvis/strategies.json`.
-
-Terminal keys: `/` command line (`BTC`, `ETH GP 30D`, `DES SOL`, `TOP`, `NEW`, `BT`,
-`TPL 3`, `HELP`), F1-F5 panes, ↑/↓ steps through the monitor.
 
 ## Unified desktop
 
