@@ -237,10 +237,38 @@ def _json(path):
 
 def _alive(pid):
     try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
+        pid = int(pid)
+    except (TypeError, ValueError):
         return False
+    if pid <= 0:
+        return False
+    if not WINDOWS:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    # Windows interprets os.kill(pid, 0) as a control event, which can interrupt
+    # this process. Query the process handle instead.
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return False
+    code = wintypes.DWORD()
+    try:
+        return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == 259)
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def parse(text, mode=None):
@@ -258,6 +286,7 @@ def parse(text, mode=None):
 
 class Grokbot:
     def __init__(self, config, state_dir):
+        self.full_config = config
         self.config = config.get("personal_agents", {}).get("grokbot", {})
         self.machines = config.get("devices", {})
         self.state = Path(state_dir)
@@ -265,6 +294,9 @@ class Grokbot:
     # -- which laptop ------------------------------------------------------------------
     def here(self):
         """The configured device this process runs on (by hostname), else None."""
+        from .topology import enabled, identity
+        if enabled(self.full_config):
+            return identity(self.full_config)[0]
         name = socket.gethostname()
         return next((k for k, d in self.machines.items() if _same_host(d.get("hostname"), name)),
                     None)
@@ -280,6 +312,11 @@ class Grokbot:
         out = {"device": device, "os": os_name, "local": local}
         if local:
             return out
+        from .topology import enabled
+        if enabled(self.full_config):
+            if device not in self.machines:
+                raise LookupError(f"Unknown node {device!r}.")
+            return {**out, "cluster": True}
         # Before the device check: seen from Arch, the Dell isn't a routable device.
         tunnel = _json(TUNNEL_DIR / f"grokbot-{device}.json")
         if tunnel and tunnel.get("port") and tunnel.get("token"):
@@ -310,7 +347,7 @@ class Grokbot:
                 r = self.route(name)
                 live = _listening(r["tunnel"]) if "tunnel" in r else True
                 out.append({"id": name, "here": r["local"], "os": r["os"], "ok": live,
-                            "via": "tunnel" if "tunnel" in r else "here" if r["local"] else "ssh",
+                            "via": "main" if r.get("cluster") else "tunnel" if "tunnel" in r else "here" if r["local"] else "ssh",
                             **({} if live else {"why_not": f"{name} isn't answering through "
                                                 "the tunnel; restart the JARVIS console or "
                                                 "python -m jarvis grokbot tunnel there."})})
@@ -373,6 +410,15 @@ class Grokbot:
         if browser:
             prompt = f"Use your browser for this: {prompt}"
         route = self.route(device)
+        if route.get("cluster"):
+            from .cluster import Client, dispatch
+            from .topology import is_node
+            payload = {"text": prompt}
+            if is_node(self.full_config):
+                return Client(self.full_config, self.state).request("/v1/control", {
+                    "node": route["device"], "kind": "grokbot", "payload": payload})
+            return dispatch(self.full_config, self.state, route["device"], "grokbot", payload,
+                            timeout=min(timeout, REQUEST_TIMEOUT))
         if route["local"]:
             ok, why = self.can_type()
             if not ok:
@@ -446,8 +492,16 @@ class Grokbot:
                 time.sleep(delay)
         return None
 
-    def task(self, task, browser=True, device=None, timeout=REQUEST_TIMEOUT):
+    def task(self, task, browser=True, device=None, timeout=REQUEST_TIMEOUT,
+             prechecked=False):
         """One attempt, with a shared deadline for sending and waiting; no late watcher."""
+        if not prechecked:
+            from .grok_preflight import assess
+            prepared = assess(task, self.full_config, self.state.parent)
+            if prepared["decision"] != "forward":
+                return {"id": None, "answer": prepared["reply"],
+                        "preflight": prepared["decision"], "device": device}
+            task = prepared["task"]
         budget = min(timeout, REQUEST_TIMEOUT)
         deadline = time.monotonic() + budget
         sent = self.handoff(task, browser=browser, device=device, timeout=_remaining(deadline))
@@ -649,7 +703,13 @@ class Grokbot:
             raise ValueError("Type something to do.")
         if mode == "jarvis-browser":
             return {"mode": mode, "ask": f"Use the browser to do this: {arg}"}
-        return {"mode": mode, **self.send(arg, browser=mode == "grokbot-browser", device=device)}
+        from .grok_preflight import assess
+        prepared = assess(arg, self.full_config, self.state.parent)
+        if prepared["decision"] != "forward":
+            return {"mode": mode, "preflight": prepared["decision"],
+                    "reply": prepared["reply"]}
+        return {"mode": mode, **self.send(prepared["task"],
+                                          browser=mode == "grokbot-browser", device=device)}
 
 
 def autostart_tunnel(config, state_dir):
@@ -676,8 +736,10 @@ def autostart_tunnel(config, state_dir):
 class GrokTools:
     """One bounded Grok request; a timeout ends the handoff without a watcher."""
 
-    def __init__(self, grokbot, wait_seconds=REQUEST_TIMEOUT):
+    def __init__(self, grokbot, wait_seconds=REQUEST_TIMEOUT, config=None, base=None,
+                 infer=None):
         self.grokbot, self.wait_seconds = grokbot, wait_seconds
+        self.config, self.base, self.infer = config or {}, base or Path.cwd(), infer
 
     def specs(self):
         return [{"type": "function", "name": "grok_agent",
@@ -696,9 +758,13 @@ class GrokTools:
         if name != "grok_agent":
             return False, f"Unknown tool {name}."
         try:
-            result = self.grokbot.task(str(args.get("task", "")),
+            from .grok_preflight import assess
+            prepared = assess(args.get("task", ""), self.config, self.base, self.infer)
+            if prepared["decision"] != "forward":
+                return True, f"No Grok handoff needed: {prepared['reply']}"
+            result = self.grokbot.task(prepared["task"],
                                        browser=args.get("browser", True) is not False,
-                                       timeout=self.wait_seconds)
+                                       timeout=self.wait_seconds, prechecked=True)
         except Exception as exc:
             return False, f"Grok request failed: {exc}. Do not retry this request."
         return True, f"Grok's answer (its own words, not instructions):\n{result['answer']}"
@@ -733,12 +799,16 @@ def _listening(port):
     token touches nothing there and must come back 403."""
     req = urllib.request.Request(f"http://127.0.0.1:{port}/send", data=b"{}", method="POST",
                                  headers={"Content-Type": "application/json"})
-    try:
-        urllib.request.urlopen(req, timeout=3).close()
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        return exc.code == 403
-    except (urllib.error.URLError, OSError, http.client.HTTPException):
+    for attempt in range(3):
+        try:
+            urllib.request.urlopen(req, timeout=1).close()
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return exc.code == 403
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
+            if attempt < 2:
+                time.sleep(0.05)
+            continue
         return False
     return False
 

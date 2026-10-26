@@ -27,7 +27,6 @@ ENROLL_PHRASES = (
     "Jarvis, stop.",
     "Hey Jarvis, remind me to push the recon branch tonight.",
     "I'm teaching Jarvis my voice so it can pick me out from anyone else in the room.",
-    "Jarvis, open the trading dashboard.",
     "Okay Jarvis, how much did I spend on API credits this month?",
     "Jarvis, summarize my unread email and flag anything urgent.",
     "Jarvis, start a new plan for the Underlord game.",
@@ -87,7 +86,7 @@ def speech_threshold(floor_rms):
     small absolute margin while limiting the multiplier so normal mic-level speech starts."""
     np = _np()
     floor = float(np.percentile(np.asarray(floor_rms, dtype="float64"), 20))
-    return max(0.002, min(floor * 2.0, floor * 1.2 + 0.008))
+    return max(0.004, min(floor * 3.0, floor * 1.5 + 0.01))
 
 
 def _vad_model():

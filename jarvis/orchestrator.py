@@ -71,7 +71,29 @@ def extract_json(text):
         raise ValueError("Planner answer is not valid JSON.") from None
 
 
-def validate_plan(plan, catalog):
+def _owned_path(value, workspace=None):
+    """Canonical comparison key for a writer's workspace-relative ownership."""
+    if not isinstance(value, str) or not value or value.startswith(("/", "\\")):
+        raise ValueError(f"Invalid owned path: {value!r}.")
+    parts = value.replace("\\", "/").split("/")
+    if (any(part == ".." or ":" in part or "\x00" in part for part in parts)
+            or not any(part and part != "." for part in parts)):
+        raise ValueError(f"Invalid owned path: {value!r}.")
+    # Windows treats trailing dots/spaces and case as aliases. Reject ambiguous names
+    # even on other hosts so plans retain their meaning when moved to Windows.
+    if any(part.rstrip(" .") != part for part in parts if part not in ("", ".")):
+        raise ValueError(f"Invalid owned path: {value!r}.")
+    normalized = [part for part in parts if part not in ("", ".")]
+    if workspace is not None:
+        root = Path(workspace).resolve()
+        target = root.joinpath(*normalized).resolve()
+        if target == root or root not in target.parents:
+            raise ValueError(f"Owned path escapes workspace: {value!r}.")
+        normalized = list(target.relative_to(root).parts)
+    return "/".join(normalized).casefold()
+
+
+def validate_plan(plan, catalog, workspace=None):
     if not isinstance(plan, dict) or not isinstance(plan.get("subtasks"), list):
         raise ValueError("Plan needs a subtasks list.")
     subtasks = plan["subtasks"]
@@ -103,11 +125,14 @@ def validate_plan(plan, catalog):
         if sub["specialist"] in READ_ONLY_SPECIALISTS:
             sub["mode"] = "read-only"
         if sub.get("mode", "read-only") == "workspace-write":
+            if not sub.get("owned_paths"):
+                raise ValueError(f"{sid}: workspace-write needs owned_paths.")
             for path in sub.get("owned_paths", []):
-                clash = next((p for p in owners if _nested(p, path)), None)
+                key = _owned_path(path, workspace)
+                clash = next((p for p in owners if _nested(p, key)), None)
                 if clash is not None:
                     raise ValueError(f"{sid}: {path} overlaps {clash}, owned by {owners[clash]}.")
-                owners[path] = sid
+                owners[key] = sid
         seen.append(sid)
     return plan
 
@@ -217,6 +242,8 @@ class Orchestrator:
         record = self.load(plan_id)
         if record["state"] in ("finished", "blocked"):
             return record
+        root = (self.base / record["workspace"]).resolve()
+        validate_plan({"subtasks": record["subtasks"]}, self.catalog, root)
         uncertain = {sid for sid, task_id in record["tasks"].items()
                      if sid not in record["results"]
                      and record.get("resume_tasks", {}).get(sid) != task_id}

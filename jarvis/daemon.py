@@ -62,8 +62,10 @@ def listen_loop(state, config, base, threshold=None):
     from .speech import SpeechQueue, Voice, spoken
     from .store import Store, lanes_from
 
-    store = Store(state, lanes_from(config))
-    memory, voice = Memory(state), Voice(state, config)
+    from .topology import is_node
+    node = is_node(config)
+    store = None if node else Store(state, lanes_from(config))
+    memory, voice = (None if node else Memory(state)), Voice(state, config)
     speaker = SpeechQueue(voice)
     ears, stt = VoicePrint(state, config), Transcriber(config)
     lane = make_lane(config, base, state)
@@ -81,6 +83,9 @@ def listen_loop(state, config, base, threshold=None):
         stt(_np().zeros(16000, dtype="float32"))
         voice.synth(ACK)
         lane.warm()
+        if not node:
+            from .pipeline import warm
+            warm()  # the installed-app list, for the direct-action fast path
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device)
         failures = 0

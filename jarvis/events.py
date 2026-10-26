@@ -31,9 +31,10 @@ RELAYED = ("turn.", "voice.", "kb.", "grok.")  # kinds other processes may put o
 
 
 class Bus:
-    def __init__(self, replay=300):
+    def __init__(self, replay=300, subscriber_queue=2000):
         self.lock = threading.Lock()
         self.seq, self.recent, self.subs = 0, deque(maxlen=replay), set()
+        self.subscriber_queue = subscriber_queue
 
     def publish(self, kind, data=None):
         with self.lock:
@@ -43,13 +44,19 @@ class Bus:
             for sub in list(self.subs):
                 try:
                     sub.put_nowait(event)
-                except queue.Full:  # a stalled client; it resyncs from the API on reconnect
-                    pass
+                except queue.Full:
+                    # Force a reconnect and authoritative reload. Silently dropping
+                    # one event would leave this stream apparently healthy forever.
+                    self.subs.discard(sub)
+                    with sub.mutex:
+                        sub.queue.clear()
+                        sub.queue.append(None)
+                        sub.not_empty.notify()
         return event
 
     def subscribe(self, after=None):
         """(queue, backlog): backlog is what a reconnecting client missed after `after`."""
-        sub = queue.Queue(maxsize=2000)
+        sub = queue.Queue(maxsize=self.subscriber_queue)
         with self.lock:
             backlog = ([e for e in self.recent if e["seq"] > after]
                        if after is not None and after <= self.seq else [])
@@ -126,13 +133,18 @@ class Watcher:
 
     def __init__(self, bus, state, memory, store, interval=0.75, vault=None):
         """vault: the Obsidian vault folder; edits there (from Obsidian or any JARVIS
-        process) are announced as vault.changed, so the task board stays current."""
+                    process) are announced as vault.changed, so task data stays current."""
         self.bus, self.state, self.memory, self.store = bus, Path(state).resolve(), memory, store
         self.interval, self.stopped = interval, threading.Event()
         self.vault = Path(vault) if vault else None
         self._vault_at, self._vault_mark = 0, self._vault_stamp()
         self.feed = self.state / FEED
-        self.offset = self.feed.stat().st_size if self.feed.is_file() else 0
+        try:
+            feed_stat = self.feed.stat()
+        except FileNotFoundError:
+            feed_stat = None
+        self.offset = feed_stat.st_size if feed_stat else 0
+        self.feed_identity = ((feed_stat.st_dev, feed_stat.st_ino) if feed_stat else None)
         self.item_row = self._scalar(self.memory, "SELECT COALESCE(MAX(rowid), 0) FROM items")
         self.event_seq = self._scalar(self.store, "SELECT COALESCE(MAX(seq), 0) FROM events")
         self.plans = self._plan_mtimes()
@@ -196,15 +208,21 @@ class Watcher:
             self.bus.publish("vault.changed", {"notes": mark[0]})
 
     def _poll_feed(self):
-        if not self.feed.is_file():
+        try:
+            feed = self.feed.open("rb")
+        except FileNotFoundError:
             self.offset = 0
+            self.feed_identity = None
             return
-        size = self.feed.stat().st_size
-        if size < self.offset:  # rolled over
-            self.offset = 0
-        if size == self.offset:
-            return
-        with open(self.feed, "rb") as feed:
+        with feed:
+            stat = os.fstat(feed.fileno())
+            identity = (stat.st_dev, stat.st_ino)
+            size = stat.st_size
+            if identity != self.feed_identity or size < self.offset:
+                self.offset = 0
+            self.feed_identity = identity
+            if size == self.offset:
+                return
             feed.seek(self.offset)
             chunk = feed.read(size - self.offset)
         complete = chunk.rfind(b"\n") + 1  # leave a half-written last line for next time

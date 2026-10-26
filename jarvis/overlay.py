@@ -315,15 +315,22 @@ def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=Fal
     window = Window(url, Path(state) / "overlay-profile", opacity)
     window.close_stale()
     overlay = Overlay(window, hotkey)
-    console = Console(config, base, state)
-    if hasattr(console, "start_live"):
-        console = console.start_live()
-    console.overlay = overlay
-    from .grokbot import autostart_tunnel
-    autostart_tunnel(config, state)  # lets the other laptop reach this one
-    handler = type("OverlayHandler", (Handler,), {
-        "console": console, "hosts": ("127.0.0.1", "localhost", "::1")})
-    server = ConsoleServer(("127.0.0.1", port), handler)
+    from .topology import enabled
+    runtime = None
+    if enabled(config):
+        from .cluster_proxy import local_server
+        server, runtime = local_server(config, base, state, port, overlay)
+        console = runtime.console
+    else:
+        console = Console(config, base, state)
+        if hasattr(console, "start_live"):
+            console = console.start_live()
+        console.overlay = overlay
+        from .grokbot import autostart_tunnel
+        autostart_tunnel(config, state)
+        handler = type("OverlayHandler", (Handler,), {
+            "console": console, "hosts": ("127.0.0.1", "localhost", "::1")})
+        server = ConsoleServer(("127.0.0.1", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"JARVIS overlay console on http://127.0.0.1:{port}/", flush=True)
     try:
@@ -333,7 +340,10 @@ def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=Fal
     finally:
         overlay.stop()
         server.shutdown()
-        if hasattr(console, "close"):
+        server.server_close()
+        if runtime:
+            runtime.close()
+        elif hasattr(console, "close"):
             console.close()
         ctypes.windll.kernel32.CloseHandle(mutex)
     return 0
