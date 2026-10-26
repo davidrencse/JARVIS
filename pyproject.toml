@@ -13,6 +13,7 @@ voice = ["numpy", "sounddevice", "faster-whisper", "sherpa-onnx", "kokoro-onnx"]
 
 [project.scripts]
 jarvis = "jarvis.__main__:main"
+jarvis-node = "jarvis.node:main"
 
 [tool.setuptools]
 packages = ["jarvis"]
