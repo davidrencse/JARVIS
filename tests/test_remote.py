@@ -92,7 +92,12 @@ class RemoteTests(unittest.TestCase):
         # wrong token: refused
         (folder / "grokbot-dell.json").write_text(json.dumps({"port": port, "token": "nope"}))
         with patch.object(grokbot, "TUNNEL_DIR", folder):
-            ok, text = self.remote("zenbook").call("dell", "open_app", "x")
+            # Windows can abort a fresh localhost connection before the relay
+            # replies. Repeating an invalid-token request has no side effects.
+            for _ in range(3):
+                ok, text = self.remote("zenbook").call("dell", "open_app", "x")
+                if "Refused" in text:
+                    break
         self.assertFalse(ok)
         self.assertIn("Refused", text)
 
@@ -136,6 +141,53 @@ class AutostartTests(unittest.TestCase):
             tunnel.assert_called_once()
             off = {**CONFIG, "personal_agents": {"grokbot": {"tunnel_autostart": False}}}
             self.assertIsNone(grokbot.autostart_tunnel(off, "."))
+
+
+class ClusterFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = {**CONFIG, "cluster": {"enabled": True, "local_device": "dell", "main_device": "dell"}}
+        self.remote = Remote(self.config, self.tmp.name)
+
+    def test_offline_before_dispatch_uses_ssh(self):
+        from jarvis.cluster import NodeOffline
+        with patch("jarvis.cluster.dispatch", side_effect=NodeOffline("offline")), \
+                patch.object(self.remote, "_ssh", return_value=(True, "opened")) as ssh:
+            self.assertEqual(self.remote.call("zenbook", "open_app", "Chrome"), (True, "opened"))
+        ssh.assert_called_once_with("zenbook", CONFIG["devices"]["zenbook"], "open_app", "Chrome")
+
+    def test_uncertain_or_denied_cluster_never_retries_over_ssh(self):
+        for error in (TimeoutError("may have run"), ConnectionError("hub lost"), ValueError("not enrolled")):
+            with patch("jarvis.cluster.dispatch", side_effect=error), patch.object(self.remote, "_ssh") as ssh:
+                self.assertFalse(self.remote.call("zenbook", "open_app", "Chrome")[0])
+                ssh.assert_not_called()
+
+    def test_online_uses_cluster_only(self):
+        with patch("jarvis.cluster.dispatch", return_value={"ok": True, "text": "opened"}), \
+                patch.object(self.remote, "_ssh") as ssh:
+            self.assertEqual(self.remote.call("zenbook", "open_app", "Chrome"), (True, "opened"))
+            ssh.assert_not_called()
+
+
+class LocalTargetWithClusterTests(unittest.TestCase):
+    def check(self, local):
+        cfg = {"devices": {"dell": {"transport": "local", "hostname": "d"},
+                           "zenbook": {"transport": "ssh", "target": "x@y", "hostname": "z"}},
+               "cluster": {"enabled": True, "main_device": "dell", "local_device": local}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("jarvis.remote.run_here", return_value=(True, "here")) as run, \
+                patch("jarvis.cluster.Client", side_effect=AssertionError("Client used")), \
+                patch("jarvis.cluster.dispatch", side_effect=AssertionError("dispatch used")):
+            r = Remote(cfg, tmp, tools=FakeTools())
+            self.assertEqual(r.call(local, "open_app", "x"), (True, "here"))
+            self.assertEqual(run.call_count, 1)
+
+    def test_main_runs_its_own_action_locally(self):
+        self.check("dell")
+
+    def test_node_runs_its_own_action_locally(self):
+        self.check("zenbook")
 
 
 if __name__ == "__main__":

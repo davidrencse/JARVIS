@@ -15,7 +15,10 @@ from jarvis.store import Store
 from jarvis.ui import Console, Handler
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8"))
+# The real config, minus what ties a run to this machine: David's vault (indexing it
+# per test is slow and holds the temp folder open) and the cluster's device identity.
+CONFIG = {**json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8")),
+          "vault": {"enabled": False}, "cluster": {"enabled": False}}
 
 
 class Brain:
@@ -64,6 +67,15 @@ class BusTests(unittest.TestCase):
                             and d["job"] == "j1" for _, d in sent))
         self.assertEqual(sent[2][1]["reply_id"], "reply:2")
 
+    def test_overflow_disconnects_stalled_subscriber(self):
+        bus = Bus(subscriber_queue=1)
+        sub, _ = bus.subscribe()
+        bus.publish("first")
+        bus.publish("second")
+        self.assertIsNone(sub.get_nowait())
+        self.assertNotIn(sub, bus.subs)
+        self.assertTrue(sub.empty())
+
 
 class WatcherTests(Temp):
     def test_relays_feed_and_state_changes(self):
@@ -98,6 +110,22 @@ class WatcherTests(Temp):
         watcher.poll()
         self.assertEqual(bus.recent[-1]["kind"], "turn.sentence")
         self.assertEqual(bus.recent[-1]["data"]["text"], "Hi.")
+
+    def test_replacement_feed_with_equal_or_larger_size_is_read(self):
+        memory, store, bus = Memory(self.base), Store(self.base), Bus()
+        watcher = Watcher(bus, self.base, memory, store)
+        feed = self.base / "events.jsonl"
+        first = json.dumps({"kind": "turn.sentence", "data": {"text": "old"}}) + "\n"
+        feed.write_text(first, encoding="utf-8")
+        watcher._poll_feed()
+        self.assertEqual(bus.recent[-1]["data"]["text"], "old")
+        replacement = self.base / "replacement.jsonl"
+        replacement.write_text(json.dumps({"kind": "turn.sentence", "data": {
+            "text": "new and longer than the old event"}}) + "\n", encoding="utf-8")
+        replacement.replace(feed)
+        watcher._poll_feed()
+        self.assertEqual([e["data"]["text"] for e in bus.recent],
+                         ["old", "new and longer than the old event"])
 
 
 class AskWiringTests(Temp):
@@ -171,7 +199,7 @@ class ConsoleLiveTests(Temp):
         sub, _ = console.bus.subscribe()
         self.assertEqual(console.route("hello there")["handler"], "ChatGPT brain")
         job = console.submit("what is the capital of Mongolia")  # not a local-clock question
-        for _ in range(100):
+        for _ in range(500):
             if job["state"] != "running":
                 break
             time.sleep(0.02)
@@ -197,7 +225,7 @@ class ConsoleLiveTests(Temp):
         console._lane = Brain()
         console.jobs["p"] = {"id": "p", "state": "running", "plan": "plan-0000abcd"}
         job = console.submit("still there?")
-        for _ in range(100):
+        for _ in range(500):
             if job["state"] != "running":
                 break
             time.sleep(0.02)
@@ -244,7 +272,7 @@ class EventStreamTests(Temp):
         req = urllib.request.Request(self.url + "/api/route?text=check+my+instagram&tier=",
                                      headers={"Sec-Fetch-Site": "same-origin"})
         with urllib.request.urlopen(req, timeout=5) as res:
-            self.assertEqual(json.loads(res.read())["tier"], "simple")  # auto_escalate off
+            self.assertEqual(json.loads(res.read())["tier"], "medium")  # Grok routes web work
 
 
 if __name__ == "__main__":

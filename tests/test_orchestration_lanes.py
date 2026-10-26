@@ -241,6 +241,60 @@ class OwnedPathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlaps"):
             validate_plan(self.plan(r"src\app.py", "src/app.py"), CATALOG)
 
+    def test_path_aliases_are_compared_before_parallel_writers_run(self):
+        for first, second in (("src/./app.py", "src/app.py"),
+                              ("src//app.py", "src/app.py"),
+                              ("SRC/app.py", "src/app.py")):
+            with self.subTest(first=first), self.assertRaisesRegex(ValueError, "overlaps"):
+                validate_plan(self.plan(first, second), CATALOG)
+
+    def test_unsafe_or_missing_writer_ownership_is_refused(self):
+        for path in ("", ".", "../outside", "src/../other", "/absolute",
+                     r"C:\absolute", "src/file. "):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "owned path"):
+                validate_plan(self.plan(path), CATALOG)
+        with self.assertRaisesRegex(ValueError, "needs owned_paths"):
+            validate_plan({"subtasks": [{"id": "s0", "specialist": "implementer",
+                                         "objective": "write", "mode": "workspace-write"}]},
+                          CATALOG)
+
+    def test_symlink_alias_and_escape_are_refused_at_execution(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        root = base / "workspace"
+        root.mkdir()
+        (root / "real").mkdir()
+        try:
+            (root / "alias").symlink_to(root / "real", target_is_directory=True)
+            (root / "escape").symlink_to(base, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlinks unavailable")
+        with self.assertRaisesRegex(ValueError, "overlaps"):
+            validate_plan(self.plan("alias/file.py", "real/file.py"), CATALOG, root)
+        with self.assertRaisesRegex(ValueError, "escapes workspace"):
+            validate_plan(self.plan("escape/file.py"), CATALOG, root)
+
+    def test_new_alias_after_plan_creation_blocks_dispatch(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        base = Path(temp.name)
+        (base / "real").mkdir()
+        state = base / "state"
+        with patch("jarvis.orchestrator.specialists", return_value=CATALOG):
+            orch = Orchestrator(Store(state, lanes=2), Memory(state),
+                                {"workspace_roots": ["."]}, base)
+        plan = orch.create("write files", plan=self.plan("alias/file.py", "real/file.py"))
+        try:
+            (base / "alias").symlink_to(base / "real", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("directory symlinks unavailable")
+        with patch("jarvis.orchestrator.run_task") as run:
+            with self.assertRaisesRegex(ValueError, "overlaps"):
+                orch.run(plan["id"])
+        run.assert_not_called()
+        self.assertEqual(orch.load(plan["id"])["tasks"], {})
+
     def test_siblings_are_allowed(self):
         plan = validate_plan(self.plan("src/app.py", "src/other.py", "docs"), CATALOG)
         self.assertEqual(len(plan["subtasks"]), 3)

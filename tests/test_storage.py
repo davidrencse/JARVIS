@@ -192,7 +192,8 @@ class StorageHttpTests(Temp):
     def setUp(self):
         super().setUp()
         self.console = Console({**json.loads((ROOT / "jarvis.config.json").read_text("utf-8")),
-                                **self.config}, ROOT, self.base / "state")
+                                **self.config, "cluster": {"enabled": False}},
+                               ROOT, self.base / "state")
         handler = type("H", (Handler,), {"console": self.console,
                                           "hosts": ("127.0.0.1", "localhost")})
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
