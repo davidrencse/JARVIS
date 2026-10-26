@@ -12,7 +12,7 @@ export default function Hero() {
           <RevealText
             as="h1"
             id="hero-title"
-            text={"A Bloomberg Terminal\nfor everything."}
+            text={"A personal assistant\nfor everything."}
             variant="rise"
             trigger="mount"
             step={0.07}
@@ -22,16 +22,15 @@ export default function Hero() {
           <div className={styles.side}>
             <FadeIn delay={0.5} className={styles.lede}>
               <p>
-                Bloomberg built a terminal for money. JARVIS is one for the rest of your life: your notes, deadlines,
-                markets, machines and AI usage on one screen, in plain English. Type a command, or just say “Jarvis.”
+                JARVIS brings your notes, deadlines, machines and AI usage together in plain English. Type a request, or just say “Jarvis.”
               </p>
             </FadeIn>
             <FadeIn delay={0.7} className={styles.actions}>
               <Button href="#access" size="lg" arrow className={styles.cta}>
                 Request early access
               </Button>
-              <Button href="#terminal" variant="quiet">
-                Try the terminal
+              <Button href="#how" variant="quiet">
+                See how it works
               </Button>
             </FadeIn>
           </div>

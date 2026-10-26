@@ -46,9 +46,8 @@ export const CommandSearch: FC<Props> = ({ items, placeholder = 'Ask or jump toâ
   useEffect(() => {
     const onKey = (e: globalThis.KeyboardEvent) => {
       const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName ?? '');
-      const ownsSlash = e.target instanceof Element && !!e.target.closest('#terminal');
       const combo = (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k';
-      if (!isOpen && (combo || (e.key === '/' && !typing && !ownsSlash))) {
+      if (!isOpen && (combo || (e.key === '/' && !typing))) {
         e.preventDefault();
         setIsOpen(true);
       } else if (isOpen && e.key === 'Escape') {

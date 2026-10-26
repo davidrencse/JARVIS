@@ -1,12 +1,12 @@
 .track {
   position: relative;
-  margin-bottom: clamp(64px, 8vw, 112px);
+  margin-bottom: 0;
 }
 
 .roles {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  column-gap: var(--space-6);
+  grid-template-columns: minmax(0, 1fr);
+  row-gap: var(--space-5);
 }
 
 .lineH,
@@ -16,27 +16,24 @@
   pointer-events: none;
 }
 .lineH {
-  top: 4px;
-  left: 4px;
-  right: 0;
-  height: 1px;
+  display: none;
 }
 .lineV {
-  display: none;
-  top: 12px;
+  display: block;
+  top: 4px;
   left: 4px;
-  bottom: 0;
+  bottom: 10px;
   width: 1px;
 }
 
 .role {
   position: relative;
-  padding-top: var(--space-6);
+  padding: 0 0 0 var(--space-6);
 }
 
 .node {
   position: absolute;
-  top: 0;
+  top: 7px;
   left: 0;
   width: 9px;
   height: 9px;
@@ -59,30 +56,8 @@
   color: var(--ink-2);
 }
 
-@media (max-width: 1000px) {
-  .text {
-    font-size: var(--text-sm);
-  }
-}
-
 @media (max-width: 760px) {
-  .text {
-    font-size: var(--text-base);
-  }
   .roles {
-    grid-template-columns: minmax(0, 1fr);
-    row-gap: var(--space-6);
-  }
-  .lineH {
-    display: none;
-  }
-  .lineV {
-    display: block;
-  }
-  .role {
-    padding: 0 0 0 var(--space-6);
-  }
-  .node {
-    top: 8px;
+    row-gap: var(--space-4);
   }
 }

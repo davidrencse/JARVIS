@@ -11,11 +11,6 @@ const CATEGORIES: FaqCategory[] = [
           "No. Every command answers with a plain-English line, the F-keys open the common views, and you can always skip the typing and just ask JARVIS out loud.",
       },
       {
-        question: "Is Markets financial advice? Does it trade for me?",
-        answer:
-          "Neither. Markets reads market data, explains it and tests strategy ideas on history in practice mode. There is no code in JARVIS that can place an order, move money or touch a wallet.",
-      },
-      {
         question: "Do I need an OpenAI or Anthropic API key?",
         answer:
           "No. JARVIS signs in through the ChatGPT or Claude apps you already use, so its answers count against your plan's normal limits rather than a per-token bill.",

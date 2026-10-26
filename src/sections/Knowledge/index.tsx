@@ -15,11 +15,18 @@ export default function Knowledge() {
           lede="Hand it a PDF, a link or a voice memo. Three plain scripts take it from there, and you have the final word."
         />
 
-        <Roles />
+        <div className={styles.workspace}>
+          <div className={styles.workflow}>
+            <p className={styles.workflowIntro}>
+              A claim moves from its original source to review. Nothing becomes fact without your call.
+            </p>
+            <Roles />
+          </div>
 
-        <FadeIn>
-          <ConflictDemo />
-        </FadeIn>
+          <FadeIn className={styles.conflict}>
+            <ConflictDemo />
+          </FadeIn>
+        </div>
 
         <FadeIn className={styles.wiki}>
           <p className={styles.wikiLabel}>One line from the wiki</p>

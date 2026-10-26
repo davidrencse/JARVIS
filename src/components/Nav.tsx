@@ -2,8 +2,6 @@ import { AnimatePresence, motion, useMotionValueEvent, useScroll } from "motion/
 import {
   ArrowUpRight,
   AudioLines,
-  ChartCandlestick,
-  SquareTerminal,
   Coins,
   HelpCircle,
   Laptop,
@@ -27,8 +25,6 @@ import Announcement1 from "./ui/announcement-1";
 import styles from "./Nav.module.css";
 
 const LINKS = [
-  { href: "#terminal", label: "Terminal" },
-  { href: "#markets", label: "Markets" },
   { href: "#how", label: "How it works" },
   { href: "#privacy", label: "Privacy" },
 ];
@@ -40,8 +36,6 @@ const goTo = (id: string) => () => {
 const icon = (I: typeof Mic) => <I size={16} strokeWidth={1.75} />;
 
 const COMMANDS: CommandItem[] = [
-  { id: "terminal", section: "Jump to", title: "The terminal", icon: icon(SquareTerminal), action: goTo("terminal") },
-  { id: "markets", section: "Jump to", title: "Markets in plain English", icon: icon(ChartCandlestick), action: goTo("markets") },
   { id: "voice", section: "Jump to", title: "Voice check", icon: icon(AudioLines), action: goTo("voice") },
   { id: "how", section: "Jump to", title: "How it works", icon: icon(Waypoints), action: goTo("how") },
   { id: "memory", section: "Jump to", title: "Memory and tasks", icon: icon(NotebookPen), action: goTo("memory") },
@@ -51,9 +45,6 @@ const COMMANDS: CommandItem[] = [
   { id: "everywhere", section: "Jump to", title: "Every machine", icon: icon(Laptop), action: goTo("everywhere") },
   { id: "privacy", section: "Jump to", title: "Privacy", icon: icon(ShieldCheck), action: goTo("privacy") },
   { id: "faq", section: "Jump to", title: "Questions", icon: icon(HelpCircle), action: goTo("faq") },
-  { id: "type-brief", section: "Try typing", title: "BRIEF", icon: icon(SquareTerminal), hint: "morning brief", action: goTo("terminal") },
-  { id: "type-gp", section: "Try typing", title: "BTC GP 30D", icon: icon(SquareTerminal), hint: "price chart", action: goTo("terminal") },
-  { id: "type-cred", section: "Try typing", title: "CRED", icon: icon(SquareTerminal), hint: "AI usage left", action: goTo("terminal") },
   { id: "say-due", section: "Try saying", title: "“Jarvis, what's due this week?”", icon: icon(Mic), hint: "voice check", action: goTo("voice") },
   { id: "say-done", section: "Try saying", title: "“I finished picking the motors.”", icon: icon(Mic), hint: "tasks", action: goTo("memory") },
   { id: "say-send", section: "Try saying", title: "“Send my draft to the study group.”", icon: icon(Mic), hint: "approval", action: goTo("actions") },
@@ -104,7 +95,7 @@ export function Nav() {
             transition={{ duration: 0.35, ease: ease.out }}
           >
             <Announcement1
-              message="The terminal for everything is opening to early access on Windows and Arch Linux."
+              message="Your personal assistant is opening to early access on Windows and Arch Linux."
               shortMessage="Early access is opening."
               linkLabel="Request access"
               href="#access"

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect } from "react";
+import { useEffect } from "react";
 import { Nav } from "./components/Nav";
 import { ScrollIsland } from "./components/scroll-island";
 import { interceptHashLinks, scrollToId } from "./lib/scroll";
@@ -15,19 +15,7 @@ import Faq from "./sections/Faq";
 import EarlyAccess from "./sections/EarlyAccess";
 import Footer from "./sections/Footer";
 
-const loadTerminal = () => import("./sections/Terminal");
-const loadMarkets = () => import("./sections/Markets");
-const Terminal = lazy(loadTerminal);
-const Markets = lazy(loadMarkets);
-
-/** Holds the anchor and the space while a below-the-fold section's code loads. */
-function Reserve({ id, height, band = false }: { id: string; height: number; band?: boolean }) {
-  return <section id={id} aria-busy="true" style={{ minHeight: height, background: band ? "var(--paper-2)" : undefined }} />;
-}
-
 const TOPICS = [
-  { id: "terminal", title: "The terminal" },
-  { id: "markets", title: "Markets" },
   { id: "voice", title: "Voice check" },
   { id: "how", title: "How it works" },
   { id: "memory", title: "Memory and tasks" },
@@ -46,9 +34,7 @@ export default function App() {
     const id = decodeURIComponent(location.hash.slice(1));
     if (!id) return;
     let live = true;
-    Promise.all([loadTerminal(), loadMarkets()]).then(() =>
-      requestAnimationFrame(() => requestAnimationFrame(() => live && scrollToId(id, { instant: true }))),
-    );
+    requestAnimationFrame(() => requestAnimationFrame(() => live && scrollToId(id, { instant: true })));
     return () => {
       live = false;
     };
@@ -62,12 +48,6 @@ export default function App() {
       <Nav />
       <main id="main">
         <Hero />
-        <Suspense fallback={<Reserve id="terminal" height={1400} />}>
-          <Terminal />
-        </Suspense>
-        <Suspense fallback={<Reserve id="markets" height={2000} band />}>
-          <Markets />
-        </Suspense>
         <Voice />
         <Pipeline />
         <Memory />
