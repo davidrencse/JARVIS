@@ -90,9 +90,6 @@
       ["Busiest hour", peak ? `${hourLabel(peakAt)}, ${compact(peak)}` : "—"],
       ["Last 5 hours", compact(cur.slice(-5).reduce((a, b) => a + b, 0))],
     ].map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join("");
-    const rows = [];
-    for (let i = n - 1; i >= n - 10; i--) rows.push(`<li><span>${hourLabel(usage.start + i * 3600)}</span><b>${usage.output[i] ? compact(usage.output[i]) : "·"}</b></li>`);
-    $("#ridge-hours").innerHTML = rows.join("");
     $("#ridge-axis").innerHTML = [0, 12, 24, 36].map((i) => `<span style="left:${(i / (n - 1)) * 100}%">${hourLabel(usage.start + i * 3600)}</span>`).join("") + `<span style="left:100%">now</span>`;
   }
 
@@ -110,17 +107,36 @@
   }
 
   const tip = $("#ridge-tip");
-  box.addEventListener("pointermove", (e) => {
-    if (!usage) return;
-    // The line sits exactly under the pointer; the label names the nearest hour.
+  const tipValue = tip.querySelector("span");
+  const pointReadout = $("#ridge-point-readout");
+  let keyboardIndex = null;
+  function showAt(x, i, announce = false) {
     const r = box.getBoundingClientRect(), n = usage.output.length;
-    const x = Math.min(r.width, Math.max(0, e.clientX - r.left)), i = Math.round((x / r.width) * (n - 1));
+    x = Math.min(r.width, Math.max(0, x));
+    i = Math.min(n - 1, Math.max(0, i));
     tip.hidden = false;
     tip.style.left = x + "px";
     tip.classList.toggle("flip", x > r.width - 180);
-    tip.innerHTML = `<span>${hourLabel(usage.start + i * 3600)}  ${usage.output[i] ? compact(usage.output[i]) + " tokens" : "no output"}</span>`;
+    tipValue.textContent = `${hourLabel(usage.start + i * 3600)}  ${usage.output[i] ? compact(usage.output[i]) + " tokens" : "no output"}`;
+    if (announce) pointReadout.textContent = `${hourLabel(usage.start + i * 3600)}, ${nf.format(usage.output[i])} tokens`;
+  }
+  box.addEventListener("pointermove", (e) => {
+    if (!usage) return;
+    const r = box.getBoundingClientRect(), n = usage.output.length;
+    const x = Math.min(r.width, Math.max(0, e.clientX - r.left)), i = Math.round((x / r.width) * (n - 1));
+    keyboardIndex = i;
+    showAt(x, i);
   });
   box.addEventListener("pointerleave", () => { tip.hidden = true; });
+  box.addEventListener("keydown", (e) => {
+    if (!usage || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const last = usage.output.length - 1;
+    if (e.key === "Home") keyboardIndex = 0;
+    else if (e.key === "End") keyboardIndex = last;
+    else keyboardIndex = Math.min(last, Math.max(0, (keyboardIndex ?? last) + (e.key === "ArrowRight" ? 1 : -1)));
+    showAt((keyboardIndex / last) * box.getBoundingClientRect().width, keyboardIndex, true);
+  });
   let resizeT = 0;
   new ResizeObserver(() => { clearTimeout(resizeT); resizeT = setTimeout(draw, 150); }).observe(box);
   load();

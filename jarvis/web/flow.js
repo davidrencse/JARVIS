@@ -36,18 +36,55 @@
       <span class="flow-meta"></span>
       <button type="button" class="flow-btn flow-prev" title="Previous request" aria-label="Previous request">‹</button>
       <button type="button" class="flow-btn flow-next" title="Next request" aria-label="Next request">›</button>
+      <button type="button" class="flow-btn flow-hist" title="Replay recent commands from history">History</button>
       <button type="button" class="flow-btn flow-pin" title="Keep this panel open" aria-pressed="false">Pin</button>
       <button type="button" class="flow-btn flow-close" title="Hide until the next request" aria-label="Hide">×</button>
     </header>
     <p class="flow-ask"></p>
+    <section class="flow-confirm" aria-label="Pending confirmations" hidden></section>
     <i class="flow-reg tl">+</i><i class="flow-reg tr">+</i><i class="flow-reg bl">+</i><i class="flow-reg br">+</i>
     <div class="flow-body"><div class="flow-canvas"><svg class="flow-edges" aria-hidden="true"></svg></div></div>`;
   document.body.appendChild(panel);
   const $ = (s) => panel.querySelector(s);
   const canvas = $(".flow-canvas"), svg = $(".flow-edges");
+  let pending = [], confirmBusy = false;
+  async function refreshConfirmations() {
+    if (confirmBusy) return;
+    try {
+      const data = await J.api("/api/confirm");
+      const hadPending = pending.length > 0;
+      pending = data.pending || [];
+      const region = $(".flow-confirm");
+      region.hidden = !pending.length;
+      region.innerHTML = pending.map((item) => `<div class="flow-confirm-row">
+        <p><strong>${esc(item.id)}</strong> ${esc(item.summary)}</p>
+        <div><button type="button" class="flow-btn" data-confirm="${esc(item.id)}" data-action="approve">Confirm</button>
+        <button type="button" class="flow-btn" data-confirm="${esc(item.id)}" data-action="reject">Reject</button></div>
+        </div>`).join("");
+      if (pending.length && !hadPending) hidden = false;
+      sync();
+    } catch (err) { /* The live reconnect and periodic refresh try again. */ }
+  }
+  $(".flow-confirm").addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-confirm]");
+    if (!button || confirmBusy) return;
+    const item = pending.find((x) => x.id === button.dataset.confirm);
+    if (!item) return;
+    confirmBusy = true;
+    $(".flow-confirm").querySelectorAll("button").forEach((b) => { b.disabled = true; });
+    try {
+      const result = await J.api("/api/confirm", { id: item.id, action: button.dataset.action, hash: item.hash });
+      J.toast?.(result.reply);
+    } catch (err) { J.toast?.(`Confirmation failed: ${err.message}`); }
+    finally { confirmBusy = false; await refreshConfirmations(); }
+  });
+  refreshConfirmations();
+  setInterval(refreshConfirmations, 5000);
 
   $(".flow-pin").addEventListener("click", () => { pinned = !pinned; store.set("jarvis.flow.pin", pinned); sync(); });
   $(".flow-close").addEventListener("click", () => { hidden = true; pinned = false; store.set("jarvis.flow.pin", false); sync(); });
+  $(".flow-hist").addEventListener("click", () => replay());
+  document.getElementById("flow-history")?.addEventListener("click", () => replay());
   $(".flow-prev").addEventListener("click", () => step(-1));
   $(".flow-next").addEventListener("click", () => step(1));
   function step(dir) {
@@ -73,6 +110,7 @@
 
   on("live", (e) => {
     const d = e.data || {};
+    if (e.kind === "turn.confirm" || e.kind === "hello") refreshConfirmations();
     if (e.kind === "hello") { if (!turns.size) return; turns.clear(); shown = null; sync(); return; }
     if (!e.kind.startsWith("turn.") || !d.message) return;
     let t = turns.get(d.message);
@@ -102,6 +140,50 @@
     if (d.message === shown) draw();
     sync();
   });
+
+  // ---------- replay: recent fast-path requests from the history DB (/api/history/commands) ----------
+  const HOP = { parse: "Parser", gates: "Gates", run: "Run", observe: "Observe" };
+  const OUTCOME = { observed: "done", acknowledged: "done", merged: "done", unconfirmed: "fail",
+                    uncertain: "fail", pre_effect_failure: "fail", partial_effect: "fail",
+                    not_sent: "fail" };
+
+  function fromHistory(r) {
+    const t = { id: "h:" + r.request, channel: "history", text: r.text || "", tier: "replay",
+                at: r.at * 1000, done: true, replay: true, nodes: new Map(), sentences: 0,
+                seconds: r.total_ms != null ? (r.total_ms / 1000).toFixed(2) : null };
+    const ok = r.commands.every((c) => OUTCOME[c.state] === "done");
+    node(t, "root", null, `Replay · ${J.ago ? J.ago(r.at) : new Date(r.at * 1000).toLocaleTimeString()}`,
+         (r.text || "").slice(0, 90), ok ? "done" : "fail");
+    const first = (r.commands[0]?.hops || []).find((h) => h.name === "parse");
+    node(t, "parse", "root", "Parser", `${r.commands.length} command${r.commands.length > 1 ? "s" : ""}, no model${first ? ` · ${first.ms} ms` : ""}`, "done");
+    r.commands.forEach((c, i) => {
+      const n = i + 1, hop = (name) => c.hops.find((h) => h.name === name);
+      const gates = hop("gates"), run = hop("run"), obs = hop("observe");
+      node(t, `gate:${n}`, "parse", `Gates · ${c.intent}`,
+           `${c.state === "not_sent" ? c.result || "blocked" : "passed"}${gates ? ` · ${gates.ms} ms` : ""}`,
+           c.state === "not_sent" ? "fail" : "done");
+      if (c.state === "not_sent") return;
+      node(t, `run:${n}`, "parse", `${c.intent} · ${c.device}`, `${c.result}${run ? ` · ${run.ms} ms` : ""}`, c.ok ? "done" : "fail");
+      if (obs) node(t, `obs:${n}`, `run:${n}`, "Observe", `${c.state}${obs ? ` · ${obs.ms} ms` : ""}`, OUTCOME[c.state] || "done");
+    });
+    return t;
+  }
+
+  async function replay() {
+    let data;
+    try { data = await J.api("/api/history/commands?limit=12"); }
+    catch (err) { J.toast?.(`History unavailable: ${err.message}`); return; }
+    const past = (data.requests || []).slice().reverse().map(fromHistory);  // oldest first, like live turns
+    if (!past.length) { J.toast?.("No fast-path commands in history yet."); return; }
+    const live = [...turns.entries()].filter(([, t]) => !t.replay);
+    turns.clear();
+    for (const t of past) turns.set(t.id, t);
+    for (const [k, t] of live) turns.set(k, t);
+    shown = past[past.length - 1].id;
+    hidden = false; pinned = true; store.set("jarvis.flow.pin", true);
+    draw(); sync();
+  }
+  window.JarvisFlow = { replay };
 
   // ---------- layout: staircase, one row per node in tree order, indented by depth ----------
   function layout(t) {
@@ -197,7 +279,7 @@
     const working = [...turns.values()].some((x) => !x.done);
     $(".flow-pin").setAttribute("aria-pressed", String(pinned));
     $(".flow-pin").textContent = pinned ? "Pinned" : "Pin";
-    const want = !!t && !hidden && (pinned || working || !t.done);
+    const want = !hidden && (pending.length > 0 || (!!t && (pinned || working || !t.done)));
     if (want) { panel.hidden = false; requestAnimationFrame(() => panel.classList.add("on")); }
     else if (t && !hidden) fadeTimer = setTimeout(hide, LINGER);  // finished: linger, then fade
     else hide();

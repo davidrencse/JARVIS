@@ -13,6 +13,13 @@
 }
 .flow.on { opacity: 1; transform: none; pointer-events: auto; }
 .flow[hidden] { display: none; }
+.flow-confirm { padding: 4px 18px 12px; overflow-y: auto; flex-shrink: 0; max-height: 180px; }
+.flow-confirm[hidden] { display: none; }
+.flow-confirm-row { padding: 8px 0; border-top: 1px solid var(--f-faint); }
+.flow-confirm-row p { margin: 0 0 8px; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.flow-confirm-row .flow-btn { height: 32px; color: var(--f-ink); margin-right: 8px; }
+.flow-confirm-row .flow-btn[data-action="approve"] { background: var(--f-ink); color: var(--f-bg); }
+.flow-confirm-row .flow-btn[data-action="approve"]:hover:not(:disabled) { background: var(--f-fill); color: var(--f-bg); }
 
 .flow-reg { position: absolute; font: 400 11px/1 var(--mono, monospace); color: var(--f-dim); font-style: normal; pointer-events: none; }
 .flow-reg.tl { left: 2px; top: 1px; } .flow-reg.tr { right: 2px; top: 1px; }

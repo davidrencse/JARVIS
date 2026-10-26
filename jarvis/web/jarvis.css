@@ -1,4 +1,4 @@
-/* Shared look for the pages that are not the console (Knowledge, System, Markets, Pro terminal).
+/* Shared look for the pages that are not the console (Knowledge and System).
    Same black skin as the console (console.css): pure black, hairline rules, 2px corners, Geist for
    text and Geist Mono for labels and numbers. Each page maps its own variables onto these jv-* tokens,
    so colour, type and radius match everywhere. The sidebar is the console's rail.

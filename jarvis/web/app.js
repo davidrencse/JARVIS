@@ -73,7 +73,7 @@
   const typing = () => /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
 
   // ---------- state ----------
-  // dashboard.js draws gauges, charts and the task board from these events.
+  // dashboard.js draws the dashboard from these events.
   const emit = (name, detail) => dispatchEvent(new CustomEvent("jarvis:" + name, { detail }));
   const QUERY = new URLSearchParams(location.search);
   const OVERLAY = QUERY.has("overlay"), OVERLAY_KEY = QUERY.get("key") || "Alt+1";
@@ -82,7 +82,7 @@
 
   // ---------- views ----------
   // Order is the rail's own order, so the number keys read top to bottom.
-  const VIEWS = ["console", "graph", "system", "credits", "memory", "tasks", "run", "files", "devices"];
+  const VIEWS = ["console", "graph", "system", "credits", "memory", "run", "files", "devices", "settings"];
   const loaded = {};
   async function show() {
     // The graph view gave way to the knowledge engine page; old links and key 2 go there.
@@ -95,11 +95,12 @@
     document.title = OVERLAY ? "JARVIS Overlay" : `JARVIS · ${$("#view-" + name).dataset.title}`;
     emit("view", name);
     const load = { graph: loadGraph, credits: () => renderCreditTable(state.credits),
-                   memory: loadMemory, tasks: loadTasks, devices: renderDevices, files: () => window.JarvisFiles?.open(),
+                   memory: loadMemory, devices: renderDevices, files: () => window.JarvisFiles?.open(),
                    run: () => window.JarvisRun?.open(), system: (a) => window.JarvisSystem?.open(a) }[name];
     if (load) { try { if ((await load(loaded[name])) !== false) loaded[name] = true; } catch (e) { toast(plainError(e.message)); } }
   }
   addEventListener("hashchange", show);
+  $("#voice-btn").addEventListener("click", () => { location.hash = "settings"; });
 
   // ---------- theme: system → light → dark ----------
   const THEME_LABEL = { system: "Theme follows the system", light: "Light theme", dark: "Dark theme" };
@@ -268,10 +269,9 @@
     try { state.overview = await api("/api/overview"); emit("overview", state.overview); }
     catch (e) { $("#top-status").innerHTML = `<span class="chip">Console server unreachable</span>`; return; }
     const o = state.overview;
-    const running = o.tasks.states.running || 0;
+    renderInputSettings();
     $("#top-status").innerHTML = [
       `<a class="chip" href="#memory">${icon("database")} ${o.memory.items} in memory</a>`,
-      `<a class="chip${running ? " on" : ""}" href="#tasks">${running ? '<span class="dot"></span>' : icon("list-checks")} ${running ? running + " running" : Object.values(o.tasks.states).reduce((a, b) => a + b, 0) + " tasks"}</a>`,
       `<span class="chip">${icon("audio-lines")} ${o.voice.voiceprint ? "voiceprint enrolled" : "no voiceprint"}</span>`,
     ].join("");
     lastOverview = Date.now();
@@ -283,7 +283,6 @@
     auto.title = o.routing.auto_escalate ? "Let the router pick from your words" : `Conversation: the ${o.brain?.name || "ChatGPT"} brain answers. Pick Tools or Plan for more.`;
     renderRouter(o); renderMachines(o); renderHeapFacts(o);
     if (!$("#view-devices").hidden) renderDevices();
-    if (!$("#view-tasks").hidden) loadTasks();
     loaded.console = true;
   }
   function renderRouter(o) {
@@ -335,9 +334,104 @@
     } else if (live.error) rows.push(["Error", live.error]);
     return `<dl class="facts mono live-facts">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>`;
   }
+  function renderInputSettings() {
+    const checked = $("#input-settings-checked"), status = $("#input-settings-status");
+    const facts = $("#input-settings-facts"), lines = $("#input-settings-lines");
+    const p = state.probe, input = state.overview?.desktop?.input || {};
+    if (!p) {
+      checked.textContent = "Checking connection";
+      status.textContent = "Checking";
+      status.dataset.level = "checking";
+      renderPeripheralInventory();
+      return;
+    }
+    const level = p.input_link?.level || "down";
+    status.textContent = level === "up" ? "Services online" : level === "warn" ? "Needs attention" : "Connection unavailable";
+    status.dataset.level = level;
+    checked.textContent = "Checked " + ago(p.checked_at);
+    lines.innerHTML = (p.input_link?.lines || ["No input status was returned."]).map((line) => `<li>${esc(line)}</li>`).join("");
+
+    const devices = Object.entries(p.devices || {});
+    const inventory = state.overview?.devices || [];
+    const nameFor = (id) => {
+      const item = inventory.find((device) => device.id === id);
+      return item?.hostname || item?.label || words(id) || "Device";
+    };
+    const serviceFor = (device) => {
+      if (!device) return "Not configured";
+      const value = device[1], lm = value.lan_mouse || {};
+      if (value.local) return lm.running ? `Running · ${lm.listening ? `UDP ${input.port || 4242} listening` : "socket not detected"}` : "Not running";
+      if (!value.ssh) return value.reachable ? "SSH unavailable" : "Unreachable";
+      return lm.running ? `${lm.fallback === "active" ? "Fallback build" : "Running"} · ${lm.listening ? `UDP ${input.port || 4242} listening` : "socket not detected"}` : "Not running";
+    };
+    const rows = devices.map(([id, value]) => {
+      const item = inventory.find((device) => device.id === id);
+      const edge = input.layout?.[id];
+      const facts = [
+        ["Lan Mouse", serviceFor([id, value])],
+        ["Screen edge", edge || (value.local ? "This is the local screen" : "No edge configured")],
+      ];
+      if (value.lan_mouse?.peers?.length) facts.push(["Peers", value.lan_mouse.peers.join(", ")]);
+      return `<section class="input-device" aria-label="${esc(nameFor(id))}">
+        <header><b>${esc(nameFor(id))}</b><span>${value.local ? "Local" : esc(item?.transport || "Remote")}</span></header>
+        <dl>${facts.map(([label, text]) => `<div><dt>${esc(label)}</dt><dd>${esc(text)}</dd></div>`).join("")}</dl>
+      </section>`;
+    });
+    if (Array.isArray(input.peripherals) && input.peripherals.length) {
+      rows.push(...input.peripherals.map((peripheral) => {
+        const title = peripheral.name || peripheral.label || peripheral.type || "Peripheral";
+        const host = peripheral.device || peripheral.host || peripheral.computer;
+        return `<section class="input-device" aria-label="${esc(title)}">
+          <header><b>${esc(title)}</b><span>Configured peripheral</span></header>
+          <dl><div><dt>Connected to</dt><dd>${esc(host ? nameFor(host) : "Not assigned")}</dd></div>
+          <div><dt>Type</dt><dd>${esc(peripheral.type || "Peripheral")}</dd></div></dl>
+        </section>`;
+      }));
+    }
+    rows.push(`<section class="input-device input-shared-facts">
+      <header><b>Shared input</b><span>Lan Mouse</span></header>
+      <dl><div><dt>UDP port</dt><dd>UDP ${esc(input.port || 4242)}</dd></div>
+      <div><dt>Release chord</dt><dd>Left Ctrl + Shift + Super + Alt</dd></div></dl>
+    </section>`);
+    facts.innerHTML = rows.length ? rows.join("") : `<p class="input-empty">No computers are configured for input sharing yet.</p>`;
+    renderPeripheralInventory();
+  }
+  let peripheralInventory = store.get("jarvis.input.peripherals", []);
+  if (!Array.isArray(peripheralInventory)) peripheralInventory = [];
+  function renderPeripheralInventory() {
+    const select = $("#input-peripheral-device"), list = $("#input-peripheral-list");
+    if (!select || !list) return;
+    const current = select.value;
+    const devices = state.overview?.devices || [];
+    select.innerHTML = `<option value="">Unassigned</option>` + devices.map((d) =>
+      `<option value="${esc(d.id)}">${esc(d.hostname || d.label || words(d.id))}</option>`).join("");
+    if (devices.some((d) => d.id === current)) select.value = current;
+    list.innerHTML = peripheralInventory.length ? peripheralInventory.map((item) => {
+      const device = devices.find((d) => d.id === item.device);
+      return `<li><div><b>${esc(item.name)}</b><span>${esc(item.type)}${device ? ` · ${esc(device.hostname || device.label || device.id)}` : " · Unassigned"}</span></div>
+        <button class="btn ghost peripheral-remove" type="button" data-id="${esc(item.id)}" aria-label="Remove ${esc(item.name)}">Remove</button></li>`;
+    }).join("") : `<li class="peripheral-empty">No peripherals added yet.</li>`;
+  }
+  $("#input-peripheral-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = event.currentTarget, data = new FormData(form), name = String(data.get("name") || "").trim();
+    if (!name) return;
+    const id = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    peripheralInventory.push({ id, name, type: String(data.get("type") || "Other"), device: String(data.get("device") || "") });
+    store.set("jarvis.input.peripherals", peripheralInventory);
+    form.reset(); renderPeripheralInventory(); announce(`${name} added to the peripheral list.`);
+  });
+  $("#input-peripheral-list").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-id]");
+    if (!button) return;
+    peripheralInventory = peripheralInventory.filter((item) => item.id !== button.dataset.id);
+    store.set("jarvis.input.peripherals", peripheralInventory);
+    renderPeripheralInventory(); announce("Peripheral removed.");
+  });
   function renderProbe() {
     const p = state.probe;
     $("#probe-checked").textContent = p ? "checked " + ago(p.checked_at) : "checking…";
+    renderInputSettings();
     if (!p) return;
     const [label, cls] = LEVEL[p.input_link.level] || LEVEL.warn;
     $("#link-status").innerHTML = `<div class="link-verdict lvl-${esc(p.input_link.level)}">${icon("keyboard", "i")}<b>Input sharing</b><span class="state-word ${cls}">${label}</span>
@@ -347,13 +441,23 @@
   let probing = false;
   async function refreshProbe(force) {
     if (probing) return;
-    probing = true; const b = $("#probe-refresh"); b.disabled = true;
+    probing = true;
+    const buttons = [$("#probe-refresh"), $("#input-probe-refresh")];
+    buttons.forEach((button) => { button.disabled = true; });
     if (force) $("#probe-checked").textContent = "checking…";
     try { state.probe = await api("/api/probe" + (force ? "?refresh=1" : "")); renderProbe(); emit("probe", state.probe); if (force) announce("Machines checked: " + state.probe.input_link.lines[0]); }
-    catch (e) { $("#probe-checked").textContent = "check failed"; $("#link-status").innerHTML = `<div class="empty"><b>Couldn't run the live check.</b>${esc(plainError(e.message))}</div>`; }
-    finally { probing = false; b.disabled = false; }
+    catch (e) {
+      $("#probe-checked").textContent = "check failed";
+      $("#link-status").innerHTML = `<div class="empty"><b>Couldn't run the live check.</b>${esc(plainError(e.message))}</div>`;
+      $("#input-settings-checked").textContent = "Check failed";
+      $("#input-settings-status").textContent = "Couldn't refresh";
+      $("#input-settings-status").dataset.level = "down";
+      $("#input-settings-lines").innerHTML = `<li>${esc(plainError(e.message))}</li>`;
+    }
+    finally { probing = false; buttons.forEach((button) => { button.disabled = false; }); }
   }
   $("#probe-refresh").addEventListener("click", () => refreshProbe(true));
+  $("#input-probe-refresh").addEventListener("click", () => refreshProbe(true));
 
   function renderMachines(o) {
     const live = state.probe?.devices || {};
@@ -519,67 +623,6 @@
     } catch (err) { toast(plainError(err.message)); }
   });
 
-  // ---------- tasks and plans ----------
-  let planPoll = null, openPlanId = null, pendingPlan = null;
-  function loadTasks() {
-    const o = state.overview; if (!o) return false;
-    const list = o.tasks.recent;
-    $("#tasks-meta").textContent = Object.entries(o.tasks.states).map(([k, v]) => `${v} ${words(k)}`).join(" · ");
-    $("#task-list").innerHTML = list.length ? list.map((t) => `<li><button type="button" data-id="${t.id}"><b>${esc(t.objective || t.id)}</b><span class="state-word ${t.state === "finished" ? "ok" : ""}">${esc(words(t.state))}</span><p class="mono">${esc([t.provider, t.power && t.power + " effort", t.role, t.mode].filter(Boolean).join(" · "))} · ${ago(t.created_at)}</p></button></li>`).join("")
-      : `<li class="empty"><b>No tasks yet.</b>Quick and Tools requests create a task here as they run.</li>`;
-    $("#plan-list").innerHTML = o.plans.length ? o.plans.map((p) => { const done = p.steps.filter((s) => s.state === "finished").length;
-      return `<li><button type="button" data-plan="${esc(p.id)}"><b>${esc(p.goal)}</b><span class="state-word ${p.state === "finished" ? "ok" : ""}">${esc(p.state)}</span><p>${done}/${p.steps.length} steps done · ${esc(p.summary)}</p></button></li>`; }).join("")
-      : `<li class="empty"><b>No plans yet.</b>Pick <b>Plan</b> in the prompt bar (or describe something big) and specialists draft one here for you to review and run.</li>`;
-    $$("#task-list button").forEach((b) => b.addEventListener("click", () => openTask(b.dataset.id)));
-    $$("#plan-list button").forEach((b) => b.addEventListener("click", () => openPlan(b.dataset.plan)));
-    if (pendingPlan) { openPlan(pendingPlan); pendingPlan = null; }
-  }
-  async function openTask(id) {
-    clearInterval(planPoll); openPlanId = null; emit("detail", { task: id });
-    $$("#task-list button, #plan-list button").forEach((x) => x.setAttribute("aria-current", x.dataset.id === id));
-    try {
-      const t = await api("/api/tasks/" + id);
-      $("#task-detail-title").textContent = "Task events";
-      $("#task-detail").innerHTML = `<h3 style="font-size:16px;font-weight:500">${esc(t.spec.objective)}</h3>
-        <dl class="facts mono"><dt>ID</dt><dd>${esc(t.id)}</dd><dt>State</dt><dd>${esc(t.state)}</dd><dt>Provider</dt><dd>${esc(t.spec.provider)} · ${esc(t.spec.power || "")} effort</dd><dt>Mode</dt><dd>${esc(t.spec.mode)}</dd></dl>
-        <ol class="events">${t.events.map((ev) => { let d = {}; try { d = JSON.parse(ev.detail); } catch (x) {} const extra = Object.entries(d).filter(([k]) => !/prompt|stdout/.test(k)).slice(0, 3).map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v).slice(0, 80) : String(v).slice(0, 80)}`).join(" · ");
-          return `<li><b>${esc(words(ev.kind))}</b><span class="mono">${new Date(ev.at).toLocaleString()}${extra ? " · " + esc(extra) : ""}</span></li>`; }).join("")}</ol>`;
-    } catch (e) { toast(plainError(e.message)); }
-  }
-  async function openPlan(id, quiet) {
-    if (!quiet) emit("detail", { plan: id });
-    $$("#task-list button, #plan-list button").forEach((x) => x.setAttribute("aria-current", x.dataset.plan === id));
-    let p;
-    try { p = await api("/api/plans/" + id); } catch (e) { return toast(plainError(e.message)); }
-    $("#task-detail-title").textContent = "Plan"; openPlanId = id;
-    const runnable = p.state === "planned";
-    const left = p.steps.filter((s) => s.state === "pending").length;
-    $("#task-detail").innerHTML = `<h3 style="font-size:16px;font-weight:500">${esc(p.goal)}</h3>
-      <p class="muted" style="font-size:13px">${esc(p.summary)}</p>
-      <div class="run-row">${runnable ? `<button class="btn" type="button" id="plan-run">${icon("play")} Run ${left} step${left === 1 ? "" : "s"}</button>
-        <p>Each step is a real model run on your subscription, one at a time in order. It stops at the first failed step.</p>` :
-        `<span class="state-word ${p.state === "finished" ? "ok" : ""}">${esc(p.state)}</span><p>${p.state === "running" ? "Running. Each step updates here as it finishes." : p.state === "blocked" ? "A step failed; open its task to see why." : "All steps finished. Results are in Memory."}</p>`}</div>
-      <ol class="steps">${p.steps.map((s) => `<li><div class="step-head"><span class="mono">${esc(s.id)}</span>${esc(s.specialist)}<span class="mono">${esc(s.power || "")} effort${s.depends_on.length ? " · after " + esc(s.depends_on.join(", ")) : ""}</span><span class="state-word ${s.state === "finished" ? "ok" : s.state === "pending" ? "warn" : ""}">${esc(s.state)}</span></div>
-        <p>${esc(s.objective)}</p>
-        ${s.acceptance?.length ? `<details><summary>Done when…</summary><ul style="margin:4px 0 0;padding-left:18px;font-size:12.5px;color:var(--ink-2)">${s.acceptance.map((a) => `<li>${esc(a)}</li>`).join("")}</ul></details>` : ""}
-        ${s.answer ? `<details><summary>Result</summary><pre>${esc(s.answer)}</pre></details>` : ""}</li>`).join("")}</ol>`;
-    $("#plan-run")?.addEventListener("click", async (e) => {
-      const b = e.currentTarget;
-      if (b.dataset.armed !== "1") { b.dataset.armed = "1"; b.innerHTML = `${icon("play")} Confirm: run ${left} step${left === 1 ? "" : "s"}`; setTimeout(() => { if (b.isConnected) { b.dataset.armed = ""; b.innerHTML = `${icon("play")} Run ${left} step${left === 1 ? "" : "s"}`; } }, 4000); return; }
-      try { await api(`/api/plans/${id}/run`, {}); toast("Plan started."); announce("Plan started."); setTimeout(() => openPlan(id), 600); }
-      catch (err) { toast(plainError(err.message)); }
-    });
-    clearInterval(planPoll);
-    // The live stream pushes plan.updated; this poll only covers a dropped connection.
-    if (p.state === "running" || !quiet) planPoll = setInterval(async () => {
-      if ($("#view-tasks").hidden) return clearInterval(planPoll);
-      if (live.connected) return;
-      const q = await api("/api/plans/" + id).catch(() => null);
-      if (q && JSON.stringify(q.steps.map((s) => s.state)) + q.state !== JSON.stringify(p.steps.map((s) => s.state)) + p.state) { openPlan(id, true); refreshOverview(); }
-      if (q && q.state !== "running" && p.state !== "running") clearInterval(planPoll);
-    }, 3000);
-  }
-
   // ---------- devices ----------
   function renderDevices() {
     const o = state.overview; if (!o) return false;
@@ -642,7 +685,8 @@
       const li = line(`${mode.selectedOptions[0].text} ${text.value.trim()}`.trim() + " …", "pending");
       try {
         const r = await api("/api/grokbot", { text: text.value, mode: mode.value, device: dev.value || undefined });
-        li.textContent = r.mode === "terminal" ? `Terminal (${r.terminal})${r.command ? ": " + r.command : ""}`
+        li.textContent = r.preflight ? r.reply
+          : r.mode === "terminal" ? `Terminal (${r.terminal})${r.command ? ": " + r.command : ""}`
           : r.mode === "browser" ? `JARVIS browser${r.url ? ": " + r.url : ""}`
           : r.mode === "jarvis-browser" ? `JARVIS is on it (reply in the console)`
           : `Typed to Grokbot on ${r.device}${r.workspace ? " (workspace " + r.workspace + ")" : ""}`;
@@ -719,9 +763,7 @@
     const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     el.innerHTML = rows.slice(-60).map((m) => `<li class="msg ${m.who}${m.error ? " error" : ""}${m.streaming ? " streaming" : ""}"${m.streaming ? ' aria-busy="true"' : ""}>
       <div class="msg-head"><span class="who">${m.who === "you" ? "You" : "JARVIS"}</span>${m.who === "you" && m.channel ? `<span class="src-tag">${esc(m.voice ? m.channel + " · voice" : m.channel)}</span>` : ""}${m.tier ? `<span class="tier">${esc(tierName(m.tier))}</span>` : ""}<time>${dayTime(m.at)}</time></div>
-      <div class="msg-body">${esc(m.text)}</div>
-      ${m.meta?.length || m.plan ? `<div class="msg-meta">${(m.meta || []).map((x) => `<span class="state-word">${esc(x)}</span>`).join("")}${m.plan ? `<a class="state-word" href="#tasks" data-plan-open="${esc(m.plan)}" title="Review and run this plan">${icon("list-checks")} open ${esc(m.plan)}</a>` : ""}</div>` : ""}</li>`).join("");
-    $$("[data-plan-open]", el).forEach((a) => a.addEventListener("click", () => { pendingPlan = a.dataset.planOpen; if (!$("#view-tasks").hidden) loadTasks(); }));
+      <div class="msg-body">${esc(m.text)}</div>${m.meta?.length ? `<div class="msg-meta">${m.meta.map((x) => `<span class="state-word">${esc(x)}</span>`).join("")}</div>` : ""}</li>`).join("");
     if (stick || busy) el.scrollTop = el.scrollHeight;
   }
   $("#thread-clear").addEventListener("click", () => { local = []; renderThread(); toast("Cleared unsent and failed lines. Everything else stays in Memory."); });
@@ -834,7 +876,7 @@
       const done = await waitForJob(job.id, 15 * 60e3);
       const routed = routeLabel(current.route);
       if (done.state === "stopped") { trace([...pre, [routed, "done"], ["stopped waiting · JARVIS may still finish; the reply will appear here", "fail"]]); announce("Stopped waiting."); return; }
-      if (done.state === "timeout") { trace([...pre, [routed, "done"], ["still running after 15 min · check Tasks", "fail"]]); return; }
+      if (done.state === "timeout") { trace([...pre, [routed, "done"], ["still running after 15 min · check the Run view", "fail"]]); return; }
       if (done.state === "lost") { trace([...pre, [routed, "done"], ["lost contact with the console server · the job may still be running", "fail"]]); return; }
       if (current.message) local = local.filter((m) => m !== pending); // memory has it now
       const secs = Math.round((done.finished - done.started) * 10) / 10;
@@ -843,7 +885,7 @@
         (res.memory || []).slice(0, 1).forEach((id) => mine.add(id)); store.set("jarvis.mine", [...mine].slice(-300));
         local = local.filter((m) => m !== pending);
         await loadHistory();
-        trace([...pre, [routed, "done"], [`answered in ${secs}s${res.voice?.source ? " · spoke via " + res.voice.source : ""}${res.plan ? " · plan ready in Tasks" : ""}`, "done"]]);
+        trace([...pre, [routed, "done"], [`answered in ${secs}s${res.voice?.source ? " · spoke via " + res.voice.source : ""}${res.plan ? " · plan ready in the Run view" : ""}`, "done"]]);
         announce("JARVIS answered: " + String(res.reply).slice(0, 240));
         if (state.case) loadCases();
       } else {
@@ -976,22 +1018,45 @@
     connecting: "Connecting to the ElevenLabs agent…", listening: "On a live call: just talk. Click or Esc to hang up.",
     speaking: "JARVIS is speaking; talk over it to interrupt. Click or Esc to hang up." };
   const clip = (t, n = 90) => (t.length > n ? t.slice(0, n - 1) + "…" : t);
+  const caption = $("#agent-caption"), captionWho = $("#agent-caption-who"), captionText = $("#agent-caption-text");
+  let captionRun = 0, streamedAgentText = "", agentTextStreaming = false;
+  function showCaption(who, text, typewriter = false) {
+    caption.hidden = false; captionWho.textContent = who; const run = ++captionRun;
+    const value = String(text || "");
+    if (!typewriter) { captionText.textContent = value; return; }
+    captionText.textContent = "";
+    let at = 0;
+    const step = () => {
+      if (run !== captionRun) return;
+      at = Math.min(value.length, at + Math.max(1, Math.ceil(value.length / 90)));
+      captionText.textContent = value.slice(0, at);
+      if (at < value.length) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }
   const agent = new ElevenAgent({
     api,
     onState(s) {
       callBtn.dataset.state = s; callBtn.setAttribute("aria-pressed", String(s !== "idle")); callBtn.title = CALL_TITLE[s];
       if (s === "connecting") trace([["connecting to the voice agent", "active"]]);
-      if (s === "idle") { trace([["call ended", "done"]]); setTimeout(() => { if (!agent.live && !busy) idleTrace(); }, 3000); relisten(); }
+      if (s === "idle") { caption.hidden = true; captionText.textContent = ""; captionRun++; streamedAgentText = ""; agentTextStreaming = false;
+        trace([["call ended", "done"]]); setTimeout(() => { if (!agent.live && !busy) idleTrace(); }, 3000); relisten(); }
     },
     onLevel: (l) => (Terrain.level = l),
-    onUser: (t) => { if (t) { trace([[`you · ${clip(t)}`, "done"]]); announce("You said: " + t); } },
-    onAgent: (t) => { if (t) trace([[`jarvis · ${clip(t)}`, "done"]]); },
+    onUser: (t) => { if (t) { showCaption("David", t, true); trace([[`you · ${clip(t)}`, "done"]]); announce("You said: " + t); } },
+    onAgent: (t) => { if (t) { if (!agentTextStreaming && t !== streamedAgentText) showCaption("JARVIS", t, false); trace([[`jarvis · ${clip(t)}`, "done"]]); } },
+    onAgentPart: (part) => {
+      if (part.type === "start") { streamedAgentText = ""; agentTextStreaming = true; showCaption("JARVIS", "", false); }
+      else if (part.type === "delta") { streamedAgentText += part.text || ""; showCaption("JARVIS", streamedAgentText, false); }
+      else if (part.type === "stop") agentTextStreaming = false;
+    },
     onTool: (req, phase) => trace([[`asking JARVIS · ${clip(req, 60)}`, phase === "start" ? "active" : phase]]),
     onVoice(r) {
       if (r.current && voiceSel.querySelector(`option[value="${CSS.escape(r.current)}"]`)) voiceSel.value = voiceSel.dataset.value = r.current;
       const extra = [r.speed != null && `speed ${r.speed}`, r.stability != null && `stability ${r.stability}`].filter(Boolean).join(", ");
       toast(`Voice: ${String(r.name || "unchanged").split(" - ")[0]}${extra ? ` (${extra})` : ""}. Reconnecting…`);
     },
+    onMicSelected: (label) => { if (allMics.checked) $("#mic-settings-status").textContent = `Using ${label}`; },
     onError: (m) => toast(plainError(m)),
   });
   async function toggleCall() {
@@ -1004,6 +1069,39 @@
   if (handsFree) startMic(true); // always-on: listen from page load
   addEventListener("keydown", (e) => { if (e.key === "Escape" && agent.live) { e.preventDefault(); agent.stop(); } });
   const showTune = (k) => { $(`#voice-${k}-out`).textContent = Number(tune[k].value).toFixed(2); };
+  const audioPrefs = store.get("jarvis.agentAudio", {});
+  const deviceSelect = $("#agent-mic-device"), gainSelect = $("#agent-mic-gain");
+  const allMics = $("#agent-mic-all");
+  allMics.checked = typeof audioPrefs.allMicrophones === "boolean" ? audioPrefs.allMicrophones : !audioPrefs.deviceId;
+  const audioToggles = { echoCancellation: $("#agent-echo"), noiseSuppression: $("#agent-noise"), autoGainControl: $("#agent-agc") };
+  gainSelect.value = audioPrefs.gain || 1;
+  for (const [key, input] of Object.entries(audioToggles)) input.checked = audioPrefs[key] !== false;
+  const persistAudioPrefs = () => {
+    const next = { deviceId: deviceSelect.value, gain: Number(gainSelect.value), allMicrophones: allMics.checked };
+    for (const [key, input] of Object.entries(audioToggles)) next[key] = input.checked;
+    store.set("jarvis.agentAudio", next); $("#agent-mic-gain-out").textContent = `${Math.round(next.gain * 100)}%`;
+    agent.setAudioSettings?.(next);
+  };
+  const syncMicOptions = () => { deviceSelect.disabled = allMics.checked; };
+  deviceSelect.value = audioPrefs.deviceId || "";
+  syncMicOptions();
+  deviceSelect.addEventListener("change", persistAudioPrefs);
+  allMics.addEventListener("change", () => { syncMicOptions(); persistAudioPrefs(); });
+  gainSelect.addEventListener("input", persistAudioPrefs);
+  for (const input of Object.values(audioToggles)) input.addEventListener("change", persistAudioPrefs);
+  $("#agent-mic-refresh").addEventListener("click", async () => {
+    const status = $("#mic-settings-status");
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter((d) => d.kind === "audioinput");
+      const selectedDevice = store.get("jarvis.agentAudio", {}).deviceId;
+      deviceSelect.innerHTML = '<option value="">System default</option>' + inputs.map((d, i) => `<option value="${esc(d.deviceId)}">${esc(d.label || `Microphone ${i + 1}`)}</option>`).join("");
+      deviceSelect.value = selectedDevice && inputs.some((d) => d.deviceId === selectedDevice) ? selectedDevice : "";
+      status.textContent = `${inputs.length} input${inputs.length === 1 ? "" : "s"} found`;
+    } catch (e) { status.textContent = "Device list unavailable"; toast(plainError(e.message)); }
+  });
+  navigator.mediaDevices?.addEventListener?.("devicechange", () => $("#agent-mic-refresh").click());
+  $("#agent-mic-gain-out").textContent = `${Math.round(Number(gainSelect.value) * 100)}%`;
   async function loadVoices() {
     let status;
     try { status = await api("/api/agent"); } catch (e) { return; }
@@ -1053,10 +1151,11 @@
     setTimeout(() => { b.disabled = false; }, 1500);
   });
   loadVoices().then(() => { voiceSel.dataset.value = voiceSel.value; });
+  $("#agent-mic-refresh").click();
 
   // ---------- live: one event stream for console, voice listener and CLI ----------
   // turn.* events stream every request as it happens, whichever channel it came from;
-  // memory/task/plan/voice events say what changed so only that part reloads.
+  // memory/plan/voice events say what changed so only that part reloads.
   const live = { connected: false, turns: new Map(), waiters: new Map(), seq: 0, es: null };
   const soon = (fn, ms) => { let t; return () => { clearTimeout(t); t = setTimeout(fn, ms); }; };
   const soonHistory = soon(loadHistory, 200), soonOverview = soon(refreshOverview, 500), soonMini = soon(loadMini, 1500);
@@ -1111,7 +1210,6 @@
       if (d.kind === "case") loadCases();
     },
     "task.event"() { soonOverview(); },
-    "plan.updated"(d) { soonOverview(); if (openPlanId === d.id && !$("#view-tasks").hidden) openPlan(d.id, true); },
     "voice.state"(d) {
       if (state.overview) state.overview.voice.listening = d.listening;
       // A listener killed mid-answer never sends turn.done.
@@ -1171,7 +1269,7 @@
     $(".topbar-right").prepend(chip);
   }
 
-  window.Jarvis = { openTask, openPlan, api, esc, icon, ago, tierName, words, toast, state };
+  window.Jarvis = { api, esc, icon, ago, tierName, words, toast, state };
 
   // ---------- boot ----------
   renderThread(); show(); syncLive();

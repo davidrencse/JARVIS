@@ -1,5 +1,5 @@
 // Porcelain dashboard layer: sidebar pill, header pills, runs timeline, usage trend,
-// recent memory, limits with the silk panel, the task board and its drawer. app.js owns
+// recent memory and limits with the silk panel. app.js owns
 // data and behaviour and announces changes as "jarvis:*" events; this file only draws.
 // Sliding-pill and rolling-number motion are ported from Watermelon UI's Continuous
 // Tabs and Run Widget (MIT, ui.watermelon.sh) to plain DOM.
@@ -29,11 +29,11 @@
   }
   const navPill = () => slide($(".rail-pill"), $('.rail a[aria-current="page"]'));
   const rangePill = () => slide($(".range .tabs-pill"), $('.range [aria-checked="true"]'));
-  addEventListener("resize", () => { navPill(); rangePill(); boardPill(); });
+  addEventListener("resize", () => { navPill(); rangePill(); });
   // Fonts and wrapping change the pills' targets after first paint; re-measure then too.
   if (window.ResizeObserver) {
-    const ro = new ResizeObserver(() => { navPill(); rangePill(); boardPill(); });
-    $$(".rail, .range, #view-tasks .tabs").forEach((el) => ro.observe(el));
+    const ro = new ResizeObserver(() => { navPill(); rangePill(); });
+    $$(".rail, .range").forEach((el) => ro.observe(el));
   }
   document.fonts?.ready.then(() => { navPill(); rangePill(); });
 
@@ -48,11 +48,9 @@
   }
   function onView(name) {
     view = name;
-    $("#page-title").textContent = $("#view-" + name)?.dataset.title?.replace(" and plans", "") || "Console";
+    $("#page-title").textContent = $("#view-" + name)?.dataset.title || "Console";
     document.documentElement.dataset.view = name;
     placeDock(); requestAnimationFrame(() => { navPill(); rangePill(); });
-    if (name === "tasks") { setPane(pane); requestAnimationFrame(boardPill); }
-    if (name !== "tasks" && !drawer.hidden) closeDrawer();
   }
   on("view", onView);
   addEventListener("resize", placeDock);
@@ -236,7 +234,7 @@
       $("#mem-q").value = ""; setTimeout(() => $(`#mem-list [data-id="${CSS.escape(a.dataset.id)}"]`)?.click(), 400);
     }));
   }
-  on("overview", (o) => { recent(o); timeline(); if (view === "tasks") renderBoard(); });
+  on("overview", (o) => { recent(o); timeline();  });
 
   // ---------- runs timeline (the reference's schedule) ----------
   let range = "day";
@@ -274,17 +272,13 @@
         <i class="tl-now" style="left:100%" title="now"></i>
         ${runs.filter((r) => rows.includes(r.row)).map((r) => {
           const left = pos(r.a), width = Math.max(pos(r.b) - left, 0);
-          return `<button type="button" class="tl-run ${r.state === "finished" || r.state === "done" ? "" : "alt"}" data-kind="${r.kind}" data-id="${esc(r.id)}"
+          return `<div class="tl-run ${r.state === "finished" || r.state === "done" ? "" : "alt"}"
             style="--row:${rows.indexOf(r.row)};left:min(${left.toFixed(2)}%, calc(100% - 128px));min-width:max(${width.toFixed(2)}%, 118px)"
-            title="${esc(r.title)} · ${esc(r.state)}"><span>${esc(dur(r.b - r.a))} · ${esc(J.words(r.state))}</span><span class="tl-who" aria-hidden="true">${esc(r.who)}</span></button>`;
+            title="${esc(r.title)} · ${esc(r.state)}"><span>${esc(dur(r.b - r.a))} · ${esc(J.words(r.state))}</span><span class="tl-who" aria-hidden="true">${esc(r.who)}</span></div>`;
         }).join("")}
       </div>
       <div class="tl-axis">${Array.from({ length: ticks + 1 }, (_, i) => `<span style="left:${(i / ticks) * 100}%">${esc(tickLabel(i))}</span>`).join("")}</div>
     </div>`;
-    $$(".tl-run", host).forEach((b) => b.addEventListener("click", () => {
-      location.hash = "tasks";
-      setTimeout(() => (b.dataset.kind === "plan" ? J.openPlan(b.dataset.id) : J.openTask(b.dataset.id)), 60);
-    }));
   }
   $$(".range [data-range]").forEach((b) => b.addEventListener("click", () => {
     range = b.dataset.range;
@@ -292,216 +286,6 @@
     rangePill(); timeline();
   }));
   setInterval(timeline, 60000);
-
-  // ---------- agent runs board (the second tab) ----------
-  const COLUMNS = [
-    { id: "queued", title: "Queued", states: ["queued", "planned"] },
-    { id: "running", title: "Running", states: ["running"] },
-    { id: "done", title: "Done", states: ["finished"] },
-    { id: "attention", title: "Needs attention", states: null },
-  ];
-  const PRIORITY = { high: ["High", "p-high"], mid: ["Medium", "p-mid"], low: ["Low", "p-low"] };
-  function cardsFrom(o) {
-    const tasks = (o.tasks?.recent || []).map((t) => ({
-      kind: "task", id: t.id, state: t.state, title: t.objective || t.id, at: t.created_at,
-      prio: PRIORITY[t.power] || ["Auto", "p-low"],
-      tags: [t.provider, t.role, t.mode === "workspace-write" ? "can edit" : "read-only"].filter(Boolean),
-      desc: `${J.words(t.state)} ${J.ago(t.updated_at || t.created_at)}`, foot: t.id.slice(0, 6) }));
-    const plans = (o.plans || []).map((p) => { const done = p.steps.filter((s) => s.state === "finished").length;
-      return { kind: "plan", id: p.id, state: p.state, title: p.goal, at: p.updated_at ? p.updated_at * 1000 : null,
-        prio: ["Plan", "p-plan"], tags: [...new Set(p.steps.map((s) => s.specialist))].slice(0, 3),
-        desc: p.summary, foot: `${done}/${p.steps.length} steps` }; });
-    return [...plans, ...tasks];
-  }
-  function card(c) {
-    const date = c.at ? new Date(typeof c.at === "number" ? c.at : Date.parse(c.at)).toLocaleDateString([], { month: "short", day: "numeric" }) : "—";
-    return `<li><button type="button" class="t-card" data-kind="${c.kind}" data-id="${esc(c.id)}">
-      <span class="t-top"><span class="prio ${c.prio[1]}">${esc(c.prio[0])}</span></span>
-      ${c.tags.length ? `<span class="t-tags">${c.tags.map((t) => `<span>${esc(t)}</span>`).join("")}</span>` : ""}
-      <b class="t-title">${esc(c.title)}</b>
-      ${c.desc ? `<span class="t-desc">${esc(c.desc)}</span>` : ""}
-      <span class="t-foot"><span class="t-chip">${icon("flag")} ${esc(date)}</span><span class="t-chip">${icon(c.kind === "plan" ? "list-checks" : "terminal")} ${esc(c.foot)}</span></span>
-    </button></li>`;
-  }
-  function renderBoard() {
-    const o = J.state.overview, host = $("#task-board");
-    if (!o || !host) return;
-    const q = ($("#board-q").value || "").trim().toLowerCase();
-    const all = cardsFrom(o).filter((c) => !q || (c.title + " " + c.tags.join(" ") + " " + (c.desc || "")).toLowerCase().includes(q));
-    const known = COLUMNS.flatMap((col) => col.states || []);
-    host.innerHTML = COLUMNS.map((col) => {
-      const items = all.filter((c) => (col.states ? col.states.includes(c.state) : !known.includes(c.state)));
-      return `<section class="col" aria-label="${esc(col.title)}">
-        <header class="col-head"><div><h2>${esc(col.title)}</h2><span>${items.length} ${items.length === 1 ? "run" : "runs"}</span></div>
-          ${col.id === "queued" ? `<button type="button" class="round-btn sm" data-new aria-label="Ask JARVIS to do something">${icon("plus")}</button>` : ""}</header>
-        <ol class="col-cards">${items.map(card).join("") || `<li class="col-empty">${col.id === "attention" ? "Nothing failed." : col.id === "running" ? "Nothing running." : "Empty."}</li>`}</ol>
-      </section>`;
-    }).join("");
-    $$(".t-card", host).forEach((b) => b.addEventListener("click", () => (b.dataset.kind === "plan" ? J.openPlan(b.dataset.id) : J.openTask(b.dataset.id))));
-    $("[data-new]", host)?.addEventListener("click", () => { location.hash = "console"; setTimeout(() => $("#prompt").focus(), 80); });
-  }
-
-  // ---------- tabs: To-dos (the vault) | Agent runs ----------
-  let pane = "todos";
-  const tabsPill = $("#view-tasks .tabs-pill"), tabs = $$("#view-tasks [data-pane]");
-  function boardPill() { slide(tabsPill, $('#view-tasks [data-pane][aria-selected="true"]')); }
-  function setPane(name, focus) {
-    pane = name;
-    tabs.forEach((t) => { const on = t.dataset.pane === name; t.setAttribute("aria-selected", on); t.tabIndex = on ? 0 : -1; if (on && focus) t.focus(); });
-    $("#todo-pane").hidden = name !== "todos"; $("#runs-pane").hidden = name !== "runs";
-    $("#board-q").placeholder = name === "todos" ? "Filter to-dos" : "Filter agent runs";
-    boardPill();
-    if (name === "runs") renderBoard(); else loadTodos();
-  }
-  tabs.forEach((t, i) => {
-    t.addEventListener("click", () => setPane(t.dataset.pane));
-    t.addEventListener("keydown", (e) => { const d = { ArrowRight: 1, ArrowLeft: -1 }[e.key]; if (d) { e.preventDefault(); setPane(tabs[(i + d + tabs.length) % tabs.length].dataset.pane, true); } });
-  });
-  let qTimer;
-  $("#board-q").addEventListener("input", () => { clearTimeout(qTimer); qTimer = setTimeout(() => (pane === "runs" ? renderBoard() : loadTodos()), 220); });
-
-  // ---------- to-dos from the vault ----------
-  // Every action is followed by a fresh fetch: a task's id comes from its note and words,
-  // so an edit (or Obsidian changing the note) can give it a new one.
-  const TODO_COLUMNS = [
-    { id: "overdue", title: "Overdue", from: ["overdue"], empty: "Nothing overdue." },
-    { id: "today", title: "Today", from: ["today", "in_progress"], empty: "Nothing due today." },
-    { id: "upcoming", title: "Upcoming", from: ["upcoming", "later"], empty: "Nothing scheduled ahead." },
-    { id: "anytime", title: "Anytime", from: ["anytime"], empty: "No undated to-dos." },
-    { id: "done", title: "Done this week", from: ["done"], empty: "Nothing finished this week yet." },
-  ];
-  const PRIO = { highest: ["Highest", "p-high"], high: ["High", "p-high"], medium: ["Medium", "p-mid"], low: ["Low", "p-low"], lowest: ["Lowest", "p-low"] };
-  let agenda = null, todoSeq = 0, todoBusy = false;
-  const byId = new Map();
-  const fmtDay = (iso) => { if (!iso) return ""; const d = new Date(iso + "T12:00"), t = new Date(); t.setHours(12, 0, 0, 0);
-    const diff = Math.round((d - t) / 86400e3);
-    return diff === 0 ? "Today" : diff === 1 ? "Tomorrow" : diff === -1 ? "Yesterday" : d.toLocaleDateString([], { month: "short", day: "numeric", ...(d.getFullYear() !== t.getFullYear() ? { year: "numeric" } : {}) }); };
-  const obsidian = (path) => `obsidian://open?vault=${encodeURIComponent(agenda?.vault || "Vault")}&file=${encodeURIComponent(path.replace(/\.md$/i, ""))}`;
-
-  async function loadTodos() {
-    const seq = ++todoSeq, q = ($("#board-q").value || "").trim();
-    try {
-      const a = await J.api("/api/vault/tasks" + (q ? "?q=" + encodeURIComponent(q) : ""));
-      if (seq !== todoSeq) return; // a newer fetch is on its way
-      agenda = a; drawTodos();
-    } catch (e) {
-      if (seq !== todoSeq) return;
-      $("#todo-board").innerHTML = `<div class="empty card"><b>Your vault's to-dos can't be read right now.</b>${esc(e.message)}${/No vault/i.test(e.message) ? "" : " If the console was started before the to-do board existed, restart it."}</div>`;
-      $("#study-plans").innerHTML = ""; $("#todo-count").textContent = "";
-    }
-  }
-  function todoCard(t, col) {
-    const done = t.status === "done", prio = PRIO[t.priority];
-    const when = t.due ? `due ${fmtDay(t.due)}` : t.scheduled ? `scheduled ${fmtDay(t.scheduled)}` : done && t.done ? `done ${fmtDay(t.done)}` : "";
-    const whenTip = t.due_from_text ? "Due date read from the task's words, not a 📅 field" : "";
-    return `<li class="todo ${done ? "is-done" : ""} ${t.status === "in_progress" ? "is-started" : ""}">
-      <button type="button" class="tick" data-tick="${esc(t.id)}" aria-label="${done ? "Reopen" : "Mark done"}: ${esc(t.title)}" ${agenda.writable ? "" : "disabled"}>${icon(done ? "check" : "circle", "i")}</button>
-      <button type="button" class="todo-body" data-open="${esc(t.id)}">
-        ${prio || t.status === "in_progress" || t.recur ? `<span class="t-top">${prio ? `<span class="prio ${prio[1]}">${prio[0]}</span>` : ""}${t.status === "in_progress" ? `<span class="prio p-plan">Started</span>` : ""}${t.recur ? `<span class="t-chip sm">${icon("rotate-ccw")} ${esc(t.recur)}</span>` : ""}</span>` : ""}
-        <b class="t-title">${esc(t.title)}</b>
-        <span class="t-foot">${when ? `<span class="t-chip ${col === "overdue" ? "late" : ""}" ${whenTip ? `title="${esc(whenTip)}"` : ""}>${icon("calendar")} ${esc(when)}</span>` : "<span></span>"}<span class="t-note" title="${esc(t.path)}">${icon("book-open")} ${esc(t.note)}</span></span>
-      </button></li>`;
-  }
-  function drawTodos() {
-    const a = agenda; if (!a) return;
-    byId.clear();
-    TODO_COLUMNS.forEach((c) => c.from.forEach((b) => (a[b] || []).forEach((t) => byId.set(t.id, t))));
-    const open = (a.counts.overdue || 0) + (a.counts.today || 0) + (a.counts.in_progress || 0);
-    $("#todo-count").textContent = open ? String(open) : "";
-    $("#tasks-meta").textContent = `${a.open} open in ${a.vault}${a.writable ? "" : ", read-only"}`;
-    $("#quick-add").hidden = !a.writable;
-    $("#study-plans").innerHTML = (a.checklists || []).map((c) => {
-      const pct = c.total ? Math.round((c.done / c.total) * 100) : 0;
-      return `<a class="plan-bar card" href="${esc(obsidian(c.path))}" title="Open ${esc(c.note)} in Obsidian">
-        <span class="pb-head"><b>${esc(c.note)}</b><span>${c.done} of ${c.total}</span></span>
-        <span class="pb-track" role="img" aria-label="${pct}% done"><i style="width:${pct}%"></i></span>
-        <span class="pb-next">${c.next ? `Next: ${esc(c.next)}` : "All done."}</span></a>`;
-    }).join("");
-    $("#todo-board").innerHTML = TODO_COLUMNS.map((col) => {
-      const items = col.from.flatMap((b) => a[b] || []);
-      return `<section class="col todo-col col-${col.id}" aria-label="${esc(col.title)}">
-        <header class="col-head"><div><h2>${esc(col.title)}</h2><span>${items.length} ${items.length === 1 ? "to-do" : "to-dos"}</span></div></header>
-        <ol class="col-cards">${items.map((t) => todoCard(t, col.id)).join("") || `<li class="col-empty">${esc(col.empty)}</li>`}</ol>
-      </section>`;
-    }).join("");
-  }
-  async function act(id, action, value) {
-    if (todoBusy) return;
-    const t = byId.get(id); todoBusy = true;
-    document.documentElement.classList.add("todo-busy");
-    try {
-      const r = await J.api(`/api/vault/tasks/${encodeURIComponent(id)}`, { action, value: value ?? null });
-      J.toast({ done: "Done. Ticked in " + (t?.note || r.path) + ".", reopen: "Reopened.", start: "Marked started.", cancel: "Cancelled.",
-                due: value ? "Due date set." : "Due date cleared.", priority: "Priority set." }[action] + (r.next ? " The next one is scheduled." : ""));
-      await loadTodos();
-      if (!drawer.hidden && drawer.dataset.todo) { const fresh = [...byId.values()].find((x) => x.path === t?.path && x.line === t?.line) || byId.get(id); fresh ? openTodo(fresh.id) : closeDrawer(); }
-    } catch (e) {
-      J.toast(/changed since/i.test(e.message) ? "That note changed since the board loaded. It's refreshed now; try again." : e.message);
-      await loadTodos();
-    } finally { todoBusy = false; document.documentElement.classList.remove("todo-busy"); }
-  }
-  function openTodo(id) {
-    const t = byId.get(id); if (!t) return;
-    const done = t.status === "done", w = agenda.writable;
-    drawer.dataset.todo = id;
-    $("#task-detail-title").textContent = "To-do";
-    const fact = (k, v) => (v ? `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>` : "");
-    $("#task-detail").innerHTML = `<h3 class="todo-h">${esc(t.title)}</h3>
-      <dl class="facts">${fact("Note", t.note)}${fact("Section", t.section)}${fact("Due", t.due ? fmtDay(t.due) + (t.due_from_text ? " (read from the text)" : "") : "")}${fact("Scheduled", t.scheduled && fmtDay(t.scheduled))}${fact("Starts", t.start && fmtDay(t.start))}${fact("Repeats", t.recur)}${fact("Created", t.created && fmtDay(t.created))}${fact("Done", t.done && fmtDay(t.done))}${fact("Priority", t.priority)}</dl>
-      <a class="btn ghost obsidian" href="${esc(obsidian(t.path))}">${icon("book-open")} Open in Obsidian</a>
-      <p class="todo-path">${esc(t.path)}, line ${t.line}</p>
-      ${w ? `<div class="todo-actions">
-        ${done ? `<button class="btn" type="button" data-act="reopen">${icon("rotate-ccw")} Reopen</button>`
-               : `<button class="btn" type="button" data-act="done">${icon("check")} Mark done</button>
-                  ${t.status === "in_progress" ? "" : `<button class="btn ghost" type="button" data-act="start">Start</button>`}
-                  <button class="btn ghost" type="button" data-act="cancel">${icon("ban")} Cancel</button>`}
-      </div>
-      ${done ? "" : `<form class="todo-edit" id="todo-due"><label for="td-due">Due date</label><input class="field" id="td-due" type="date" value="${esc(t.due || "")}">
-        <button class="btn ghost sm" type="submit">Set</button>${t.due ? `<button class="btn ghost sm" type="button" data-clear-due>Clear</button>` : ""}</form>
-      <form class="todo-edit" id="todo-prio"><label for="td-prio">Priority</label><select class="field" id="td-prio">
-        ${["", "highest", "high", "medium", "low", "lowest"].map((p) => `<option value="${p}" ${(t.priority || "") === p ? "selected" : ""}>${p ? p[0].toUpperCase() + p.slice(1) : "None"}</option>`).join("")}</select>
-        <button class="btn ghost sm" type="submit">Set</button></form>`}` : `<p class="muted">Vault writes are off (vault.write in jarvis.config.json), so this to-do can only be changed in Obsidian.</p>`}`;
-    $$("[data-act]", $("#task-detail")).forEach((b) => b.addEventListener("click", () => {
-      if (b.dataset.act === "cancel" && b.dataset.armed !== "1") { b.dataset.armed = "1"; b.lastChild.textContent = " Confirm cancel"; return; }
-      act(id, b.dataset.act);
-    }));
-    $("#todo-due")?.addEventListener("submit", (e) => { e.preventDefault(); act(id, "due", $("#td-due").value || null); });
-    $("[data-clear-due]")?.addEventListener("click", () => act(id, "due", null));
-    $("#todo-prio")?.addEventListener("submit", (e) => { e.preventDefault(); act(id, "priority", $("#td-prio").value || null); });
-    drawer.hidden = false; requestAnimationFrame(() => drawer.classList.add("open"));
-  }
-  $("#todo-board").addEventListener("click", (e) => {
-    const tick = e.target.closest("[data-tick]"), open = e.target.closest("[data-open]");
-    if (tick) { const t = byId.get(tick.dataset.tick); act(tick.dataset.tick, t?.status === "done" ? "reopen" : "done"); }
-    else if (open) openTodo(open.dataset.open);
-  });
-  $("#quick-add").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const text = $("#qa-text").value.trim(); if (!text) return;
-    const btn = $("#qa-add"); btn.disabled = true;
-    try {
-      await J.api("/api/vault/tasks", { text, due: $("#qa-due").value || null, priority: $("#qa-prio").value || null });
-      $("#qa-text").value = ""; $("#qa-due").value = ""; $("#qa-prio").value = "";
-      J.toast("Added to the Inbox in tasks.md.");
-      await loadTodos();
-    } catch (err) { J.toast(err.message); }
-    finally { btn.disabled = false; $("#qa-text").focus(); }
-  });
-  // Obsidian edits arrive through the console's file watcher, JARVIS's own through its
-  // writes; both are "vault.changed". Coalesce bursts (a save touches a note twice).
-  let vaultTimer;
-  on("vault", () => { clearTimeout(vaultTimer); vaultTimer = setTimeout(() => { if (view === "tasks" && pane === "todos" && !todoBusy) loadTodos(); }, 400); });
-
-  // ---------- detail drawer ----------
-  const drawer = $("#task-drawer");
-  on("detail", () => {
-    delete drawer.dataset.todo;
-    if (pane !== "runs") setPane("runs");
-    drawer.hidden = false; requestAnimationFrame(() => drawer.classList.add("open"));
-  });
-  function closeDrawer() { drawer.classList.remove("open"); delete drawer.dataset.todo; setTimeout(() => { if (!drawer.classList.contains("open")) drawer.hidden = true; }, reduce.matches ? 0 : 220); }
-  $("#drawer-close").addEventListener("click", closeDrawer);
-  addEventListener("keydown", (e) => { if (e.key === "Escape" && !drawer.hidden) { e.stopPropagation(); closeDrawer(); } }, true);
 
   // ---------- boot from whatever app.js already has ----------
   $("#theme-toggle").addEventListener("click", () => setTimeout(silk, 30));

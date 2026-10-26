@@ -14,6 +14,7 @@
 <link rel="stylesheet" href="porcelain.css">
 <link rel="stylesheet" href="runview.css">
 <link rel="stylesheet" href="flow.css">
+<link rel="stylesheet" href="sharedinput.css">
 <link rel="stylesheet" href="console.css">
 <script src="theme.js"></script>
 </head>
@@ -32,11 +33,10 @@
       <a href="design.html" data-page="design" title="System design: how JARVIS works and what needs fixing (3)"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
       <a href="#credits" data-view="credits" title="Credits (4)"><svg class="i"><use href="icons.svg?v=2#i-gauge"/></svg><span>Credits</span></a>
       <a href="#memory" data-view="memory" title="Memory (5)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
-      <a href="trade.html" data-page="trade" title="Markets: live market pulse, strategies and signals (practice mode) — opens its own page"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Markets</span></a>
-      <a href="#tasks" data-view="tasks" title="Tasks and plans (6)"><svg class="i"><use href="icons.svg?v=2#i-list-checks"/></svg><span>Tasks</span></a>
-      <a href="#run" data-view="run" title="Run: a plan on one screen (7)"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Run</span></a>
-      <a href="#files" data-view="files" title="Files across both laptops (8)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
-      <a href="#devices" data-view="devices" title="Devices (9)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
+      <a href="#run" data-view="run" title="Run: a plan on one screen (6)"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Run</span></a>
+      <a href="#files" data-view="files" title="Files across both laptops (7)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
+      <a href="#devices" data-view="devices" title="Devices (8)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
+      <a href="#settings" data-view="settings" title="Voice and input settings"><svg class="i"><use href="icons.svg?v=2#i-audio-lines"/></svg><span>Settings</span></a>
     </nav>
     <div class="profile">
       <span class="avatar" aria-hidden="true">D</span>
@@ -77,6 +77,7 @@
     <div class="topbar-right">
       <span class="chip" id="live-chip" role="status" hidden><span class="dot" aria-hidden="true"></span><span class="chip-label">Connecting</span></span>
       <time class="top-clock sr" id="top-clock"></time>
+      <button class="round-btn" id="flow-history" type="button" aria-label="Replay recent commands" title="Replay recent commands"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-waypoints"/></svg></button>
       <button class="round-btn" id="hero-refresh" type="button" aria-label="Recheck credits and machines" title="Recheck credits and machines"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg></button>
       <button class="icon-btn" id="theme-toggle" type="button" aria-label="Switch light or dark">
         <svg class="i"><use href="icons.svg?v=2#i-contrast"/></svg>
@@ -94,15 +95,18 @@
       <section class="cx-hero" aria-label="Claude output, last 48 hours">
         <header class="cx-rule"><h2>Claude output</h2><span>tokens per hour, last 48 hours</span>
           <a class="cx-link" href="#credits">Credits</a></header>
-        <div class="cx-ridge">
-          <canvas id="cx-ridge" aria-hidden="true"></canvas>
+        <div class="cx-output-summary">
           <div class="cx-ridge-read">
             <p class="cx-big" id="ridge-total">—</p>
             <p class="cx-big-sub">tokens in the last 24 hours</p>
-            <dl class="cx-kv" id="ridge-facts"></dl>
           </div>
-          <ol class="cx-hours" id="ridge-hours" aria-label="Output by hour, most recent first"></ol>
-          <span class="cx-tip" id="ridge-tip" hidden></span>
+          <dl class="cx-kv" id="ridge-facts"></dl>
+        </div>
+        <div class="cx-ridge" role="group" tabindex="0" aria-label="Claude output by hour over 48 hours" aria-describedby="ridge-key-help">
+          <canvas id="cx-ridge" aria-hidden="true"></canvas>
+          <span class="cx-tip" id="ridge-tip" aria-hidden="true" hidden><span></span></span>
+          <span class="sr" id="ridge-key-help">Use the left and right arrow keys to inspect each hour. Home selects the oldest hour; End selects the newest.</span>
+          <span class="sr" id="ridge-point-readout" role="status" aria-live="polite" aria-atomic="true"></span>
           <div class="cx-axis" id="ridge-axis" aria-hidden="true"></div>
         </div>
       </section>
@@ -134,7 +138,6 @@
       <div class="cx-grid">
         <article class="card cx-w2 timeline-card" id="w-timeline">
           <header class="ph"><h2>Runs</h2><span class="ph-meta" id="timeline-meta"></span>
-            <a class="round-btn sm" href="#tasks" aria-label="Open tasks"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
           <div class="timeline" id="timeline"><div class="skeleton" style="height:210px"></div></div>
         </article>
 
@@ -290,49 +293,6 @@
       </div>
     </section>
 
-    <!-- TASKS -->
-    <section class="view" id="view-tasks" data-title="Tasks and plans" hidden>
-      <div class="board-head">
-        <div class="tabs" role="tablist" aria-label="Tasks">
-          <span class="tabs-pill" aria-hidden="true"></span>
-          <button role="tab" type="button" id="tab-todos" data-pane="todos" aria-selected="true" aria-controls="todo-pane">To-dos <span class="tab-count" id="todo-count"></span></button>
-          <button role="tab" type="button" id="tab-runs" data-pane="runs" aria-selected="false" aria-controls="runs-pane" tabindex="-1">Agent runs</button>
-        </div>
-        <div class="board-tools">
-          <label class="pill-field"><span class="sr">Filter</span>
-            <input id="board-q" type="search" placeholder="Filter to-dos" autocomplete="off">
-            <svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-search"/></svg></label>
-          <span class="ph-meta" id="tasks-meta"></span>
-        </div>
-      </div>
-
-      <div id="todo-pane" role="tabpanel" aria-labelledby="tab-todos">
-        <form class="quick-add card" id="quick-add" autocomplete="off">
-          <span class="qa-ic" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-plus"/></svg></span>
-          <label class="qa-text"><span class="sr">New to-do</span>
-            <input id="qa-text" placeholder="Add a to-do. It goes to the Inbox in tasks.md" maxlength="300" required></label>
-          <label class="qa-field" title="Due date (optional)"><span class="sr">Due date</span><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-calendar"/></svg><input id="qa-due" type="date"></label>
-          <label class="qa-field"><span class="sr">Priority</span><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-flag"/></svg>
-            <select id="qa-prio"><option value="">No priority</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
-          <button class="btn" type="submit" id="qa-add">Add</button>
-        </form>
-        <div class="study-plans" id="study-plans" aria-label="Study plans and checklists"></div>
-        <div class="board todo-board" id="todo-board" aria-label="To-dos by when they matter"><div class="skeleton" style="height:320px"></div></div>
-      </div>
-
-      <div id="runs-pane" role="tabpanel" aria-labelledby="tab-runs" hidden>
-        <p class="pane-note">Runs JARVIS made with Claude and Codex, and specialist plans you can run. Your to-dos are in the other tab.</p>
-        <div class="board" id="task-board" aria-label="Agent runs by state"></div>
-      </div>
-      <ol class="task-list" id="task-list" hidden></ol>
-      <ol class="task-list" id="plan-list" hidden></ol>
-      <aside class="drawer panel" id="task-drawer" aria-labelledby="task-detail-title" hidden>
-        <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-activity"/></svg></span><h2 id="task-detail-title">Details</h2>
-          <button class="round-btn sm" id="drawer-close" type="button" aria-label="Close details"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-x"/></svg></button></header>
-        <div id="task-detail" class="mem-detail"></div>
-      </aside>
-    </section>
-
     <!-- DEVICES -->
     <section class="view" id="view-files" data-title="Files" hidden>
       <div class="files-wrap" id="files-wrap"></div>
@@ -340,10 +300,70 @@
     <section class="view" id="view-devices" data-title="Devices" hidden>
       <div class="devices-grid" id="devices-grid"></div>
     </section>
+    <section class="view voice-settings" id="view-settings" data-title="Voice and input settings" hidden>
+      <header class="settings-intro"><p class="settings-kicker">VOICE · INPUT</p><h2>Set up voice and shared input.</h2><p>Choose how JARVIS hears you, tune its voice, and check every configured computer and input route.</p></header>
+      <div class="voice-settings-grid">
+        <article class="card settings-card settings-input-card">
+          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-keyboard"/></svg></span><h2>Computers and peripherals</h2><span class="ph-meta" id="input-settings-checked">Checking connection</span></header>
+          <div class="input-settings-status">
+            <p class="input-status-word" id="input-settings-status" role="status">Checking</p>
+            <ul id="input-settings-lines"><li>Checking every configured Lan Mouse service and UDP socket.</li></ul>
+          </div>
+          <div class="input-settings-facts" id="input-settings-facts"></div>
+          <section class="input-peripheral-manager" aria-labelledby="input-peripheral-title">
+            <header><h3 id="input-peripheral-title">Peripheral list</h3><p>Keep track of multiple mice, keyboards, displays, and other devices. Saved in this browser.</p></header>
+            <form class="input-peripheral-form" id="input-peripheral-form">
+              <label><span>Name</span><input class="field" name="name" maxlength="60" placeholder="e.g. Travel mouse" required></label>
+              <label><span>Type</span><select class="field" name="type"><option>Mouse</option><option>Keyboard</option><option>Display</option><option>Controller</option><option>Other</option></select></label>
+              <label><span>Connected to</span><select class="field" name="device" id="input-peripheral-device"></select></label>
+              <button class="btn ghost" type="submit">Add peripheral</button>
+            </form>
+            <ul class="input-peripheral-list" id="input-peripheral-list" aria-live="polite"></ul>
+            <p class="settings-hint">This is a personal inventory. Pairing and hardware detection are managed by each computer and Lan Mouse.</p>
+          </section>
+          <p class="settings-hint input-settings-hint" id="input-settings-hint">Add computers under devices and screen edges under desktop.input.layout in jarvis.config.json. Mouse and keyboard sharing runs through Lan Mouse; individual USB devices are managed by each computer’s operating system. This check reads service and socket status, not cursor movement or key presses.</p>
+          <button class="btn ghost settings-refresh" id="input-probe-refresh" type="button">Check connection</button>
+        </article>
+        <article class="card settings-card shared-input-card" id="shared-input" aria-labelledby="shared-input-title">
+          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-monitor"/></svg></span><h2 id="shared-input-title">Shared mouse and keyboard</h2><span class="ph-meta" id="si-checked">Not checked yet</span></header>
+          <figure class="si-layout" id="si-layout" aria-label="Screens drawn to physical scale"><p class="si-empty">Open this view to read both computers’ screens and Lan Mouse settings.</p></figure>
+          <ul class="si-checks" id="si-checks" role="status" aria-live="polite"></ul>
+          <div class="si-machines" id="si-machines"></div>
+          <p class="settings-hint">Read-only. JARVIS reads each computer’s screens and Lan Mouse config.toml; it never starts, stops or changes Lan Mouse. The keyboard follows the mouse: keys go to whichever screen has the cursor.</p>
+          <button class="btn ghost settings-refresh" id="si-refresh" type="button">Check again</button>
+        </article>
+        <article class="card settings-card">
+          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-mic"/></svg></span><h2>Microphone</h2><span class="ph-meta" id="mic-settings-status">Ready when you are</span></header>
+          <label class="vp-row"><span>Input device</span><select class="field" id="agent-mic-device"><option value="">System default</option></select></label>
+          <label class="vp-row"><span>Auto-select clearest microphone</span><input type="checkbox" id="agent-mic-all"></label>
+          <p class="settings-hint">When enabled, JARVIS compares available microphones during speech and switches to a clearer input. Replies still play through your system output.</p>
+          <label class="vp-row"><span>Input level <output id="agent-mic-gain-out" for="agent-mic-gain">100%</output></span><input type="range" id="agent-mic-gain" min="0.7" max="1.8" step="0.05" value="1"></label>
+          <p class="settings-hint">Gain applies immediately during a call. Device and processing choices apply on the next call; device names may appear after microphone permission is granted.</p>
+          <div class="settings-toggles">
+            <label><input type="checkbox" id="agent-echo" checked><span><b>Echo cancellation</b><small>Reduces JARVIS playback leaking back into the mic.</small></span></label>
+            <label><input type="checkbox" id="agent-noise" checked><span><b>Noise suppression</b><small>Filters steady room and fan noise.</small></span></label>
+            <label><input type="checkbox" id="agent-agc" checked><span><b>Automatic mic level</b><small>Lets the browser balance input volume.</small></span></label>
+          </div>
+          <button class="btn ghost settings-refresh" id="agent-mic-refresh" type="button">Refresh devices</button>
+        </article>
+        <article class="card settings-card">
+          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-audio-lines"/></svg></span><h2>JARVIS's voice</h2></header>
+          <label class="vp-row"><span>Voice</span><select class="field" id="voice-select"></select></label>
+          <label class="vp-row"><span>Speaking speed <output id="voice-speed-out" for="voice-speed"></output></span><input type="range" id="voice-speed" min="0.7" max="1.2" step="0.05" value="1"></label>
+          <label class="vp-row"><span>Steadiness <output id="voice-stability-out" for="voice-stability"></output></span><input type="range" id="voice-stability" min="0" max="1" step="0.05" value="0.5"></label>
+          <p class="settings-hint" id="voice-note"></p>
+          <button type="button" class="vp-preview" id="voice-preview"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-play"/></svg>Preview this voice</button>
+        </article>
+      </div>
+    </section>
   </main>
 
   <!-- COMMAND DOCK -->
   <form class="dock glass-strong" id="dock" autocomplete="off">
+    <div class="agent-caption" id="agent-caption" hidden aria-live="off">
+      <span class="agent-caption-who" id="agent-caption-who">David</span>
+      <p id="agent-caption-text"></p><span class="caption-caret" aria-hidden="true"></span>
+    </div>
     <div class="trace mono" id="trace"></div>
     <div class="dock-row">
       <button class="mic" id="mic" type="button" aria-label="Talk to JARVIS" title="Talk: click, or hold Space when nothing is focused" aria-pressed="false">
@@ -365,18 +385,9 @@
         <select class="field tier-select" id="tier-select" aria-label="How JARVIS should handle it">
           <option value="">Auto</option><option value="simple">Quick</option><option value="medium">Tools</option><option value="complex">Plan</option>
         </select>
-        <button type="button" class="icon-btn" id="voice-btn" popovertarget="voice-panel" aria-label="JARVIS's voice" title="JARVIS's voice" hidden>
+        <button type="button" class="icon-btn" id="voice-btn" aria-label="Open voice and input settings" title="Voice and input settings" hidden>
           <svg class="i"><use href="icons.svg?v=2#i-audio-lines"/></svg>
         </button>
-        <div class="voice-panel" id="voice-panel" popover>
-          <label class="vp-row"><span>Voice</span><select class="field" id="voice-select"></select></label>
-          <label class="vp-row"><span>Speed <output id="voice-speed-out" for="voice-speed"></output></span>
-            <input type="range" id="voice-speed" min="0.7" max="1.2" step="0.05" value="1"></label>
-          <label class="vp-row"><span>Stability <output id="voice-stability-out" for="voice-stability"></output></span>
-            <input type="range" id="voice-stability" min="0" max="1" step="0.05" value="0.5"></label>
-          <p class="vp-note" id="voice-note"></p>
-          <button type="button" class="vp-preview" id="voice-preview"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-play"/></svg>Preview on this laptop</button>
-        </div>
         <button type="button" class="icon-btn" id="speak-toggle" aria-pressed="false" aria-label="Read replies aloud" title="Read replies aloud on this laptop">
           <svg class="i"><use href="icons.svg?v=2#i-volume-x"/></svg>
         </button>
@@ -400,5 +411,6 @@
 <script src="system.js"></script>
 <script src="files.js"></script>
 <script src="flow.js"></script>
+<script src="sharedinput.js"></script>
 </body>
 </html>
