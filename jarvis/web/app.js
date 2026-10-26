@@ -735,7 +735,8 @@
   const prompt = $("#prompt");
   function autosize() { prompt.style.height = "auto"; prompt.style.height = Math.min(160, prompt.scrollHeight) + "px"; }
   prompt.addEventListener("input", autosize);
-  let handsFree = store.get("jarvis.handsFree", true); // mic always listening; see microphone below
+  let handsFree = true; // always-on is the default for every console launch
+  store.set("jarvis.handsFree", true);
   const narrow = matchMedia("(max-width: 640px)");
   const placeholder = () => (prompt.placeholder = narrow.matches ? "Ask JARVIS…" : state.case ? "Ask JARVIS (filed into this investigation)" : handsFree ? "Ask JARVIS, or say “Jarvis, …”" : "Ask JARVIS, or hold Space to talk");
   narrow.addEventListener("change", placeholder); placeholder();
@@ -867,7 +868,7 @@
   // but only a request that starts with "Jarvis" is sent; the server drops everything
   // else. Push-to-talk (Space, or with always-on off) needs no wake word.
   const micBtn = $("#mic");
-  let firstListen = true, spaceAt = 0;
+  let firstListen = true, spaceAt = 0, micRetryDelay = 1000, micRetryTimer = null;
   const LISTENING = [["listening for “Jarvis, …” · Esc cancels", "active"]];
   const idleTrace = () => trace(mic.active && handsFree ? LISTENING : []);
   const mic = new Mic({ wave: $("#mic-wave"), onLevel: (l) => (Terrain.level = l), onAutoStop: () => stopMic() });
@@ -877,7 +878,11 @@
       : "Talk: click to listen all the time, or hold Space when nothing is focused";
   }
   function relisten() {
-    setTimeout(() => { if (handsFree && !busy && !agent.live) startMic(true); }, 600);
+    clearTimeout(micRetryTimer);
+    micRetryTimer = setTimeout(() => {
+      micRetryTimer = null;
+      if (handsFree && !busy && !agent.live) startMic(true);
+    }, 600);
   }
   async function startMic(auto) {
     if (mic.active || mic.starting || agent.live) return;
@@ -885,13 +890,25 @@
     try {
       await mic.start({ wait: handsFree });
       if (!mic.active) return;
+      micRetryDelay = 1000;
       syncMicBtn();
       // Don't wipe an answer's trace when listening resumes; it clears to "listening" later.
       if (!auto || !$("#trace").children.length) trace(handsFree ? LISTENING : [["listening · stops when you pause · Esc cancels", "active"]]);
       if (!auto) announce("Listening.");
       Terrain.redraw();
     } catch (e) {
-      if (handsFree) { handsFree = false; store.set("jarvis.handsFree", false); syncMicBtn(); }
+      if (handsFree) {
+        syncMicBtn();
+        if (e.name !== "NotAllowedError" && e.name !== "SecurityError") {
+          const delay = micRetryDelay;
+          micRetryDelay = Math.min(micRetryDelay * 2, 30000);
+          clearTimeout(micRetryTimer);
+          micRetryTimer = setTimeout(() => {
+            micRetryTimer = null;
+            if (handsFree && !busy && !agent.live) startMic(true);
+          }, delay);
+        }
+      }
       toast(e.name === "NotAllowedError" ? "Microphone permission was denied. Allow it for this page, then try again." : plainError(e.message));
     }
   }
@@ -925,8 +942,12 @@
   }
   micBtn.addEventListener("click", () => {
     handsFree = !handsFree; store.set("jarvis.handsFree", handsFree);
-    if (handsFree) { announce("Always listening."); startMic(); }
-    else { if (mic.active || mic.starting) stopMic(true); announce("Stopped listening."); }
+    if (handsFree) { micRetryDelay = 1000; announce("Always listening."); startMic(); }
+    else {
+      clearTimeout(micRetryTimer); micRetryTimer = null;
+      if (mic.active || mic.starting) stopMic(true);
+      announce("Stopped listening.");
+    }
     syncMicBtn(); placeholder();
   });
   syncMicBtn();
