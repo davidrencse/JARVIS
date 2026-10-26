@@ -1,5 +1,6 @@
 import json
 import tempfile
+import sys
 import threading
 import time
 import unittest
@@ -8,6 +9,7 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 from jarvis import credits as credits_mod
@@ -274,7 +276,7 @@ class HttpTests(Temp):
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
 
     def call(self, path, body=None, headers=None):
-        data = json.dumps(body).encode() if body is not None else None
+        data = body if isinstance(body, bytes) else json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.url + path, data=data, headers=headers or {},
                                      method="POST" if data is not None else "GET")
         try:
@@ -313,6 +315,32 @@ class HttpTests(Temp):
         self.assertEqual((job["state"], job["result"]["reply"]), ("done", "It's Tuesday."))
         self.assertEqual(self.call("/api/jobs/missing")[0], 404)
         self.assertEqual(self.call("/api/ask", {"text": " "}, {"X-JARVIS": "1"})[0], 400)
+
+    def test_noisy_float32_mic_clip_reaches_local_transcriber(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("needs the [voice] extra: pip install numpy")
+        c = self.server.RequestHandlerClass.console
+        c._stt = MagicMock(device="cpu", return_value="Open my calendar.")
+        rate = 16000
+        t = np.arange(rate, dtype="float32") / rate
+        room = 0.018 * np.sin(2 * np.pi * 70 * t)
+        speech = np.zeros_like(t)
+        speech[rate // 4:rate * 3 // 4] = 0.045 * np.sin(2 * np.pi * 240 * t[rate // 4:rate * 3 // 4])
+        clip = (room + speech).astype("<f4").tobytes()
+        assistant_stub = ModuleType("jarvis.assistant")
+        assistant_stub.wake_word = lambda _text: None
+        with patch.dict(sys.modules, {"jarvis.assistant": assistant_stub}), \
+                patch("jarvis.daemon._pid", return_value=None):
+            status, body = self.call("/api/listen", clip, {"X-JARVIS": "1"})
+        result = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["text"], "Open my calendar.")
+        self.assertAlmostEqual(result["seconds"], 1.0)
+        sent_audio = c._stt.call_args.args[0]
+        self.assertEqual(len(sent_audio), rate)
+        self.assertGreater(float(np.sqrt(np.mean(sent_audio ** 2))), 0.01)
 
 
 if __name__ == "__main__":

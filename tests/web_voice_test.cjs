@@ -11,7 +11,7 @@ function deferred() {
 }
 
 function harness() {
-  const state = { fail: null, streams: [], contexts: [], nodes: [], requests: 0, frames: [] };
+  const state = { fail: null, streams: [], contexts: [], nodes: [], gains: [], requests: 0, frames: [] };
   const check = (phase) => { if (state.fail === phase) throw new Error(phase); };
   const stream = () => {
     const track = { stopped: 0, stop() { this.stopped++; } };
@@ -31,7 +31,7 @@ function harness() {
     } } },
     AudioContext: class {
       constructor() {
-        check("context"); this.sampleRate = 48000; this.state = "running"; this.closed = 0;
+        check("context"); this.sampleRate = 48000; this.state = "running"; this.closed = 0; this.destination = {};
         this.audioWorklet = { addModule: async () => { check("worklet"); if (state.worklet) await state.worklet.promise; } };
         state.contexts.push(this);
       }
@@ -39,11 +39,17 @@ function harness() {
         check("source");
         return { connect() { check("connect"); }, disconnect() {} };
       }
-      createAnalyser() { check("analyser"); return { frequencyBinCount: 8, getByteTimeDomainData() {} }; }
+      createAnalyser() { check("analyser"); return { frequencyBinCount: 8, getByteTimeDomainData() {}, disconnect() {} }; }
+      createGain() {
+        check("gain");
+        const gain = { gain: { value: 1 }, connections: [], connect(target) { check("connect"); this.connections.push(target); }, disconnect() { this.disconnected = true; } };
+        state.gains.push(gain); return gain;
+      }
       async close() { this.closed++; this.state = "closed"; check("close"); }
     },
     AudioWorkletNode: class {
-      constructor() { check("node"); this.port = {}; this.disconnected = 0; state.nodes.push(this); }
+      constructor() { check("node"); this.port = {}; this.disconnected = 0; this.connections = []; state.nodes.push(this); }
+      connect(target) { check("connect"); this.connections.push(target); }
       disconnect() { this.disconnected++; }
     },
   };
@@ -56,16 +62,16 @@ function pageHarness({ handsFree = false, listen = {} } = {}) {
   const env = harness(), { context } = env;
   const button = { handlers: {}, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; },
     addEventListener(k, v) { this.handlers[k] = v; }, classList: { add() {}, remove() {} } };
-  const page = { handlers: {}, announcements: [], now: 0, stored: {}, calls: [], asked: [] };
+  const page = { handlers: {}, announcements: [], now: 0, stored: {}, calls: [], asked: [], audioBytes: 0 };
   Object.assign(context, {
-    api: async (path) => { page.calls.push(path); return listen; },
+    api: async (path, body) => { page.calls.push(path); page.audioBytes = body?.byteLength || 0; return listen; },
     ask: async (text) => { page.asked.push(text); }, prompt: { value: "" }, autosize() {},
     Mic: context.window.Mic, $: (selector) => selector === "#mic" ? button : null,
     Terrain: { redraw() {} }, busy: false, trace() {}, toast() {}, agent: { live: false },
     announce: (text) => page.announcements.push(text),
     plainError: (text) => text, typing: () => false, OVERLAY: false,
     addEventListener: (name, callback) => { page.handlers[name] = callback; },
-    setTimeout() {}, Date: { now: () => page.now },
+    setTimeout() {}, clearTimeout() {}, Date: { now: () => page.now },
     handsFree, placeholder() {}, store: { set: (k, v) => { page.stored[k] = v; } },
   });
   context.document.activeElement = null;
@@ -95,11 +101,12 @@ function released(state) {
     assert.equal(node.port.onmessage, null);
     assert.equal(node.disconnected, 1);
   }
+  for (const gain of state.gains) assert.equal(gain.disconnected, true);
 }
 
 const scenarios = {
   async failures_and_retry() {
-    for (const phase of ["permission", "context", "worklet", "source", "node", "analyser", "connect"]) {
+    for (const phase of ["permission", "context", "worklet", "source", "node", "analyser", "gain", "connect"]) {
       const { state, mic } = harness(); state.fail = phase;
       await assert.rejects(mic.start(), { message: phase });
       assert.equal(mic.active, false); assert.equal(await mic.stop(), null); released(state);
@@ -142,11 +149,35 @@ const scenarios = {
   },
   async audio_and_cleanup() {
     const { state, mic } = harness(); await mic.start();
+    assert.equal(state.gains[0].gain.value, 0, "the worklet output must be silently connected to the render graph");
+    assert.equal(state.gains[0].connections[0], state.contexts[0].destination);
+    assert.equal(state.nodes[0].connections[0], state.gains[0]);
     mic.node.port.onmessage({ data: new Float32Array(24000).fill(0.25) });
     const clip = await mic.stop();
     assert.equal(clip.voiced, 0.5); assert.equal(clip.audio.length, 8000);
     assert.equal(clip.audio[0], 0.25); assert.equal(clip.audio[7999], 0.25);
     assert.equal(mic.active, false); assert.equal(await mic.stop(), null); released(state);
+  },
+  async malformed_audio_is_sanitized() {
+    const { state, mic } = harness(); await mic.start();
+    mic.frame(new Float32Array(0));
+    mic.frame(new Float32Array(4800).fill(NaN));
+    for (let i = 0; i < 5; i++) mic.frame(new Float32Array(4800).fill(0.25));
+    const clip = await mic.stop();
+    assert.ok(clip.audio?.length > 0);
+    assert.ok(clip.audio.every(Number.isFinite), "corrupt samples must not poison the transcription payload");
+    assert.equal(clip.audio[0], 0);
+    released(state);
+  },
+  async recording_length_is_capped() {
+    const { state, mic } = harness(); await mic.start();
+    let stops = 0; mic.onAutoStop = () => stops++;
+    mic.frame(new Float32Array(31 * 48000).fill(0.25));
+    assert.equal(mic.samples, 30 * 48000, "capture storage must stop at the 30 second limit");
+    assert.equal(stops, 1, "hitting the cap must end capture immediately");
+    const clip = await mic.stop();
+    assert.equal(clip.audio.length, 30 * 16000);
+    released(state);
   },
   async no_speech_and_close_error() {
     const { state, mic } = harness(); await mic.start(); state.fail = "close";
@@ -222,6 +253,46 @@ const scenarios = {
   async push_to_talk_needs_no_wake_word() {
     const { state, page } = await spoke({ listen: { owner: true, addressed: false, text: "open up Spotify." } });
     assert.deepEqual(page.calls, ["/api/listen"]); assert.deepEqual(page.asked, ["open up Spotify."]);
+    released(state);
+  },
+  async noisy_room_mic_to_transcription() {
+    const { state, page } = pageHarness({ listen: { owner: true, text: "Open my calendar." } });
+    page.handlers.keydown(page.event()); await new Promise(setImmediate);
+    const room = new Float32Array(4800), speech = new Float32Array(4800);
+    for (let i = 0; i < room.length; i++) {
+      const t = i / 48000;
+      room[i] = 0.03 * Math.sin(2 * Math.PI * 180 * t);
+      speech[i] = room[i] + 0.06 * Math.sin(2 * Math.PI * 420 * t);
+    }
+    const frame = (data) => state.nodes[0].port.onmessage({ data });
+    for (let i = 0; i < 5; i++) frame(room); // steady room noise, about 0.02 RMS
+    assert.deepEqual(page.calls, [], "steady room noise must not auto-submit a transcript");
+    for (let i = 0; i < 6; i++) frame(speech); // quieter speech mixed into the same room
+    await page.handlers.keydown(page.event({ code: "Enter", key: "Enter" }));
+    await new Promise(setImmediate); await new Promise(setImmediate);
+    assert.deepEqual(page.calls, ["/api/listen"]);
+    assert.ok(page.audioBytes >= 48000 * 4 * 0.3, "captured Float32 audio must reach the transcription API");
+    assert.deepEqual(page.asked, ["Open my calendar."]);
+    released(state);
+  },
+  async noisy_room_wait_does_not_submit_ambience() {
+    const { state, mic } = harness(); await mic.start({ wait: true });
+    let stops = 0; mic.onAutoStop = () => stops++;
+    const room = new Float32Array(4800), speech = new Float32Array(4800), silence = new Float32Array(4800);
+    for (let i = 0; i < room.length; i++) {
+      const t = i / 48000;
+      room[i] = 0.03 * Math.sin(2 * Math.PI * 180 * t);
+      speech[i] = room[i] + 0.06 * Math.sin(2 * Math.PI * 420 * t);
+    }
+    for (let i = 0; i < 20; i++) mic.frame(room); // 2 s of steady fan/room noise
+    for (let i = 0; i < 13; i++) mic.frame(silence); // noise pause must not count as a spoken turn
+    assert.equal(stops, 0);
+    assert.equal(mic.voiced, 0);
+    for (let i = 0; i < 6; i++) mic.frame(speech);
+    for (let i = 0; i < 13; i++) mic.frame(room);
+    assert.equal(stops, 1, "speech in the noisy room should end after a real pause");
+    const clip = await mic.stop();
+    assert.ok(clip.audio?.length > 16000, "retain the speech and pre-roll for transcription");
     released(state);
   },
   async waiting_keeps_only_a_preroll() {

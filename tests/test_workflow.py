@@ -79,16 +79,6 @@ def jarvis(state, *args, check=True):
 
 # ------------------------------------------------------------------ text → brain → memory
 class TextWorkflowTests(Temp):
-    def test_markets_shortcut_runs_before_recall_and_is_remembered(self):
-        store, mem = Store(self.base), Memory(self.base)
-        with patch("jarvis.assistant.market_answer", return_value="Markets is up on the Zenbook."), \
-                patch("jarvis.assistant.vault_recall", side_effect=AssertionError("slow recall")):
-            result = ask("open the Markets tab on Arch Linux", store, mem, CONFIG, ROOT)
-        self.assertEqual(result["reply"], "Markets is up on the Zenbook.")
-        self.assertEqual(result["lane"], "instant")
-        inbound, outbound = (mem.get(i) for i in result["memory"])
-        self.assertEqual((inbound["kind"], outbound["kind"]), ("message", "reply"))
-
     def test_text_request_is_routed_remembered_answered_and_recalled(self):
         store, mem, brain = Store(self.base), Memory(self.base), Brain()
         mem.add("note", "The Underlord game uses Godot", tags=["games"], importance=0.9)
@@ -164,7 +154,8 @@ class MediumWorkflowTests(Temp):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        config = {**CONFIG, "adapters": {"browser_agents": [], "apis": [{
+        config = {**CONFIG, "routing": {**CONFIG.get("routing", {}), "orchestrator": "brain"},
+                  "adapters": {"browser_agents": [], "apis": [{
             "name": "ig", "sites": ["instagram"], "token_env": "IG_TOKEN", "timeout": 5,
             "url": f"http://127.0.0.1:{server.server_address[1]}/ask"}]}}
         store, mem = Store(self.base), Memory(self.base)

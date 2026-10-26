@@ -2,6 +2,8 @@ import json
 import sys
 import tempfile
 import unittest
+import urllib.request
+from unittest import mock
 from datetime import date, datetime
 from pathlib import Path
 
@@ -10,7 +12,8 @@ from jarvis.chatgpt import Brain, ChatGPTLane, make_lane
 from jarvis.memory import Memory
 from jarvis.store import Store
 from jarvis.vault import (Toolbox, Vault, VaultTools, is_vault_request, links_in, moment,
-                          recall, split_frontmatter)
+                          recall, split_frontmatter, _PinnedHTTPHandler,
+                          _PinnedHTTPSHandler, _Guarded, _connect_pinned, _public)
 from jarvis.vault_mcp import handle
 
 TODAY = date(2026, 10, 21)
@@ -263,6 +266,90 @@ class HealthTests(VaultCase):
         self.assertNotIn("notes/lonely.md", issues["orphans"])
         self.assertEqual(issues["stale_projects"], ["projects/old.md (updated 2026-01-01)"])
         self.assertNotIn("no_frontmatter", issues)  # root map files have none by design
+
+
+class FetchNetworkSafetyTests(unittest.TestCase):
+    def test_validation_returns_the_address_that_must_be_used(self):
+        infos = [(2, 1, 6, "", ("93.184.216.34", 80)),
+                 (10, 1, 6, "", ("2606:2800:220:1:248:1893:25c8:1946", 80, 0, 0))]
+        with mock.patch("jarvis.vault.socket.getaddrinfo", return_value=infos) as resolve:
+            self.assertEqual(_public("http://example.test/page"), tuple(infos))
+        resolve.assert_called_once_with("example.test", 80, proto=6)
+
+    def test_http_handler_uses_validated_addresses_without_host_resolution(self):
+        infos = [(2, 1, 6, "", ("93.184.216.34", 80))]
+        addresses = {"example.test": tuple(infos)}
+        handler = _PinnedHTTPHandler(addresses)
+        req = urllib.request.Request("http://example.test/page")
+        captured = {}
+
+        def open_connection(factory, request):
+            captured["connection"] = factory("example.test", timeout=5)
+            return object()
+
+        with mock.patch.object(handler, "do_open", side_effect=open_connection), \
+             mock.patch("jarvis.vault._connect_pinned", return_value=mock.Mock()) as connect, \
+             mock.patch("jarvis.vault.socket.getaddrinfo") as resolve:
+            handler.http_open(req)
+            captured["connection"].connect()
+        connect.assert_called_once_with(tuple(infos), 5, None)
+        resolve.assert_not_called()
+
+    def test_https_handler_pins_ip_and_keeps_hostname_for_tls(self):
+        infos = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        handler = _PinnedHTTPSHandler({"example.test": tuple(infos)})
+        req = urllib.request.Request("https://example.test/page")
+        captured = {}
+
+        def open_connection(factory, request, **kwargs):
+            captured["connection"] = factory("example.test", timeout=5,
+                                               context=kwargs["context"])
+            return object()
+
+        raw, wrapped = mock.Mock(), mock.Mock()
+        context = mock.Mock()
+        context.wrap_socket.return_value = wrapped
+        handler._context = context
+        with mock.patch.object(handler, "do_open", side_effect=open_connection), \
+             mock.patch("jarvis.vault._connect_pinned", return_value=raw) as connect:
+            handler.https_open(req)
+            captured["connection"].connect()
+        connect.assert_called_once_with(tuple(infos), 5, None)
+        context.wrap_socket.assert_called_once_with(raw, server_hostname="example.test")
+        self.assertIs(captured["connection"].sock, wrapped)
+
+    def test_pinned_connect_fails_over_without_resolving_again(self):
+        infos = [(2, 1, 6, "", ("93.184.216.34", 80)),
+                 (2, 1, 6, "", ("203.0.113.7", 80))]
+        first, second = mock.Mock(), mock.Mock()
+        first.connect.side_effect = OSError("unreachable")
+        with mock.patch("jarvis.vault.socket.socket", side_effect=[first, second]) as sock, \
+             mock.patch("jarvis.vault.socket.getaddrinfo") as resolve:
+            self.assertIs(_connect_pinned(infos, 4, None), second)
+        self.assertEqual(sock.call_count, 2)
+        first.close.assert_called_once()
+        second.connect.assert_called_once_with(("203.0.113.7", 80))
+        resolve.assert_not_called()
+
+    def test_socket_creation_failure_fails_over_to_next_address(self):
+        infos = [(10, 1, 6, "", ("2606:2800::1", 80, 0, 0)),
+                 (2, 1, 6, "", ("93.184.216.34", 80))]
+        second = mock.Mock()
+        with mock.patch("jarvis.vault.socket.socket",
+                        side_effect=[OSError("IPv6 unavailable"), second]) as sock, \
+             mock.patch("jarvis.vault.socket.getaddrinfo") as resolve:
+            self.assertIs(_connect_pinned(infos, 4, None), second)
+        self.assertEqual(sock.call_count, 2)
+        second.connect.assert_called_once_with(("93.184.216.34", 80))
+        resolve.assert_not_called()
+
+    def test_redirect_to_private_address_is_refused(self):
+        private = [(2, 1, 6, "", ("127.0.0.1", 80))]
+        guard = _Guarded({})
+        with mock.patch("jarvis.vault.socket.getaddrinfo", return_value=private):
+            with self.assertRaisesRegex(ValueError, "local or private"):
+                guard.redirect_request(None, None, 302, "Found", {},
+                                       "http://localhost/private")
 
 
 class ToolTests(VaultCase):

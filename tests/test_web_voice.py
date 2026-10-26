@@ -36,8 +36,20 @@ class BrowserMicrophoneTests(unittest.TestCase):
     def test_successful_recording_keeps_audio_and_releases_resources(self):
         self.check_scenario("audio_and_cleanup")
 
+    def test_noisy_room_speech_reaches_transcription_and_jarvis(self):
+        self.check_scenario("noisy_room_mic_to_transcription")
+
+    def test_always_on_mic_rejects_noise_and_recovers_for_speech(self):
+        self.check_scenario("noisy_room_wait_does_not_submit_ambience")
+
     def test_silence_and_context_close_error_do_not_leak_microphone(self):
         self.check_scenario("no_speech_and_close_error")
+
+    def test_malformed_audio_is_cleaned_before_transcription(self):
+        self.check_scenario("malformed_audio_is_sanitized")
+
+    def test_recording_memory_is_bounded(self):
+        self.check_scenario("recording_length_is_capped")
 
     def test_throwing_ui_callback_cannot_skip_microphone_cleanup(self):
         self.check_scenario("callback_error_still_releases")

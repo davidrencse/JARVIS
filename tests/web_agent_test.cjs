@@ -6,8 +6,9 @@ const vm = require("node:vm");
 
 const tick = () => new Promise((r) => setImmediate(r));
 
-function harness({ failMic = false } = {}) {
-  const state = { sockets: [], sources: [], tracks: [], contexts: [], calls: [], states: [], tools: [] };
+function harness({ failMic = false, missingDevice = false, failDeviceId = null, failEnumeration = false, audioPrefs = null,
+  microphoneLevels = [[0.02], [0.02]] } = {}) {
+  const state = { sockets: [], sources: [], tracks: [], contexts: [], calls: [], states: [], tools: [], mediaConstraints: [], errors: [], connectedMics: 0, selectedMics: [], analyserCount: 0 };
   class FakeSocket {
     constructor(url) { this.url = url; this.sent = []; this.readyState = 0; state.sockets.push(this); setImmediate(() => { this.readyState = 1; this.onopen?.(); }); }
     send(data) { this.sent.push(JSON.parse(data)); }
@@ -16,22 +17,36 @@ function harness({ failMic = false } = {}) {
   }
   FakeSocket.OPEN = 1;
   const context = {
-    window: {}, setTimeout: (fn) => setImmediate(fn), setImmediate, btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+    window: {}, localStorage: { getItem: () => audioPrefs ? JSON.stringify(audioPrefs) : null }, setTimeout: (fn) => setImmediate(fn), setImmediate, btoa: (s) => Buffer.from(s, "binary").toString("base64"),
     atob: (s) => Buffer.from(s, "base64").toString("binary"), WebSocket: FakeSocket,
-    navigator: { mediaDevices: { async getUserMedia() {
+    navigator: { mediaDevices: { async getUserMedia(constraints) {
+      state.mediaConstraints.push(JSON.parse(JSON.stringify(constraints)));
       if (failMic) throw Object.assign(new Error("denied"), { name: "NotAllowedError" });
+      if (failDeviceId && constraints.audio.deviceId?.exact === failDeviceId)
+        throw Object.assign(new Error("unavailable"), { name: "NotFoundError" });
+      if (missingDevice && constraints.audio.deviceId) throw Object.assign(new Error("missing"), { name: "OverconstrainedError" });
       const track = { stopped: 0, stop() { this.stopped++; } }; state.tracks.push(track);
       return { getTracks: () => [track] };
+    }, async enumerateDevices() {
+      if (failEnumeration) throw Object.assign(new Error("blocked"), { name: "NotAllowedError" });
+      return ["mic-a", "mic-b", "default"].map((deviceId) => ({ kind: "audioinput", deviceId }));
     } } },
     AudioContext: class {
       constructor() { this.sampleRate = 48000; this.currentTime = 0; this.state = "running"; this.destination = {}; state.contexts.push(this);
         this.audioWorklet = { addModule: async () => {} }; }
-      createMediaStreamSource() { return { connect() {}, disconnect() {} }; }
+      createGain() { return { gain: { value: 1, setTargetAtTime(v) { this.value = v; } }, connect() {}, disconnect() {} }; }
+      createAnalyser() {
+        const index = state.analyserCount++; let read = 0;
+        return { fftSize: 0, getFloatTimeDomainData(data) {
+          const levels = microphoneLevels[index] || [0]; data.fill(levels[read++ % levels.length]);
+        }, connect() {}, disconnect() {} };
+      }
+      createMediaStreamSource() { state.connectedMics++; return { connections: [], connect(target) { this.connections.push(target); }, disconnect(target) { this.connections = this.connections.filter((item) => item !== target); } }; }
       createBuffer(ch, n, rate) { const data = new Float32Array(n); return { duration: n / rate, getChannelData: () => data, rate }; }
       createBufferSource() { const s = { connect() {}, start(at) { this.at = at; }, stop() { this.stopped = true; } }; state.sources.push(s); return s; }
       async close() { this.state = "closed"; }
     },
-    AudioWorkletNode: class { constructor() { this.port = {}; } disconnect() {} },
+    AudioWorkletNode: class { constructor() { this.port = {}; } connect() {} disconnect() {} },
   };
   for (const file of ["voice.js", "agent.js"])
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, "../jarvis/web", file), "utf8"), context);
@@ -46,6 +61,8 @@ function harness({ failMic = false } = {}) {
       throw new Error("unexpected " + p);
     },
     onState: (s) => state.states.push(s), onTool: (r, phase) => state.tools.push([r, phase]),
+    onError: (message) => state.errors.push(message),
+    onMicSelected: (label) => state.selectedMics.push(label),
   });
   return { state, agent };
 }
@@ -168,6 +185,76 @@ const scenarios = {
     assert.equal(fresh.sent.at(-1).is_error, true);
     assert.equal(state.sockets.length, 2);
     await agent.stop();
+  },
+
+  async audio_controls() {
+    const env = harness({ audioPrefs: { deviceId: "mic-2", gain: 1.4, echoCancellation: false, noiseSuppression: true, autoGainControl: false } });
+    const ws = await connect(env);
+    assert.deepEqual(JSON.parse(JSON.stringify(env.state.mediaConstraints[0])), { audio: {
+      channelCount: 1, deviceId: { exact: "mic-2" }, echoCancellation: false, noiseSuppression: true, autoGainControl: false,
+    } });
+    assert.equal(env.agent.inputGain.gain.value, 1.4);
+    env.agent.setAudioSettings({ gain: 1.1 });
+    assert.equal(env.agent.inputGain.gain.value, 1.1);
+    assert.equal(env.agent.mute.gain.value, 0);
+    await env.agent.stop();
+  },
+  async microphone_fallback_and_gain_limits() {
+    const env = harness({ missingDevice: true, audioPrefs: { deviceId: "removed-mic", gain: 99 } });
+    await connect(env);
+    assert.equal(env.state.mediaConstraints.length, 2);
+    assert.deepEqual(JSON.parse(JSON.stringify(env.state.mediaConstraints[0].audio.deviceId)), { exact: "removed-mic" });
+    assert.equal(env.state.mediaConstraints[1].audio.deviceId, undefined);
+    assert.equal(env.agent.inputGain.gain.value, 1.8, "saved gain must be clamped to the UI range");
+    assert.match(env.state.errors[0], /system default/);
+    env.agent.setAudioSettings({ gain: -10 });
+    assert.equal(env.agent.inputGain.gain.value, 0.7);
+    await env.agent.stop();
+  },
+  async all_microphones_select_one_input_and_use_one_playback_output() {
+    const env = harness({ audioPrefs: { allMicrophones: true } });
+    await connect(env);
+    assert.equal(env.state.mediaConstraints.length, 2, "open each physical mic and skip the default alias");
+    assert.equal(env.state.connectedMics, 2);
+    assert.equal(env.agent.inputGain.gain.value, 1);
+    assert.equal(env.agent.mute.gain.value, 0, "mic mix stays muted at the output destination");
+    await env.agent.stop();
+    assert.ok(env.state.tracks.every((track) => track.stopped === 1), "stop every microphone track");
+  },
+  async clearest_microphone_is_selected_during_speech() {
+    const env = harness({ audioPrefs: { allMicrophones: true }, microphoneLevels: [
+      [0.02], [0.01, 0.05, 0.025, 0.06, 0.012, 0.055],
+    ] });
+    await connect(env);
+    for (let i = 0; i < 192; i++) env.agent.capture(new Float32Array(128).fill(0.1));
+    assert.equal(env.agent.activeInput, 1, "choose the mic with stronger speech dynamics instead of blending inputs");
+    assert.deepEqual(env.state.selectedMics, ["Microphone 1", "Microphone 2"]);
+    assert.equal(env.agent.inputCandidates[0].source.connections.includes(env.agent.inputGain), false);
+    assert.equal(env.agent.inputCandidates[1].source.connections.includes(env.agent.inputGain), true);
+    await env.agent.stop();
+  },
+  async all_microphone_mode_survives_unavailable_inputs() {
+    const partial = harness({ audioPrefs: { allMicrophones: true }, failDeviceId: "mic-b" });
+    await connect(partial);
+    assert.equal(partial.state.tracks.length, 1);
+    assert.equal(partial.agent.inputGain.gain.value, 1, "normalize against successfully opened inputs only");
+    assert.match(partial.state.errors[0], /continuing with the others/);
+    await partial.agent.stop();
+
+    const blocked = harness({ audioPrefs: { allMicrophones: true }, failEnumeration: true });
+    await connect(blocked);
+    assert.equal(blocked.state.mediaConstraints.length, 1, "enumeration failure falls back to the system default");
+    assert.equal(blocked.state.tracks.length, 1);
+    assert.match(blocked.state.errors[0], /using the system default/);
+    await blocked.agent.stop();
+  },
+  async corrupt_live_audio_is_silent_not_nan() {
+    const env = harness(), ws = await connect(env);
+    env.agent.capture(new Float32Array(4800).fill(NaN));
+    const chunk = ws.sent.find((message) => message.user_audio_chunk);
+    assert.ok(chunk);
+    assert.ok(Buffer.from(chunk.user_audio_chunk, "base64").every((byte) => byte === 0));
+    await env.agent.stop();
   },
 };
 
