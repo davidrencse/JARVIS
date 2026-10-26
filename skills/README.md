@@ -36,6 +36,19 @@ Notes on the frontend copies:
 
 Popularity was a selection signal, not a security guarantee or proof these are universally the best skills. The actual skill text was reviewed before use. Their general principles were applied to JARVIS's single-owner local workload; distributed-service recipes are not requirements to add infrastructure.
 
+## WebGL / Three.js skills
+
+Four project-local references were added on 2026-10-26 from [CloudAI-X/threejs-skills](https://github.com/CloudAI-X/threejs-skills), pinned to commit `0e181866f095b5f06d005133876e926515390d95` (MIT). The upstream guidance targets Three.js r186 and React Three Fiber 9.8, matching this project's `three@0.186.1` and `@react-three/fiber@9.8.2` dependencies.
+
+| Skill | Why selected |
+| --- | --- |
+| [Three.js fundamentals](threejs-fundamentals/SKILL.md) | Scene, camera, renderer, transforms, and animation loop for the site's 3D scenes. |
+| [React Three Fiber](threejs-react-three-fiber/SKILL.md) | React renderer patterns and lifecycle guidance for the app's R3F scenes. |
+| [Shaders](threejs-shaders/SKILL.md) | ShaderMaterial, GLSL, and node material guidance for the custom visuals. |
+| [Performance](threejs-performance/SKILL.md) | Frame cost, draw calls, GPU memory, and compile stalls for the WebGL sections. |
+
+`sources.json` records the source revision and SHA-256 checksums. These are project-local references, not automatically registered agent skills.
+
 Registries: [system-design](https://www.skills.sh/wondelai/skills/system-design), [architecture-patterns](https://www.skills.sh/wshobson/agents/architecture-patterns), [vercel-react-best-practices](https://www.skills.sh/vercel-labs/agent-skills/vercel-react-best-practices), [vercel-composition-patterns](https://www.skills.sh/vercel-labs/agent-skills/vercel-composition-patterns), [emil-design-eng](https://www.skills.sh/emilkowalski/skills/emil-design-eng), [shadcn](https://www.skills.sh/shadcn/ui/shadcn), [webapp-testing](https://www.skills.sh/anthropics/skills/webapp-testing), [tailwind-design-system](https://www.skills.sh/wshobson/agents/tailwind-design-system), [accessibility](https://www.skills.sh/addyosmani/web-quality-skills/accessibility), [performance-optimization](https://www.skills.sh/addyosmani/agent-skills/performance-optimization), [kpi-dashboard-design](https://www.skills.sh/wshobson/agents/kpi-dashboard-design), [refactoring-ui](https://www.skills.sh/wondelai/skills/refactoring-ui).
 
 ## Availability

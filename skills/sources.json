@@ -1,5 +1,5 @@
 {
-  "downloaded_at": "2026-10-21",
+  "downloaded_at": "2026-10-26",
   "registration": "local-reference-only",
   "skills": [
     {
@@ -244,6 +244,19 @@
         "references/data-visualization.md": "53401fa2cc58a2ae412d03e52fcbc53dc9d4acdd45aaed6c3747299273530bc6",
         "references/theming-dark-mode.md": "61159934eee491713718d6a725e2e25e34aa73f2e6433214aca9afdc413212e6",
         "SKILL.md": "d10d15b81aa00f427811741d83ac2bb918aabfae3d4489c751615bdf85e1674c"
+      }
+    },
+    {
+      "skill": "threejs-webgl-guides",
+      "repository": "CloudAI-X/threejs-skills",
+      "commit": "0e181866f095b5f06d005133876e926515390d95",
+      "source_path": "skills/",
+      "files_sha256": {
+        "threejs-LICENSE": "d26f12fa1a0e03fd5aa4d3cbf05262a9f1c684672d0864abac78b3bbb12b268c",
+        "threejs-fundamentals/SKILL.md": "cb6a0db8f05bb7d8196cad0ca6ae245e2baec53da4675e1b94be4fa735ed8a09",
+        "threejs-react-three-fiber/SKILL.md": "07c0f09516dce50c91c3d23c5baca83c35d161e1abe3d8460782aba56e9476fa",
+        "threejs-shaders/SKILL.md": "8dc55ed6cc348abaad60851ae9f3f5ebcc6e3027dd7f7a55acc1832c73f11bca",
+        "threejs-performance/SKILL.md": "dacbf6a43ed280bdfcda2ce9fcf7a3f0ae54c25ed264e62f6e9a0117d6534285"
       }
     }
   ]
