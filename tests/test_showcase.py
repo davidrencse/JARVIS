@@ -16,7 +16,8 @@ class FakeRemote:
         return self._here
 
     def resolve(self, name):
-        return (name or "").lower() or None
+        word = (name or "").lower()
+        return {"arch linux": "zenbook", "arch": "zenbook"}.get(word, word or None)
 
     def call(self, device, action, arg):
         self.calls.append((device, action, arg))
@@ -50,6 +51,11 @@ class ShowMarketTest(unittest.TestCase):
     def test_names_the_laptop(self):
         self.assertEqual(SHOW_MARKET.match("pull up the markets on the dell").group("device"), "dell")
 
+    def test_open_markets_tab_on_arch_is_a_direct_action(self):
+        match = SHOW_MARKET.match("open the Markets tab on Arch Linux")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group("device"), "Arch Linux")
+
 
 class AnswerTest(unittest.TestCase):
     def test_opens_terminal_here_and_reads_the_market(self):
@@ -65,6 +71,13 @@ class AnswerTest(unittest.TestCase):
         reply = answer("check the market on the dell", {}, "/tmp", remote=fake, market=Broken())
         self.assertEqual(fake.calls, [("dell", "open_page", "terminal")])
         self.assertEqual(reply, "Pro terminal is up on the Dell.")
+
+    def test_open_markets_tab_opens_markets_without_waiting_for_market_data(self):
+        fake = FakeRemote(here="dell")
+        reply = answer("open the Markets tab on Arch Linux", {}, "/tmp", remote=fake,
+                       market=Broken())
+        self.assertEqual(fake.calls, [("zenbook", "open_page", "markets")])
+        self.assertEqual(reply, "Markets is up on the Zenbook.")
 
     def test_unknown_laptop_is_said_not_tried(self):
         fake = FakeRemote()
@@ -94,6 +107,14 @@ class OpenPageTest(unittest.TestCase):
         start.assert_not_called()
         self.assertEqual(window.call_args.args[0], "http://127.0.0.1:7790/terminal.html")
         self.assertIn("Pro terminal", text)
+
+    def test_markets_page_uses_running_console(self):
+        with patch.object(showcase, "console_port", return_value=7777), \
+                patch("jarvis.ui.app_window") as window:
+            ok, text = open_page("markets")
+        self.assertTrue(ok)
+        self.assertEqual(window.call_args.args[0], "http://127.0.0.1:7777/trade.html")
+        self.assertEqual(text, "Opened Markets.")
 
     def test_starts_a_console_when_none_runs(self):
         with patch.object(showcase, "console_port", return_value=None), \

@@ -79,6 +79,16 @@ def jarvis(state, *args, check=True):
 
 # ------------------------------------------------------------------ text → brain → memory
 class TextWorkflowTests(Temp):
+    def test_markets_shortcut_runs_before_recall_and_is_remembered(self):
+        store, mem = Store(self.base), Memory(self.base)
+        with patch("jarvis.assistant.market_answer", return_value="Markets is up on the Zenbook."), \
+                patch("jarvis.assistant.vault_recall", side_effect=AssertionError("slow recall")):
+            result = ask("open the Markets tab on Arch Linux", store, mem, CONFIG, ROOT)
+        self.assertEqual(result["reply"], "Markets is up on the Zenbook.")
+        self.assertEqual(result["lane"], "instant")
+        inbound, outbound = (mem.get(i) for i in result["memory"])
+        self.assertEqual((inbound["kind"], outbound["kind"]), ("message", "reply"))
+
     def test_text_request_is_routed_remembered_answered_and_recalled(self):
         store, mem, brain = Store(self.base), Memory(self.base), Brain()
         mem.add("note", "The Underlord game uses Godot", tags=["games"], importance=0.9)
