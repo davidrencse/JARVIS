@@ -349,9 +349,8 @@ class Brain:
         """'act' (tools) or 'chat': which conversation ask(text) will use."""
         if self.wants is None:
             from .actions import is_action
-            from .paper import is_trading_request
             from .vault import is_vault_request
-            wants = is_action(text) or is_vault_request(text) or is_trading_request(text)
+            wants = is_action(text) or is_vault_request(text)
         else:
             wants = self.wants(text)
         return "act" if wants else "chat"
@@ -414,15 +413,19 @@ def grok_ready(config):
         config.get("actions", {}).get("grokbot", True)
 
 
-def grok_tools(config, state):
+def grok_tools(config, state, base):
     """A single Grok request, bounded to 30 seconds with no late-answer watcher."""
     from .grokbot import Grokbot, GrokTools
-    return GrokTools(Grokbot(config, state))
+    return GrokTools(Grokbot(config, state), config=config, base=base)
 
 
 def make_lane(config, base, state_dir=None):
     """The configured brain: ChatGPT (default) or Claude; with actions unless disabled,
     and with David's Obsidian vault when `vault.path` is configured."""
+    from .topology import is_node
+    if is_node(config):
+        from .cluster import ProxyLane
+        return ProxyLane(config, state_dir or Path(base) / ".jarvis")
     if config.get("routing", {}).get("brain", "chatgpt") == "claude":
         from .fastlane import FastLane
         return FastLane(config, base)
@@ -451,12 +454,8 @@ def make_lane(config, base, state_dir=None):
     else:
         instructions.append(VAULT_ONLY)
     if actions and grok_ready(config):
-        tools.append(grok_tools(config, state))
+        tools.append(grok_tools(config, state, base))
         instructions.append(GROK_INSTRUCTIONS)
-    if actions and config.get("actions", {}).get("paper_trading", True):
-        from .paper import TRADING_INSTRUCTIONS, TradingTools
-        tools.append(TradingTools(config, state))
-        instructions.append(TRADING_INSTRUCTIONS)
     if vault is not None:
         from .memory import Memory
         from .tasks import TASK_INSTRUCTIONS, TaskTools, tasks_for

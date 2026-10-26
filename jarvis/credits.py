@@ -27,7 +27,12 @@ from pathlib import Path
 
 from .claude_auth import renew_claude_session
 
-HOME = Path.home()
+try:
+    HOME = Path.home()
+except RuntimeError:
+    # Service or isolated test environments may have no home variables. Keep
+    # credential lookup unavailable without breaking unrelated credit helpers.
+    HOME = Path(__file__).resolve().parent / "__home_unavailable__"
 TIMEOUT = 8
 
 # id, display name, group, key names (first found wins), short description

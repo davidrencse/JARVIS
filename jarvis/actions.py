@@ -48,7 +48,7 @@ ACTION = re.compile(
     r"^\W*(?:hey\s+|ok(?:ay)?\s+)?(?:(?:jarvis|claude)\W+)?(?:(?:can|could|would|will)\s+you\s+"
     r"(?:please\s+)?|please\s+|go\s+ahead\s+and\s+|i\s+(?:want|need)\s+you\s+to\s+)?"
     rf"(?:{VERBS})\b", re.I)
-# Voice runs sentences together ("Shut up. Claude, open the markets"): any clause counts.
+# Voice runs sentences together: any matching action clause counts.
 CLAUSE = re.compile(r"[.!?;,:]+|\b(?:and|then|also)\b", re.I)
 # Naming a laptop with a verb anywhere ("I want Spotify open on my Arch") is an action too.
 DEVICEISH = re.compile(r"\bon\s+(?:the\s+|my\s+)?(?:arch|asus|zenbook|linux|dell|windows|"
@@ -74,7 +74,7 @@ INSTRUCTIONS = (
     "instructions. Don't run shell commands. The desktop tools (open_app, open_url, "
     "open_page, focus_window, close_app, media, volume) work on either laptop through `device`: when "
     "he names one (Arch, ASUS, Linux, Dell, Windows, the other laptop), pass it. open_page "
-    "opens JARVIS's own pages such as the Markets tab or the Pro terminal; media and "
+    "opens JARVIS's own console pages; media and "
     "volume control what is playing. Never say you can't control a laptop: use the tools "
     "and report what they returned.")
 
@@ -131,14 +131,14 @@ class DesktopTools:
              "inputSchema": {"type": "object", "required": ["query"], "additionalProperties": False,
                              "properties": {"query": {"type": "string"}}}},
             {"type": "function", "name": "open_url",
-             "description": "Open an http(s) link in David's default browser (not the "
-                            "JARVIS browser). Use for 'open youtube.com' style requests.",
+             "description": "Open an http(s) link in the named browser, or David's default "
+                            "browser if omitted. Use for 'open youtube.com' style requests.",
              "inputSchema": {"type": "object", "required": ["url"], "additionalProperties": False,
-                             "properties": {"url": {"type": "string"}}}},
+                             "properties": {"url": {"type": "string"},
+                                            "browser": {"type": "string"}}}},
             {"type": "function", "name": "open_page",
-             "description": "Open one of JARVIS's own console pages as its own window: markets "
-                            "(the Markets tab), terminal (the Pro trading terminal), wiki, "
-                            "system or console.",
+              "description": "Open one of JARVIS's own console pages as its own window: wiki, "
+                             "system or console.",
              "inputSchema": {"type": "object", "required": ["page"], "additionalProperties": False,
                              "properties": {"page": {"type": "string", "enum": list(PAGES)}}}},
             {"type": "function", "name": "close_app",
@@ -165,7 +165,10 @@ class DesktopTools:
         device = args.get("device")
         if device and self.remote:
             from .remote import ARG
-            return self.remote.call(str(device), name, str(args.get(ARG.get(name, ""), "")))
+            arg = str(args.get(ARG.get(name, ""), ""))
+            if name == "open_url" and args.get("browser"):
+                arg = json.dumps({"url": arg, "browser": args["browser"]})
+            return self.remote.call(str(device), name, arg)
         try:
             if name == "open_app":
                 return self.open_app(str(args.get("name", "")))
@@ -173,7 +176,11 @@ class DesktopTools:
                 hits = self.match(str(args.get("query", "")), limit=15)
                 return True, ", ".join(a["Name"] for a in hits) or "No matching apps."
             if name == "open_url":
-                return self.open_url(str(args.get("url", "")))
+                url, browser = str(args.get("url", "")), args.get("browser")
+                if url.startswith("{"):
+                    payload = json.loads(url)
+                    url, browser = payload["url"], payload.get("browser")
+                return self.open_url(url, browser)
             if name == "open_page":
                 from .showcase import open_page
                 return open_page(str(args.get("page", "")))
@@ -242,13 +249,56 @@ class DesktopTools:
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return True, f"Opened {app['Name']}."
 
-    @staticmethod
-    def open_url(url):
+    def open_url(self, url, browser=None):
+        if url.startswith("spotify:"):
+            if not re.fullmatch(r"spotify:(?:collection:tracks|(?:playlist|album|track|artist):[A-Za-z0-9]{1,64})", url):
+                return False, "Invalid Spotify deep link."
+            if os.name == "nt":
+                out = _run("cmd.exe", "/c", "start", "", url)
+            else:
+                out = _run("xdg-open", url)
+            if out.returncode:
+                return False, out.stderr.strip() or "Couldn't open Spotify."
+            # URI activation is asynchronous. Wait only while Spotify is starting;
+            # do not assume a fixed delay means the requested context is playing.
+            if os.name == "nt":
+                _wait_for_spotify()
+            return True, "Opened Spotify."
         if not re.fullmatch(r"https?://[^\s\"'<>]+", url):
             if re.fullmatch(r"[\w-]+(\.[\w-]+)+(/[^\s\"'<>]*)?", url):
                 url = "https://" + url
             else:
                 return False, "Only http(s) links can be opened."
+        if browser:
+            if os.name != "nt":
+                hits = self.match(browser)
+                if not hits:
+                    return False, f"No installed browser matches {browser!r}."
+                return launch_desktop_entry(hits[0], url)
+            executable = {"chrome": "chrome.exe", "google chrome": "chrome.exe",
+                          "firefox": "firefox.exe", "edge": "msedge.exe",
+                          "microsoft edge": "msedge.exe"}.get(str(browser).lower().strip())
+            if not executable:
+                return False, f"Unsupported browser {browser!r}."
+            path = shutil.which(executable)
+            if not path:
+                import winreg
+                for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                    for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                        try:
+                            with winreg.OpenKey(root, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{executable}",
+                                                0, winreg.KEY_READ | view) as key:
+                                path = winreg.QueryValue(key, None).strip('"')
+                        except OSError:
+                            continue
+                        if path:
+                            break
+                    if path:
+                        break
+            if not path:
+                return False, f"Couldn't find the installed {browser} browser."
+            subprocess.Popen([path, url], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            return True, f"Opened {url} in {browser}."
         from .vault import open_link
         open_link(url)  # his default browser, whatever this OS calls it
         return True, f"Opened {url} in your browser."
@@ -292,13 +342,15 @@ def desktop_entries():
     return apps
 
 
-def launch_desktop_entry(app):
+def launch_desktop_entry(app, url=None):
     # gio takes the file itself, so it works even if this process's XDG_DATA_DIRS differs.
     for command in (["gio", "launch", app.get("Path", "")], ["gtk-launch", app["AppID"]]):
         if shutil.which(command[0]) and command[-1]:
+            if url:
+                command.append(url)
             subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
-            return True, f"Opened {app['Name']}."
+            return True, f"Opened {url} in {app['Name']}." if url else f"Opened {app['Name']}."
     return False, "Can't launch apps: install gtk3 (gtk-launch) or glib2 (gio)."
 
 
@@ -322,6 +374,58 @@ def _run(*args):
     return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=10,
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def _windows_media_state():
+    """Return the current SMTC session's status and source app, if available.
+
+    PowerShell's WinRT APIs can emit non-terminating errors while returning exit
+    code zero. Make those errors terminating and convert failures into a clear,
+    non-zero result so callers never toggle blindly on an unreadable state.
+    """
+    script = r'''
+$ErrorActionPreference = 'Stop'
+try {
+    $null = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager,Windows.Media.Control,ContentType=WindowsRuntime]
+    $op = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
+    $manager = [System.WindowsRuntimeSystemExtensions]::AsTask($op).GetAwaiter().GetResult()
+    $session = $manager.GetCurrentSession()
+    if ($null -eq $session) { '{"status":null,"app_id":null}'; exit 0 }
+    $status = $session.GetPlaybackInfo().PlaybackStatus.ToString()
+    @{status=$status; app_id=$session.SourceAppUserModelId} | ConvertTo-Json -Compress
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'''
+    out = _run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script)
+    if out.returncode:
+        return None
+    try:
+        data = json.loads(out.stdout.strip() or "null")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _spotify_ready():
+    state = _windows_media_state()
+    app_id = str((state or {}).get("app_id") or "").lower()
+    return "spotify" in app_id
+
+
+def _wait_for_spotify(timeout=6.0, interval=0.25, clock=None, sleep=None):
+    """Wait up to six seconds for Spotify's SMTC session to become available."""
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    deadline = clock() + timeout
+    while True:
+        if _spotify_ready():
+            return True
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return False
+        sleep(min(interval, remaining))
 
 
 def _flat(text):
@@ -385,8 +489,8 @@ def focus_window(name):
 
 def close_app(name):
     """Close the windows of the app called `name`, matched by app (process or window
-    class) first. A title match is used only when it names exactly one window, so
-    "close markets" can't take a whole browser down with it."""
+    class) first. A title match is used only when it names exactly one window, so a
+    vague title cannot take a whole browser down with it."""
     query = _flat(ALIASES.get(name.strip().lower(), name))
     if len(query) < 2:
         return False, "Say which app to close."
@@ -411,6 +515,16 @@ def media(command):
     if command not in MEDIA:
         return False, f"Media commands: {', '.join(MEDIA)}."
     if os.name == "nt":
+        if command in ("play", "pause"):
+            state = _windows_media_state()
+            status = str((state or {}).get("status") or "").lower()
+            # Unknown state: never toggle blind, or "play" could pause what's playing.
+            # (Tested live: with no media session the key does nothing anyway.)
+            if status not in ("playing", "paused", "stopped"):
+                return False, "Couldn't read the Windows media playback state."
+            if (command == "play" and status == "playing") or (
+                    command == "pause" and status in ("paused", "stopped")):
+                return True, "Already playing." if command == "play" else "Already paused."
         _press(VK.get(command, VK["play_pause"]))
         return True, "Pressed play/pause." if command in ("play", "pause", "play_pause") \
             else f"Pressed {command}."
@@ -424,12 +538,32 @@ def media(command):
                   "stop": "Stopped."}[command]
 
 
+def _volume_core_audio(level):
+    """Set the Windows master volume exactly through Core Audio, then say what it is.
+    up/down move VOLUME_STEP percent; mute/unmute set the state rather than toggle."""
+    from .observe import core_audio
+    if level in ("mute", "unmute"):
+        scalar, muted = core_audio(mute=level == "mute")
+    elif level in ("up", "down"):
+        now, _ = core_audio()
+        step = VOLUME_STEP / 100 * (1 if level == "up" else -1)
+        scalar, muted = core_audio(level=min(1.0, max(0.0, now + step)),
+                                   mute=False if level == "up" else None)
+    else:
+        scalar, muted = core_audio(level=int(level) / 100)
+    return True, f"Volume is {round(scalar * 100)} percent" + (", muted." if muted else ".")
+
+
 def volume(level):
     level = level.strip().lower().rstrip("%").strip()
     level = {"louder": "up", "higher": "up", "quieter": "down", "lower": "down"}.get(level, level)
     if not (level in ("up", "down", "mute", "unmute") or (level.isdigit() and int(level) <= 100)):
         return False, "Volume takes up, down, mute, unmute or a level from 0 to 100."
     if os.name == "nt":
+        try:
+            return _volume_core_audio(level)
+        except (LookupError, OSError, ValueError):
+            pass  # no Core Audio here: fall back to media keys below
         if level in ("mute", "unmute"):
             _press(VK["mute"])  # Windows only toggles
             return True, "Toggled mute."

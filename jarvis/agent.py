@@ -30,6 +30,9 @@ through the ask_jarvis tool.
 
 - For any request, question or command beyond a greeting or small talk, call ask_jarvis
   with David's words as close to verbatim as you can. Never make up facts about him.
+- Treat every utterance as addressed to you; never wait for a wake word such as "Jarvis".
+- Let David interrupt you at any point. Stop speaking immediately and answer his new turn,
+  including while a tool is running. Never require him to repeat himself after interruption.
 - While waiting, say at most a few words ("One moment.").
 - Speak the tool's answer naturally and briefly. Skip code, links and markdown; say
   it's in the console instead.
@@ -204,7 +207,12 @@ class Agent:
         if not agent or not ID.fullmatch(agent):
             raise ValueError("No ElevenLabs agent yet. Run: jarvis voice agent-setup")
         _call("PATCH", f"/convai/agents/{agent}", self.key(), {
-            "conversation_config": {"agent": {"prompt": {"prompt": PROMPT, "tools": TOOLS}}},
+            "conversation_config": {
+                "asr": {"quality": "high", "user_input_audio_format": "pcm_16000",
+                        "keywords": ["JARVIS", "Obsidian", "Zenbook", "Dell"]},
+                "agent": {"prompt": {"prompt": PROMPT, "tools": TOOLS}},
+                "conversation": {"client_events": ["audio", "interruption", "agent_chat_response_part"]},
+            },
             "platform_settings": {"overrides": OVERRIDES}}, timeout=60)
         return {**self.status(), "synced": True}
 
@@ -218,6 +226,7 @@ class Agent:
             },
             "asr": {"quality": "high", "user_input_audio_format": "pcm_16000",
                     "keywords": ["JARVIS", "Obsidian", "Zenbook", "Dell"]},
+            "conversation": {"client_events": ["audio", "interruption", "agent_chat_response_part"]},
         }
         if self.voice_id():
             config["tts"] = {"voice_id": self.voice_id()}

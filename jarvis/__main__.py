@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--config", default=str(HOME / "jarvis.config.json"))
     parser.add_argument("--state", default=str(HOME / ".jarvis"))
     sub = parser.add_subparsers(dest="command", required=True)
+    from .cluster_cli import parser as cluster_parser
+    cluster_parser(sub)
     sub.add_parser("doctor")
     inv = sub.add_parser("inventory")
     inv.add_argument("--device", default="local")
@@ -54,10 +56,6 @@ def main():
         cmd.add_argument("id")
         if name == "run":
             cmd.add_argument("--timeout", type=int, default=900)
-    mk = sub.add_parser("markets", help="True Markets recon: quotes, intel, strategies")
-    mk.add_argument("action", choices=("setup", "status", "quote", "intel", "monitor",
-                                       "strategies", "backtest"))
-    mk.add_argument("value", nargs="?", help="setup: key file; quote: ticker; backtest: id")
     cb = sub.add_parser("clipboard", help="Unified clipboard with the other laptop over SSH")
     cb.add_argument("action", choices=("start", "stop", "status", "run", "autostart", "serve"))
     cb.add_argument("value", nargs="?", help="autostart: on|off")
@@ -72,8 +70,8 @@ def main():
     lm.add_argument("--capture-backend", help="config: e.g. layer-shell on Hyprland")
     lm.add_argument("--output", help="config: write here instead of printing")
     dk = sub.add_parser("desktop", help="Open an app or link here (the other laptop calls this)")
-    dk.add_argument("action", choices=("open_app", "open_url", "list_apps", "open_page",
-                                       "close_app", "media", "volume"))
+    from .remote import ACTIONS
+    dk.add_argument("action", choices=ACTIONS)  # focus_window was missing, so SSH callers failed
     dk.add_argument("value", nargs="?", default="")
     dk.add_argument("--b64", default=None, help="the value, base64 (how SSH callers pass it)")
     dk.add_argument("--device", default=None, help="run it on this configured laptop instead")
@@ -181,7 +179,21 @@ def main():
         config_path = Path(args.config).resolve()
         base = config_path.parent
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        config["devices"] = devices_here(config.get("devices", {}))
+        from .topology import enabled, identity, is_node
+        if args.command == "cluster":
+            from .cluster_cli import run as cluster_command
+            result = cluster_command(args, config, base)
+            if result is not None:
+                emit(result)
+            return 0
+        if enabled(config):
+            identity(config)
+        else:
+            config["devices"] = devices_here(config.get("devices", {}))
+        if is_node(config) and args.command in ("add", "runs", "show", "plan", "engineer", "run",
+                "mem", "orchestrate", "kb", "vault", "tasks", "task", "credits", "grokbot", "route",
+                "send", "fetch", "inbox"):
+            raise ValueError("This PC is a proxy node. Use the main console or jarvis ask for shared state and control.")
         if args.command == "doctor":
             emit({"version": __version__, "tools": {name: shutil.which(name) is not None
                   for name in ("codex", "claude", "ssh", "tailscale", "lan-mouse",
@@ -190,7 +202,9 @@ def main():
                             ("ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_ID")},
                   "devices": config.get("devices", {}),
                   "personal_agents": config.get("personal_agents", {}),
-                  "desktop": config.get("desktop", {}), "vault": vault_doctor(config, args.state),
+                  "desktop": config.get("desktop", {}),
+                  "cluster": config.get("cluster", {"enabled": False}),
+                  "vault": {"hosted_on": identity(config)[1]} if is_node(config) else vault_doctor(config, args.state),
                   "note": "Installed tools do not prove authentication or connectivity."})
         elif args.command == "overlay":
             from . import overlay
@@ -218,7 +232,17 @@ def main():
                 device = config.get("devices", {}).get(args.device)
                 if not device:
                     raise ValueError("Unknown configured device.")
-                if device["transport"] == "local":
+                if enabled(config):
+                    from .cluster import Client, dispatch
+                    local, main = identity(config)
+                    if args.device == local:
+                        result = collect()
+                    elif local != main:
+                        result = Client(config, args.state).request("/v1/control", {
+                            "node": args.device, "kind": "inventory", "payload": {}})
+                    else:
+                        result = dispatch(config, args.state, args.device, "inventory", {})
+                elif device["transport"] == "local":
                     result = collect()
                 else:
                     result = ssh_inventory(device.get("target"), device.get("identity_file"))
@@ -227,29 +251,6 @@ def main():
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_text(json.dumps(result, indent=2), encoding="utf-8")
             emit(result)
-        elif args.command == "markets":
-            from .markets import TrueMarkets, setup as markets_setup
-            from .strategy import Book, run as run_strategy
-            market = TrueMarkets(args.state, config)
-            if args.action == "setup":
-                if not args.value:
-                    raise ValueError("Usage: jarvis markets setup <truemarkets-key.json>")
-                emit(markets_setup(args.state, args.value))
-            elif args.action == "quote":
-                emit(market.quote((args.value or "BTC").upper()))
-            elif args.action == "intel":
-                emit(market.intel())
-            elif args.action == "monitor":
-                emit([{k: r[k] for k in r if k != "spark"} for r in market.monitor()["rows"]])
-            elif args.action == "strategies":
-                emit(Book(args.state).all())
-            elif args.action == "backtest":
-                result = run_strategy(Book(args.state).get(args.value or ""), market)
-                emit({"summary": result["summary"], "results": [
-                    {k: r.get(k) for k in ("symbol", "metrics", "signal", "error")}
-                    for r in result["results"]]})
-            else:
-                emit(market.status())
         elif args.command == "clipboard":
             from . import clipsync
             if args.action == "serve":  # the remote half, for manual testing over a pipe
@@ -575,13 +576,19 @@ def render_agenda(agenda, view="agenda"):
 
 
 def cognition(args, config, base):
+    from .topology import is_node
+    node = is_node(config)
+    if node and args.command in ("ask", "chat"):
+        from .cluster_cli import proxy_cognition
+        return proxy_cognition(args, config)
     from .assistant import ask
     from .memory import Memory
     from .orchestrator import Orchestrator
     from .router import pick_adapter
     from .speech import Voice
 
-    store, memory = Store(args.state, lanes_from(config)), Memory(args.state)
+    store = None if node else Store(args.state, lanes_from(config))
+    memory = None if node else Memory(args.state)
     if args.command == "route":
         from .assistant import decide
         route = decide(args.text, config, conversational=True)
@@ -692,6 +699,8 @@ def cognition(args, config, base):
         else:
             emit(orch.load(args.value or ""))
     elif args.command == "voice":
+        if node and args.action in ("agent-setup", "agent"):
+            raise ValueError("The shared voice agent is configured on the main PC.")
         voice = Voice(args.state, config)
         if args.action == "setup":
             from .speech import setup
