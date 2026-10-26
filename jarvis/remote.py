@@ -7,7 +7,7 @@ DesktopTools directly. The other laptop is reached the same way Grokbot prompts 
   open on David's screen, not in the SSH session.
 - Zenbook -> Dell: Windows OpenSSH sessions can't reach the desktop, so the Dell's JARVIS
   keeps `grokbot tunnel` running; its loopback relay takes /desktop calls with the token.
-Only the actions below travel (open_page: a console page, e.g. the Pro terminal, as a window;
+Only the actions below travel (open_page: a console page, e.g. the knowledge page, as a window;
 close_app, media and volume: close an app's windows, play/pause/skip, speaker volume);
 arguments go as base64 or JSON data, never as code.
 A laptop can be named by its key, hostname, configured `aliases` ("arch", "asus"...) or
@@ -25,10 +25,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media", "volume")
+ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media",
+           "volume", "observe", "input_info")
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
-       "focus_window": "name", "close_app": "name", "media": "command", "volume": "level"}
+       "focus_window": "name", "close_app": "name", "media": "command", "volume": "level",
+       "observe": "predicate", "input_info": "query"}
 # Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
 SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
@@ -88,6 +90,12 @@ def run_here(action, arg, tools=None):
     if action == "open_page":
         from .showcase import open_page
         return open_page(arg)
+    if action == "observe":  # read-only: did the last action's window appear?
+        from .observe import run
+        return run(arg)
+    if action == "input_info":  # read-only: screens and Lan Mouse, for Settings
+        from .sharedinput import run
+        return run(arg)
     if tools is None:
         from .actions import DesktopTools
         tools = DesktopTools()
@@ -100,6 +108,9 @@ class Remote:
         self.machines = config.get("devices", {})
 
     def here(self):
+        from .topology import enabled, identity
+        if enabled(self.config):
+            return identity(self.config)[0]
         from .grokbot import Grokbot
         return Grokbot(self.config, self.state).here()
 
@@ -123,6 +134,9 @@ class Remote:
         None means this laptop; an unknown name comes back as it was."""
         word = re.sub(r"^(?:the|my)\s+|\s+(?:laptop|pc|computer|machine)$", "",
                       re.sub(r"\s+", " ", str(name or "").strip().lower()))
+        from .topology import enabled, identity
+        if enabled(self.config) and word in ("main", "main pc", "controller"):
+            return identity(self.config)[1]
         if word in ("", "here", "local", "this", "this one"):
             return None
         for key, machine in self.machines.items():
@@ -139,6 +153,40 @@ class Remote:
         if action not in ACTIONS:
             return False, f"Unknown desktop action {action}."
         device = self.resolve(device)
+        from .topology import ORIGIN, enabled, identity
+        if enabled(self.config):
+            from .cluster import Client, NodeOffline, dispatch
+            local, main = identity(self.config)
+            target = device or ORIGIN.get() or local
+            if target not in self.machines:
+                return False, f"Unknown node {target!r}; known: {', '.join(self.names())}."
+            if target == local:
+                # This machine acts itself. On a node this matters: the main's SSH fallback
+                # runs `jarvis desktop ...` here, and routing that back through the main
+                # would send it to this (stopped) node agent again.
+                return run_here(action, arg, self.tools)
+            try:
+                payload = {"action": action, "arg": arg}
+                if local != main:
+                    result = Client(self.config, self.state).request("/v1/control", {
+                        "node": target, "kind": "desktop", "payload": payload}, timeout=50)
+                elif target == main:
+                    return run_here(action, arg, self.tools)
+                else:
+                    result = dispatch(self.config, self.state, target, "desktop", payload)
+                return bool(result.get("ok")), str(result.get("text", ""))
+            except NodeOffline as exc:
+                # Only a pre-dispatch offline verdict permits another transport.
+                # Timeouts and lost acknowledgements may already have had effects.
+                machine = self.machines[target]
+                if local == main and machine.get("transport") == "ssh" and machine.get("target"):
+                    try:
+                        return self._ssh(target, machine, action, arg)
+                    except (OSError, subprocess.SubprocessError, ValueError, LookupError) as fallback:
+                        return False, f"Couldn't reach {target}: {fallback}"
+                return False, str(exc)
+            except (OSError, ValueError, RuntimeError) as exc:
+                return False, str(exc)
         if not device or device == self.here():
             return run_here(action, arg, self.tools)
         if device not in self.machines:
@@ -166,8 +214,12 @@ class Remote:
                 "-o", "ConnectTimeout=6"]
         if machine.get("identity_file"):
             args += ["-i", str(Path(machine["identity_file"]).expanduser()), "-o", "IdentitiesOnly=yes"]
+        from .cluster_tunnel import pinned_host
+        from .transfer import _check_target
+        args += pinned_host(machine, self.state)
         last = ""
         for target in [machine["target"], *machine.get("fallback_targets", [])]:
+            _check_target(target)
             out = subprocess.run([*args, target, remote], capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", timeout=45, creationflags=FLAGS)
             if out.returncode == 255:  # ssh itself failed: try the next address
@@ -194,8 +246,11 @@ class Remote:
             with urllib.request.urlopen(req, timeout=45) as res:
                 body = _loads(res.read())
         except urllib.error.HTTPError as exc:
-            body = _loads(exc.read())
-            return False, body.get("error") or f"{device} refused ({exc.code})."
+            try:
+                body = _loads(exc.read())
+                return False, body.get("error") or f"{device} refused ({exc.code})."
+            finally:
+                exc.close()
         except (urllib.error.URLError, OSError):
             raise ConnectionError(f"the tunnel from {device} is down")
         return bool(body.get("ok")), str(body.get("text", ""))

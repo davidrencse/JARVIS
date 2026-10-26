@@ -47,13 +47,18 @@ def grok_first(text, config):
     such requests go straight to it instead of waiting on the brain to pick a tool.
     routing.orchestrator: "grokbot" (default) or "brain"; routing.grok_scope: "accounts"
     (default: email, logged-in sites, the web, anything naming Grok) or "all"."""
+    if not grok_available(config):
+        return False
+    return config.get("routing", {}).get("grok_scope", "accounts") == "all" or bool(WEB.search(text))
+
+
+def grok_available(config):
+    """Grok Bot is configured as the orchestrator and JARVIS may type to it."""
     routing = config.get("routing", {})
     agent = config.get("personal_agents", {}).get("grokbot", {})
-    if (routing.get("orchestrator", "grokbot") != "grokbot"
-            or agent.get("integration") != "window_automation"
-            or not config.get("actions", {}).get("grokbot", True)):
-        return False
-    return routing.get("grok_scope", "accounts") == "all" or bool(WEB.search(text))
+    return (routing.get("orchestrator", "grokbot") == "grokbot"
+            and agent.get("integration") == "window_automation"
+            and bool(config.get("actions", {}).get("grokbot", True)))
 
 
 def pick_adapter(text, config):

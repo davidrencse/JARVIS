@@ -77,8 +77,9 @@ def _name_ok(name):
 
 
 class Storage:
-    def __init__(self, config):
+    def __init__(self, config, state=None):
         self.config = config
+        self.state = state
 
     # ---- devices and roots -------------------------------------------------------------
     def device(self, device_id):
@@ -88,6 +89,10 @@ class Storage:
         return device
 
     def is_remote(self, device_id):
+        from .topology import enabled, identity
+        if enabled(self.config):
+            self.device(device_id)
+            return device_id != identity(self.config)[0]
         return self.device(device_id).get("transport") == "ssh"
 
     def roots(self, device_id):
@@ -143,6 +148,13 @@ class Storage:
         return res
 
     def _remote(self, device_id, path, action):
+        from .topology import enabled
+        if enabled(self.config):
+            if self.state is None:
+                raise ValueError("Node storage queries require the main runtime's state directory.")
+            from .cluster import dispatch
+            return dispatch(self.config, self.state, device_id, "storage", {
+                "path": path or "", "action": action})
         device = self.device(device_id)
         _check_target(device.get("target"))
         ssh = shutil.which("ssh")

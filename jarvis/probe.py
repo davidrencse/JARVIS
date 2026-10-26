@@ -153,37 +153,36 @@ def remote_summary(kv):
     }
 
 
-def verdict(local, remote, device_ip):
+def verdict(local, remote, device_ip, local_name="Dell", remote_name="Zenbook"):
     """One plain-language line per concern, worst first, for the Machines panel."""
     issues = []
     lm_local, lm_remote = local.get("lan_mouse", {}), (remote or {}).get("lan_mouse", {})
     if remote and not remote.get("reachable"):
-        issues.append(("down", remote.get("error") or "Zenbook unreachable."))
+        issues.append(("down", remote.get("error") or f"{remote_name} unreachable."))
     elif remote and not remote.get("ssh"):
         issues.append(("down", remote.get("error") or "SSH failed."))
     if not lm_local.get("running"):
-        issues.append(("down", "Lan Mouse isn't running on the Dell. Restart it with "
-                               "“JARVIS Lan Mouse.vbs” in the Startup folder, which also "
-                               "restarts its watchdog."))
+        issues.append(("down", f"Lan Mouse isn't running on the {local_name}."))
     elif not lm_local.get("listening"):
-        issues.append(("warn", f"Dell Lan Mouse isn't holding UDP {PORT}."))
+        issues.append(("warn", f"{local_name} Lan Mouse isn't holding UDP {PORT}."))
     if remote and remote.get("ssh"):
         if not lm_remote.get("running"):
-            issues.append(("down", "Lan Mouse isn't running on the Zenbook."))
+            issues.append(("down", f"Lan Mouse isn't running on the {remote_name}."))
         elif lm_remote.get("fallback") == "active":
-            issues.append(("warn", "Zenbook is on the fallback (official) Lan Mouse build."))
+            issues.append(("warn", f"{remote_name} is on the fallback (official) Lan Mouse build."))
         if remote.get("ip") and device_ip and remote["ip"] != device_ip:
-            issues.append(("warn", f"Zenbook moved to {remote['ip']} (paired as {device_ip}); "
+            issues.append(("warn", f"{remote_name} moved to {remote['ip']} (paired as {device_ip}); "
                                    "regenerate the Lan Mouse config."))
         if lm_local.get("peers") and remote.get("ip") and remote["ip"] not in lm_local["peers"]:
-            issues.append(("warn", "Dell is sending to "
-                                   f"{', '.join(lm_local['peers'])}, not the Zenbook's {remote['ip']}."))
+            issues.append(("warn", f"{local_name} is sending to "
+                                   f"{', '.join(lm_local['peers'])}, not {remote_name}'s {remote['ip']}."))
         if (remote["mem_avail_pct"] if remote.get("mem_avail_pct") is not None else 100) < 10:
-            issues.append(("warn", f"Zenbook memory is tight ({remote['mem_avail_pct']}% free); "
+            issues.append(("warn", f"{remote_name} memory is tight ({remote['mem_avail_pct']}% free); "
                                    "expect input lag."))
         if remote.get("wifi_power_save") == "on":
-            issues.append(("warn", "Zenbook Wi-Fi power save is on again; it causes Lan Mouse lag."))
-    up = "Both Lan Mouse daemons are up and holding UDP 4242."
+            issues.append(("warn", f"{remote_name} Wi-Fi power save is on; it can cause Lan Mouse lag."))
+    up = ("Both Lan Mouse daemons are up and holding UDP 4242." if remote is not None
+          else f"{local_name} Lan Mouse is up and holding UDP 4242.")
     if not issues:
         return "up", [up]
     if not any(level == "down" for level, _ in issues):
@@ -195,8 +194,9 @@ def verdict(local, remote, device_ip):
 class Prober:
     """Cached, single-flight probe so many open tabs don't SSH in parallel."""
 
-    def __init__(self, config, max_age=55):
+    def __init__(self, config, max_age=55, state=None):
         self.config, self.max_age = config, max_age
+        self.state = state
         self._lock, self._result = threading.Lock(), None
 
     def get(self, refresh=False):
@@ -207,6 +207,18 @@ class Prober:
             return self._result
 
     def _probe(self):
+        from .topology import enabled, identity
+        if enabled(self.config):
+            from .cluster import _HUBS
+            here, main = identity(self.config)
+            hub = _HUBS.get(str(Path(self.state).resolve())) if self.state else None
+            live = {n["id"]: n for n in hub.broker.nodes()} if hub else {}
+            results = {name: {"local": name == here, "reachable": name == here or live.get(name, {}).get("online", False),
+                             "via": "main" if name == main else "node", **live.get(name, {})}
+                       for name in self.config.get("devices", {})}
+            return {"checked_at": time.time(), "devices": results,
+                    "input_link": {"level": "warn", "lines": [
+                        "Node reachability is reported by authenticated heartbeats. Input sharing is configured separately."]}}
         devices = self.config.get("devices", {})
         results, threads = {}, []
 
@@ -222,11 +234,26 @@ class Prober:
             threads.append(thread)
         for thread in threads:
             thread.join(20)
-        local = next((r for r in results.values() if r.get("local")), {"lan_mouse": {}})
-        remote_name = next((n for n, d in devices.items() if d.get("transport") == "ssh"), None)
-        remote = results.get(remote_name) if remote_name else None
-        device_ip = (devices.get(remote_name, {}).get("target", "").split("@")[-1]
-                     if remote_name else None)
-        level, lines = verdict(local, remote, device_ip)
+        local_id = next((n for n, r in results.items() if r.get("local")), None)
+        local = results.get(local_id, {"lan_mouse": {}})
+        local_label = (devices.get(local_id, {}).get("hostname") or local_id or "Local device")
+        assessments = []
+        for remote_id, device in devices.items():
+            if device.get("transport") != "ssh":
+                continue
+            remote = results.get(remote_id)
+            device_ip = device.get("target", "").split("@")[-1] or None
+            remote_label = device.get("hostname") or remote_id
+            assessments.append(verdict(local, remote, device_ip, local_label, remote_label))
+        if not assessments:
+            assessments.append(verdict(local, None, None, local_label))
+        level = max((item[0] for item in assessments), key={"up": 0, "warn": 1, "down": 2}.get)
+        lines = list(dict.fromkeys(line for _, items in assessments for line in items))
+        if len(assessments) > 1:
+            lines = [line.replace("Both Lan Mouse daemons are up and holding UDP 4242.",
+                                  "Lan Mouse daemons are up across configured computers and holding UDP 4242.")
+                     for line in lines]
+        if level == "down":
+            lines = [line for line in lines if " daemons are up " not in line and " Lan Mouse is up " not in line]
         return {"checked_at": time.time(), "devices": results,
                 "input_link": {"level": level, "lines": lines}}

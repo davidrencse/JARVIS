@@ -117,6 +117,9 @@ def stop_process(process):
 
 
 def run_task(store, task_id, config, base, timeout=900):
+    from .topology import is_node
+    if is_node(config):
+        raise ValueError("Model tasks run on the main PC. Submit this request through jarvis ask.")
     if not 1 <= timeout <= 3600:
         raise ValueError("timeout must be between 1 and 3600 seconds.")
     task = store.get(task_id)
