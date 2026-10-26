@@ -65,17 +65,20 @@ class Console:
     """Everything the HTTP layer exposes, kept separate so tests can call it directly."""
 
     def __init__(self, config, base, state):
+        from .topology import is_node
+        if is_node(config):
+            raise ValueError("A node uses the main PC's console proxy, not a local JARVIS brain.")
         self.config, self.base, self.state = config, Path(base), Path(state).resolve()
         self.store = Store(self.state, lanes_from(config))
         self.memory = Memory(self.state)
         self.credits = Credits(self.state, config)
-        self.prober = Prober(config)
+        self.prober = Prober(config, state=state)
         self.jobs, self._jobs_lock = {}, threading.Lock()
         self.max_jobs = 200  # the page only ever polls recent ones; older entries are dropped
         self._ears = self._stt = None
         self._voice_lock = threading.Lock()
         self.bus, self.watcher = Bus(), None
-        self._lane = self._speaker = self._agent = self._markets = None
+        self._lane = self._speaker = self._agent = None
         self._lane_lock = threading.Lock()
 
     # ---- live: event stream, warm brain, speech ---------------------------------------
@@ -84,8 +87,6 @@ class Console:
         vault = self.vault()
         self.watcher = Watcher(self.bus, self.state, self.memory, self.store,
                                vault=vault.root if vault else None).start()
-        from .paper import ensure_ticker
-        ensure_ticker(self.state, self.config, self.markets())  # paper strategies keep trading
         if warm:
             def warm_up():
                 try:
@@ -94,6 +95,8 @@ class Console:
                 except Exception as exc:  # no codex/claude: asks fall back to one-shot runs
                     self.bus.publish("brain.state", {**self.brain(), "error": str(exc)})
             threading.Thread(target=warm_up, daemon=True).start()
+            from .pipeline import warm
+            warm()  # the installed-app list, so the first direct action is fast
         return self
 
     def close(self):
@@ -152,84 +155,6 @@ class Console:
         reply = job["result"].get("reply", "")
         return {"reply": spoken(reply, 1200), "job": job["id"]}
 
-    # ---- markets: True Markets recon + strategy lab (read-only) ----------------------
-    def markets(self):
-        with self._lane_lock:
-            if self._markets is None:
-                from .markets import TrueMarkets
-                self._markets = TrueMarkets(self.state, self.config)
-            return self._markets
-
-    def strategies(self):
-        from .strategy import Book
-        return Book(self.state)
-
-    def pipeline(self, refresh=False):
-        """Feed -> signals -> review -> execution (off), each stage with live counts."""
-        cached = getattr(self, "_pipeline", None)
-        if cached and not refresh and time.time() - cached["at"] < 60:
-            return cached
-        from .strategy import scan
-        market, t0 = self.markets(), time.time()
-        feed = {"ok": False, **market.status()}
-        try:
-            universe, monitor = market.universe(), market.monitor(40)
-            feed.update(ok=True, assets=len(universe), priced=len(monitor["rows"]),
-                        unpriced=len(monitor["unpriced"]),
-                        latency_ms=round((time.time() - t0) * 1000))
-        except Exception as exc:
-            feed["error"] = str(exc)
-        signals = {"ok": False}
-        if feed["ok"]:
-            try:
-                signals = {"ok": True, **scan(self.strategies().all(), market)}
-            except Exception as exc:
-                signals["error"] = str(exc)
-        if market.last_error and (not market.last_ok or market.last_error[0] > market.last_ok):
-            feed["stale"] = market.last_error[1]
-        self._pipeline = {"feed": feed, "signals": signals,
-                          "execution": {"enabled": False, "orders": 0,
-                                        "why": "Recon only: no order code is built in."},
-                          "seconds": round(time.time() - t0, 2), "at": time.time()}
-        return self._pipeline
-
-    def paper(self):
-        from .paper import Paper
-        return Paper(self.state)
-
-    def paper_summary(self, refresh=False):
-        """The practice account; a refresh re-runs the running strategies on live prices."""
-        paper = self.paper()
-        if refresh and self.markets().configured():
-            paper.tick(self.markets(), force=True)
-        return paper.summary()
-
-    def paper_action(self, action, body):
-        from .paper import ensure_ticker
-        paper, market = self.paper(), self.markets()
-        if action == "start":
-            spec = paper.start(str(body.get("id", "")), body.get("budget"))
-            ensure_ticker(self.state, self.config, market)
-            if market.configured():
-                paper.tick(market, force=True)
-            return {"started": spec["id"], **paper.summary()}
-        if action == "stop":
-            paper.stop(str(body.get("id", "")))
-        elif action == "order":
-            paper.order(body.get("symbol"), body.get("side"), body.get("usd"), market)
-        elif action == "reset":
-            paper.reset()
-        else:
-            raise LookupError(f"Unknown paper action {action}.")
-        return paper.summary()
-
-    def backtest(self, body):
-        from .strategy import run
-        spec = body.get("spec") or (self.strategies().get(body["id"]) if body.get("id") else None)
-        if not spec:
-            raise ValueError("Send a strategy (spec) or a saved strategy id.")
-        return run(spec, self.markets())
-
     # ---- vault tasks -----------------------------------------------------------------
     def vault(self):
         from .vault import vault_for
@@ -246,7 +171,7 @@ class Console:
         return tasks_for(vault)
 
     def vault_tasks(self, query=""):
-        """The task board: agenda buckets plus what the page needs to link into Obsidian."""
+        """Vault task agenda buckets plus fields needed by console API clients."""
         tasks = self.tasks()
         agenda = tasks.agenda(query=query or "")
         for name in ("overdue", "today", "in_progress", "upcoming", "later", "anytime", "done"):
@@ -290,8 +215,17 @@ class Console:
             voice = {"listening": False, "error": str(exc)}
         month = time.strftime("%Y-%m", time.gmtime())
         usage = _read_json(self.state / "voice-usage.json", {})
+        from .topology import enabled, identity
+        cluster = {"enabled": enabled(self.config)}
+        if cluster["enabled"]:
+            from .cluster import _HUBS
+            local, main = identity(self.config)
+            hub = _HUBS.get(str(self.state))
+            cluster.update(local_device=local, main_device=main, role="main",
+                           nodes=hub.broker.nodes() if hub else [])
         return {
             "version": __version__, "now": time.time(),
+            "cluster": cluster,
             "devices": self.devices(),
             "desktop": self.config.get("desktop", {}),
             "agents": self.config.get("personal_agents", {}),
@@ -735,7 +669,7 @@ class Console:
             route["handler"] = "specialist planner"
         return route
 
-    def submit(self, text, tier=None, speak=False, case=None):
+    def submit(self, text, tier=None, speak=False, case=None, origin_device=None, write=False):
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Say or type something for JARVIS to do.")
         if tier not in (None, "", "simple", "medium", "complex"):
@@ -743,6 +677,9 @@ class Console:
         job = {"id": uuid.uuid4().hex[:12], "text": text.strip(), "state": "running",
                "started": time.time(), "route": self.route(text.strip(), tier), "result": None,
                "error": None, "partial": "", "message": None}
+        from .topology import ORIGIN
+        job["origin_device"] = origin_device or ORIGIN.get()
+        job["write"] = bool(write)
         if case:
             self.case_item(case)
             job["case"] = case
@@ -774,9 +711,13 @@ class Console:
                 voice.put(text)
 
         try:
-            result = ask(job["text"], self.store, self.memory, self.config, self.base, tier,
-                         lane=self.lane(), on_sentence=sentence, on_start=started,
-                         on_step=turn.step, channel="console")
+            from .topology import request_from
+            with request_from(job.get("origin_device")):
+                result = ask(job["text"], self.store, self.memory, self.config, self.base, tier,
+                             write=job.get("write", False),
+                             lane=None if job.get("write") else self.lane(),
+                             on_sentence=sentence, on_start=started,
+                             on_step=turn.step, channel="console")
             if job.get("case"):
                 ids = list(result.get("memory", []))
                 if result.get("plan"):
@@ -869,7 +810,7 @@ class Console:
 
     def storage(self):
         from .storage import Storage
-        return Storage(self.config)
+        return Storage(self.config, self.state)
 
     def fs_list(self, device, path=""):
         return self.storage().list(device or "", path or "")
@@ -889,6 +830,34 @@ class Console:
     def grokbot(self):
         from .grokbot import Grokbot
         return Grokbot(self.config, self.state)
+
+    def confirmations(self):
+        from .confirm import ConfirmQueue
+        from .assistant import confirmation_origin
+        return {"pending": ConfirmQueue(self.state).pending(confirmation_origin(self.config, self.state))}
+
+    def confirmation(self, body):
+        from .assistant import confirm_pending
+        if not isinstance(body.get("id"), str):
+            raise ValueError("Choose a confirmation ID.")
+        result = confirm_pending(self.config, self.state, body["id"], body.get("action"),
+                                 hash=body.get("hash"))
+        self.bus.publish("turn.confirm", {"handled": body["id"]})
+        return result
+
+    def shared_input(self):
+        """Both computers' screens and Lan Mouse configs, cross-checked (read-only)."""
+        from .sharedinput import overview
+        return overview(self.config, self.state)
+
+    def command_history(self, limit=12):
+        """Recent fast-path requests with their commands and hops, for the tree's replay."""
+        from .history import History
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            raise ValueError("limit must be a number.")
+        return {"requests": History(self.state).requests(limit)}
 
     def grokbot_command(self, body):
         """Devices view: a command for Grokbot, a terminal, or a browser."""
@@ -998,6 +967,21 @@ class Handler(BaseHTTPRequestHandler):
         site = self.headers.get("Sec-Fetch-Site")
         return host in self.hosts and site in (None, "same-origin", "none")
 
+    def _refuse(self):
+        """403 a POST. A small unread body is drained first: closing a socket with unread
+        data makes Windows reset it, and the client sees an abort instead of the 403."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if 0 < length <= 65536:
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+        self.close_connection = True
+        return self._send(HTTPStatus.FORBIDDEN, {"error": "Refused."})
+
     def _events(self, query):
         """Server-Sent Events: what a reconnecting tab missed (Last-Event-ID), then live."""
         after = self.headers.get("Last-Event-ID") or query.get("after") or ""
@@ -1021,7 +1005,10 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
             while True:
                 try:
-                    write(sub.get(timeout=15))
+                    event = sub.get(timeout=15)
+                    if event is None:  # queue overflow: reconnect and reload authoritative state
+                        break
+                    write(event)
                 except queue.Empty:
                     self.wfile.write(b": keep-alive\n\n")
                 self.wfile.flush()
@@ -1045,6 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
         query = {k: v[-1] for k, v in parse_qs(url.query).items()}
         c = self.console
         routes = {
+            "/api/confirm": lambda: c.confirmations(),
             "/api/overview": c.overview,
             "/api/credits": lambda: c.credits.all(refresh=query.get("refresh") == "1"),
             "/api/graph/system": c.system_graph,
@@ -1058,21 +1046,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/route": lambda: c.route(query.get("text", ""), query.get("tier") or None),
             "/api/voice": lambda: c.daemon("status"),
             "/api/agent": lambda: c.agent().status(),
-            "/api/markets/status": lambda: c.markets().status(),
-            "/api/markets/monitor": lambda: c.markets().monitor(min(int(query.get("limit", 40)), 100)),
-            "/api/markets/intel": lambda: c.markets().intel(),
-            "/api/markets/pipeline": lambda: c.pipeline(query.get("refresh") == "1"),
-            "/api/markets/universe": lambda: c.markets().universe(),
-            "/api/markets/quote": lambda: c.markets().quote(query.get("symbol", "").upper()),
-            "/api/markets/history": lambda: c.markets().history(
-                query.get("symbol", "").upper(), query.get("window", "1d"),
-                query.get("resolution", "1h")),
-            "/api/strategies": lambda: c.strategies().all(),
-            "/api/paper": lambda: c.paper_summary(query.get("refresh") == "1"),
-            "/api/strategies/templates": lambda: __import__(
-                "jarvis.strategy", fromlist=["TEMPLATES"]).TEMPLATES,
             "/api/agent/voices": lambda: c.agent().voices(refresh=query.get("refresh") == "1"),
             "/api/grokbot": lambda: c.grokbot().status(),
+            "/api/history/commands": lambda: c.command_history(query.get("limit", 12)),
+            "/api/input/shared": c.shared_input,
             "/api/probe": lambda: c.prober.get(refresh=query.get("refresh") == "1"),
             "/api/usage": lambda: c.credits.claude_hourly(int(query.get("hours", 24))),
             "/api/inbox": lambda: c.inbox(query.get("device")),
@@ -1117,7 +1094,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._allowed() or self.headers.get("X-JARVIS") != "1":
-            return self._send(HTTPStatus.FORBIDDEN, {"error": "Refused."})
+            return self._refuse()
         url = urlparse(self.path)
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -1152,20 +1129,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw or b"{}")
             if not isinstance(body, dict):
                 raise ValueError("Request body must be a JSON object.")
+            if url.path == "/api/confirm":
+                return self._send(HTTPStatus.OK, c.confirmation(body))
             if url.path == "/api/ask":
                 return self._send(HTTPStatus.OK, c.submit(body.get("text"), body.get("tier"),
                                                           bool(body.get("speak")),
                                                           body.get("case") or None))
             if url.path == "/api/voice":
                 return self._send(HTTPStatus.OK, c.daemon(body.get("action")))
-            if url.path == "/api/strategies":
-                return self._send(HTTPStatus.OK, c.strategies().save(body))
-            if url.path == "/api/strategies/delete":
-                return self._send(HTTPStatus.OK, c.strategies().delete(str(body.get("id", ""))))
-            if url.path.startswith("/api/paper/"):
-                return self._send(HTTPStatus.OK, c.paper_action(url.path.rsplit("/", 1)[1], body))
-            if url.path == "/api/strategies/backtest":
-                return self._send(HTTPStatus.OK, c.backtest(body))
             if url.path == "/api/agent/session":
                 return self._send(HTTPStatus.OK, c.agent().session())
             if url.path == "/api/agent/voice":
@@ -1289,18 +1260,26 @@ def serve(config, base, state, port=7777, open_browser=False, app=False):
         print(f"JARVIS console is already running on {url}; opening its window.", flush=True)
         app_window(url, profile=profile)
         return 0
-    console = Console(config, base, state).start_live()
-    from .grokbot import autostart_tunnel
-    autostart_tunnel(config, state)  # Windows: lets the other laptop reach this one
-    handler = type("BoundHandler", (Handler,), {
-        "console": console, "hosts": ("127.0.0.1", "localhost", "::1")})
-    server = ConsoleServer(("127.0.0.1", port), handler)
+    from .topology import enabled
+    runtime = None
+    if enabled(config):
+        from .cluster_proxy import local_server
+        server, runtime = local_server(config, base, state, port)
+        console = runtime.console
+    else:
+        console = Console(config, base, state).start_live()
+        from .grokbot import autostart_tunnel
+        autostart_tunnel(config, state)
+        handler = type("BoundHandler", (Handler,), {
+            "console": console, "hosts": ("127.0.0.1", "localhost", "::1")})
+        server = ConsoleServer(("127.0.0.1", port), handler)
     print(f"JARVIS console on {url}  (Ctrl+C to stop)", flush=True)
     if app:
         app_window(url, profile=profile)
-        threading.Thread(target=close_with_window, args=(server, console.bus),
-                         daemon=True).start()
-        threading.Thread(target=ensure_window, args=(url, console.bus), daemon=True).start()
+        if not enabled(config):
+            threading.Thread(target=close_with_window, args=(server, console.bus),
+                             daemon=True).start()
+            threading.Thread(target=ensure_window, args=(url, console.bus), daemon=True).start()
     elif open_browser:
         webbrowser.open(url)
     try:
@@ -1308,6 +1287,9 @@ def serve(config, base, state, port=7777, open_browser=False, app=False):
     except KeyboardInterrupt:
         pass
     finally:
-        console.close()
+        if runtime:
+            runtime.close()
+        else:
+            console.close()
         server.server_close()
     return 0

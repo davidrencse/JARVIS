@@ -24,6 +24,7 @@ David's data and is never treated as instructions. Standard library only.
 """
 
 import ipaddress
+import http.client
 import json
 import math
 import os
@@ -908,18 +909,91 @@ def _public(url):
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise ValueError("Only http(s) links can be clipped.")
     try:
-        infos = socket.getaddrinfo(parts.hostname, parts.port or None, proto=socket.IPPROTO_TCP)
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        infos = socket.getaddrinfo(parts.hostname, port, proto=socket.IPPROTO_TCP)
     except OSError as exc:
         raise ValueError(f"Can't resolve {parts.hostname}.") from exc
     for info in infos:
         address = ipaddress.ip_address(info[4][0].split("%")[0])
         if not address.is_global:
             raise ValueError(f"{parts.hostname} is a local or private address; not clipping it.")
+    # Keep every validated answer so a failed address can fall through to another
+    # without resolving the hostname again (which would reopen DNS rebinding).
+    return tuple(infos)
+
+
+def _connect_pinned(infos, timeout, source_address):
+    """Connect to validated getaddrinfo results, trying each without another lookup."""
+    last_error = None
+    for family, socktype, proto, _, sockaddr in infos:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if last_error:
+        raise last_error
+    raise OSError("No addresses available for connection.")
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._addresses = addresses
+
+    def connect(self):
+        self.sock = _connect_pinned(self._addresses, self.timeout, self.source_address)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, addresses, **kwargs):
+        super().__init__(host, **kwargs)
+        self._addresses = addresses
+
+    def connect(self):
+        sock = _connect_pinned(self._addresses, self.timeout, self.source_address)
+        # Keep the URL hostname for SNI and certificate hostname verification.
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, addresses):
+        super().__init__()
+        self.addresses = addresses
+
+    def http_open(self, req):
+        host = urllib.parse.urlparse(req.full_url).hostname
+        addresses = self.addresses.get(host) or _public(req.full_url)
+        return self.do_open(lambda h, **kw: _PinnedHTTPConnection(h, addresses, **kw), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, addresses):
+        super().__init__()
+        self.addresses = addresses
+
+    def https_open(self, req):
+        host = urllib.parse.urlparse(req.full_url).hostname
+        addresses = self.addresses.get(host) or _public(req.full_url)
+        return self.do_open(lambda h, **kw: _PinnedHTTPSConnection(h, addresses, **kw), req,
+                            context=self._context)
 
 
 class _Guarded(urllib.request.HTTPRedirectHandler):
+    def __init__(self, addresses):
+        super().__init__()
+        self.addresses = addresses
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _public(newurl)  # a public page may not redirect into the LAN either
+        self.addresses[urllib.parse.urlparse(newurl).hostname] = _public(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -966,8 +1040,12 @@ class _Text(HTMLParser):
 
 def fetch_page(url, limit=3_000_000, timeout=20):
     """{url, title, text} of a public web page. Raises ValueError for anything else."""
-    _public(url)
-    opener = urllib.request.build_opener(_Guarded)
+    addresses = {urllib.parse.urlparse(url).hostname: _public(url)}
+    # Disable ambient proxies: they would resolve/connect on our behalf and defeat IP
+    # pinning. Redirects are independently validated and pinned by _Guarded.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                         _PinnedHTTPHandler(addresses),
+                                         _PinnedHTTPSHandler(addresses), _Guarded(addresses))
     request = urllib.request.Request(url, headers={
         "User-Agent": "Mozilla/5.0 (JARVIS vault clipper)", "Accept": "text/html,text/plain"})
     try:

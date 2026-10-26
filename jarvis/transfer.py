@@ -21,6 +21,10 @@ NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. ()+,@-]{0,199}")
 def ssh_device(config, name=None):
     """The configured laptop reached over SSH (the named one, else the first)."""
     devices = {k: v for k, v in config.get("devices", {}).items() if v.get("transport") == "ssh"}
+    from .topology import enabled, identity
+    if enabled(config):
+        local, _ = identity(config)
+        devices.pop(local, None)
     if name:
         if name not in devices:
             raise ValueError(f"{name!r} is not a configured SSH device.")
