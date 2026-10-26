@@ -80,17 +80,33 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
     text = text.strip()
     routing = config.get("routing", {})
     route = decide(text, config, tier, lane is not None, write)
+    inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
+                         meta={"route": route, "channel": channel}, importance=0.4)
+    if on_start:
+        on_start({"route": route, "message": inbound["id"]})
+    step = _stepper(on_step)
+    # This deterministic desktop shortcut needs no recalled context or model turn.
+    # Run it before vault/wiki/heap lookup so opening a laptop page feels immediate.
+    if route["tier"] == "simple" and not write:
+        quick_market = market_answer(text, config, memory.path.parent)
+        if quick_market is not None:
+            outbound = memory.add("reply", quick_market, source="jarvis",
+                                  tags=["outbound", route["tier"]],
+                                  meta={"lane": "instant"},
+                                  links=[("answers", inbound["id"])], importance=0.4)
+            step("instant", "route", "Instant", "market page opened without a model")
+            step("memory", "root", "Remembered", outbound["id"])
+            if on_sentence:
+                on_sentence(quick_market)
+            return {"tier": route["tier"], "reasons": route["reasons"],
+                    "reply": quick_market, "memory": [inbound["id"], outbound["id"]],
+                    "lane": "instant", "streamed": on_sentence is not None}
     # Vault notes first (what David knows and decided), then wiki claims with their
     # sources and dates, then the heap (what was said).
     notes = vault_recall(config, memory.path.parent, text)
     claims = kb_recall(config, memory.path.parent, text)
     heap = memory.context(text)
     recall = notes + claims + heap
-    inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
-                         meta={"route": route, "channel": channel}, importance=0.4)
-    if on_start:
-        on_start({"route": route, "message": inbound["id"]})
-    step = _stepper(on_step)
     step("recall", "root", "Recall", f"{len(notes)} vault · {len(claims)} wiki · {len(heap)} heap")
     step("route", "root", f"Route · {route['tier']}", "; ".join(route["reasons"]))
     reply, detail = None, {}

@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 PAGES = {"terminal": "terminal.html", "markets": "trade.html", "wiki": "knowledge.html",
@@ -29,7 +30,7 @@ SHOW_MARKET = re.compile(
     r"(?:check(?:\s+on)?|show(?:\s+me)?|pull\s+up|bring\s+up|open(?:\s+up)?|launch|"
     r"how(?:'s|\s+is|\s+are))\s+"
     r"(?:the\s+|my\s+)?(?:crypto\s+)?(?:markets?|pro\s+terminal|markets?\s+terminal|"
-    r"trading\s+terminal)\b(?:\s+(?:doing|looking))?(?:\s+(?:today|now|right\s+now))?"
+    r"trading\s+terminal)\b(?:\s+tab)?(?:\s+(?:doing|looking))?(?:\s+(?:today|now|right\s+now))?"
     r"(?:\s+(?:on|over\s+on)\s+(?:the\s+|my\s+)?(?P<device>[a-z]+(?:\s+linux)?)"
     r"(?:\s+(?:laptop|pc|computer))?)?"
     r"(?:\s+(?:please|for\s+me))?\W*$", re.I)
@@ -45,7 +46,11 @@ def serves_console(port, timeout=1.5):
 
 def console_port(ports=PORTS):
     """The port of a JARVIS console already running on this laptop, or None."""
-    return next((p for p in ports if serves_console(p)), None)
+    # Overlay ports are probed in parallel: serial connection timeouts made an
+    # already-running console look like a slow cold start on remote machines.
+    with ThreadPoolExecutor(max_workers=min(8, len(ports) or 1)) as pool:
+        return next((port for port, ready in zip(ports, pool.map(
+            lambda p: serves_console(p, timeout=0.35), ports)) if ready), None)
 
 
 def start_console(port=7777, wait=25):
@@ -111,12 +116,18 @@ def answer(text, config, state, remote=None, market=None):
     device = remote.resolve(match.group("device"))  # "arch linux" -> zenbook
     if device and device not in remote.names():
         return f"I don't know a laptop called {device}; I know {', '.join(remote.names())}."
+    # Opening the Markets tab is a UI request; don't hold it up on a live market
+    # data request. Status/check-market requests still include the spoken summary.
+    page = "markets" if re.search(r"\b(?:markets?\s+tab|open\s+(?:up\s+)?markets?)\b", text, re.I) else "terminal"
     try:
-        ok, text_ = remote.call(device, "open_page", "terminal")
+        ok, text_ = remote.call(device, "open_page", page)
     except Exception as exc:  # never let the shortcut take the turn down
         ok, text_ = False, str(exc)
     where = f" on the {device.title()}" if device and device != remote.here() else ""
-    opened = f"Pro terminal is up{where}." if ok else f"I couldn't open the Pro terminal{where}: {text_}"
+    label = "Markets" if page == "markets" else "Pro terminal"
+    opened = f"{label} is up{where}." if ok else f"I couldn't open {'the ' if page == 'terminal' else ''}{label}{where}: {text_}"
+    if page == "markets":
+        return opened
     if market is None:
         try:
             from .markets import TrueMarkets
