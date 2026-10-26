@@ -3,8 +3,7 @@
 // Reads only endpoints that already exist (/api/overview, /api/plans/<id>, /api/tasks/<id>)
 // and renders them in one grammar: inputs on the left, the subtask DAG as the spine, one
 // card per step in dependency order, then run log / dispatch / human gate across the foot.
-// Nothing here runs a plan: spending model calls stays behind the Tasks view's armed
-// button, so there is exactly one way to start work.
+// Plan execution has a short confirmation step because it starts real model runs.
 (function () {
   "use strict";
   const J = window.Jarvis;
@@ -174,7 +173,7 @@
       <span class="rv-sub">${plan ? esc(clip(plan.summary || plan.goal, 90)) : "—"}</span>
       <span class="${plan && plan.state !== "finished" ? "rv-wait" : "rv-sub"}">${esc(waiting)}</span>
       ${plan && plan.state === "planned"
-        ? `<button class="btn ghost sm rv-run" type="button" id="rv-open">Review and run in Tasks</button>` : ""}
+        ? `<button class="btn ghost sm rv-run" type="button" id="rv-run">Run this plan</button>` : ""}
     </div>`;
 
     return `<div class="rv-foot">
@@ -222,7 +221,25 @@
          <span class="rv-right">${plan ? esc(words(plan.state)) : "idle"} · nothing runs from this screen</span></div>`;
     graph = null;  // the old canvas went with the innerHTML
     spine(plan);
-    $("#rv-open")?.addEventListener("click", () => { location.hash = "tasks"; J.openPlan(plan.id); });
+    $("#rv-run")?.addEventListener("click", async (event) => {
+      const button = event.currentTarget;
+      if (button.dataset.armed !== "1") {
+        button.dataset.armed = "1";
+        button.textContent = "Confirm: run plan";
+        setTimeout(() => {
+          if (button.isConnected) { button.dataset.armed = ""; button.textContent = "Run this plan"; }
+        }, 4000);
+        return;
+      }
+      button.disabled = true;
+      try {
+        await api(`/api/plans/${encodeURIComponent(plan.id)}/run`, {});
+        await open(plan.id);
+      } catch (error) {
+        window.Jarvis.toast(error.message);
+        button.disabled = false;
+      }
+    });
   }
 
   async function open(id) {
