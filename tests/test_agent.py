@@ -180,6 +180,24 @@ class BrowserAgentTests(unittest.TestCase):
     def test_change_voice_reconnects_with_context(self):
         self.check_scenario("change_voice")
 
+    def test_corrupt_live_audio_is_sanitized(self):
+        self.check_scenario("corrupt_live_audio_is_silent_not_nan")
+
+    def test_live_mic_survives_removed_device_and_clamps_gain(self):
+        self.check_scenario("microphone_fallback_and_gain_limits")
+
+    def test_audio_preferences_reach_the_live_input(self):
+        self.check_scenario("audio_controls")
+
+    def test_all_microphones_select_one_input_and_use_one_playback_output(self):
+        self.check_scenario("all_microphones_select_one_input_and_use_one_playback_output")
+
+    def test_clearest_microphone_is_selected_from_live_signal(self):
+        self.check_scenario("clearest_microphone_is_selected_during_speech")
+
+    def test_multi_mic_falls_back_when_devices_are_unavailable(self):
+        self.check_scenario("all_microphone_mode_survives_unavailable_inputs")
+
 
 if __name__ == "__main__":
     unittest.main()

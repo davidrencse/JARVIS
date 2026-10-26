@@ -11,7 +11,6 @@ from jarvis import actions, remote
 from jarvis.actions import DesktopTools, is_action
 from jarvis.chatgpt import HANDOFF, Brain
 from jarvis.remote import Remote
-from jarvis.showcase import answer
 
 CONFIG = {"devices": {
     "dell": {"transport": "local", "hostname": "WinLaptop", "aliases": ["windows"]},
@@ -25,7 +24,7 @@ def done(out="", code=0, err=""):
 
 class RoutingTests(unittest.TestCase):
     def test_actions_anywhere_in_what_he_said(self):
-        for q in ("Shut up. Claude, open up the markets tab, like my markets tab on my Arch Linux.",
+        for q in ("Shut up. Claude, open the wiki page on my Arch Linux.",
                   "I want Spotify open on my Arch", "I need you to close Chrome",
                   "turn the volume down", "pause the music", "okay so, next song please",
                   "mute it on the dell"):
@@ -48,9 +47,9 @@ class NameTests(unittest.TestCase):
             self.assertEqual(self.remote.resolve(said), key, said)
 
     def test_named_laptop_is_reached_and_unknown_one_refused(self):
-        with patch.object(Remote, "_ssh", return_value=(True, "Opened Markets.")) as ssh:
-            self.assertEqual(self.remote.call("arch linux", "open_page", "markets"),
-                             (True, "Opened Markets."))
+        with patch.object(Remote, "_ssh", return_value=(True, "Opened Knowledge.")) as ssh:
+            self.assertEqual(self.remote.call("arch linux", "open_page", "wiki"),
+                             (True, "Opened Knowledge."))
         self.assertEqual(ssh.call_args.args[0], "zenbook")
         self.assertFalse(self.remote.call("toaster", "open_app", "x")[0])
 
@@ -60,18 +59,11 @@ class NameTests(unittest.TestCase):
         tools = DesktopTools(remote=self.remote)
         spec = next(s for s in tools.specs() if s["name"] == "volume")
         self.assertIn("Arch Linux", spec["description"])
-        for name, args in (("open_page", {"page": "markets"}), ("close_app", {"name": "Chrome"}),
+        for name, args in (("open_page", {"page": "wiki"}), ("close_app", {"name": "Chrome"}),
                            ("media", {"command": "pause"}), ("volume", {"level": "30"})):
             tools.call(name, {**args, "device": "zenbook"})
-        self.assertEqual(seen, [("zenbook", "open_page", "markets"), ("zenbook", "close_app", "Chrome"),
+        self.assertEqual(seen, [("zenbook", "open_page", "wiki"), ("zenbook", "close_app", "Chrome"),
                                 ("zenbook", "media", "pause"), ("zenbook", "volume", "30")])
-
-    def test_market_on_the_arch(self):
-        with patch.object(Remote, "_ssh", return_value=(True, "Opened.")) as ssh:
-            reply = answer("check the market on my Arch Linux", CONFIG, tempfile.gettempdir(),
-                           remote=self.remote, market=False)
-        self.assertEqual(ssh.call_args.args[:3], ("zenbook", CONFIG["devices"]["zenbook"], "open_page"))
-        self.assertIn("on the Zenbook", reply)
 
 
 class SessionTests(unittest.TestCase):
@@ -91,9 +83,9 @@ class SessionTests(unittest.TestCase):
 class LinuxControlTests(unittest.TestCase):
     CLIENTS = json.dumps([
         {"address": "0x55aa", "class": "google-chrome", "initialClass": "google-chrome", "title": "YouTube"},
-        {"address": "0x55bb", "class": "app.zen_browser.zen", "initialClass": "", "title": "True Markets — Zen"},
+        {"address": "0x55bb", "class": "app.zen_browser.zen", "initialClass": "", "title": "JARVIS Wiki — Zen"},
         {"address": "0x55cc", "class": "app.zen_browser.zen", "initialClass": "", "title": "Pinterest — Zen"},
-        {"address": "0x55dd", "class": "chrome-127.0.0.1__trade.html", "initialClass": "", "title": "JARVIS Markets"}])
+        {"address": "0x55dd", "class": "chrome-127.0.0.1__console.html", "initialClass": "", "title": "JARVIS Console"}])
 
     def run_with(self, calls, replies):
         def run(*args):
@@ -116,7 +108,7 @@ class LinuxControlTests(unittest.TestCase):
         calls = []
         replies = lambda a: done(self.CLIENTS) if a[1] == "clients" else done("ok")
         with self.run_with(calls, replies):
-            ok, text = actions.close_app("markets")
+            ok, text = actions.close_app("JARVIS")
         self.assertFalse(ok)
         self.assertIn("Several windows match", text)
         self.assertFalse([a for a in calls if a[1] == "dispatch"])
@@ -158,12 +150,12 @@ class HandoffTests(unittest.TestCase):
             return self.reply
 
     def test_talk_hands_a_missed_action_to_the_tools(self):
-        chat, act = self.Lane(HANDOFF + "."), self.Lane("Opened Markets on the Arch.")
+        chat, act = self.Lane(HANDOFF + "."), self.Lane("Opened Knowledge on the Arch.")
         spoken = []
-        reply = Brain(chat, act, wants=lambda t: False).ask("yo the markets thing on arch",
+        reply = Brain(chat, act, wants=lambda t: False).ask("yo the wiki page on arch",
                                                             on_sentence=spoken.append)
-        self.assertEqual(reply, "Opened Markets on the Arch.")
-        self.assertEqual(spoken, ["Opened Markets on the Arch."])  # the token is never spoken
+        self.assertEqual(reply, "Opened Knowledge on the Arch.")
+        self.assertEqual(spoken, ["Opened Knowledge on the Arch."])  # the token is never spoken
 
     def test_plain_talk_stays_talk(self):
         chat, act = self.Lane("Lima."), self.Lane("x")

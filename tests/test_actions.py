@@ -156,7 +156,8 @@ for line in sys.stdin:
         p = m["params"]
         assert p["approvalPolicy"] == "on-request"
         assert [t["name"] for t in p["dynamicTools"]] == ["open_app", "list_apps", "open_url",
-                                                          "open_page", "close_app", "media", "volume"]
+                                                          "open_page", "close_app", "focus_window",
+                                                          "media", "volume"]
         send({"method": "mcpServer/startupStatus/updated", "params": {"name": "playwright", "status": "ready"}})
         send({"id": rid, "result": {"thread": {"id": "t1"}}})
     elif meth == "turn/start":

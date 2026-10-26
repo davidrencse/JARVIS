@@ -112,7 +112,8 @@ class SyncTests(unittest.TestCase):
 
     def test_remote_half_is_standalone(self):
         """The remote side runs the file as a bare script with no package around it."""
-        source = open(clipsync.__file__, encoding="utf-8").read()
+        with open(clipsync.__file__, encoding="utf-8") as stream:
+            source = stream.read()
         scope = {"__name__": "jarvis_clip"}
         exec(compile(source, "remote", "exec"), scope)
         self.assertTrue(callable(scope["serve"]))

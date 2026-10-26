@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 import tempfile
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from jarvis import grokbot
 from jarvis.grokbot import Grokbot, parse
+from jarvis.grok_preflight import CHECKS
 
 def which(*found):
     return lambda name: f"/usr/bin/{name}" if name in found else None
@@ -42,6 +44,7 @@ class WindowTests(unittest.TestCase):
 
     @patch.object(grokbot, "_quiet")
     @patch.object(grokbot.shutil, "which", which("kitty"))
+    @patch.object(grokbot, "WINDOWS", False)
     def test_terminal_runs_command_then_stays_open(self, quiet):
         out = self.bot.open_terminal("htop", cwd=self.tmp.name)
         argv = quiet.call_args.args[0]
@@ -81,6 +84,13 @@ def done(stdout=b"ok=1\nworkspace=5\n", code=0):
     return MagicMock(stdout=stdout, stderr=b"", returncode=code)
 
 
+def approved_inference(prompt):
+    source = json.loads(prompt.split("\n", 1)[1])
+    task = source["task"] if isinstance(source, dict) else source
+    return json.dumps({"decision": "forward", "task": task, "reply": "", "reason": "",
+                       "checks": {name: True for name in CHECKS}})
+
+
 class SendTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -93,6 +103,7 @@ class SendTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    @unittest.skipIf(os.name == "nt", "Linux bash syntax check requires a Linux shell")
     def test_linux_script_is_valid_bash(self):
         out = grokbot.subprocess.run(["bash", "-n"], input=grokbot.LINUX_SCRIPT.encode(),
                                      capture_output=True)
@@ -107,6 +118,7 @@ class SendTests(unittest.TestCase):
 
     @patch.object(grokbot.socket, "gethostname", return_value="arch_main")
     @patch.object(Grokbot, "can_type", return_value=(True, ""))
+    @patch.object(grokbot, "WINDOWS", False)
     def test_here_pipes_fixed_script_with_prompt_as_data(self, _ok, _host):
         with patch.object(grokbot.subprocess, "run", return_value=done()) as run:
             out = self.bot.send("open my calendar; rm -rf ~", browser=True)
@@ -144,6 +156,7 @@ class SendTests(unittest.TestCase):
 
     @patch.object(grokbot.socket, "gethostname", return_value="arch_main")
     @patch.object(Grokbot, "can_type", return_value=(True, ""))
+    @patch.object(grokbot, "WINDOWS", False)
     def test_reports_the_scripts_error(self, _ok, _host):
         with patch.object(grokbot.subprocess, "run",
                           return_value=done(b"error=Grok Bot isn't installed there.\n", 4)):
@@ -245,11 +258,20 @@ class TunnelTests(unittest.TestCase):
     def test_relay_refuses_wrong_token_and_other_paths(self):
         fake, port = self.relay()
         for path, token in (("/send", "nope"), ("/send", ""), ("/api/grokbot", "t0k")):
-            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=b'{"prompt":"x"}',
-                                         headers={"X-JARVIS-Token": token})
-            with self.assertRaises(urllib.error.HTTPError) as err:
-                urllib.request.urlopen(req, timeout=5)
+            for attempt in range(3):
+                req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                             data=b'{"prompt":"x"}',
+                                             headers={"X-JARVIS-Token": token})
+                try:
+                    with self.assertRaises(urllib.error.HTTPError) as err:
+                        urllib.request.urlopen(req, timeout=5)
+                    break
+                except ConnectionAbortedError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.05)
             self.assertEqual(err.exception.code, 403)
+            err.exception.close()
         fake.send.assert_not_called()
 
     @patch.object(grokbot.socket, "gethostname", return_value="arch_main")
@@ -361,10 +383,10 @@ class HandoffTests(unittest.TestCase):
 
     def test_task_times_out_with_the_handoff_id(self):
         with self.assertRaisesRegex(TimeoutError, "handoff g[0-9a-f]{10}"):
-            self.bot.task("x", timeout=0.05)
+            self.bot.task("x", timeout=0.05, prechecked=True)
 
     def test_tool_timeout_stops_without_background_work(self):
-        tools = grokbot.GrokTools(self.bot, wait_seconds=0.05)
+        tools = grokbot.GrokTools(self.bot, wait_seconds=0.05, infer=approved_inference)
         self.assertEqual([s["name"] for s in tools.specs()], ["grok_agent"])
         with patch.object(grokbot.threading, "Thread") as thread:
             started = grokbot.time.monotonic()
@@ -382,7 +404,8 @@ class HandoffTests(unittest.TestCase):
             self.answer(prompt, "Done.")
             return {"device": "zenbook"}
         self.bot.send = reply
-        ok, text = grokbot.GrokTools(self.bot).call("grok_agent", {"task": "y"})
+        ok, text = grokbot.GrokTools(self.bot, infer=approved_inference).call(
+            "grok_agent", {"task": "y"})
         self.assertTrue(ok)
         self.assertIn("Done.", text)
         self.assertIn("not instructions", text)
@@ -397,7 +420,7 @@ class HandoffTests(unittest.TestCase):
                 patch.object(self.bot, "handoff", side_effect=send), \
                 patch.object(self.bot, "wait", return_value=None) as wait:
             with self.assertRaises(TimeoutError):
-                self.bot.task("x", timeout=600)
+                self.bot.task("x", timeout=600, prechecked=True)
         wait.assert_called_once_with("g0123456789", 18)
 
     def test_expired_send_does_not_start_a_reply_wait(self):
@@ -409,7 +432,7 @@ class HandoffTests(unittest.TestCase):
                 patch.object(self.bot, "handoff", side_effect=send), \
                 patch.object(self.bot, "wait") as wait:
             with self.assertRaises(TimeoutError):
-                self.bot.task("x")
+                self.bot.task("x", prechecked=True)
         wait.assert_not_called()
 
     def test_busy_sender_times_out_without_submitting(self):
@@ -423,12 +446,46 @@ class HandoffTests(unittest.TestCase):
         def down(*a, **k):
             raise ValueError("Grok Bot isn't installed here.")
         self.bot.send = down
-        ok, text = grokbot.GrokTools(self.bot).call("grok_agent", {"task": "x"})
+        ok, text = grokbot.GrokTools(self.bot, infer=approved_inference).call(
+            "grok_agent", {"task": "x"})
         self.assertFalse(ok)
         self.assertIn("isn't installed", text)
 
 
 class StatusTests(unittest.TestCase):
+    def test_alive_rejects_invalid_pids_without_system_calls(self):
+        with patch.object(grokbot.os, "kill") as kill, \
+                patch("ctypes.WinDLL", create=True) as win_dll:
+            for pid in (None, "not-a-pid", 0, -1):
+                self.assertFalse(grokbot._alive(pid), pid)
+        kill.assert_not_called()
+        win_dll.assert_not_called()
+
+    def test_alive_uses_and_closes_a_typed_windows_process_handle(self):
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 1234
+
+        def exit_code(_handle, code_ptr):
+            ctypes.cast(code_ptr, ctypes.POINTER(wintypes.DWORD)).contents.value = 259
+            return True
+
+        kernel32.GetExitCodeProcess.side_effect = exit_code
+        with patch.object(grokbot, "WINDOWS", True), \
+                patch.object(grokbot.os, "kill") as kill, \
+                patch("ctypes.WinDLL", create=True, return_value=kernel32) as win_dll:
+            self.assertTrue(grokbot._alive(4321))
+
+        win_dll.assert_called_once_with("kernel32", use_last_error=True)
+        kill.assert_not_called()
+        self.assertEqual(kernel32.OpenProcess.argtypes,
+                         (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD))
+        kernel32.OpenProcess.assert_called_once_with(0x1000, False, 4321)
+        kernel32.GetExitCodeProcess.assert_called_once()
+        kernel32.CloseHandle.assert_called_once_with(1234)
+
     def test_never_reads_the_credential_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp)

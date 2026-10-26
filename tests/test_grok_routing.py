@@ -40,15 +40,18 @@ class GrokRoutingTest(unittest.TestCase):
         steps = []
         with tempfile.TemporaryDirectory() as folder, \
                 patch.object(Grokbot, "task", side_effect=TimeoutError("timed out")) as task, \
+                patch("jarvis.grok_preflight.assess", return_value={
+                    "decision": "forward", "task": "find flights", "reply": None}) as check, \
                 patch("jarvis.grokbot.threading.Thread") as thread:
             base = Path(folder)
             result = ask("ask grok to find flights", Store(base), Memory(base),
                          GROK, base, on_step=lambda *args: steps.append(args))
-        task.assert_called_once_with("ask grok to find flights", timeout=30)
+        check.assert_called_once()
+        task.assert_called_once_with("find flights", timeout=30, prechecked=True)
         thread.assert_not_called()
         self.assertEqual(result["state"], "failed")
         self.assertIn("timed out", result["reply"])
-        self.assertTrue(any(s[0] == "adapter" and s[-1] == "fail" for s in steps))
+        self.assertTrue(any(s[0] == "grok-send" and s[-1] == "fail" for s in steps))
 
 
 if __name__ == "__main__":
