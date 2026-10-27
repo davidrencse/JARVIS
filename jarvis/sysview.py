@@ -31,11 +31,11 @@ STATIONS = [
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",
      "modules": ["chatgpt", "fastlane", "runner", "orchestrator", "prompts", "adapters",
-                 "claude_auth", "grok_preflight"]},
+                 "claude_auth", "grok_preflight", "usage"]},
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "remote", "grokbot", "transfer", "storage", "clipsync", "showcase", "observe", "sharedinput"]},
+     "modules": ["actions", "remote", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by ElevenLabs, falling back to Kokoro, a voice that "
               "runs on this laptop. ElevenLabs' agent also runs live calls from the console.",
@@ -48,7 +48,7 @@ STATIONS = [
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay.",
-     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_proxy", "cluster_tunnel", "deploy", "node", "platforms", "autostart"]},
+     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_proxy", "cluster_tunnel", "deploy", "node", "platforms", "autostart", "settings"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",

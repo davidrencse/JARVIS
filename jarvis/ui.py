@@ -776,6 +776,11 @@ class Console:
             owner, score = True, None
             if verify and (self.state / "voice" / "voiceprint.json").is_file():
                 owner, score = self._ears.verify(audio)
+                if not owner and not wake:
+                    # Push-to-talk is a deliberate key press at this computer, so a near miss
+                    # (far from the mic, quieter) still counts, like the listener's "Jarvis" rule.
+                    from .daemon import BORDERLINE
+                    owner = score >= (self.config.get("voice") or {}).get("near_miss", BORDERLINE)
             text = self._stt(audio) if owner else ""
         request = wake_word(text)
         heard = {"owner": owner, "score": score, "addressed": request is not None,
@@ -1047,6 +1052,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/memory/item": lambda: c.memory.get(query.get("id", "")),
             "/api/route": lambda: c.route(query.get("text", ""), query.get("tier") or None),
             "/api/voice": lambda: c.daemon("status"),
+            "/api/settings": lambda: __import__("jarvis.settings", fromlist=["read"]).read(c.config, c.state),
             "/api/agent": lambda: c.agent().status(),
             "/api/agent/voices": lambda: c.agent().voices(refresh=query.get("refresh") == "1"),
             "/api/grokbot": lambda: c.grokbot().status(),
@@ -1068,6 +1074,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if url.path == "/api/events":
                 return self._events(query)
+            if url.path == "/api/fs/thumbnail":
+                import base64
+                result = c.storage().resolve(query.get("device"), query.get("path") or "", "thumbnail")
+                return self._send(HTTPStatus.OK, base64.b64decode(result["image"], validate=True), "image/png")
             if url.path in routes:
                 return self._send(HTTPStatus.OK, routes[url.path]())
             if url.path == "/api/export":
@@ -1139,6 +1149,10 @@ class Handler(BaseHTTPRequestHandler):
                                                           body.get("case") or None))
             if url.path == "/api/voice":
                 return self._send(HTTPStatus.OK, c.daemon(body.get("action")))
+            if url.path == "/api/settings":
+                from .settings import write
+                return self._send(HTTPStatus.OK, write(c.config, c.base / "jarvis.config.json",
+                                                       c.state, body.get("changes")))
             if url.path == "/api/agent/session":
                 return self._send(HTTPStatus.OK, c.agent().session())
             if url.path == "/api/agent/voice":
