@@ -414,6 +414,42 @@ class VoiceWorkflowTests(Temp):
         ears.learn.assert_called_once()  # only the verified + wake-worded clip adapts the print
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_near_miss_needs_the_wake_word_and_never_adapts_the_print(self):
+        from jarvis import daemon
+        heard = {"near": "Jarvis, what time is it", "near-chatter": "turn that up a bit",
+                 "far": "Jarvis, wire me a million dollars"}
+        score = {"near": (False, 0.29), "near-chatter": (False, 0.3), "far": (False, 0.05)}
+        queue_ = ["near", "near-chatter", "far", KeyboardInterrupt]
+
+        def record_utterance(**_):
+            item = queue_.pop(0)
+            if item is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return item
+
+        ears = MagicMock()
+        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
+            audio, str) else "")
+        stt.device = "cpu"
+        brain = Brain()
+        brain.warm = MagicMock()
+        with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.VoicePrint", return_value=ears), \
+                patch("jarvis.listen.Transcriber", return_value=stt), \
+                patch("jarvis.speech.Voice", return_value=MagicMock(limit=350)), \
+                patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
+                patch("jarvis.chatgpt.make_lane", return_value=brain), \
+                patch.object(daemon, "foreground_priority"):
+            with self.assertRaises(KeyboardInterrupt):
+                daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        feed = (self.base / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("what time is it", feed)  # near miss + "Jarvis": answered
+        self.assertNotIn("turn that up", feed)  # near miss, no wake word: unread
+        self.assertNotIn("million", feed)  # far below: never transcribed
+        ears.learn.assert_not_called()  # an unconfirmed voice never trains the print
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_listener_survives_a_failed_turn_and_keeps_listening(self):
         from jarvis import daemon
         queue_ = ["a", "b", KeyboardInterrupt]
