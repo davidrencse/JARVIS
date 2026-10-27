@@ -155,7 +155,8 @@
     "simple_power": "low",
     "web_power": "mid",
     "brain": "chatgpt",
-    "auto_escalate": false
+    "auto_escalate": false,
+    "interpreter": true
   },
   "adapters": {
     "browser_agents": [
@@ -202,5 +203,11 @@
   },
   "orchestration": {
     "lanes": 2
+  },
+  "memory": {
+    "semantic": true
+  },
+  "decisions": {
+    "shadow": true
   }
 }
