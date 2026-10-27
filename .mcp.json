@@ -1,8 +1,3 @@
 {
-  "mcpServers": {
-    "jarvis-vault": {
-      "command": "python",
-      "args": ["-m", "jarvis", "vault", "mcp"]
-    }
-  }
+  "mcpServers": {}
 }
