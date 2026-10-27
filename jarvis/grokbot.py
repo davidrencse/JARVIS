@@ -447,7 +447,8 @@ class Grokbot:
         hid = "g" + secrets.token_hex(5)
         INBOX.mkdir(parents=True, exist_ok=True)
         path = INBOX / f"{hid}.md"
-        where = (f"{'Windows' if WINDOWS else 'Arch Linux'} laptop '{socket.gethostname()}'"
+        from .platforms import label
+        where = (f"{label()} computer '{socket.gethostname()}'"
                  f"{f' ({self.here()})' if self.here() else ''}, user {_user()}")
         prompt = (f"{task}\n\n[JARVIS handoff {hid}] "
                   + ("Use your agent browser for the web parts. " if browser else "")

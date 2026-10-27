@@ -70,7 +70,8 @@ class Console:
             raise ValueError("A node uses the main PC's console proxy, not a local JARVIS brain.")
         self.config, self.base, self.state = config, Path(base), Path(state).resolve()
         self.store = Store(self.state, lanes_from(config))
-        self.memory = Memory(self.state)
+        from .memory import semantic_recall
+        self.memory = Memory(self.state, semantic=semantic_recall(config))
         self.credits = Credits(self.state, config)
         self.prober = Prober(config, state=state)
         self.jobs, self._jobs_lock = {}, threading.Lock()
@@ -97,6 +98,7 @@ class Console:
             threading.Thread(target=warm_up, daemon=True).start()
             from .pipeline import warm
             warm()  # the installed-app list, so the first direct action is fast
+            self.memory.warm_vectors()  # meaning-based recall index, in the background
         return self
 
     def close(self):

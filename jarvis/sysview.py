@@ -22,11 +22,11 @@ STATIONS = [
     {"id": "decide", "title": "Decide", "verb": "routes",
      "plain": "Simple rules, no AI, pick the cheapest way to answer: the clock or your vault "
               "instantly, a quick chat, a web task, or a multi-step plan.",
-     "modules": ["router", "assistant", "instant", "briefing", "parse", "registry", "gates", "pipeline", "confirm"]},
+     "modules": ["router", "assistant", "instant", "briefing", "parse", "registry", "gates", "pipeline", "confirm", "decide", "interpret", "selfmodel"]},
     {"id": "remember", "title": "Remember", "verb": "recalls",
      "plain": "Before answering it gathers what it already knows: your Obsidian notes, wiki "
               "claims with their sources and dates, and past conversations.",
-     "modules": ["vault", "knowledge", "memory", "vault_mcp", "tasks", "history"]},
+     "modules": ["vault", "knowledge", "memory", "vault_mcp", "tasks", "history", "embed"]},
     {"id": "think", "title": "Think", "verb": "answers",
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",
@@ -48,7 +48,7 @@ STATIONS = [
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay.",
-     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_proxy", "cluster_tunnel", "node"]},
+     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_proxy", "cluster_tunnel", "deploy", "node", "platforms", "autostart"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",

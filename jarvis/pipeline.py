@@ -106,23 +106,39 @@ def fast_path(text, config, state, step=None, origin=None, origin_class="owner",
     reported, so the caller can start the turn (the console drops steps of unknown turns).
     history: a History to check (H1, H3) and record into; False turns it off."""
     started = time.monotonic()
+    remote = remote or Remote(config, state, tools=None)
+    origin = origin or remote.here()
+    if origin not in config.get("devices", {}):
+        return None  # an unconfigured PC can't resolve "here"
+    commands = parse_for(text, config, origin)["commands"]
+    if not commands or any(c["intent"] not in DIRECT for c in commands):
+        return None  # not certain, or no direct executor: the brain or Grok handles it
+    return run_commands(text, commands, config, state, step=step, origin=origin,
+                        origin_class=origin_class, remote=remote, app_exists=app_exists,
+                        history=history, on_begin=on_begin, channel=channel,
+                        source="Parser", detail="no model", started=started)
+
+
+def run_commands(text, commands, config, state, step=None, origin=None, origin_class="owner",
+                 remote=None, app_exists=None, history=None, on_begin=None, channel="cli",
+                 source="Parser", detail="no model", started=None):
+    """Run already-understood direct commands (from the parser or the interpreter) through
+    the same gates, history, executor and observe steps. None if they aren't all valid,
+    runnable Registry commands, so a bad interpretation never acts."""
+    from . import registry
+    started = started or time.monotonic()
     step = step or (lambda *a, **k: None)
     remote = remote or Remote(config, state, tools=None)
     origin = origin or remote.here()
     devices = config.get("devices", {})
-    if origin not in devices:
-        return None  # an unconfigured PC can't resolve "here"
-    parsed = parse_for(text, config, origin)
-    commands = parsed["commands"]
-    if not commands:
+    if (origin not in devices or not commands or registry.validate(commands, devices)
+            or any(c["intent"] not in DIRECT for c in commands)):
         return None
-    if any(c["intent"] not in DIRECT for c in commands):
-        return None  # no direct executor, so the brain handles it
     parse_ms = _ms(started)
     if on_begin:
         on_begin(commands)
-    step("parse", "root", "Parser",
-         f"{len(commands)} command{'s' * (len(commands) > 1)}, no model · {parse_ms} ms")
+    step("parse", "root", source,
+         f"{len(commands)} command{'s' * (len(commands) > 1)}, {detail} · {parse_ms} ms")
     if history is None:
         history = _history(state)
     turn = {"request": uuid.uuid4().hex, "text": text, "origin": origin,

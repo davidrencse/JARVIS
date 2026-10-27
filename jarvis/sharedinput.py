@@ -6,6 +6,9 @@ whether motion_scale keeps hand travel identical across screens of different pix
 density. It reads configs, processes and monitor geometry; it never starts, stops or
 edits Lan Mouse.
 
+Screens, processes and addresses are read per OS and desktop (Windows, macOS, Hyprland, sway,
+X11); platforms.detect() says which.
+
 Each computer reports itself through the read-only `input_info` desktop action
 (local_info), so the Zenbook answers over the cluster or SSH like any other action.
 Certificate fingerprints and authorized keys are never read out of the configs.
@@ -19,6 +22,8 @@ import shutil
 import socket
 import subprocess
 from pathlib import Path
+
+from . import platforms
 
 try:
     import tomllib
@@ -36,7 +41,14 @@ def _run(*args, timeout=5):
 
 
 # -- this computer ---------------------------------------------------------------------------
+def _desktop():
+    """platforms.detect()'s desktop family; os.name == "nt" always wins (checked by callers)."""
+    return platforms.detect()["desktop"]
+
+
 def config_path():
+    if _desktop() == "macos":  # never true on Windows, so that branch below is unchanged
+        return Path.home() / "Library" / "Application Support" / "lan-mouse" / "config.toml"
     if os.name == "nt":
         return Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "lan-mouse" / "config.toml"
     base = os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config"
@@ -92,8 +104,17 @@ def _mini_toml(text):
 
 def monitors():
     """This computer's screens in physical pixels: [{name, width, height, x, y, primary}]."""
+    desktop = _desktop()
+    if desktop == "sway":
+        return _monitors_sway()
+    if desktop == "macos":
+        return _monitors_macos()
+    if desktop in ("x11", "gnome", "kde"):
+        return _monitors_xrandr()
     if os.name == "nt":
         return _monitors_nt()
+    if desktop not in ("hyprland", "windows"):  # another Wayland compositor, or no desktop
+        return []
     if not shutil.which("hyprctl"):
         return []
     from .remote import session_env
@@ -108,6 +129,67 @@ def monitors():
              "width": m.get("width"), "height": m.get("height"), "x": m.get("x"),
              "y": m.get("y"), "scale": m.get("scale"), "primary": bool(m.get("focused"))}
             for m in listed]
+
+
+def _monitors_sway():
+    if not shutil.which("swaymsg"):
+        return []
+    try:
+        listed = json.loads(_run("swaymsg", "-t", "get_outputs").stdout or "[]")
+    except ValueError:
+        return []
+    found = []
+    for m in listed if isinstance(listed, list) else []:
+        if not isinstance(m, dict) or m.get("active") is False:
+            continue
+        mode, rect = m.get("current_mode") or {}, m.get("rect") or {}
+        found.append({"name": m.get("name"),
+                      "description": " ".join(str(m.get(k)) for k in ("make", "model") if m.get(k)) or None,
+                      "width": mode.get("width") or rect.get("width"),
+                      "height": mode.get("height") or rect.get("height"),
+                      "x": rect.get("x", 0), "y": rect.get("y", 0), "scale": m.get("scale"),
+                      "primary": bool(m.get("focused"))})
+    return found
+
+
+# "0: +*eDP-1 1920/344x1080/194+0+0  eDP-1"; the /mm parts are optional.
+XRANDR_MONITOR = re.compile(r"^\s*\d+:\s+\+?(\*)?(\S+)\s+(\d+)(?:/\d+)?x(\d+)(?:/\d+)?\+(-?\d+)\+(-?\d+)")
+
+
+def _monitors_xrandr():
+    if not shutil.which("xrandr"):
+        return []
+    found = []
+    for line in _run("xrandr", "--listmonitors").stdout.splitlines():
+        m = XRANDR_MONITOR.match(line)
+        if m:
+            star, name, w, h, x, y = m.groups()
+            found.append({"name": name, "width": int(w), "height": int(h), "x": int(x),
+                          "y": int(y), "primary": bool(star)})
+    if found and not any(m["primary"] for m in found):
+        found[0]["primary"] = True
+    return found
+
+
+def _monitors_macos():
+    if not shutil.which("system_profiler"):
+        return []
+    try:
+        data = json.loads(_run("system_profiler", "SPDisplaysDataType", "-json", timeout=20).stdout or "{}")
+    except ValueError:
+        return []
+    found = []
+    for card in data.get("SPDisplaysDataType") or []:
+        for d in card.get("spdisplays_ndrvs") or []:
+            size = re.search(r"(\d+)\s*x\s*(\d+)", str(d.get("_spdisplays_resolution")
+                                                      or d.get("_spdisplays_pixels") or ""))
+            if size:  # x/y are not reported: the arrangement is not known here
+                found.append({"name": d.get("_name"), "width": int(size.group(1)),
+                              "height": int(size.group(2)), "x": 0, "y": 0,
+                              "primary": d.get("spdisplays_main") == "spdisplays_yes"})
+    if found and not any(m["primary"] for m in found):
+        found[0]["primary"] = True
+    return found
 
 
 def _monitors_nt():
@@ -144,6 +226,10 @@ def _monitors_nt():
 
 def lan_mouse_status():
     """{running, build} where build is patched (JARVIS), official, or None when stopped."""
+    if _desktop() == "macos":
+        if shutil.which("pgrep") and _run("pgrep", "-x", "lan-mouse").returncode == 0:
+            return {"running": True, "build": "official"}  # the JARVIS patches target Windows/Arch
+        return {"running": False, "build": None}
     if os.name == "nt":
         out = _run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                    "Get-CimInstance Win32_Process -Filter \"Name='lan-mouse.exe'\" | "
@@ -163,7 +249,9 @@ def lan_mouse_status():
 def addresses():
     """This computer's IPv4 addresses (LAN and Tailscale), loopback excluded."""
     found = set()
-    if os.name != "nt" and shutil.which("ip"):
+    if _desktop() == "macos" and shutil.which("ifconfig"):
+        found.update(re.findall(r"(?:^|\s)inet (\d+\.\d+\.\d+\.\d+)\s", _run("ifconfig").stdout))
+    elif os.name != "nt" and shutil.which("ip"):
         found.update(re.findall(r"inet (\d+\.\d+\.\d+\.\d+)/", _run("ip", "-4", "-o", "addr").stdout))
     else:
         try:
@@ -180,7 +268,7 @@ def local_info():
             return fn()
         except Exception:  # one unreadable part must not hide the rest
             return fallback
-    return {"hostname": socket.gethostname(), "os": "windows" if os.name == "nt" else "linux",
+    return {"hostname": socket.gethostname(), "os": "windows" if os.name == "nt" else platforms.detect()["os"],
             "monitors": safely(monitors, []), "addresses": safely(addresses, []),
             "lan_mouse": {**safely(lan_mouse_status, {"running": False, "build": None}),
                           "config": safely(read_config, None)}}

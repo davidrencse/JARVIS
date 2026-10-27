@@ -231,13 +231,19 @@ def check_queue_log(lines):
 
 
 def check_peer(config):
-    target = (config.get("devices", {}).get("zenbook", {}) or {}).get("target", "")
+    # The first other computer reached over SSH, whatever it is called or runs.
+    peer = next((d for d in (config.get("devices") or {}).values()
+                 if d.get("transport") == "ssh" and d.get("target")), {})
+    target = peer.get("target", "")
     host = target.split("@")[-1] if target else ""
+    name = peer.get("label", "peer").split(",")[0]
     if not host:
-        return result("ASUS reachable", "SKIP", "no zenbook device configured")
-    ok = subprocess.run(["ping", "-n", "1", "-w", "1500", host], capture_output=True,
+        return result("peer reachable", "SKIP", "no SSH peer configured")
+    # Windows ping: -n count, -w milliseconds; elsewhere: -c count, -W seconds.
+    flags = ["-n", "1", "-w", "1500"] if os.name == "nt" else ["-c", "1", "-W", "2"]
+    ok = subprocess.run(["ping", *flags, host], capture_output=True,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
-    return result("ASUS reachable", "PASS" if ok else "WARN",
+    return result(f"{name} reachable", "PASS" if ok else "WARN",
                   f"{host} {'answers ping' if ok else 'no ping reply (asleep? IP changed?)'}")
 
 

@@ -5,8 +5,9 @@ youtube"), and this polls the desktop every 250 ms until the predicate holds or 
 settle time runs out. Only {"match", "after_ms", "app"} travels back: window titles never
 leave the machine (docs/jarvis-os-architecture.md, "Privacy at the source").
 
-Windows are listed straight from Win32 (EnumWindows) or Hyprland (hyprctl), not through
-PowerShell, which takes most of a second per call and is too slow to poll.
+Windows are listed straight from Win32 (EnumWindows), Hyprland (hyprctl), sway (swaymsg),
+X11 (wmctrl) or macOS (System Events through osascript), chosen by platforms.detect(), not
+through PowerShell, which takes most of a second per call and is too slow to poll.
 """
 
 import json
@@ -18,6 +19,8 @@ import time
 import ctypes
 import uuid
 from urllib.parse import urlsplit
+
+from . import platforms
 
 KINDS = ("window", "title", "focused", "gone", "playback", "volume")
 MAX_SETTLE = 15.0
@@ -129,8 +132,110 @@ def _windows_hyprland():
             for c in query("clients") or []]
 
 
+def _run(*args, timeout=5):
+    """Argument-list subprocess (never a shell); no console window on Windows."""
+    return subprocess.run(list(args), capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=timeout,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def backend():
+    """Which desktop family to drive. A non-Windows os.name never maps to the Windows
+    backend: it falls back to Hyprland, the original non-Windows behaviour."""
+    if os.name == "nt":
+        return "windows"
+    desktop = platforms.detect()["desktop"]
+    return "hyprland" if desktop == "windows" else desktop
+
+
+NO_WINDOW_TOOL = ("window control needs wmctrl (X11) or a supported compositor "
+                  "(Hyprland, sway): install wmctrl, or run an X11 session")
+
+
+def _sway_tree(node, found):
+    """Walk `swaymsg -t get_tree`: leaves with an app_id (Wayland) or window class (XWayland)."""
+    app = node.get("app_id") or (node.get("window_properties") or {}).get("class")
+    if app and node.get("type") in (None, "con", "floating_con"):
+        found.append({"id": node.get("id"), "app": str(app), "title": node.get("name") or "",
+                      "focused": bool(node.get("focused"))})
+    for child in (node.get("nodes") or []) + (node.get("floating_nodes") or []):
+        _sway_tree(child, found)
+    return found
+
+
+def _windows_sway():
+    if not shutil.which("swaymsg"):
+        raise LookupError("window control needs swaymsg (sway)")
+    try:
+        tree = json.loads(_run("swaymsg", "-t", "get_tree").stdout or "null")
+    except ValueError:
+        return []
+    return _sway_tree(tree, []) if isinstance(tree, dict) else []
+
+
+def _windows_wmctrl():
+    if not shutil.which("wmctrl"):
+        raise LookupError(NO_WINDOW_TOOL)
+    active = None
+    if shutil.which("xdotool"):
+        out = _run("xdotool", "getactivewindow")
+        if not out.returncode and out.stdout.strip().isdigit():
+            active = int(out.stdout.strip())
+    found = []
+    for line in _run("wmctrl", "-lx").stdout.splitlines():
+        parts = line.split(None, 4)  # id, desktop, class, host, title
+        if len(parts) < 4 or not re.fullmatch(r"0x[0-9a-fA-F]+", parts[0]):
+            continue
+        found.append({"id": parts[0].lower(), "app": parts[2].replace(".", " "),
+                      "title": parts[4] if len(parts) > 4 else "",
+                      "focused": active is not None and int(parts[0], 16) == active})
+    return found
+
+
+def parse_macos_processes(text):
+    """osascript prints {name, frontmost} lists flat: 'Finder, Safari, true, false'. Names
+    come first, then one boolean each; parse defensively and never invent a pairing."""
+    tokens = [t.strip().strip("{}").strip().strip('"') for t in str(text).strip().split(",")]
+    tokens = [t for t in tokens if t]
+    flags = []
+    while tokens and tokens[-1] in ("true", "false") and len(tokens) - 1 >= len(flags) + 1:
+        flags.insert(0, tokens.pop() == "true")
+    if len(flags) != len(tokens):  # unreadable pairing: names only, focus unknown
+        flags = [False] * len(tokens)
+    return [{"id": name, "app": name, "title": name, "focused": focused}
+            for name, focused in zip(tokens, flags)]
+
+
+def _windows_macos():
+    script = ('tell application "System Events" to get {name, frontmost} of '
+              '(processes whose background only is false)')
+    out = _run("osascript", "-e", script, timeout=10)
+    if out.returncode:
+        raise LookupError(out.stderr.strip() or "System Events could not list the apps")
+    return parse_macos_processes(out.stdout)
+
+
+def window_details():
+    """Windows with their ids for the non-Windows, non-Hyprland desktops (actions.py uses
+    the ids to focus and close). Raises LookupError when nothing can drive this desktop."""
+    desktop = backend()
+    if desktop == "sway":
+        return _windows_sway()
+    if desktop == "macos":
+        return _windows_macos()
+    if desktop in ("x11", "gnome", "kde"):
+        return _windows_wmctrl()
+    raise LookupError(NO_WINDOW_TOOL)
+
+
 def windows():
-    return _windows_nt() if os.name == "nt" else _windows_hyprland()
+    desktop = backend()
+    if desktop == "windows":
+        return _windows_nt()
+    if desktop == "hyprland":
+        return _windows_hyprland()
+    return [{"app": w["app"], "title": w["title"], "focused": w["focused"]}
+            for w in window_details()]
 
 
 # -- playback and master volume ----------------------------------------------------------
@@ -160,6 +265,15 @@ $status = $session.GetPlaybackInfo().PlaybackStatus.ToString()
 def playback():
     if os.name == "nt":
         return _playback_nt()
+    if backend() == "macos":
+        if not shutil.which("nowplaying-cli"):
+            raise LookupError("observing playback on macOS needs nowplaying-cli "
+                              "(brew install nowplaying-cli)")
+        out = _run("nowplaying-cli", "get", "playbackRate")
+        rate = out.stdout.strip()
+        if out.returncode or not re.fullmatch(r"-?\d+(?:\.\d+)?", rate):
+            return None  # "(null)": nothing is playing
+        return {"status": "Playing" if float(rate) > 0 else "Paused"}
     if not shutil.which("playerctl"):
         raise LookupError("observing playback needs playerctl")
     out = subprocess.run(["playerctl", "status"], capture_output=True, text=True, timeout=5)
@@ -168,10 +282,40 @@ def playback():
     return {"status": out.stdout.strip()}
 
 
+def pactl_volume():
+    """PulseAudio / PipeWire-pulse default sink: (percent, muted)."""
+    vol = _run("pactl", "get-sink-volume", "@DEFAULT_SINK@")
+    mute = _run("pactl", "get-sink-mute", "@DEFAULT_SINK@")
+    if vol.returncode or mute.returncode:
+        raise LookupError((vol.stderr or mute.stderr).strip() or "pactl could not read volume")
+    match = re.search(r"(\d+)%", vol.stdout)
+    if not match:
+        raise LookupError("pactl returned unreadable volume")
+    return int(match.group(1)), bool(re.search(r"yes", mute.stdout, re.I))
+
+
+def macos_volume():
+    """macOS output volume: (percent, muted), through osascript."""
+    vol = _run("osascript", "-e", "output volume of (get volume settings)")
+    mute = _run("osascript", "-e", "output muted of (get volume settings)")
+    if vol.returncode or mute.returncode:
+        raise LookupError((vol.stderr or mute.stderr).strip() or "osascript could not read volume")
+    text = vol.stdout.strip()
+    if not text.isdigit():  # "missing value" on outputs without a software volume
+        raise LookupError("macOS returned unreadable volume")
+    return int(text), mute.stdout.strip().lower() == "true"
+
+
 def volume_state():
     if os.name != "nt":
+        if backend() == "macos":
+            percent, muted = macos_volume()
+            return {"percent": percent, "muted": muted}
         if not shutil.which("wpctl"):
-            raise LookupError("observing volume needs wpctl")
+            if shutil.which("pactl"):
+                percent, muted = pactl_volume()
+                return {"percent": percent, "muted": muted}
+            raise LookupError("observing volume needs wpctl or pactl")
         out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
                              capture_output=True, text=True, timeout=5)
         if out.returncode:

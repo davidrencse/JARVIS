@@ -32,8 +32,20 @@ def _fts_query(text):
     return " OR ".join(f'"{t.replace(chr(34), "")}"*' for t in terms[:32])
 
 
+def semantic_recall(config):
+    """memory.semantic in jarvis.config.json: meaning-based recall for JARVIS's own answers.
+    Off when unset, or without the local model: recall stays keyword-only."""
+    import os
+    if os.environ.get("JARVIS_SEMANTIC") == "0":  # tests, or a quick opt-out
+        return False
+    return bool((config.get("memory") or {}).get("semantic", False))
+
+
 class Memory:
-    def __init__(self, directory):
+    def __init__(self, directory, semantic=False):
+        """semantic: also rank by meaning with local embeddings (jarvis/embed.py), merged
+        with the keyword ranking; quietly keyword-only when the model isn't available."""
+        self.semantic = semantic
         self.path = Path(directory).resolve() / "memory.sqlite3"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
@@ -60,6 +72,8 @@ class Memory:
                   src TEXT NOT NULL, dst TEXT NOT NULL, rel TEXT NOT NULL,
                   created_at TEXT NOT NULL, PRIMARY KEY(src, dst, rel));
                 CREATE INDEX IF NOT EXISTS links_dst ON links(dst);
+                CREATE TABLE IF NOT EXISTS vectors(
+                  id TEXT PRIMARY KEY, model TEXT NOT NULL, vec BLOB NOT NULL);
             """)
 
     @contextmanager
@@ -181,7 +195,101 @@ class Memory:
             scored.append(item)
         if query:
             scored.sort(key=lambda i: i["score"], reverse=True)
+            if self.semantic:
+                fused = self._fuse(text, scored, where, args, limit)
+                if fused is not None:
+                    return fused[:limit]
         return scored[:limit]
+
+    # -- meaning-based ranking (local embeddings) -------------------------------------------
+    SEMANTIC_FLOOR = 0.3  # cosine below this is noise for MiniLM
+    RRF_K = 60            # reciprocal-rank-fusion constant
+
+    def _vector_text(self, row):
+        return f"{row['title']}\n{row['body'][:1500]}"
+
+    def index_vectors(self, limit=500):
+        """Embed up to `limit` items that have no vector yet (newest first). Returns how many."""
+        from .embed import MODEL, embed
+        with self.connect() as db:
+            rows = db.execute("SELECT i.id, i.title, i.body FROM items i LEFT JOIN vectors v "
+                              "ON v.id = i.id AND v.model = ? WHERE v.id IS NULL "
+                              "ORDER BY i.created_at DESC LIMIT ?", (MODEL, limit)).fetchall()
+        if not rows:
+            return 0
+        vectors = embed([self._vector_text(r) for r in rows])
+        if vectors is None:
+            return 0
+        with self.connect() as db:
+            db.executemany("INSERT OR REPLACE INTO vectors(id, model, vec) VALUES(?,?,?)",
+                           [(r["id"], MODEL, v.tobytes()) for r, v in zip(rows, vectors)])
+        return len(rows)
+
+    def warm_vectors(self):
+        """Index everything not yet embedded, in a background thread (startup), so no
+        request ever waits for the first full index. No-op when semantic recall is off."""
+        if not self.semantic:
+            return
+
+        def run():
+            try:
+                while self.index_vectors(limit=200):
+                    pass
+            except Exception:
+                pass  # recall falls back to keyword search
+        import threading
+        threading.Thread(target=run, name="jarvis-memory-index", daemon=True).start()
+
+    def similar(self, text, limit=20, where=(), args=()):
+        """[(id, cosine)] by meaning, best first; None when embeddings are unavailable."""
+        from .embed import MODEL, embed
+        import numpy as np
+        query = embed([text])
+        if query is None:
+            return None
+        self.index_vectors(limit=25)  # new items only; warm_vectors() does the bulk in the background
+        sql = ("SELECT v.id, v.vec FROM vectors v JOIN items i ON i.id = v.id WHERE v.model=?"
+               + "".join(" AND " + w for w in where))
+        with self.connect() as db:
+            rows = db.execute(sql, [MODEL, *args]).fetchall()
+        if not rows:
+            return []
+        matrix = np.frombuffer(b"".join(r["vec"] for r in rows), dtype=np.float32).reshape(len(rows), -1)
+        scores = matrix @ query[0]
+        best = np.argsort(-scores)[:limit]
+        return [(rows[i]["id"], float(scores[i])) for i in best if scores[i] >= self.SEMANTIC_FLOOR]
+
+    def _fuse(self, text, keyword, where, args, limit):
+        """Merge keyword and meaning rankings (reciprocal rank fusion); importance and
+        recency stay as small tiebreakers. None leaves the keyword ranking as it was."""
+        try:
+            meaning = self.similar(text, limit=max(limit * 3, 20), where=where, args=args)
+        except Exception:  # recall must never break a request
+            return None
+        if not meaning:
+            return None
+        by_id = {item["id"]: item for item in keyword}
+        missing = [i for i, _ in meaning if i not in by_id]
+        if missing:
+            with self.connect() as db:
+                marks = ",".join("?" * len(missing))
+                for row in db.execute(f"SELECT *, 0.0 AS rank FROM items WHERE id IN ({marks})", missing):
+                    item = self._row(row, body=False)
+                    item.pop("rank", None)
+                    by_id[item["id"]] = item
+        fused = {}
+        for rank, item in enumerate(keyword):
+            fused[item["id"]] = 1 / (self.RRF_K + rank + 1)
+        for rank, (item_id, cosine) in enumerate(meaning):
+            fused[item_id] = fused.get(item_id, 0) + 1 / (self.RRF_K + rank + 1)
+            by_id[item_id]["similarity"] = round(cosine, 3)
+        now = _now()
+        for item_id, score in fused.items():
+            item = by_id[item_id]
+            age = (now - datetime.fromisoformat(item["created_at"])).total_seconds() / 86400
+            fused[item_id] = score + 0.002 * item["importance"] + 0.001 * math.exp(-age / 30)
+            item["score"] = round(fused[item_id] * 100, 4)
+        return sorted((by_id[i] for i in fused), key=lambda i: i["score"], reverse=True)
 
     def context(self, text, limit=5, max_chars=4000):
         """Compact recall block for injecting into an agent prompt as untrusted evidence."""
