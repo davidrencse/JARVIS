@@ -391,5 +391,5 @@ class Transcriber:
 
     def _run(self, audio):
         segments, _ = self._model.transcribe(audio, language=self.language, vad_filter=True,
-                                             beam_size=1)
+                                             beam_size=1, hotwords="Jarvis")
         return " ".join(s.text.strip() for s in segments).strip()

@@ -50,6 +50,26 @@ def lane_label(lane, text):
 
 def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, lane=None,
         on_sentence=None, on_start=None, channel="cli", on_step=None):
+    """One request, metered: the result carries `usage` (tokens, API-equivalent dollars,
+    share of the subscription windows; see usage.py), also saved on the reply."""
+    from .usage import meter
+    with meter() as m:
+        result = _ask(text, store, memory, config, base, tier, write, timeout, lane,
+                      on_sentence, on_start, channel, on_step)
+    if isinstance(result, dict) and "usage" not in result:
+        spent = m.summary()
+        result = {**result, "usage": spent}
+        reply = (result.get("memory") or [None, None])[-1]
+        if reply and memory is not None:
+            try:
+                memory.merge_meta(reply, {"usage": spent})
+            except Exception:  # bookkeeping must never fail the turn
+                pass
+    return result
+
+
+def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600, lane=None,
+         on_sentence=None, on_start=None, channel="cli", on_step=None):
     """on_sentence: optional callback for streamed sentences (fast lane only).
     on_start({"route", "message"}): called once the request is routed and remembered.
     channel: where it came from (console, voice, cli), kept on the inbound message.
@@ -501,7 +521,7 @@ def _with_tools(lane, step, call):
         lane.on_tool = None
 
 
-def wake_word(text, words=("jarvis", "jervis")):
+def wake_word(text, words=("jarvis", "jervis", "jarvas", "javis")):
     """Strip a leading wake word; None if absent. "Jervis" is Whisper mishearing 'Jarvis';
     'Travis' is a real name, and "Jarvis's ..." is talking about JARVIS, not to it."""
     match = re.match(r"^\W*(?:hey\s+|ok\s+|okay\s+)?(" + "|".join(words) +

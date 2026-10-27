@@ -160,5 +160,7 @@ def run_task(store, task_id, config, base, timeout=900):
         raise
     finally:
         store.transition(task_id, "running", state, {**detail, "artifacts": str(directory)})
+    from .usage import record_run
+    record_run(directory, plan["provider"], plan.get("model"))
     return {"task_id": task_id, "state": state, "artifacts": str(directory),
             "answer": final_message(plan["provider"], directory), **detail}

@@ -27,7 +27,7 @@ import json, os
 req = json.loads(REQUEST)
 roots = [os.path.realpath(os.path.expanduser(r)) for r in req["roots"]]
 def inside(p):
-    return any(p == r or p.startswith(r.rstrip("/") + "/") for r in roots)
+    return any(p == r or p.startswith(r.rstrip(os.sep) + os.sep) for r in roots)
 def out(value):
     print(json.dumps(value))
 if req["action"] == "exists":
@@ -49,6 +49,12 @@ if not os.path.exists(path):
     out({"error": "No such file or folder."}); raise SystemExit
 info = os.stat(path)
 res = {"path": path, "dir": os.path.isdir(path), "size": info.st_size, "roots": roots}
+if req["action"] == "thumbnail":
+    try:
+        out(thumbnail_payload(path))
+    except Exception:
+        out({"error": "Image preview unavailable."})
+    raise SystemExit
 if req["action"] == "list":
     if not res["dir"]:
         out({"error": "Not a folder."}); raise SystemExit
@@ -126,6 +132,11 @@ class Storage:
             raise ValueError("No such file or folder.")
         res = {"path": str(target), "dir": target.is_dir(), "size": target.stat().st_size,
                "roots": [str(r) for r in roots]}
+        if action == "thumbnail":
+            if not target.is_file():
+                raise ValueError("Preview requires an image file.")
+            from .thumbnails import thumbnail_payload
+            return thumbnail_payload(target)
         if action == "list":
             if not target.is_dir():
                 raise ValueError("Not a folder.")
@@ -162,6 +173,10 @@ class Storage:
             raise ValueError("The OpenSSH client is not installed.")
         request = json.dumps({"action": action, "path": path or "", "roots": self.roots(device_id)})
         script = f"REQUEST = {json.dumps(request)}\n" + REMOTE_SCRIPT
+        if action == "thumbnail":
+            import inspect
+            from .thumbnails import thumbnail_payload
+            script = inspect.getsource(thumbnail_payload) + "\n" + script
         try:
             done = subprocess.run(
                 [*_ssh_args(ssh, device.get("identity_file")), "-T", device["target"], "python3 -"],

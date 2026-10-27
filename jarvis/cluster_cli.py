@@ -15,7 +15,7 @@ from .topology import DEVICE_ID, enabled, endpoint, identity, is_node
 def parser(sub):
     command = sub.add_parser("cluster", help="Configure the main PC and its lightweight nodes")
     command.add_argument("action", choices=("configure", "enroll", "join", "revoke", "status",
-                                           "run", "serve", "node", "request", "autostart", "tunnel", "update"))
+                                           "run", "serve", "node", "request", "autostart", "tunnel", "update", "main", "roles"))
     command.add_argument("value", nargs="?", help="node ID, pairing file, request ID, or on/off")
     command.add_argument("--main", dest="main_device", help="device ID of the main PC")
     command.add_argument("--local", dest="local_device", help="this PC's device ID, or auto")
@@ -28,6 +28,30 @@ def parser(sub):
     command.add_argument("--autostart", action="store_true", help="tunnel start/stop: also enable/disable login startup")
 
 
+def roles(config):
+    """Every configured machine and its role. Exactly one is main: cluster.main_device."""
+    main = (config.get("cluster") or {}).get("main_device")
+    local = identity(config)[0] if (config.get("cluster") or {}).get("enabled") else None
+    return {"main_device": main, "tunnel": (config.get("cluster") or {}).get("tunnel", "reverse"),
+            "devices": {key: {"label": (device or {}).get("label") or key,
+                              "role": "main" if key == main else "node", "this_pc": key == local}
+                        for key, device in (config.get("devices") or {}).items()}}
+
+
+def set_main(config, path, device):
+    """Make one configured machine the main; every other machine becomes a node."""
+    devices = config.get("devices") or {}
+    if not device:
+        raise ValueError("Usage: jarvis cluster main DEVICE_ID  (one of: " + ", ".join(devices) + ")")
+    if device not in devices:
+        raise ValueError(f"No device '{device}'. Configured: {', '.join(devices)}.")
+    proposed = {**config, "cluster": {**(config.get("cluster") or {}), "main_device": device}}
+    save_json(path, proposed)
+    return {**roles(proposed), "next": "Copy this jarvis.config.json to every machine (or "
+            "commit it), restart `jarvis cluster run` on the new main and `jarvis cluster node` "
+            "on the others. See docs/architecture-guide.md#main-and-nodes."}
+
+
 def run(args, config, base):
     action = args.action
     path, state = Path(args.config).resolve(), Path(args.state).resolve()
@@ -35,6 +59,10 @@ def run(args, config, base):
         logs = state / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         sys.stdout = sys.stderr = open(logs / "cluster.log", "a", encoding="utf-8", buffering=1)
+    if action == "roles":
+        return roles(config)
+    if action == "main":
+        return set_main(config, path, args.value)
     if action == "configure":
         settings = dict(config.get("cluster", {}))
         settings.update(enabled=True,

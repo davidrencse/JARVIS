@@ -166,7 +166,7 @@ def validate_action(kind, payload):
         if not isinstance(payload.get("text"), str) or not 0 < len(payload["text"]) <= 16000:
             raise ValueError("Invalid Grokbot prompt.")
     elif kind == "storage":
-        if payload.get("action") not in ("list", "resolve", "exists") or not isinstance(payload.get("path"), str):
+        if payload.get("action") not in ("list", "resolve", "exists", "thumbnail") or not isinstance(payload.get("path"), str):
             raise ValueError("Invalid node storage query.")
     elif kind != "inventory":
         raise ValueError("Nodes execute only desktop, inventory, or Grokbot operations.")

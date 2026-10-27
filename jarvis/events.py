@@ -116,7 +116,7 @@ class Turn:
         memory = result.get("memory") or [None, None]
         self._send("turn.done", reply_id=memory[-1], reply=result.get("reply", ""),
                    tier=result.get("tier"), seconds=round(time.time() - self.t0, 1),
-                   **{k: result[k] for k in ("plan", "task", "adapter", "streamed") if k in result})
+                   **{k: result[k] for k in ("plan", "task", "adapter", "streamed", "usage") if k in result})
 
     def error(self, exc):
         self._send("turn.error", error=f"{type(exc).__name__}: {exc}",

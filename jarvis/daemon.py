@@ -50,6 +50,9 @@ class InstanceLock:
         self.handle.close()
 
 
+BORDERLINE = 0.10  # live mic scores dropped to 0.11-0.28 on 2026-10-26; the wake word gates the rest
+
+
 def listen_loop(state, config, base, threshold=None):
     from .assistant import ask, wake_word
     from .chatgpt import make_lane
@@ -101,15 +104,24 @@ def listen_loop(state, config, base, threshold=None):
                 # A stranger's transcript is discarded unread: never logged or answered.
                 check, text = pool.submit(ears.verify, audio, threshold), pool.submit(stt, audio)
                 is_owner, score = check.result()
-                if not is_owner:
+                # A near miss (David further from the mic, quieter, music behind him) is
+                # accepted only when it also starts with "Jarvis"; strangers score far lower.
+                near = not is_owner and score >= config.get("voice", {}).get("near_miss", BORDERLINE)
+                if not is_owner and not near:
                     text.cancel()
                     log(f"ignored another voice (similarity {score})")
                     emit(state, "voice.ignored", score=score)
                     continue
-                request = wake_word(text.result())
-                if not request:  # not addressed to JARVIS: never logged or answered
+                heard = text.result()
+                request = wake_word(heard)
+                if not request:  # not addressed to JARVIS: never answered
+                    if near:  # still unconfirmed as David: discarded unread
+                        log(f"ignored another voice (similarity {score})")
+                    elif heard:  # David's own voice without the wake word: say so, briefly
+                        log(f"no wake word ({score}): {' '.join(heard.split()[:3])}...")
                     continue
-                ears.learn()  # passed the voice check AND said "Jarvis": adapt to live audio
+                if not near:
+                    ears.learn()  # passed the voice check AND said "Jarvis": adapt to live audio
                 log(f"you ({score}): {request}")
                 emit(state, "voice.heard", text=request, score=score)
                 if not instant_answer(request):  # instant answers need no "On it."

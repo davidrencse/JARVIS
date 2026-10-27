@@ -146,6 +146,16 @@ class Memory:
             item["preview"] = text[:240] + ("…" if len(text) > 240 else "")
         return item
 
+    def merge_meta(self, item_id, extra):
+        """Add keys to an item's meta (e.g. a reply's usage, known only once the turn ends)."""
+        with self.connect() as db:
+            row = db.execute("SELECT meta FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                return False
+            meta = {**json.loads(row["meta"] or "{}"), **extra}
+            db.execute("UPDATE items SET meta=? WHERE id=?", (json.dumps(meta), item_id))
+        return True
+
     def get(self, item_id):
         with self.connect() as db:
             row = db.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()

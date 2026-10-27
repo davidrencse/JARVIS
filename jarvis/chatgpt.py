@@ -326,9 +326,13 @@ class ChatGPTLane:
         self.tool_log = []
         deadline = time.monotonic() + self.timeout
         items, order, pending = {}, [], ""
+        spent = None  # this turn's token usage, from the server's usage notification
         while True:
             message = self._next(deadline)
             method, params = message.get("method"), message.get("params") or {}
+            if method and "tokenusage" in method.lower().replace("_", ""):
+                found = params.get("tokenUsage") or params.get("token_usage") or params
+                spent = found.get("last") or found.get("lastTokenUsage") or found.get("last_token_usage") or spent
             if message.get("id") == rid and "error" in message:
                 raise RuntimeError(f"ChatGPT turn/start failed: {message['error']}")
             if method == "item/agentMessage/delta":
@@ -361,6 +365,9 @@ class ChatGPTLane:
                 answer = items[order[-1]].strip() if order else ""
                 if not answer:
                     raise RuntimeError("ChatGPT returned no answer.")
+                from .usage import record
+                record("chatgpt", self.model, spent)
+                self.last_usage = spent
                 return answer
 
 

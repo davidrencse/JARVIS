@@ -168,6 +168,8 @@ class FastLane:
             if event.get("type") == "result":
                 if event.get("is_error") or not isinstance(event.get("result"), str):
                     raise RuntimeError(f"Fast lane error: {event.get('subtype')}")
+                from .usage import record
+                record("claude", self.model, event.get("usage"), event.get("total_cost_usd"))
                 if on_sentence:
                     # Remainder of the stream, or the whole answer if nothing streamed.
                     rest = pending.strip() if spoke else event["result"].strip()
