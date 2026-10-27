@@ -89,6 +89,7 @@
     if (location.hash === "#graph") { location.replace("knowledge.html"); return; }
     const name = VIEWS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "console";
     for (const v of VIEWS) $("#view-" + v).hidden = v !== name;
+    $("#case-switch").hidden = name === "console";
     $$(".rail a[data-view]").forEach((a) => { if (a.dataset.view === name) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
     $("#crumb-view").textContent = $("#view-" + name).dataset.title;
     // The overlay controller finds its window by this exact title, so it never changes there.
@@ -734,7 +735,19 @@
   const CHANNEL = { console: "console", voice: "voice", cli: "CLI" };
   const channelOf = (h) => CHANNEL[h.channel] || (mine.has(h.id) ? "console" : "voice or CLI");
   // Streaming (or just-finished) reply for a request whose answer isn't in memory yet.
-  const liveReply = (t, tier) => ({ who: "jarvis", text: t.done ? t.reply : t.sentences.join(" "), at: t.at + 1, tier: t.tier || tier,
+  // What a reply cost (usage.py): tokens, API-equivalent dollars (notional: JARVIS runs on
+  // subscriptions) and the share of the Codex 5-hour and weekly windows it used.
+  const pct = (v) => v == null ? "?" : v === 0 ? "0" : v >= 1 ? v.toFixed(1) : v >= 0.1 ? v.toFixed(2) : v < 0.0001 ? "<0.0001" : String(+v.toPrecision(2));
+  function usageChip(u) {
+    if (!u) return "";
+    if (!u.calls) return `<div class="msg-usage" title="Answered locally (parser, clock or memory): no model call, nothing spent."><b>free</b><span>0 tokens · local</span></div>`;
+    const w = u.windows || {}, usd = u.usd < 0.0001 ? "<$0.0001" : "$" + u.usd.toFixed(u.usd < 0.01 ? 4 : 3);
+    const tip = `${u.engine} · ${u.calls} call${u.calls === 1 ? "" : "s"} · ${(u.input || 0).toLocaleString()} new in, ${(u.cached || 0).toLocaleString()} cached, ${(u.output || 0).toLocaleString()} out. `
+      + `${usd} is what these tokens would cost at API prices; your subscription is what you actually pay. Window shares are estimated from your Codex history.`;
+    return `<div class="msg-usage" title="${esc(tip)}"><b>${pct(w["5h"])}%</b><span>of 5 h</span><b>${pct(w.week)}%</b><span>of week</span>`
+      + `<span class="sep">·</span><span>${u.tokens.toLocaleString()} tok</span><span>≈ ${usd}</span></div>`;
+  }
+  const liveReply = (t, tier) => ({ who: "jarvis", text: t.done ? t.reply : t.sentences.join(" "), at: t.at + 1, tier: t.tier || tier, usage: t.usage,
     streaming: !t.done, error: t.error, meta: t.done ? [t.seconds != null ? t.seconds + "s" : null, t.plan || null].filter(Boolean) : [t.sentences.length ? "answering" : "thinking"] });
   function renderThread() {
     const el = $("#thread");
@@ -742,7 +755,7 @@
     for (const h of history) {
       known.add(h.id);
       rows.push({ who: "you", text: h.text, at: stamp(h.at), tier: h.tier, channel: channelOf(h), voice: live.turns.get(h.id)?.voice });
-      if (h.reply) rows.push({ who: "jarvis", text: h.reply.body, at: stamp(h.reply.at), tier: h.tier, plan: h.reply.meta?.plan,
+      if (h.reply) rows.push({ who: "jarvis", text: h.reply.body, at: stamp(h.reply.at), tier: h.tier, plan: h.reply.meta?.plan, usage: h.reply.meta?.usage,
         meta: [h.reply.meta?.task ? "task " + h.reply.meta.task.slice(0, 6) : null, h.reply.meta?.adapter || null].filter(Boolean) });
       else if (live.turns.has(h.id)) rows.push(liveReply(live.turns.get(h.id), h.tier));
     }
@@ -763,7 +776,7 @@
     const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     el.innerHTML = rows.slice(-60).map((m) => `<li class="msg ${m.who}${m.error ? " error" : ""}${m.streaming ? " streaming" : ""}"${m.streaming ? ' aria-busy="true"' : ""}>
       <div class="msg-head"><span class="who">${m.who === "you" ? "You" : "JARVIS"}</span>${m.who === "you" && m.channel ? `<span class="src-tag">${esc(m.voice ? m.channel + " · voice" : m.channel)}</span>` : ""}${m.tier ? `<span class="tier">${esc(tierName(m.tier))}</span>` : ""}<time>${dayTime(m.at)}</time></div>
-      <div class="msg-body">${esc(m.text)}</div>${m.meta?.length ? `<div class="msg-meta">${m.meta.map((x) => `<span class="state-word">${esc(x)}</span>`).join("")}</div>` : ""}</li>`).join("");
+      <div class="msg-body">${esc(m.text)}</div>${m.meta?.length ? `<div class="msg-meta">${m.meta.map((x) => `<span class="state-word">${esc(x)}</span>`).join("")}</div>` : ""}${m.who === "jarvis" && !m.streaming ? usageChip(m.usage) : ""}</li>`).join("");
     if (stick || busy) el.scrollTop = el.scrollHeight;
   }
   $("#thread-clear").addEventListener("click", () => { local = []; renderThread(); toast("Cleared unsent and failed lines. Everything else stays in Memory."); });
@@ -780,13 +793,13 @@
   let handsFree = true; // always-on is the default for every console launch
   store.set("jarvis.handsFree", true);
   const narrow = matchMedia("(max-width: 640px)");
-  const placeholder = () => (prompt.placeholder = narrow.matches ? "Ask JARVIS…" : state.case ? "Ask JARVIS (filed into this investigation)" : handsFree ? "Ask JARVIS, or say “Jarvis, …”" : "Ask JARVIS, or hold Space to talk");
+  const placeholder = () => (prompt.placeholder = narrow.matches ? "Ask JARVIS…" : state.case ? "Ask JARVIS (filed into this investigation)" : handsFree ? "Ask JARVIS, say “Jarvis, …”, or tap Space" : "Ask JARVIS, or tap Space to talk");
   narrow.addEventListener("change", placeholder); placeholder();
   $("#case-select").addEventListener("change", placeholder);
   prompt.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("#dock").requestSubmit(); }
     // Space in an empty prompt is never a word: treat it as push-to-talk.
-    else if (e.code === "Space" && !prompt.value && !e.repeat) { e.preventDefault(); spaceAt = Date.now(); startMic(); }
+    else if (e.code === "Space" && !prompt.value && !e.repeat) { e.preventDefault(); prompt.blur(); spaceAt = Date.now(); startMic(false, true); }
   });
   const tierBtns = $$(".dock [data-tier]");
   function setTier(t) {
@@ -917,7 +930,7 @@
   function syncMicBtn() {
     micBtn.setAttribute("aria-pressed", String(handsFree || mic.active));
     micBtn.title = handsFree ? "Always listening, but only acts on requests that start with “Jarvis”. Click to stop listening."
-      : "Talk: click to listen all the time, or hold Space when nothing is focused";
+      : "Talk: click to listen all the time, or tap Space when you're not typing";
   }
   function relisten() {
     clearTimeout(micRetryTimer);
@@ -926,16 +939,20 @@
       if (handsFree && !busy && !agent.live) startMic(true);
     }, 600);
   }
-  async function startMic(auto) {
-    if (mic.active || mic.starting || agent.live) return;
+  async function startMic(auto, ptt) {
+    if (agent.live) return;
+    // Space while always-on is idling for "Jarvis": drop that wait and take this one as
+    // push-to-talk, so it needs no wake word.
+    if (ptt && mic.active && mic.wait) { clearTimeout(micRetryTimer); micRetryTimer = null; await mic.stop(); }
+    if (mic.active || mic.starting) return;
     if (busy) return auto || toast("Still answering the last request. Talk again in a moment, or press Esc to stop waiting.");
     try {
-      await mic.start({ wait: handsFree });
+      await mic.start({ wait: handsFree && !ptt });
       if (!mic.active) return;
       micRetryDelay = 1000;
       syncMicBtn();
       // Don't wipe an answer's trace when listening resumes; it clears to "listening" later.
-      if (!auto || !$("#trace").children.length) trace(handsFree ? LISTENING : [["listening · stops when you pause · Esc cancels", "active"]]);
+      if (!auto || !$("#trace").children.length) trace(mic.wait ? LISTENING : [["listening · no “Jarvis” needed · stops when you pause · Esc cancels", "active"]]);
       if (!auto) announce("Listening.");
       Terrain.redraw();
     } catch (e) {
@@ -993,8 +1010,10 @@
     syncMicBtn(); placeholder();
   });
   syncMicBtn();
-  // Space talks only when focus is on the page itself, so it never hijacks a link, summary or control.
-  const pageFocused = () => { const a = document.activeElement; return !a || a === document.body || a === $("#stage") || a.classList?.contains("view"); };
+  // Tap Space to talk (no wake word) anywhere except while typing, and except on a control,
+  // where Space keeps its usual job of pressing the button, link or menu that has focus.
+  const CONTROL = "button, a[href], summary, select, [role=button], [role=tab], [role=switch], [role=menuitem], [role=checkbox], [role=radio], input, textarea, [contenteditable]";
+  const pageFocused = () => { const a = document.activeElement; return !a || a === document.body || !a.matches?.(CONTROL); };
   addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
       if (mic.active || mic.starting) { e.preventDefault(); return stopMic(true); }
@@ -1003,13 +1022,13 @@
       if (OVERLAY && !typing()) { hideOverlay(); return; }
     }
     if (typing() || e.metaKey || e.altKey) return;
-    if (e.code === "Space" && !e.repeat && pageFocused()) { e.preventDefault(); spaceAt = Date.now(); startMic(); }
+    if (e.code === "Space" && !e.repeat && !e.ctrlKey && pageFocused()) { e.preventDefault(); spaceAt = Date.now(); startMic(false, true); }
     else if (e.key === "Enter" && (mic.active || mic.starting) && pageFocused()) { e.preventDefault(); stopMic(); }
     else if (!e.ctrlKey && /^[1-9]$/.test(e.key) && pageFocused()) location.hash = VIEWS[+e.key - 1];
     else if (e.key === "/" || (e.key.toLowerCase() === "k" && e.ctrlKey)) { e.preventDefault(); prompt.focus(); }
   });
   // Hold Space to talk; a quick tap leaves it listening until you pause.
-  addEventListener("keyup", (e) => { if (e.code === "Space" && (mic.active || mic.starting) && Date.now() - spaceAt > 400) stopMic(); });
+  addEventListener("keyup", (e) => { if (e.code === "Space" && (mic.active || mic.starting) && !mic.wait && Date.now() - spaceAt > 400) stopMic(); });
 
   // ---------- live: ElevenLabs agent call (its speech in/out, JARVIS answers) ----------
   const callBtn = $("#agent-call"), voiceSel = $("#voice-select"), voiceBtn = $("#voice-btn");
@@ -1194,7 +1213,7 @@
     },
     "turn.done"(d) {
       const t = d.message && live.turns.get(d.message);
-      if (t) Object.assign(t, { done: true, reply: d.reply, seconds: d.seconds, plan: d.plan, tier: d.tier || t.tier });
+      if (t) Object.assign(t, { done: true, reply: d.reply, seconds: d.seconds, plan: d.plan, tier: d.tier || t.tier, usage: d.usage });
       if (d.job && live.waiters.has(d.job)) api("/api/jobs/" + d.job).then((j) => finishWait(d.job, j)).catch(() => {});
       drawThread(); soonHistory(); soonOverview(); soonMini();
     },

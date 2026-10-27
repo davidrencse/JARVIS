@@ -1,11 +1,11 @@
-// Connection tree: while JARVIS works on a request, a floating panel draws the request's
+// Trace: while JARVIS works on a request, this panel draws the request's
 // path as a live tree — where it came from, what it recalled, how it was routed, which
 // brain or run took it, every tool that brain called, and the reply going back out.
 //
 // Built only from the live stream (turn.start / turn.step / turn.sentence / turn.done /
 // turn.error, see events.py), so console, voice and CLI requests all show up. It sits
-// over every view, appears on its own when a turn starts and fades a few seconds after
-// it ends unless pinned.
+// inside the console's Trace panel (#w-trace), always visible; on pages without one it
+// floats over the view, appears when a turn starts and fades after it ends unless pinned.
 (function () {
   "use strict";
   const J = window.Jarvis;
@@ -32,7 +32,7 @@
   panel.innerHTML = `
     <header class="flow-head">
       <span class="flow-dot"></span>
-      <b class="flow-title">Connection tree</b>
+      <b class="flow-title">Trace</b>
       <span class="flow-meta"></span>
       <button type="button" class="flow-btn flow-prev" title="Previous request" aria-label="Previous request">‹</button>
       <button type="button" class="flow-btn flow-next" title="Next request" aria-label="Next request">›</button>
@@ -44,7 +44,10 @@
     <section class="flow-confirm" aria-label="Pending confirmations" hidden></section>
     <i class="flow-reg tl">+</i><i class="flow-reg tr">+</i><i class="flow-reg bl">+</i><i class="flow-reg br">+</i>
     <div class="flow-body"><div class="flow-canvas"><svg class="flow-edges" aria-hidden="true"></svg></div></div>`;
-  document.body.appendChild(panel);
+  const dock = document.getElementById("w-trace");
+  const docked = !!dock;
+  if (docked) { dock.replaceChildren(panel); panel.classList.add("docked"); panel.hidden = false; }
+  else document.body.appendChild(panel);
   const $ = (s) => panel.querySelector(s);
   const canvas = $(".flow-canvas"), svg = $(".flow-edges");
   let pending = [], confirmBusy = false;
@@ -279,7 +282,8 @@
     const working = [...turns.values()].some((x) => !x.done);
     $(".flow-pin").setAttribute("aria-pressed", String(pinned));
     $(".flow-pin").textContent = pinned ? "Pinned" : "Pin";
-    const want = !hidden && (pending.length > 0 || (!!t && (pinned || working || !t.done)));
+    const want = docked || (!hidden && (pending.length > 0 || (!!t && (pinned || working || !t.done))));
+    if (docked && !t) $(".flow-ask").textContent = "No request yet. Ask something and every step appears here as it runs.";
     if (want) { panel.hidden = false; requestAnimationFrame(() => panel.classList.add("on")); }
     else if (t && !hidden) fadeTimer = setTimeout(hide, LINGER);  // finished: linger, then fade
     else hide();

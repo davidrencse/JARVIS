@@ -87,3 +87,12 @@
   .flow { right: 8px; bottom: 8px; width: calc(100vw - 16px); }
   .fn-st em { display: none; }
 }
+
+/* Docked: the console's Trace panel. Part of the page, not a popup; follows the page theme. */
+.flow.docked {
+  --f-bg: transparent; --f-ink: var(--ink); --f-dim: var(--ink-3); --f-faint: var(--line-2); --f-fill: var(--ink-2);
+  position: static; width: auto; max-height: none; opacity: 1; transform: none; pointer-events: auto;
+  border: 0; box-shadow: none; z-index: auto; margin: -10px -12px -12px;
+}
+.flow.docked .flow-pin, .flow.docked .flow-close, .flow.docked .flow-reg { display: none; }
+.flow.docked .flow-body { max-height: 460px; }

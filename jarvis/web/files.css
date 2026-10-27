@@ -1,0 +1,49 @@
+/* Folder tiles retain the console's theme, with familiar folder silhouettes. */
+.files-wrap { --folder-front: #d9b76e; --folder-back: #a48648; }
+:root[data-theme="light"] .files-wrap { --folder-front: #e2c17b; --folder-back: #b8954d; }
+.files-wrap .files-grid { gap: 24px; }
+.files-wrap .fpane { min-width: 0; padding: 0; min-height: 440px; max-height: calc(100vh - 210px); }
+.files-wrap .ph { padding: 16px 0 12px; gap: 10px; }
+.files-wrap .ph h2 { overflow: hidden; text-overflow: ellipsis; }
+.files-wrap .fpath { min-height: 52px; padding: 4px 0 8px; }
+.files-wrap .fpath button { display: grid; place-items: center; flex: 0 0 40px; min-height: 40px; border-radius: 8px; }
+.files-wrap .fsummary { padding: 12px 0; color: var(--ink-2); font-size: 12px; }
+.files-wrap .fsearch { display: grid; gap: 6px; padding-top: 12px; font-size: 12px; color: var(--ink-2); }
+.files-wrap .fsearch-input { width: 100%; min-width: 0; min-height: 44px; padding: 10px 12px; border: 1px solid var(--line-ctl); border-radius: 8px; background: var(--card-sunk); color: var(--ink); font: 400 14px/1.4 var(--sans); caret-color: var(--ink); }
+.files-wrap .fsearch-input::placeholder { color: var(--ink-3); opacity: 1; }
+.files-wrap .fsearch-input:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.files-wrap .fsearch-input:disabled { opacity: .55; }
+.files-wrap .flist > [hidden] { display: none; }
+.files-wrap .flist { display: grid; grid-template-columns: repeat(auto-fill, minmax(148px, 1fr)); align-content: start; gap: 12px; padding: 3px 4px 12px; scrollbar-color: var(--line-ctl) transparent; }
+.files-wrap .frow { position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 0; min-width: 0; padding: 0; border: 1px solid var(--line); border-radius: 12px; background: var(--card-sunk); transition: background .16s ease, border-color .16s ease; }
+.files-wrap .frow:hover, .files-wrap .frow:focus-within { background: var(--hover); border-color: var(--line-ctl); }
+.files-wrap .frow.fdrop { background: var(--hover); outline: 2px solid var(--ink); outline-offset: -2px; }
+.files-wrap .flink { display: flex; flex-direction: column; align-items: flex-start; width: 100%; padding: 16px 14px 0; white-space: normal; overflow: visible; font: inherit; text-align: left; border-radius: 12px 12px 0 0; }
+.files-wrap .flink:focus-visible { outline: 2px solid var(--ink); outline-offset: -3px; }
+.files-wrap .fart { display: block; width: 76px; height: 64px; margin-bottom: 10px; }
+.files-wrap .fart svg { display: block; width: 100%; height: 100%; }
+.files-wrap .fart.has-preview { position: relative; width: 100%; }
+.files-wrap .fart.has-preview svg { width: 76px; }
+.files-wrap .fthumbnail { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; object-position: left center; background: var(--bg); border-radius: 4px; }
+.files-wrap .folder-back { fill: var(--folder-back); }
+.files-wrap .folder-front { fill: var(--folder-front); }
+.files-wrap .file-sheet { fill: var(--hover); stroke: var(--ink-2); stroke-width: 1.5; stroke-linejoin: round; }
+.files-wrap .file-lines { fill: none; stroke: var(--ink-2); stroke-width: 1.5; stroke-linejoin: round; }
+.files-wrap .fname { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; min-height: 40px; font-size: 13px; line-height: 20px; color: var(--ink); }
+.files-wrap .fmeta { display: block; padding: 6px 48px 14px 14px; text-align: left; font-size: 12px; line-height: 18px; }
+.files-wrap .fdate { display: block; font-size: 11px; white-space: nowrap; }
+.files-wrap .fsend { position: absolute; right: 6px; bottom: 8px; display: grid; place-items: center; width: 36px; height: 40px; padding: 0; border: 0; border-radius: 8px; opacity: 1; }
+.files-wrap .fsend:hover { background: var(--track); color: var(--ink); }
+.files-wrap .fempty { grid-column: 1 / -1; padding: 48px 16px; text-align: center; font-size: 14px; }
+.files-wrap .fempty span { display: block; margin-top: 6px; font-size: 12px; }
+.files-wrap .flist[aria-busy="true"] { opacity: .55; pointer-events: none; }
+@media (max-width: 900px) {
+  .files-wrap .fpane { max-height: 640px; min-height: 300px; }
+}
+@media (max-width: 420px) {
+  .files-wrap .flist { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .files-wrap .fdate { white-space: normal; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .files-wrap .frow { transition: none; }
+}

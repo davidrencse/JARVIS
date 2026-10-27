@@ -240,6 +240,7 @@
   let range = "day";
   function timeline() {
     const o = J.state.overview, host = $("#timeline");
+    if (!host) return;  // the Runs card was removed from the console
     if (!o || !host) return;
     const now = Date.now(), span = range === "day" ? 24 * 3600e3 : 7 * 24 * 3600e3;
     const t0 = now - span, ticks = range === "day" ? 8 : 7;
