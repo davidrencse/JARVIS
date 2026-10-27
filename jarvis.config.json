@@ -4,7 +4,8 @@
   ],
   "cluster": {
     "enabled": true,
-    "main_device": "dell",
+    "main_device": "zenbook",
+    "tunnel": "forward",
     "local_device": "auto",
     "main_url": "http://127.0.0.1:7780",
     "listen_host": "127.0.0.1",
