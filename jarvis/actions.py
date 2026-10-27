@@ -1,11 +1,13 @@
-"""Hands: what JARVIS can do on David's Windows 11 PC or his Arch laptop.
+"""Hands: what JARVIS can do on whatever computer it runs on (Windows, macOS or Linux).
 
 ChatGPT (through the Codex app-server) decides; JARVIS executes. Two kinds of tools:
 
 - Desktop tools defined here and run inside JARVIS (Codex "dynamic tools"): open an
   installed app, list apps, open a link in the default browser, open a console page,
   close an app's windows (politely, as its X button does), media keys and speaker
-  volume. Each also runs on the other laptop (remote.py). Deliberately narrow: no
+  volume. Each also runs on the other computer (remote.py). The backend is chosen from
+  platforms.detect(): Win32 on Windows; hyprctl, swaymsg or wmctrl on Linux desktops;
+  osascript and `open` on macOS. Deliberately narrow: no
   arbitrary shell, no file writes, no killing processes.
 - A real browser through Microsoft's Playwright MCP server (open source, no model or
   API key of its own; ChatGPT drives it). It runs Google Chrome with a separate JARVIS
@@ -31,9 +33,10 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import platforms
 from .showcase import PAGES
 
-MACHINE = "Windows 11 PC" if os.name == "nt" else "Arch Linux laptop"
+MACHINE = platforms.label()  # e.g. "Windows 11", "Arch Linux (Hyprland)", "macOS"
 
 PLAYWRIGHT_MCP = "@playwright/mcp@0.0.83"  # pinned; published 2026-09-28
 AGENT_BROWSER = "agent-browser@0.39.1"  # pinned; published 2026-10-13
@@ -56,7 +59,7 @@ DEVICEISH = re.compile(r"\bon\s+(?:the\s+|my\s+)?(?:arch|asus|zenbook|linux|dell
 VERB = re.compile(rf"\b(?:{VERBS})\b", re.I)
 
 INSTRUCTIONS = (
-    f"You are JARVIS operating David's {MACHINE} on his behalf. Tools: open_app "
+    f"You are JARVIS operating David's computer ({MACHINE}) on his behalf. Tools: open_app "
     "launches an installed application (call list_apps if the name is unclear); open_url "
     "only opens a link in his normal browser for him to look at himself. For anything "
     "that involves a website (going to a page, searching a site, reading, clicking, "
@@ -200,7 +203,8 @@ class DesktopTools:
     def apps(self):
         if not self._apps or time.time() - self._loaded > self.cache_seconds:
             if os.name != "nt":
-                self._apps, self._loaded = desktop_entries(), time.time()
+                self._apps = macos_apps() if _backend() == "macos" else desktop_entries()
+                self._loaded = time.time()
                 return self._apps
             out = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
@@ -244,6 +248,8 @@ class DesktopTools:
         if not re.fullmatch(r"[\w .{}\\:!~()+\-]+", app["AppID"]):
             return False, "Refusing an app ID with unexpected characters."
         if os.name != "nt":
+            if _backend() == "macos":
+                return _macos_open(["-a", app["AppID"]], f"Opened {app['Name']}.", app["AppID"])
             return launch_desktop_entry(app)
         subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{app['AppID']}"],
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -255,6 +261,8 @@ class DesktopTools:
                 return False, "Invalid Spotify deep link."
             if os.name == "nt":
                 out = _run("cmd.exe", "/c", "start", "", url)
+            elif _backend() == "macos":
+                out = _run("open", url)
             else:
                 out = _run("xdg-open", url)
             if out.returncode:
@@ -274,6 +282,9 @@ class DesktopTools:
                 hits = self.match(browser)
                 if not hits:
                     return False, f"No installed browser matches {browser!r}."
+                if _backend() == "macos":
+                    return _macos_open(["-a", hits[0]["AppID"], url],
+                                       f"Opened {url} in {hits[0]['Name']}.", hits[0]["AppID"])
                 return launch_desktop_entry(hits[0], url)
             executable = {"chrome": "chrome.exe", "google chrome": "chrome.exe",
                           "firefox": "firefox.exe", "edge": "msedge.exe",
@@ -354,6 +365,49 @@ def launch_desktop_entry(app, url=None):
     return False, "Can't launch apps: install gtk3 (gtk-launch) or glib2 (gio)."
 
 
+# -- macOS ------------------------------------------------------------------------------
+# An app name is interpolated into AppleScript, so only plain names pass: letters, digits,
+# spaces, dots, dashes, underscores. Anything else (quotes, backslashes...) is rejected.
+MACOS_APP_NAME = re.compile(r"[\w .\-]{1,100}")
+
+
+def macos_app_name(name):
+    """The app name if it is safe to put in an AppleScript string, else None."""
+    name = str(name)
+    return name if MACOS_APP_NAME.fullmatch(name) and name.strip() else None
+
+
+def macos_apps():
+    """macOS counterpart of Get-StartApps: {"Name", "AppID", "Path"} for each .app bundle in
+    /Applications, ~/Applications and the system folders. AppID is what `open -a` takes."""
+    apps, seen = [], set()
+    for folder in (Path("/Applications"), Path.home() / "Applications",
+                   Path("/System/Applications"), Path("/Applications/Utilities"),
+                   Path("/System/Applications/Utilities")):
+        try:
+            bundles = sorted(folder.glob("*.app"))
+        except OSError:
+            continue
+        for path in bundles:
+            if path.stem not in seen:
+                seen.add(path.stem)
+                apps.append({"Name": path.stem, "AppID": path.stem, "Path": str(path)})
+    return apps
+
+
+def _macos_open(args, success, name):
+    if not macos_app_name(name):
+        return False, "Refusing an app name with unexpected characters."
+    out = _run("open", *args)
+    if out.returncode:
+        return False, out.stderr.strip() or f"Couldn't open {name}."
+    return True, success
+
+
+def _osascript(script):
+    return _run("osascript", "-e", script)
+
+
 # -- windows, media keys, volume -------------------------------------------------------
 MEDIA = ("play_pause", "play", "pause", "next", "previous", "stop")
 VOLUME_STEP = 10  # percent per "up" / "down"
@@ -432,8 +486,18 @@ def _flat(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
 
 
+def _backend():
+    """The desktop family driving this machine: windows, hyprland, sway, x11, gnome, kde,
+    macos, wayland or none. A non-Windows os.name never means the Windows backend."""
+    if os.name == "nt":
+        return "windows"
+    desktop = platforms.detect()["desktop"]
+    return "hyprland" if desktop == "windows" else desktop
+
+
 def open_windows():
-    """Top-level windows: {"id", "app", "title"}; id is a Hyprland address or an HWND."""
+    """Top-level windows: {"id", "app", "title"}; id is an HWND, a Hyprland address, a sway
+    container id, an X11 window id or (macOS) the app name."""
     if os.name == "nt":
         out = _run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                    "Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object "
@@ -442,6 +506,9 @@ def open_windows():
         data = json.loads(out.stdout or "[]")
         return [{"id": int(w["Handle"]), "app": w["ProcessName"], "title": w["MainWindowTitle"] or ""}
                 for w in (data if isinstance(data, list) else [data])]
+    if _backend() != "hyprland":
+        from .observe import window_details  # sway, wmctrl, macOS; LookupError if unsupported
+        return window_details()
     if not shutil.which("hyprctl"):
         raise LookupError("closing windows needs Hyprland (hyprctl)")
     clients = json.loads(_run("hyprctl", "clients", "-j").stdout or "[]")
@@ -453,9 +520,18 @@ def _close(window):
     if os.name == "nt":
         import ctypes
         return bool(ctypes.windll.user32.PostMessageW(window["id"], 0x0010, 0, 0))  # WM_CLOSE
+    backend = _backend()
+    if backend == "macos":
+        name = macos_app_name(window["app"])
+        return bool(name) and _osascript(f'tell application "{name}" to quit').returncode == 0
+    if backend == "sway":
+        return isinstance(window["id"], int) and _run(
+            "swaymsg", f"[con_id={window['id']}]", "kill").returncode == 0
     address = str(window["id"])
     if not re.fullmatch(r"0x[0-9a-f]+", address):
         return False
+    if backend != "hyprland":  # an X11 window id
+        return _run("wmctrl", "-i", "-c", address).returncode == 0
     # Hyprland 0.56+ takes Lua dispatchers; older ones the classic syntax.
     for command in ([f'hl.dsp.window.close({{ window = "address:{address}" }})'],
                     ["closewindow", f"address:{address}"]):
@@ -480,6 +556,16 @@ def focus_window(name):
     if os.name == "nt":
         import ctypes
         ok = bool(ctypes.windll.user32.SetForegroundWindow(window["id"]))
+    elif _backend() == "macos":
+        name = macos_app_name(window["app"])
+        ok = bool(name) and _osascript(f'tell application "{name}" to activate').returncode == 0
+    elif _backend() == "sway":
+        ok = isinstance(window["id"], int) and _run(
+            "swaymsg", f"[con_id={window['id']}]", "focus").returncode == 0
+    elif _backend() != "hyprland":  # an X11 window id
+        address = str(window["id"])
+        ok = bool(re.fullmatch(r"0x[0-9a-f]+", address)) and \
+            _run("wmctrl", "-i", "-a", address).returncode == 0
     else:
         address = str(window["id"])
         ok = bool(re.fullmatch(r"0x[0-9a-f]+", address) and
@@ -510,6 +596,11 @@ def close_app(name):
     return True, f"Closed {len(closed)} {name} window{'s' if len(closed) > 1 else ''}."
 
 
+MEDIA_SAID = {"play_pause": "Toggled play/pause.", "play": "Playing.", "pause": "Paused.",
+              "next": "Skipped to the next track.", "previous": "Went back a track.",
+              "stop": "Stopped."}
+
+
 def media(command):
     command = command.strip().lower().replace("-", "_").replace(" ", "_")
     if command not in MEDIA:
@@ -528,14 +619,21 @@ def media(command):
         _press(VK.get(command, VK["play_pause"]))
         return True, "Pressed play/pause." if command in ("play", "pause", "play_pause") \
             else f"Pressed {command}."
+    if _backend() == "macos":
+        if not shutil.which("nowplaying-cli"):
+            return False, "Media keys on macOS need nowplaying-cli (brew install nowplaying-cli)."
+        # nowplaying-cli has no stop; pausing is the closest.
+        verb = {"play_pause": "togglePlayPause", "stop": "pause"}.get(command, command)
+        out = _run("nowplaying-cli", verb)
+        if out.returncode:
+            return False, out.stderr.strip() or "No media player is running."
+        return True, MEDIA_SAID[command]
     if not shutil.which("playerctl"):
         return False, "Media control needs playerctl."
     out = _run("playerctl", command.replace("_", "-"))
     if out.returncode:
         return False, out.stderr.strip() or "No media player is running."
-    return True, {"play_pause": "Toggled play/pause.", "play": "Playing.", "pause": "Paused.",
-                  "next": "Skipped to the next track.", "previous": "Went back a track.",
-                  "stop": "Stopped."}[command]
+    return True, MEDIA_SAID[command]
 
 
 def _volume_core_audio(level):
@@ -552,6 +650,60 @@ def _volume_core_audio(level):
     else:
         scalar, muted = core_audio(level=int(level) / 100)
     return True, f"Volume is {round(scalar * 100)} percent" + (", muted." if muted else ".")
+
+
+def _said(percent, muted):
+    return f"Volume is {percent} percent" + (", muted." if muted else ".")
+
+
+def _volume_pactl(level):
+    """PulseAudio / PipeWire-pulse fallback when there is no wpctl."""
+    from .observe import pactl_volume
+    sink = "@DEFAULT_SINK@"
+    steps = {"up": [["set-sink-mute", sink, "0"], ["set-sink-volume", sink, f"+{VOLUME_STEP}%"]],
+             "down": [["set-sink-volume", sink, f"-{VOLUME_STEP}%"]],
+             "mute": [["set-sink-mute", sink, "1"]], "unmute": [["set-sink-mute", sink, "0"]]}.get(
+        level, [["set-sink-mute", sink, "0"], ["set-sink-volume", sink, f"{level}%"]])
+    for step in steps:
+        out = _run("pactl", *step)
+        if out.returncode:
+            return False, out.stderr.strip() or "pactl failed."
+    try:
+        percent, muted = pactl_volume()
+        if percent > 100:  # "up" past 100 percent distorts: pull it back
+            _run("pactl", "set-sink-volume", sink, "100%")
+            percent = 100
+    except LookupError:
+        return True, "Done."
+    return True, _said(percent, muted)
+
+
+def _volume_macos(level):
+    from .observe import macos_volume
+    if level == "mute":
+        scripts = ["set volume with output muted"]
+    elif level == "unmute":
+        scripts = ["set volume without output muted"]
+    else:
+        if level in ("up", "down"):
+            try:
+                now, _ = macos_volume()
+            except LookupError as exc:
+                return False, str(exc)
+            target = min(100, max(0, now + (VOLUME_STEP if level == "up" else -VOLUME_STEP)))
+        else:
+            target = int(level)
+        scripts = [f"set volume output volume {target}"]
+        if level != "down":
+            scripts.append("set volume without output muted")
+    for script in scripts:
+        out = _osascript(script)
+        if out.returncode:
+            return False, out.stderr.strip() or "osascript failed."
+    try:
+        return True, _said(*macos_volume())
+    except LookupError:
+        return True, "Done."
 
 
 def volume(level):
@@ -573,8 +725,12 @@ def volume(level):
         _press(VK["down"], 50)  # to zero, then up two percent a press
         _press(VK["up"], round(int(level) / 2))
         return True, f"Volume set to {level} percent."
+    if _backend() == "macos":
+        return _volume_macos(level)
     if not shutil.which("wpctl"):
-        return False, "Volume control needs wpctl (WirePlumber)."
+        if shutil.which("pactl"):
+            return _volume_pactl(level)
+        return False, "Volume control needs wpctl (WirePlumber) or pactl (PulseAudio)."
     sink = "@DEFAULT_AUDIO_SINK@"
     steps = {"up": [["set-mute", sink, "0"], ["set-volume", "-l", "1.0", sink, f"{VOLUME_STEP}%+"]],
              "down": [["set-volume", sink, f"{VOLUME_STEP}%-"]],

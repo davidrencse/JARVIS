@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from . import __version__
+from .deploy import code_fingerprint
 from .cluster_store import Broker, CAPABILITIES, TERMINAL
 from .topology import ORIGIN, enabled, endpoint, identity, is_node, request_from
 
@@ -32,6 +33,15 @@ FRESH = 10  # seconds after a check-in that a node counts as alive between polls
 
 class NodeOffline(ConnectionError):
     """An enrolled node was offline before any job was enqueued; SSH is safe."""
+
+
+# Queries that change nothing, allowed even when a node's code is out of date, so Settings
+# and status can still say what it is.
+READ_ONLY_DESKTOP = frozenset({"input_info", "list_apps"})
+
+
+def _read_only(kind, payload):
+    return kind == "inventory" or (kind == "desktop" and payload.get("action") in READ_ONLY_DESKTOP)
 
 
 def _connected(sock):
@@ -205,6 +215,22 @@ class Hub:
             raise PermissionError("Node credential is missing, revoked, or lacks this capability.")
         return found
 
+    def _auto_update(self, settle=20):
+        """Once after start: bring every online node that runs other code up to this main's
+        code (jarvis cluster update), so nodes follow the main without git or a manual step.
+        Failures are logged; actions to that node stay refused until it matches."""
+        if self.stop_event.wait(settle):  # let nodes reconnect and report their code
+            return
+        from .deploy import update
+        for status in self.broker.nodes():
+            if not status["online"] or status.get("code") == code_fingerprint():
+                continue
+            try:
+                report = update(self.config, self.state, status["id"])
+                print(f"JARVIS: updated {status['id']} to {report.get('after')}", flush=True)
+            except Exception as exc:  # never takes the hub down
+                print(f"JARVIS: couldn't update {status['id']}: {exc}", flush=True)
+
     def alive(self, node, status):
         """Ready to take a job now: holding a poll open, checked in moments ago (between
         polls), or running a job. A stopped node is none of these within FRESH seconds, so
@@ -232,6 +258,10 @@ class Hub:
             raise ValueError(f"Node {node} is not enrolled for {kind} actions.")
         if not self.alive(node, status):
             raise NodeOffline(f"Node {node} is offline. Start jarvis cluster node on that PC.")
+        if not _read_only(kind, payload) and status.get("code") != code_fingerprint():
+            # Mismatched code can misread a newer job; refuse rather than guess.
+            raise ValueError(f"{node} runs different JARVIS code ({status.get('code') or 'unknown'}, "
+                             f"main {code_fingerprint()}). Run: jarvis cluster update {node}")
         with self._condition:
             job_id = self.broker.enqueue(node, self.main, kind, payload, timeout)
             self._condition.notify_all()
@@ -328,6 +358,9 @@ class Hub:
             self.thread.start()
             self.worker.start()
             self.started = True
+            if settings.get("auto_update", True):
+                threading.Thread(target=self._auto_update, name="jarvis-auto-update",
+                                 daemon=True).start()
         except BaseException:
             if self.server:
                 self.server.server_close()
@@ -494,7 +527,8 @@ class NodeWorker:
             self.client.request("/v1/result", note["message"])
             self.outbox.unlink()
         response = self.client.request("/v1/poll", {"hostname": platform.node(),
-                            "platform": platform.system(), "version": __version__},
+                            "platform": platform.system(), "version": __version__,
+                            "code": code_fingerprint()},
                             timeout=POLL_WAIT + 10)
         job = response.get("job")
         if not job:

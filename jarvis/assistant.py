@@ -80,10 +80,25 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
     if tier is None and not write and routing.get("fast_path", True):
         fast = _fast_path(text, memory, config, channel, on_start, on_sentence, on_step)
         if fast is not None:
+            _shadow(config, memory, text, "act")
             return fast
     agent = tier is None and not write and _needs_agent(text, config)
+    build = False
+    if agent and routing.get("interpreter"):
+        # The parser saw an action it couldn't resolve: ask the interpreter before Grok.
+        read = _interpret(text, memory, config, base, channel, on_start, on_sentence, on_step)
+        if isinstance(read, dict):
+            return read                                  # ran it, or asked David
+        if read == "converse":
+            agent = False                                # just a question: the brain
+        elif read == "build":
+            agent, build = False, True
     route = ({"tier": "medium", "reasons": ["an action the parser can't run: Grok Bot"]}
-             if agent else decide(text, config, tier, lane is not None, write))
+             if agent else {"tier": "complex", "reasons": ["interpreter: software work"]}
+             if build else decide(text, config, tier, lane is not None, write))
+    if tier is None and not write:
+        _shadow(config, memory, text, "agent" if agent or grok_first(text, config) else
+                "build" if route["tier"] == "complex" else "converse")
     inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
                          meta={"route": route, "channel": channel,
                                "origin_device": __import__("jarvis.topology", fromlist=["ORIGIN"]).ORIGIN.get()}, importance=0.4)
@@ -118,7 +133,9 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
             try:
                 reply = _with_tools(lane, step, lambda: lane.ask(text, recall,
                                                                 on_sentence=on_sentence))
-                detail = {"lane": type(lane).__name__, "streamed": on_sentence is not None}
+                detail = {"lane": type(lane).__name__, "streamed": on_sentence is not None,
+                          "brain": "chatgpt" if "ChatGPT" in lane_label(lane, text) else
+                          type(lane).__name__.lower()}
                 step("brain", "route", lane_label(lane, text), "answered")
             except RuntimeError as exc:  # fall back to a normal one-shot run below
                 detail = {"lane_error": str(exc)}
@@ -133,9 +150,10 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
             step("task", "route", label, spec["mode"], "run")
             result = run_task(store, store.add(spec)["id"], config, base, timeout)
             reply = result.get("answer")
-            detail.update(task=result["task_id"], state=result["state"])
+            detail.update(task=result["task_id"], state=result["state"], brain=spec["provider"])
             step("task", "route", label, f"{result['task_id']} · {result['state']}",
                  "done" if reply else "fail")
+            reply = _failover_reply(reply, detail, spec["provider"])
 
     elif route["tier"] == "medium":
         adapter = ({"kind": "browser_agent", "name": "grokbot",
@@ -159,6 +177,7 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
                 if agent_risk(text) == "deny":
                     raise ValueError("I can't handle passwords, passcodes, 2FA codes or card numbers.")
                 prepared = assess(text, config, base)
+                _shadow(config, memory, text, prepared["decision"], job="grok_preflight", decided=False)
                 step("grok-check", "adapter", "Grok preflight", prepared["decision"])
                 risk = agent_risk(text, prepared)
                 if risk == "deny":
@@ -233,6 +252,45 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
             "memory": [inbound["id"], outbound["id"]], **detail}
 
 
+LOGGED_OUT = ("not logged in", "please run /login", "invalid api key", "authentication")
+
+
+def _failover_reply(reply, detail, provider):
+    """When the fallback brain can't answer either, say plainly why and how to fix it,
+    instead of reading out a CLI's error. Otherwise the reply as it came."""
+    why = detail.get("lane_error") or ""
+    text = (reply or "").strip()
+    if provider == "claude" and any(m in text.lower() for m in LOGGED_OUT):
+        from .chatgpt import usage_limit
+        until = usage_limit()  # "until 8:00 PM", parsed when the refusal came in
+        first = (f"ChatGPT is over its plan's usage limit{' ' + until if until else ''}"
+                 if "usage limit" in why.lower()
+                 else "ChatGPT didn't answer" if why else "I couldn't reach a brain")
+        detail["brain"] = None
+        return (f"{first}, and Claude isn't signed in on this PC. "
+                "Run claude in a terminal and type /login once, then ask me again.")
+    return reply
+
+
+def _shadow(config, memory, text, label, job="mode", decided=True):
+    """Log what the decider would have chosen next to what JARVIS actually did, in a
+    background thread (requests never wait). decided=False logs only the label: data for a
+    job the decider doesn't take yet (the Grok preflight). Off unless decisions.shadow."""
+    if not (config.get("decisions") or {}).get("shadow") or memory is None:
+        return
+    state = memory.path.parent
+
+    def run():
+        try:
+            from . import decide
+            guess = decide.choose(job, text) if decided else None
+            decide.record(state, job, text, guess, label=label, source="rules")
+        except Exception:
+            pass  # the shadow log must never affect a request
+    import threading
+    threading.Thread(target=run, name="jarvis-decider-shadow", daemon=True).start()
+
+
 def _needs_agent(text, config):
     """Actions the parser recognized but can't run go to Grok Bot (behind its preflight);
     conversation stays with the brain. Off when Grok isn't set up or routing says so."""
@@ -252,9 +310,49 @@ def _fast_path(text, memory, config, channel, on_start, on_sentence, on_step):
     """Certain direct actions (open, play, volume...) run without a model; None sends
     the request on to the router and the brain as before (jarvis/pipeline.py)."""
     from .pipeline import fast_path
+
+    def run(step, origin, begin):
+        return fast_path(text, config, memory.path.parent, step=step, origin=origin,
+                         on_begin=begin, channel=channel)
+    return _direct_turn(text, memory, channel, on_start, on_sentence, on_step, run,
+                        lane="parser", reason="parsed: direct actions, no model")
+
+
+def _interpret(text, memory, config, base, channel, on_start, on_sentence, on_step):
+    """Ask the interpreter about an action-like request the parser couldn't resolve.
+    Returns a finished turn (direct actions run, or a clarifying question asked), or the
+    mode ("agent", "converse", "build") for the caller to route, or None (no answer)."""
+    from .interpret import interpret
+    from .pipeline import run_commands
+    from .topology import ORIGIN
+    from .remote import Remote
+    origin = ORIGIN.get() or Remote(config, memory.path.parent).here()
+    read = interpret(text, config, base, origin)
+    if read is None:
+        return None
+    if read["mode"] == "act":
+        def run(step, origin_now, begin):
+            return run_commands(text, read["commands"], config, memory.path.parent, step=step,
+                                origin=origin_now or origin, on_begin=begin, channel=channel,
+                                source="Interpreter", detail="ChatGPT")
+        done = _direct_turn(text, memory, channel, on_start, on_sentence, on_step, run,
+                            lane="interpreter", reason="interpreted: direct actions")
+        return done if done is not None else "agent"   # invalid commands: Grok decides
+    if read["mode"] == "clarify":
+        def ask_back(step, origin_now, begin):
+            begin([])
+            return {"reply": read["question"], "commands": [], "outcomes": []}
+        return _direct_turn(text, memory, channel, on_start, on_sentence, on_step, ask_back,
+                            lane="interpreter", reason="interpreter: needs a detail")
+    return read["mode"]
+
+
+def _direct_turn(text, memory, channel, on_start, on_sentence, on_step, run, lane, reason):
+    """A turn whose work is direct actions: run(step, origin, begin) -> result or None.
+    Starts the turn on begin(), records it, speaks the reply. None: not ours."""
     from .topology import ORIGIN
     step = _stepper(on_step)
-    route = {"tier": "simple", "reasons": ["parsed: direct actions, no model"]}
+    route = {"tier": "simple", "reasons": [reason]}
     begun = {}
 
     def begin(commands):
@@ -267,8 +365,7 @@ def _fast_path(text, memory, config, channel, on_start, on_sentence, on_step):
             on_start({"route": route, "message": begun["inbound"]["id"]})
 
     try:
-        done = fast_path(text, config, memory.path.parent, step=step, origin=ORIGIN.get(),
-                         on_begin=begin, channel=channel)
+        done = run(step, ORIGIN.get(), begin)
     except Exception as exc:  # the fast path must never cost David his request
         if not begun:
             return None
@@ -283,7 +380,7 @@ def _fast_path(text, memory, config, channel, on_start, on_sentence, on_step):
         on_start({"route": route, "message": inbound["id"]})
     if on_sentence:
         on_sentence(done["reply"])
-    detail = {"lane": "parser", "streamed": on_sentence is not None,
+    detail = {"lane": lane, "streamed": on_sentence is not None,
               "commands": done["commands"], "outcomes": done["outcomes"],
               "confirmations": done.get("confirmations", [])}
     outbound = memory.add("reply", done["reply"], source="jarvis", tags=["outbound", "fast"],

@@ -65,7 +65,8 @@ def listen_loop(state, config, base, threshold=None):
     from .topology import is_node
     node = is_node(config)
     store = None if node else Store(state, lanes_from(config))
-    memory, voice = (None if node else Memory(state)), Voice(state, config)
+    from .memory import semantic_recall
+    memory, voice = (None if node else Memory(state, semantic=semantic_recall(config))), Voice(state, config)
     speaker = SpeechQueue(voice)
     ears, stt = VoicePrint(state, config), Transcriber(config)
     lane = make_lane(config, base, state)
@@ -86,6 +87,7 @@ def listen_loop(state, config, base, threshold=None):
         if not node:
             from .pipeline import warm
             warm()  # the installed-app list, for the direct-action fast path
+            memory.warm_vectors()  # meaning-based recall index, in the background
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device)
         failures = 0

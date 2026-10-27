@@ -582,13 +582,13 @@ def cognition(args, config, base):
         from .cluster_cli import proxy_cognition
         return proxy_cognition(args, config)
     from .assistant import ask
-    from .memory import Memory
+    from .memory import Memory, semantic_recall
     from .orchestrator import Orchestrator
     from .router import pick_adapter
     from .speech import Voice
 
     store = None if node else Store(args.state, lanes_from(config))
-    memory = None if node else Memory(args.state)
+    memory = None if node else Memory(args.state, semantic=semantic_recall(config))
     if args.command == "route":
         from .assistant import decide
         route = decide(args.text, config, conversational=True)

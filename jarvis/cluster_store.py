@@ -88,7 +88,7 @@ class Broker:
 
     def heartbeat(self, node, info):
         # Never accept agent-provided paths, shell commands, or credentials as config.
-        safe = {k: str(info.get(k, ""))[:120] for k in ("hostname", "platform", "version")}
+        safe = {k: str(info.get(k, ""))[:120] for k in ("hostname", "platform", "version", "code")}
         with self.db() as db:
             db.execute("UPDATE nodes SET seen=?,info=? WHERE id=?", (time.time(), json.dumps(safe), node))
 

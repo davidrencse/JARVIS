@@ -15,7 +15,7 @@ from .topology import DEVICE_ID, enabled, endpoint, identity, is_node
 def parser(sub):
     command = sub.add_parser("cluster", help="Configure the main PC and its lightweight nodes")
     command.add_argument("action", choices=("configure", "enroll", "join", "revoke", "status",
-                                           "run", "serve", "node", "request", "autostart", "tunnel"))
+                                           "run", "serve", "node", "request", "autostart", "tunnel", "update"))
     command.add_argument("value", nargs="?", help="node ID, pairing file, request ID, or on/off")
     command.add_argument("--main", dest="main_device", help="device ID of the main PC")
     command.add_argument("--local", dest="local_device", help="this PC's device ID, or auto")
@@ -24,6 +24,7 @@ def parser(sub):
     command.add_argument("--capability", action="append", choices=sorted(CAPABILITIES))
     command.add_argument("--output", help="enroll: write the one-time pairing bundle here")
     command.add_argument("--port", type=int, default=7777, help="main: local console port")
+    command.add_argument("--rollback", action="store_true", help="update: swap a node back to its previous code")
     command.add_argument("--autostart", action="store_true", help="tunnel start/stop: also enable/disable login startup")
 
 
@@ -78,10 +79,18 @@ def run(args, config, base):
     if not enabled(config):
         raise ValueError("Configure the main PC first: jarvis cluster configure --main DEVICE --local DEVICE")
     local, main = identity(config)
+    if action == "update":
+        from .deploy import update
+        from .cluster_store import Broker
+        nodes = [args.value] if args.value else [n["id"] for n in Broker(state).nodes()]
+        if not nodes:
+            raise ValueError("No enrolled nodes to update.")
+        return [update(config, state, node, rollback=args.rollback) for node in nodes]
     if action == "tunnel":
         from . import cluster_tunnel
-        if local != main:
-            raise ValueError("Manage the reverse cluster tunnel on the main PC.")
+        if (local == main) != (cluster_tunnel.mode(config) == "reverse"):
+            raise ValueError("The tunnel runs on the main (cluster.tunnel = reverse) or on each "
+                             "node (cluster.tunnel = forward); this PC is the other end.")
         if args.value not in ("start", "stop", "status", "run"):
             raise ValueError("Usage: jarvis cluster tunnel start|stop|status [--autostart]")
         if getattr(args, "autostart", False):
@@ -131,7 +140,9 @@ def run(args, config, base):
             raise ValueError("request needs a request ID.")
         return Client(config, state, owner=local == main).request("/v1/jobs/" + args.value)
     if action == "status":
+        from .deploy import code_fingerprint
         result = {"role": "main" if local == main else "node", "local_device": local,
+                  "code": code_fingerprint(),
                   "main_device": main, "main_url": endpoint(config)}
         try:
             result.update(Client(config, state, owner=local == main).request("/v1/status", timeout=3))
@@ -154,36 +165,10 @@ def run(args, config, base):
 
 
 def autostart(config_path, state, turn_on):
+    """Run this PC's role (main or node) at login: Windows, macOS or Linux."""
+    from .autostart import install
     argv = [sys.executable, "-m", "jarvis", "--config", str(config_path), "--state", str(state), "cluster", "run"]
-    if any("\n" in arg or "\r" in arg for arg in argv):
-        raise ValueError("Newlines are not allowed in startup paths.")
-    if os.name == "nt":
-        folder = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup"
-        path = folder / "JARVIS Cluster.vbs"
-        if turn_on:
-            windowless = Path(sys.executable).with_name("pythonw.exe")
-            if windowless.is_file():
-                argv[0] = str(windowless)
-            line = subprocess.list2cmdline(argv).replace('"', '""')
-            folder.mkdir(parents=True, exist_ok=True)
-            path.write_text(f'Set shell = CreateObject("WScript.Shell")\nshell.Run "{line}", 0, False\n', encoding="utf-8")
-        else:
-            path.unlink(missing_ok=True)
-    else:
-        folder = Path.home() / ".config/systemd/user"
-        path = folder / "jarvis-cluster.service"
-        if turn_on:
-            folder.mkdir(parents=True, exist_ok=True)
-            command = " ".join(json.dumps(arg) for arg in argv)
-            path.write_text("[Unit]\nDescription=JARVIS main or node agent\nAfter=graphical-session.target\n"
-                            f"[Service]\nExecStart={command}\nRestart=on-failure\nRestartSec=5\n"
-                            "[Install]\nWantedBy=default.target\n", encoding="utf-8")
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
-        subprocess.run(["systemctl", "--user", "enable" if turn_on else "disable", "--now",
-                        "jarvis-cluster.service"], check=True, timeout=15)
-        if not turn_on:
-            path.unlink(missing_ok=True)
-    return {"autostart": turn_on, "path": str(path)}
+    return install("jarvis-cluster", "JARVIS Cluster", argv, turn_on)
 
 
 def proxy_cognition(args, config):

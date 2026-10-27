@@ -1,4 +1,5 @@
-"""One supervised, host-key-pinned reverse SSH link from the main to a node.
+"""One supervised, host-key-pinned SSH link between the main and a node, in either
+direction (cluster.tunnel: reverse = main -> node, forward = node -> main).
 
 Stop uses a cooperative marker, not a stale PID that could kill an unrelated process.
 Windows launches through Explorer so the worker outlives the invoking CLI job.
@@ -40,10 +41,35 @@ def pinned_host(machine, state):
     return ["-o", f"HostKeyAlias={alias}", "-o", f"UserKnownHostsFile={path}"]
 
 
+def mode(config):
+    """reverse (default): the main runs `ssh -R` into each node, so nodes need an SSH
+    server. forward: each node runs `ssh -L` to the main, so only the main needs one
+    (e.g. a Linux or macOS main with a Windows node). Either way the node reaches the
+    main's hub on its own 127.0.0.1:<listen_port>."""
+    value = (config.get("cluster") or {}).get("tunnel", "reverse")
+    if value not in ("reverse", "forward"):
+        raise ValueError('cluster.tunnel must be "reverse" or "forward".')
+    return value
+
+
+def peer(config):
+    """The machine this end opens SSH to: a node (reverse, run on the main) or the main
+    (forward, run on a node)."""
+    local, main = identity(config)
+    if mode(config) == "forward":
+        if local == main:
+            raise ValueError("With cluster.tunnel = forward, each node runs the tunnel to the main.")
+        machine = (config.get("devices") or {}).get(main) or {}
+        if machine.get("transport") != "ssh" or not machine.get("target"):
+            raise ValueError(f"Give devices.{main} an SSH target (transport ssh) so this node can reach it.")
+        return machine
+    if local != main:
+        raise ValueError("With cluster.tunnel = reverse, the main runs the tunnel to its nodes.")
+    return ssh_device(config, config.get("cluster", {}).get("tunnel_device"))
+
+
 def command(config, state, target):
-    if identity(config)[0] != identity(config)[1]:
-        raise ValueError("The cluster reverse tunnel runs on the main PC.")
-    machine = ssh_device(config, config.get("cluster", {}).get("tunnel_device"))
+    machine = peer(config)
     _check_target(target)
     binary = shutil.which("ssh")
     if not binary:
@@ -53,7 +79,8 @@ def command(config, state, target):
         raise ValueError("Invalid cluster listen port.")
     return [*_ssh_args(binary, machine.get("identity_file")), *pinned_host(machine, state),
             "-N", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=2", "-R", f"127.0.0.1:{port}:127.0.0.1:{port}", target]
+            "-o", "ServerAliveCountMax=2", "-L" if mode(config) == "forward" else "-R",
+            f"127.0.0.1:{port}:127.0.0.1:{port}", target]
 
 
 def status(state):
@@ -71,7 +98,7 @@ def status(state):
 def run(config, state):
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True)
-    machine = ssh_device(config, config.get("cluster", {}).get("tunnel_device"))
+    machine = peer(config)
     targets = list(dict.fromkeys(t for t in [machine.get("target"), *machine.get("fallback_targets", [])] if t))
     if not targets:
         raise ValueError("No cluster tunnel targets configured.")
@@ -140,10 +167,12 @@ def run(config, state):
             publish(ssh_alive=False, pid=0)
 
 
+TITLE = "JARVIS Cluster Tunnel"
+
+
 def startup_path():
-    if os.name == "nt":
-        return Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup/JARVIS Cluster Tunnel.vbs"
-    return Path.home() / ".config/systemd/user/jarvis-cluster-tunnel.service"
+    from .autostart import path
+    return path("jarvis-cluster-tunnel", TITLE)
 
 
 def launcher(config_path, state):
@@ -158,26 +187,8 @@ def launcher(config_path, state):
 
 
 def autostart(config_path, state, enable):
-    path = startup_path()
-    if enable:
-        argv = launcher(config_path, state)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if os.name == "nt":
-            line = subprocess.list2cmdline(argv).replace('"', '""')
-            path.write_text(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n', encoding="utf-8")
-        else:
-            line = " ".join(json.dumps(a).replace("%", "%%") for a in argv)
-            path.write_text("[Unit]\nDescription=JARVIS reverse cluster tunnel\nAfter=network-online.target\n"
-                            f"[Service]\nExecStart={line}\nRestart=on-failure\nRestartSec=5\n"
-                            "[Install]\nWantedBy=default.target\n", encoding="utf-8")
-    elif os.name == "nt":
-        path.unlink(missing_ok=True)
-    if os.name != "nt":
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
-        subprocess.run(["systemctl", "--user", "enable" if enable else "disable", "--now", path.name], check=True, timeout=15)
-        if not enable:
-            path.unlink(missing_ok=True)
-    return {"autostart": enable, "path": str(path)}
+    from .autostart import install
+    return install("jarvis-cluster-tunnel", TITLE, launcher(config_path, state), enable)
 
 
 def start(config_path, state):
