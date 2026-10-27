@@ -1,6 +1,7 @@
 # JARVIS — guide for Claude (any machine, any OS)
 
-Read this first, then `JARVIS.md` (JARVIS's own self-model) and `docs/jarvis-os-architecture.md`
+Read this first, then `docs/architecture-guide.md` (complete reference), the `jarvis-memory/`
+vault (rules, machines, decisions), `JARVIS.md` (JARVIS's own self-model) and `docs/jarvis-os-architecture.md`
 (the design and its built status). This repo has moved between machines; nothing here assumes
 which OS you are on or which computer is main. Run `python -c "from jarvis.platforms import detect; print(detect())"`
 to see where you are, and read `jarvis.config.json` for the machines.
@@ -17,12 +18,13 @@ Local decider (`decide.py`, MiniLM embeddings, shadow mode) and semantic memory 
 
 ## Machines and roles
 - Roles come from `jarvis.config.json`: `cluster.main_device` is the main (brain, memory, vault,
-  hub on 127.0.0.1:`cluster.port`); the rest are nodes that long-poll the hub over an SSH tunnel.
+  hub on 127.0.0.1:`cluster.listen_port`); the rest are nodes that long-poll the hub over an SSH tunnel.
 - `cluster.tunnel`: `reverse` (main runs `ssh -R` to nodes; nodes need an SSH server) or
   `forward` (each node runs `ssh -L` to the main; only the main needs one).
 - OS-specific code lives behind `platforms.py` (detect OS/distro/desktop) and `autostart.py`
   (Windows Startup .vbs / macOS LaunchAgent / Linux systemd user unit). Add new OS branches
   there, not scattered `os.name` checks. The overlay is Windows-only by design.
+- Switch the main with `jarvis cluster main <id>`; list roles with `jarvis cluster roles`.
 - After code changes, nodes refuse mismatched code: run `jarvis cluster update <node>`.
 
 ## Hard rules (David's)
