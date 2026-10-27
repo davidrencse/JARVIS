@@ -17,7 +17,10 @@ from jarvis.credits import Credits, claude_usage_rows, codex_rate_limits
 from jarvis.ui import Console, Handler
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8"))
+# The real config, with keyword-only recall (embeddings load a model; not this file's job).
+CONFIG = {**json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8")),
+          "memory": {"semantic": False}, "decisions": {"shadow": False}}
+CONFIG["routing"] = {**CONFIG.get("routing", {}), "interpreter": False}  # never call ChatGPT from tests
 
 
 class Temp(unittest.TestCase):

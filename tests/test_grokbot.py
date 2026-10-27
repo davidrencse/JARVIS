@@ -182,11 +182,13 @@ class SendTests(unittest.TestCase):
         route = {"local": True, "os": "windows", "device": "dell"}
         with patch.object(self.bot, "route", return_value=route), \
                 patch.object(self.bot, "can_type", return_value=(True, "")), \
+                patch.object(grokbot.time, "monotonic", side_effect=[100.0, 100.025]), \
                 patch.object(self.bot, "_windows", side_effect=grokbot.subprocess.TimeoutExpired(
                     "powershell.exe", 0.1)) as send:
             with self.assertRaisesRegex(TimeoutError, "timed out while sending"):
                 self.bot.send("hello", timeout=0.1)
-        self.assertLessEqual(send.call_args.args[1], 0.1)
+        # Setup consumed 25 ms; tolerate floating-point deadline subtraction.
+        self.assertAlmostEqual(send.call_args.args[1], 0.075)
         send.assert_called_once()
 
     def test_background_keys_carry_only_key_names(self):
@@ -356,11 +358,12 @@ class HandoffTests(unittest.TestCase):
         self.assertIn("Ask David before buying", prompt)
         self.assertTrue(Path(out["path"]).parent.is_dir())
 
-    def test_windows_handoff_names_the_windows_laptop(self):
+    def test_handoff_names_the_detected_computer(self):
         with patch.object(grokbot, "WINDOWS", True), \
+                patch("jarvis.platforms.label", return_value="Windows 11"), \
                 patch.object(grokbot.socket, "gethostname", return_value="WinLaptop"):
             self.bot.handoff("x")
-        self.assertIn("Windows laptop 'WinLaptop'", self.sent[0])
+        self.assertIn("Windows 11 computer 'WinLaptop'", self.sent[0])
 
     def test_windows_script_checks_focus_before_it_pastes(self):
         script = grokbot.WINDOWS_TYPE

@@ -18,7 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # The real config, minus what ties a run to this machine: David's vault (indexing it
 # per test is slow and holds the temp folder open) and the cluster's device identity.
 CONFIG = {**json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8")),
-          "vault": {"enabled": False}, "cluster": {"enabled": False}}
+          "vault": {"enabled": False}, "cluster": {"enabled": False},
+          "memory": {"semantic": False}, "decisions": {"shadow": False}}
+CONFIG["routing"] = {**CONFIG.get("routing", {}), "interpreter": False}  # never call ChatGPT from tests
 
 
 class Brain:

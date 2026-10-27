@@ -28,7 +28,10 @@ from jarvis.store import Store
 from jarvis.ui import Console, Handler
 
 ROOT = Path(__file__).resolve().parents[1]
-CONFIG = json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8"))
+# The real config, minus the decider's shadow log and embeddings (they load a model).
+CONFIG = {**json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8")),
+          "memory": {"semantic": False}, "decisions": {"shadow": False}}
+CONFIG["routing"] = {**CONFIG.get("routing", {}), "interpreter": False}  # never call ChatGPT from tests
 CATALOG = specialists(ROOT)
 FINGERPRINT = ":".join(["ab"] * 32)
 

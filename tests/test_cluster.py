@@ -24,7 +24,7 @@ def configuration(local="main"):
     return {"devices": {"main": {"hostname": "main-host", "transport": "local"},
                         "node": {"hostname": "node-host", "transport": "ssh"},
                         "other": {"hostname": "other-host"}},
-            "cluster": {"enabled": True, "main_device": "main", "local_device": local,
+            "cluster": {"enabled": True, "main_device": "main", "local_device": local, "auto_update": False,
                         "main_url": "http://127.0.0.1:7778"}}
 
 
