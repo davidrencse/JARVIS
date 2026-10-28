@@ -157,6 +157,16 @@ class DesktopTools:
              "description": "Control whatever is playing (Spotify, YouTube...).",
              "inputSchema": {"type": "object", "required": ["command"], "additionalProperties": False,
                              "properties": {"command": {"type": "string", "enum": list(MEDIA)}}}},
+            {"type": "function", "name": "scroll",
+             "description": "Scroll a window by key presses: direction down or up; mode once, "
+                            "auto (keeps scrolling every `every` seconds while that window is "
+                            "focused, e.g. YouTube Shorts) or stop; target is a word from the "
+                            "window title such as 'youtube'.",
+             "inputSchema": {"type": "object", "additionalProperties": False,
+                             "properties": {"direction": {"type": "string", "enum": ["down", "up"]},
+                                            "mode": {"type": "string", "enum": ["once", "auto", "stop"]},
+                                            "target": {"type": "string"}, "app": {"type": "string"},
+                                            "every": {"type": "string"}, "url": {"type": "string"}}}},
             {"type": "function", "name": "volume",
              "description": "Speaker volume: up, down, mute, unmute, or a level 0-100.",
              "inputSchema": {"type": "object", "required": ["level"], "additionalProperties": False,
@@ -169,6 +179,8 @@ class DesktopTools:
         if device and self.remote:
             from .remote import ARG
             arg = str(args.get(ARG.get(name, ""), ""))
+            if name == "scroll":
+                arg = json.dumps({k: v for k, v in args.items() if k != "device"})
             if name == "open_url" and args.get("browser"):
                 arg = json.dumps({"url": arg, "browser": args["browser"]})
             return self.remote.call(str(device), name, arg)
@@ -195,6 +207,13 @@ class DesktopTools:
                 return media(str(args.get("command", "")))
             if name == "volume":
                 return volume(str(args.get("level", "")))
+            if name == "scroll":
+                spec = args.get("spec")
+                return scroll(spec if isinstance(spec, str) else json.dumps(args))
+            if name == "browse":
+                from .agent_browser import browse
+                spec = args.get("spec")
+                return browse(spec if isinstance(spec, str) else json.dumps(args))
             return False, f"Unknown tool {name}."
         except Exception as exc:  # report to the model instead of crashing the turn
             return False, f"{type(exc).__name__}: {exc}"
@@ -511,8 +530,9 @@ def open_windows():
         return window_details()
     if not shutil.which("hyprctl"):
         raise LookupError("closing windows needs Hyprland (hyprctl)")
+    from .observe import app_class
     clients = json.loads(_run("hyprctl", "clients", "-j").stdout or "[]")
-    return [{"id": c["address"], "app": f"{c.get('class', '')} {c.get('initialClass', '')}",
+    return [{"id": c["address"], "app": f"{app_class(c.get('class'))} {app_class(c.get('initialClass'))}",
              "title": c.get("title", "")} for c in clients]
 
 
@@ -568,8 +588,11 @@ def focus_window(name):
             _run("wmctrl", "-i", "-a", address).returncode == 0
     else:
         address = str(window["id"])
-        ok = bool(re.fullmatch(r"0x[0-9a-f]+", address) and
-                   _run("hyprctl", "dispatch", "focuswindow", f"address:{address}").stdout.strip() == "ok")
+        # Hyprland 0.56+ takes Lua dispatchers (classic focuswindow errors); older ones the classic syntax.
+        ok = bool(re.fullmatch(r"0x[0-9a-f]+", address)) and any(
+            _run("hyprctl", "dispatch", *command).stdout.strip() == "ok"
+            for command in ([f'hl.dsp.focus({{ window = "address:{address}" }})'],
+                            ["focuswindow", f"address:{address}"]))
     return (True, f"Switched to {window['title'] or window['app'].strip()}.") if ok else (False, f"Couldn't switch to {name}.")
 
 
@@ -747,6 +770,160 @@ def volume(level):
                   + (", muted." if now.group(2) else "."))
 
 
+# -- scrolling -------------------------------------------------------------------------
+# One key press into one named window, never a global hook or a cursor change. Shorts,
+# TikTok and Reels move one video per arrow key; other pages a screen per Page Down.
+SCROLL_KEYS = {"arrow": {"down": "Down", "up": "Up"}, "page": {"down": "Next", "up": "Prior"}}
+SCROLL_VK = {"Down": 0x28, "Up": 0x26, "Next": 0x22, "Prior": 0x21}
+SCROLL_X11 = {"Down": "Down", "Up": "Up", "Next": "Page_Down", "Prior": "Page_Up"}
+REEL_SITES = ("youtube.com/shorts", "tiktok.com", "instagram.com/reels")
+SCROLL_EVERY = 10.0                # seconds between automatic scrolls by default
+SCROLL_MAX = 30 * 60               # fail-safe: an automatic scroll ends after 30 minutes
+SCROLL_MISSES = 6                  # ...or once its window is gone this many checks in a row
+_SCROLLER = {"stop": None, "target": None}
+_SCROLLER_LOCK = __import__("threading").Lock()
+
+
+def _scroll_windows(target, app=None):
+    """Open windows whose title has `target` (and whose app is `app`, when given)."""
+    query, owner = _flat(target), _flat(ALIASES.get(str(app or "").lower(), app or ""))
+    hits = [w for w in open_windows() if query and query in _flat(w["title"])]
+    if owner:
+        hits = [w for w in hits if any(owner in _flat(a) or _flat(a) in owner
+                                       for a in w["app"].split() if len(_flat(a)) >= 3)] or hits
+    return hits
+
+
+def _active_window_id():
+    """The focused window's id in open_windows()' terms, or None if it can't be read."""
+    backend = _backend()
+    try:
+        if backend == "windows":
+            import ctypes
+            return int(ctypes.windll.user32.GetForegroundWindow()) or None
+        if backend == "hyprland":
+            return json.loads(_run("hyprctl", "activewindow", "-j").stdout or "{}").get("address")
+        if backend in ("x11", "gnome", "kde") and shutil.which("xdotool"):
+            out = _run("xdotool", "getactivewindow").stdout.strip()
+            return f"0x{int(out):08x}" if out.isdigit() else None
+    except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+        return None
+    return None
+
+
+def _send_key(window, key):
+    """Press `key` in `window` only; False when this desktop can't aim a key at it."""
+    backend = _backend()
+    if backend == "windows":
+        import ctypes
+        user32 = ctypes.windll.user32
+        if int(user32.GetForegroundWindow()) != window["id"]:
+            user32.SetForegroundWindow(window["id"])
+            time.sleep(0.15)
+        if int(user32.GetForegroundWindow()) != window["id"]:
+            return False  # never type into whatever else has focus
+        user32.keybd_event(SCROLL_VK[key], 0, 1, 0)
+        user32.keybd_event(SCROLL_VK[key], 0, 3, 0)
+        return True
+    address = str(window["id"])
+    if not re.fullmatch(r"0x[0-9a-f]+", address):
+        return False
+    if backend == "hyprland":
+        # Hyprland 0.56+ takes Lua dispatchers; older ones the classic syntax.
+        return any(_run("hyprctl", "dispatch", *command).stdout.strip() == "ok" for command in (
+            [f'hl.dsp.send_shortcut({{ mods = "", key = "{key}", window = "address:{address}" }})'],
+            ["sendshortcut", f", {key}, address:{address}"]))
+    if backend in ("x11", "gnome", "kde") and shutil.which("xdotool"):
+        return _run("xdotool", "key", "--window", str(int(address, 16)),
+                    SCROLL_X11[key]).returncode == 0
+    return False
+
+
+def _scroll_loop(stop, target, app, key, every, clock=time.monotonic):
+    """Scroll every `every` seconds while the window is the one David is looking at.
+    Switching away pauses it (no key goes anywhere); closing it, `stop`, or SCROLL_MAX
+    ends it."""
+    deadline, misses = clock() + SCROLL_MAX, 0
+    while not stop.wait(every) and clock() < deadline:
+        try:
+            hits = _scroll_windows(target, app)
+            active = _active_window_id()
+        except (LookupError, OSError, ValueError, subprocess.SubprocessError):
+            hits, active = [], None
+        if not hits:
+            misses += 1
+            if misses >= SCROLL_MISSES:
+                break
+            continue
+        misses = 0
+        window = next((w for w in hits if active is not None and w["id"] == active), None)
+        if window is not None:
+            _send_key(window, key)
+    with _SCROLLER_LOCK:
+        if _SCROLLER["stop"] is stop:
+            _SCROLLER.update(stop=None, target=None)
+
+
+def scroll(spec):
+    """spec: JSON {"direction": "down"|"up", "mode": "once"|"auto"|"stop", "target":
+    a word from the window title ("youtube"), "app": the browser, "every": seconds,
+    "url": the page, which picks video-by-video keys on Shorts/TikTok/Reels}."""
+    import threading
+    try:
+        args = json.loads(spec) if isinstance(spec, str) and spec.strip().startswith("{") \
+            else {"direction": str(spec or "down")}
+    except ValueError:
+        return False, "Scroll takes a JSON spec."
+    direction = str(args.get("direction") or "down").lower()
+    mode = str(args.get("mode") or "once").lower()
+    if direction not in ("down", "up") or mode not in ("once", "auto", "stop"):
+        return False, "Scroll takes direction up or down and mode once, auto or stop."
+    with _SCROLLER_LOCK:
+        running, _SCROLLER["stop"] = _SCROLLER["stop"], None
+        was, _SCROLLER["target"] = _SCROLLER["target"], None
+    if running:
+        running.set()
+    if mode == "stop":
+        from .agent_browser import stop_scrolling
+        agent = stop_scrolling()  # "stop scrolling" ends the agent browser's scroll too
+        if running:
+            return True, f"Stopped scrolling {was}."
+        return True, "Stopped scrolling the agent browser." if agent else "I wasn't scrolling anything."
+    url = str(args.get("url") or "").lower()
+    target, app = str(args.get("target") or "").strip(), args.get("app")
+    reels = any(site in url for site in REEL_SITES) or (
+        not url and any(w in target.lower() for w in ("youtube", "tiktok", "instagram")))
+    key = SCROLL_KEYS["arrow" if reels else "page"][direction]
+    if mode == "auto":
+        try:
+            every = min(300.0, max(2.0, float(args.get("every") or SCROLL_EVERY)))
+        except (TypeError, ValueError):
+            every = SCROLL_EVERY
+        if not target:
+            return False, "Say which window to keep scrolling."
+        stop = threading.Event()
+        with _SCROLLER_LOCK:
+            _SCROLLER.update(stop=stop, target=target)
+        threading.Thread(target=_scroll_loop, args=(stop, target, app, key, every),
+                         name="jarvis-scroll", daemon=True).start()
+        return True, (f"Scrolling {target} every {every:g} seconds while it's on screen. "
+                      "Say \"stop scrolling\" to stop.")
+    if target:
+        hits = _scroll_windows(target, app)
+        if not hits:
+            return False, f"No open window matches {target!r}."
+        active = _active_window_id()
+        window = next((w for w in hits if w["id"] == active), hits[0])
+    else:
+        active = _active_window_id()
+        window = next((w for w in open_windows() if w["id"] == active), None)
+        if window is None:
+            return False, "I couldn't tell which window to scroll."
+    if not _send_key(window, key):
+        return False, f"I can't send keys to {window['title'] or 'that window'} on this desktop."
+    return True, f"Scrolled {direction}."
+
+
 BROWSER_BLOCKED = {"browser_file_upload", "browser_run_code_unsafe", "browser_evaluate"}
 AGENT_BROWSER_BLOCKED = {"agent_browser_eval"}
 # agent-browser tool arguments that become CLI flags: raw extra flags, other sessions or
@@ -798,15 +975,15 @@ def browser_mcp(state_dir, engines=BROWSER_ENGINES):
             # No uploading local files to sites; no arbitrary page scripts.
             "disabled_tools": sorted(BROWSER_BLOCKED)}
     if "agent-browser" in engines:
-        profile = state / "agent-browser-profile"
-        profile.mkdir(parents=True, exist_ok=True)
+        from .agent_browser import env as agent_env
         servers["agent_browser"] = {
             "command": npx,
             # The core tool set only: no network interception, cookies, uploads or plugins.
             "args": ["-y", AGENT_BROWSER, "mcp", "--tools", "core"],
             "disabled_tools": sorted(AGENT_BROWSER_BLOCKED),
-            # A visible window so David can sign in himself, like the Playwright one.
-            "env": {"AGENT_BROWSER_PROFILE": str(profile), "AGENT_BROWSER_HEADED": "true"},
+            # A visible window so David can sign in himself, like the Playwright one. The
+            # session is shared with agent_browser.py, so the console shows this browser.
+            "env": agent_env(state),
             # Codex hands MCP servers a minimal environment; Chrome needs the display.
             "env_vars": ["DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "LOCALAPPDATA",
                          "PROGRAMFILES", "USERPROFILE"]}

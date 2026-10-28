@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -20,6 +21,18 @@ from .topology import identity
 from .transfer import _check_target, _ssh_args, ssh_device
 
 NAME = "cluster-tunnel"
+# While on a fallback target (e.g. Tailscale), how often to look for an earlier one (the
+# LAN) again. Doubles after each switch back that does not hold, up to LAN_RETRY_MAX.
+LAN_RETRY, LAN_RETRY_MAX = 60, 30 * 60
+
+
+def reachable(target, timeout=2):
+    """Cheap check that the target's sshd answers; the SSH attempt itself proves the rest."""
+    try:
+        socket.create_connection((target.split("@", 1)[1], 22), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
 
 
 def pinned_host(machine, state):
@@ -128,15 +141,16 @@ def run(config, state):
 
     with exclusive_lock(state / f"{NAME}.lock"):
         marker.unlink(missing_ok=True)
-        delay, proc = 1, None
+        delay, proc, retry = 1, None, LAN_RETRY
         logs = state / "logs"
         logs.mkdir(exist_ok=True)
         try:
             while not marker.exists():
-                for target in targets:
+                for index, target in enumerate(targets):
                     if marker.exists():
                         break
-                    started = time.monotonic()
+                    started = probed = time.monotonic()
+                    preferred = None
                     publish(target=target, ssh_alive=False, error=None)
                     try:
                         with (logs / f"{NAME}.log").open("a", encoding="utf-8") as log:
@@ -148,10 +162,17 @@ def run(config, state):
                                 # living SSH session, not node health; cluster status owns that.
                                 publish(ssh_alive=time.monotonic() - started >= 9)
                                 wait(1)
+                                if index and time.monotonic() - probed >= retry:
+                                    probed = time.monotonic()
+                                    preferred = next((t for t in targets[:index] if reachable(t)), None)
+                                    if preferred:
+                                        proc.terminate()
+                                        break
                             if marker.exists() and proc.poll() is None:
                                 proc.terminate()
                             proc.wait(timeout=5)
-                            publish(ssh_alive=False, error=f"SSH exited ({proc.returncode})")
+                            publish(ssh_alive=False, error=f"{preferred} is reachable again; switching back"
+                                    if preferred else f"SSH exited ({proc.returncode})")
                     except (OSError, subprocess.SubprocessError) as exc:
                         publish(ssh_alive=False, error=str(exc))
                     finally:
@@ -161,6 +182,13 @@ def run(config, state):
                         proc = None
                     if time.monotonic() - started > 60:
                         delay = 1
+                        if not index:
+                            retry = LAN_RETRY
+                    if preferred:
+                        # Restart from the first target. If the switch back does not hold,
+                        # we land on the fallback again and wait longer before the next try.
+                        retry = min(retry * 2, LAN_RETRY_MAX)
+                        break
                 wait(delay)
                 delay = min(delay * 2, 60)
         finally:

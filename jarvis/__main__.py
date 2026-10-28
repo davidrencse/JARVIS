@@ -422,7 +422,8 @@ def kb_command(args, config):
         from .vault import vault_for
         vault = vault_for(config, args.state)
         if vault is None:
-            raise ValueError("No vault configured: set vault.path in jarvis.config.json.")
+            raise ValueError("No vault configured: set vault.path in jarvis.config.json "
+                             "(and vault.enabled to true), or add sources with jarvis kb ingest.")
         result = kb.sync_vault(vault)
         emit({"added": len(result["added"]), "unchanged": result["unchanged"],
               "failed": result["failed"]})

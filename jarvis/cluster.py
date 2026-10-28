@@ -17,12 +17,11 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from . import __version__
 from .deploy import code_fingerprint
 from .cluster_store import Broker, CAPABILITIES, TERMINAL
-from .topology import ORIGIN, enabled, endpoint, identity, is_node, request_from
+from .topology import endpoint, identity, is_node, request_from
 
 _HUBS = {}
 MAX_PROTOCOL = 65536
@@ -68,6 +67,13 @@ def save_json(path, value):
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+class HubRefused(RuntimeError):
+    """The main answered with an HTTP error; `status` says which (400/404 are final)."""
+    def __init__(self, message, status):
+        super().__init__(message)
+        self.status = status
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -130,7 +136,7 @@ class Client:
                 exc.close()
             if code == "node_offline":
                 raise NodeOffline(detail) from None
-            raise RuntimeError(f"Main PC refused the request: {detail}") from None
+            raise HubRefused(f"Main PC refused the request: {detail}", exc.code) from None
         except (urllib.error.URLError, OSError) as exc:
             raise ConnectionError(f"Main PC {self.main} is unavailable at {self.url}: {exc}") from None
 
@@ -218,12 +224,14 @@ class Hub:
     def _auto_update(self, settle=20):
         """Once after start: bring every online node that runs other code up to this main's
         code (jarvis cluster update), so nodes follow the main without git or a manual step.
-        Failures are logged; actions to that node stay refused until it matches."""
+        Failures are logged; actions to that node stay refused until it matches. Nodes
+        without SSH (forward tunnel) pull the code themselves, so they are skipped here."""
         if self.stop_event.wait(settle):  # let nodes reconnect and report their code
             return
-        from .deploy import update
+        from .deploy import is_ssh_node, update
         for status in self.broker.nodes():
-            if not status["online"] or status.get("code") == code_fingerprint():
+            if (not status["online"] or status.get("code") == code_fingerprint()
+                    or not is_ssh_node(self.config, status["id"])):
                 continue
             try:
                 report = update(self.config, self.state, status["id"])
@@ -416,6 +424,9 @@ def make_server(hub, host, port):
                 node, caps = hub.authenticate(self.headers)
                 if self.path == "/v1/status" and not post:
                     return self._send(200, {"main_device": hub.main, "nodes": hub.broker.nodes()})
+                if self.path == "/v1/code" and not post and "owner" not in caps:
+                    from .deploy import code_bundle  # nodes pull the main's code over their own channel
+                    return self._send(200, code_bundle())
                 if self.path.startswith("/v1/jobs/") and not post:
                     return self._send(200, hub.broker.get(self.path.rsplit("/", 1)[-1],
                                                          None if "owner" in caps else node))
@@ -446,7 +457,8 @@ def make_server(hub, host, port):
                                 job = hub.broker.claim(node, kinds)
                         finally:
                             hub._polling[node].discard(self.connection)
-                    return self._send(200, {"job": job, "main_device": hub.main})
+                    return self._send(200, {"job": job, "main_device": hub.main,
+                                             "code": code_fingerprint()})
                 if self.path == "/v1/result" and "owner" not in caps:
                     with hub._condition:
                         hub.broker.finish(data.get("id"), node, data.get("result"), bool(data.get("failed")))
@@ -517,6 +529,35 @@ class NodeWorker:
         self.stop_event = threading.Event()
         self.outbox = self.state / "cluster-outbox.json"
         self.thread = None
+        self.restarting = False  # set once new code is installed; run() then re-execs
+
+    def _send_result(self, message):
+        """Deliver a saved result. Only the main's final answer (unknown or no-longer-running
+        job: HTTP 400/404) drops it; connection errors, timeouts and 5xx keep it for retry."""
+        try:
+            self.client.request("/v1/result", message)
+        except HubRefused as exc:
+            if exc.status not in (400, 404):
+                raise
+            print(f"JARVIS node: main rejected result {message.get('id')} for good ({exc}); dropped.", flush=True)
+        self.outbox.unlink(missing_ok=True)
+
+    def _pull_update(self, want):
+        """The main runs other code: fetch, verify and install it, then restart. Tried once
+        per target fingerprint per 10 minutes so a bad package can't loop the node."""
+        from .deploy import apply_bundle
+        mark = self.state / "cluster-update.json"
+        try:
+            last = json.loads(mark.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            last = {}
+        if last.get("code") == want and time.time() - last.get("at", 0) < 600:
+            return False
+        save_json(mark, {"code": want, "at": time.time()})
+        bundle = self.client.request("/v1/code", timeout=60)
+        count = apply_bundle(bundle)
+        print(f"JARVIS node: installed main's code {bundle.get('code')} ({count} files); restarting.", flush=True)
+        return True
 
     def once(self):
         # A crash after execution can resend the result; it never reexecutes the action.
@@ -524,25 +565,37 @@ class NodeWorker:
             note = json.loads(self.outbox.read_text(encoding="utf-8"))
             if note.get("main_device") != self.client.main:
                 raise ValueError("An unsent result belongs to the previous main PC; inspect cluster-outbox.json.")
-            self.client.request("/v1/result", note["message"])
-            self.outbox.unlink()
+            self._send_result(note["message"])
         response = self.client.request("/v1/poll", {"hostname": platform.node(),
                             "platform": platform.system(), "version": __version__,
                             "code": code_fingerprint()},
                             timeout=POLL_WAIT + 10)
+        received = time.monotonic()
+        want = response.get("code")
+        if want and want != code_fingerprint():
+            try:
+                if self._pull_update(want):
+                    self.restarting = True
+                    return False
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"JARVIS node: code update failed: {exc}", flush=True)
         job = response.get("job")
         if not job:
             return False
         try:
-            if time.time() >= job["deadline"]:
+            # Time the job on our own clock: the main's wall clock may differ from ours.
+            if "remaining" in job:
+                expired = received + job["remaining"] <= time.monotonic()
+            else:
+                expired = time.time() >= job["deadline"]
+            if expired:
                 raise TimeoutError("Node action expired before execution.")
             result = self.executor(job["kind"], job["payload"])
             message = {"id": job["id"], "result": result, "failed": False}
         except Exception as exc:
             message = {"id": job["id"], "result": {"error": str(exc)}, "failed": True}
         save_json(self.outbox, {"main_device": self.client.main, "message": message})
-        self.client.request("/v1/result", message)
-        self.outbox.unlink()
+        self._send_result(message)
         return True
 
     def run(self):
@@ -550,7 +603,7 @@ class NodeWorker:
         try:
             with exclusive_lock(self.state / "cluster-node.lock"):
                 delay = 1
-                while not self.stop_event.is_set():
+                while not self.stop_event.is_set() and not self.restarting:
                     try:
                         worked = self.once()
                         delay = 1
@@ -562,6 +615,22 @@ class NodeWorker:
                         self.stop_event.wait(delay)
         except ValueError:
             print("A JARVIS node agent is already running for this state directory.", flush=True)
+        if self.restarting:
+            self.respawn()
+
+    def respawn(self):
+        """Start the same command again (the lock is released by now), then exit. No execv:
+        it doesn't replace the process on Windows. The short sleep lets this process free
+        its ports first."""
+        import subprocess
+        import sys
+        argv = [sys.executable, *sys.argv]
+        wrapper = "import subprocess,sys,time; time.sleep(2); sys.exit(subprocess.call(sys.argv[1:]))"
+        flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                 | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.Popen([sys.executable, "-c", wrapper, *argv], close_fds=True,
+                         **({"creationflags": flags} if os.name == "nt" else {"start_new_session": True}))
+        os._exit(0)
 
     def start(self):
         self.thread = threading.Thread(target=self.run, daemon=True)

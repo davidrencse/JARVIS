@@ -36,6 +36,28 @@ LEAN_FEATURES_OFF = (
     "shell_tool", "unified_exec")
 
 
+# Codex's own system prompt is written for a coding agent with a shell; JARVIS's lanes have
+# no shell, so it was dead weight. Measured 2026-10-27 on the interpreter lane: 13,242 input
+# tokens per call as shipped, 7,116 with this base prompt and these tools off, 6,738 with
+# the environment/permission/app blurbs off too; same answer every time. Tasks run by
+# runner.py (real coding work) keep Codex's full prompt; only app-server lanes use this.
+BASE_INSTRUCTIONS = Path(__file__).with_name("codex_base.md")
+LEAN_OVERRIDES = (
+    "features.view_image=false", "features.sleep_tool=false", "features.code_mode_host=false",
+    "features.guardian_approval=false", "include_permissions_instructions=false",
+    "include_environment_context=false", "include_apps_instructions=false",
+    "include_apps_usage_instructions=false", "include_plugin_usage_instructions=false",
+    "include_skills_usage_instructions=false", "include_collaboration_mode_instructions=false",
+    "project_doc_max_bytes=0")
+
+
+def lean_prompt():
+    """The Codex overrides that shrink every app-server call (see LEAN_OVERRIDES)."""
+    if not BASE_INSTRUCTIONS.is_file():
+        return LEAN_OVERRIDES
+    return (f"model_instructions_file={json.dumps(str(BASE_INSTRUCTIONS))}", *LEAN_OVERRIDES)
+
+
 def user_mcp_servers():
     """Names of MCP servers in David's ~/.codex/config.toml (switched off for JARVIS)."""
     path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
@@ -49,7 +71,8 @@ def user_mcp_servers():
 def lean_command(binary, mcp_servers=None, overrides=()):
     """app-server argv with David's plugins/servers off and only JARVIS's MCP servers on.
     Servers must be set here, per process: set per thread they were not exposed as tools."""
-    args = [binary, "app-server"]
+    # ChatGPT-plan login only: an API-key login in ~/.codex would otherwise bill per token.
+    args = [binary, "app-server", "-c", 'forced_login_method="chatgpt"']
     for feature in LEAN_FEATURES_OFF:
         args += ["--disable", feature]
     for name in user_mcp_servers():
@@ -107,6 +130,11 @@ def usage_limit(now=None):
     return _LIMIT["text"] if (now or _time.time()) < _LIMIT["until"] else ""
 
 
+# What a lane can raise from an odd reply (KeyError...) or a failed spawn (OSError). Never
+# KeyboardInterrupt: that is BaseException and passes through untouched.
+MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError, OSError)
+
+
 class ChatGPTLane:
     """Same interface as FastLane: warm(), ask(text, recall, on_sentence), close()."""
 
@@ -126,7 +154,10 @@ class ChatGPTLane:
         self.base, self.max_turns, self.timeout = str(base), max_turns, timeout
         self.command = command  # tests substitute a fake app-server
         self.instructions, self.tools, self.mcp_servers = instructions, tools, mcp_servers or {}
-        self.approve, self.overrides, self.context = approve, tuple(overrides), context
+        self.approve, self.context = approve, context
+        # models.lean_prompt: false gives the lanes Codex's full coding-agent prompt back.
+        lean = config.get("models", {}).get("lean_prompt", True)
+        self.overrides = (*(lean_prompt() if lean else ()), *overrides)
         self.tool_log = []  # (tool, success, text) of the current turn
         self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
         self.proc = self.lines = self.thread = None
@@ -274,6 +305,9 @@ class ChatGPTLane:
         with self.lock:
             try:
                 self._ensure_thread()
+            except MALFORMED as exc:
+                self.close()
+                raise RuntimeError(f"ChatGPT lane failed: {type(exc).__name__}: {exc}") from exc
             except BaseException:
                 self.close()
                 raise
@@ -288,6 +322,17 @@ class ChatGPTLane:
         if limited:  # don't spend ~2 s asking a plan that already said no
             raise RuntimeError(f"ChatGPT usage limit: {limited}")
         with self.lock:
+            self.tool_log = []  # a stale log from an earlier turn must not block the retry
+            theirs = []  # an error raised by the caller's own on_sentence is theirs, not the lane's
+            if on_sentence:
+                inner = on_sentence
+
+                def on_sentence(sentence):
+                    try:
+                        inner(sentence)
+                    except BaseException as exc:
+                        theirs.append(exc)
+                        raise
             for attempt in (1, 2):
                 try:
                     return self._ask(text, recall, on_sentence)
@@ -296,9 +341,18 @@ class ChatGPTLane:
                     # A turn abandoned mid-flight would leave its remaining events in the pipe,
                     # and the next ask would read them as its own answer. Start clean instead.
                     self.close()
+                    if isinstance(exc, MALFORMED) and exc not in theirs:  # odd reply or failed spawn: one error type
+                        raise RuntimeError(f"ChatGPT lane failed: {type(exc).__name__}: {exc}") from exc
                     if (not isinstance(exc, RuntimeError) or attempt == 2
                             or "serverOverloaded" not in str(exc) or not self.fallback):
                         raise
+                    if self.tool_log:
+                        # Tools already ran this turn (a Grok handoff, open_app...): replaying
+                        # the turn on the fallback model would run them a second time.
+                        names = ", ".join(sorted({str(t[0]) for t in self.tool_log}))
+                        raise RuntimeError(
+                            f"ChatGPT was overloaded after {names} already ran; not repeating "
+                            "it. Check the result and ask again if needed.") from exc
                     # Model at capacity: swap to the fallback (and back again next time).
                     self.model, self.fallback = self.fallback, self.model
 

@@ -1,15 +1,13 @@
 """Explicit setup, pairing, revocation and startup for the main/node topology."""
 
 import json
-import os
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 from .cluster import Client, NodeWorker, save_json
-from .cluster_store import Broker, CAPABILITIES
-from .topology import DEVICE_ID, enabled, endpoint, identity, is_node
+from .cluster_store import CAPABILITIES, Broker
+from .topology import DEVICE_ID, enabled, endpoint, identity
 
 
 def parser(sub):
@@ -109,11 +107,18 @@ def run(args, config, base):
     local, main = identity(config)
     if action == "update":
         from .deploy import update
-        from .cluster_store import Broker
         nodes = [args.value] if args.value else [n["id"] for n in Broker(state).nodes()]
         if not nodes:
             raise ValueError("No enrolled nodes to update.")
-        return [update(config, state, node, rollback=args.rollback) for node in nodes]
+        reports = []
+        for node in nodes:  # one failing node must not stop the rest
+            try:
+                reports.append(update(config, state, node, rollback=args.rollback))
+            except (OSError, ValueError, RuntimeError) as exc:
+                if args.value:
+                    raise
+                reports.append({"node": node, "updated": False, "error": str(exc)})
+        return reports
     if action == "tunnel":
         from . import cluster_tunnel
         if (local == main) != (cluster_tunnel.mode(config) == "reverse"):

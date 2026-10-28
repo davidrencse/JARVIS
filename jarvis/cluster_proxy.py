@@ -4,7 +4,7 @@ import json
 import urllib.error
 
 from .cluster import Client, Hub, NodeWorker, _HUBS
-from .topology import identity, is_node
+from .topology import is_node
 
 
 class _Body:

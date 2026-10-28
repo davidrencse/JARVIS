@@ -9,6 +9,8 @@ systemd user unit that runs `voice start` at login.
 
 import atexit
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -50,6 +52,7 @@ class InstanceLock:
         self.handle.close()
 
 
+FOLLOW_UP = 6.0  # seconds after a bare "Jarvis" in which the next utterance is the request
 BORDERLINE = 0.10  # live mic scores dropped to 0.11-0.28 on 2026-10-26; the wake word gates the rest
 
 
@@ -60,7 +63,7 @@ def listen_loop(state, config, base, threshold=None):
 
     from .events import Turn, emit, feed_sender
     from .instant import answer as instant_answer
-    from .listen import Transcriber, VoicePrint, _np, record_utterance
+    from .listen import RATE, LiveMic, Transcriber, VoicePrint, _np, record_utterance
     from .memory import Memory
     from .speech import SpeechQueue, Voice, spoken
     from .store import Store, lanes_from
@@ -83,6 +86,8 @@ def listen_loop(state, config, base, threshold=None):
         pid_file.write_text(str(os.getpid()))
         # A stale pid file can name an unrelated process once Windows reuses the number.
         atexit.register(lambda: pid_file.unlink(missing_ok=True))
+        # `voice stop` sends SIGTERM, whose default action skips atexit and leaves the pid file.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         # Warm up so the first real request isn't slow: load Whisper, cache the ack line.
         stt(_np().zeros(16000, dtype="float32"))
         voice.synth(ACK)
@@ -93,13 +98,17 @@ def listen_loop(state, config, base, threshold=None):
             memory.warm_vectors()  # meaning-based recall index, in the background
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device)
-        failures = 0
+        failures, mic, armed, armed_by_owner = 0, None, 0.0, False
         while True:
             try:
-                audio = record_utterance()
+                mic = mic or LiveMic()
+                audio = record_utterance(mic=mic)
+                failures = 0  # the mic works again; only consecutive failures back off
                 if audio is None:  # 30 s of silence: keep the brain warm
                     lane.warm()
                     continue
+                # When this utterance began, so a long follow-up still lands in the window.
+                began = time.monotonic() - len(audio) / RATE
                 # Voice check (CPU) and transcription (GPU) run side by side to save ~0.3 s.
                 # A stranger's transcript is discarded unread: never logged or answered.
                 check, text = pool.submit(ears.verify, audio, threshold), pool.submit(stt, audio)
@@ -114,6 +123,17 @@ def listen_loop(state, config, base, threshold=None):
                     continue
                 heard = text.result()
                 request = wake_word(heard)
+                if request == "":  # a bare "Jarvis" and a pause: the request comes next
+                    armed, armed_by_owner = began + len(audio) / RATE + FOLLOW_UP, is_owner
+                    log(f"wake word ({score}): waiting for the request")
+                    emit(state, "voice.wake", score=score)
+                    continue
+                # The follow-up has no wake word of its own, so one of the two clips must
+                # pass the full voice check: two near misses are not enough.
+                if request is None and heard.strip() and began < armed and (
+                        is_owner or armed_by_owner):
+                    request = heard.strip()  # the rest of "Jarvis, ... <pause> ..."
+                armed = 0.0
                 if not request:  # not addressed to JARVIS: never answered
                     if near:  # still unconfirmed as David: discarded unread
                         log(f"ignored another voice (similarity {score})")
@@ -149,12 +169,19 @@ def listen_loop(state, config, base, threshold=None):
                 if not result.get("streamed"):
                     speaker.put(spoken(result["reply"], voice.limit))
                 speaker.drain()  # finish talking before listening again
+                mic.flush()  # and don't treat JARVIS's own reply as something heard
                 failures = 0
             except KeyboardInterrupt:
                 raise
             except Exception as exc:  # keep listening through any single failed turn
                 failures += 1
                 log(f"error: {type(exc).__name__}: {exc}")
+                if mic is not None:  # a dead or stalled stream is reopened on the next pass
+                    try:
+                        mic.close()
+                    except Exception:
+                        pass
+                    mic = None
                 if failures == 1:  # a dead mic must not apologise out loud every second
                     try:
                         voice.say("Sorry, that one failed. The details are in the log.")
@@ -190,9 +217,9 @@ def _alive(pid):
     if os.name != "nt":
         try:
             os.kill(pid, 0)
-            return True
         except OSError:
             return False
+        return True
     import ctypes
     handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
     if not handle:
@@ -208,7 +235,17 @@ def _pid(state):
         pid = int((Path(state) / "voice.pid").read_text().strip())
     except (OSError, ValueError):
         return None
-    return pid if _alive(pid) else None
+    return pid if _alive(pid) and _is_listener(pid) else None
+
+
+def _is_listener(pid):
+    """After a reboot a stale voice.pid can name an unrelated process: on Linux, check it
+    really is the listener before reporting it running (or signalling it to stop)."""
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return True  # no /proc (Windows, macOS): the liveness probe is all there is
+    return b"jarvis" in cmdline and b"listen" in cmdline
 
 
 def status(state):
@@ -228,6 +265,28 @@ NOT_ENROLLED = ("No voiceprint on this machine, so every voice would be rejected
                 "Run: jarvis voice enroll  (each laptop needs its own)")
 
 
+def _under_systemd_unit():
+    """True when this process runs inside a systemd service (Linux), whose cgroup would
+    take the listener down with it on restart."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if os.environ.get("INVOCATION_ID"):
+        return True
+    try:
+        return ".service" in Path("/proc/self/cgroup").read_text()
+    except OSError:
+        return False
+
+
+def _detach_from_unit(command):
+    """Inside a systemd unit, launch the listener in its own transient scope so restarting
+    the unit (jarvis-cluster.service) does not kill it. Otherwise the command is unchanged."""
+    if _under_systemd_unit() and shutil.which("systemd-run"):
+        return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                f"--unit=jarvis-voice-{os.getpid()}-{int(time.time())}", *command]
+    return command
+
+
 def start(state):
     if _pid(state):
         return {"started": False, **status(state)}
@@ -238,9 +297,11 @@ def start(state):
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
              if os.name == "nt" else 0)
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    command = [sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()),
+               "voice", "listen"]
+    command = _detach_from_unit(command)
     with open(logs / "voice.log", "a", encoding="utf-8") as out:
-        subprocess.Popen([sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()),
-                          "voice", "listen"], stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                          creationflags=flags, start_new_session=os.name != "nt", env=env,
                          close_fds=True)
     for _ in range(60):  # model loading takes a few seconds

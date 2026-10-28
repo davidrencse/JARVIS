@@ -17,6 +17,7 @@ TERMINAL = {"done", "failed", "expired", "uncertain"}
 # A node checks in once per held poll (cluster.POLL_WAIT, 25 s) and not at all while it
 # runs an action (up to 45 s), so "online" must outlast both, or a busy node looks gone.
 ONLINE = 75
+GRACE = 15  # seconds a running job may report past its deadline before it counts as uncertain
 
 
 class Broker:
@@ -144,8 +145,11 @@ class Broker:
             if row is None:
                 return None
             db.execute("UPDATE jobs SET state='running' WHERE id=?", (row["id"],))
+            # "remaining" lets the node time the job on its own monotonic clock; the wall-clock
+            # deadline is only compared across machines by old nodes.
             return {"id": row["id"], "kind": row["kind"], "payload": json.loads(row["payload"]),
-                    "requester": row["requester"], "deadline": row["deadline"]}
+                    "requester": row["requester"], "deadline": row["deadline"],
+                    "remaining": row["deadline"] - time.time()}
 
     def finish(self, job_id, node, result, failed=False):
         encoded = json.dumps(result)
@@ -169,7 +173,10 @@ class Broker:
             if not row or (requester is not None and requester != row["requester"]):
                 raise LookupError("Unknown request.")
             state = row["state"]
-            if state in ("pending", "running") and row["deadline"] < time.time():
+            # A running job gets GRACE past its deadline so a result landing just after the
+            # requester gave up is still accepted instead of rejected as "no longer running".
+            late = row["deadline"] + (GRACE if state == "running" else 0) < time.time()
+            if state in ("pending", "running") and late:
                 state = "expired" if state == "pending" else "uncertain"
                 db.execute("UPDATE jobs SET state=? WHERE id=?", (state, job_id))
         return {"id": row["id"], "node": row["node"], "kind": row["kind"], "state": state,

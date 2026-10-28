@@ -109,7 +109,9 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
         read = _interpret(text, memory, config, base, channel, on_start, on_sentence, on_step)
         if isinstance(read, dict):
             return read                                  # ran it, or asked David
-        if read == "converse":
+        if read is None and lane is not None:
+            agent = False   # no reading: the brain, with its desktop tools, before Grok
+        elif read == "converse":
             agent = False                                # just a question: the brain
         elif read == "build":
             agent, build = False, True
@@ -157,7 +159,8 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                           "brain": "chatgpt" if "ChatGPT" in lane_label(lane, text) else
                           type(lane).__name__.lower()}
                 step("brain", "route", lane_label(lane, text), "answered")
-            except RuntimeError as exc:  # fall back to a normal one-shot run below
+            except (RuntimeError, LookupError, TypeError, ValueError, OSError) as exc:
+                # fall back to a normal one-shot run below
                 detail = {"lane_error": str(exc)}
                 step("brain", "route", lane_label(lane, text), str(exc), "fail")
         if reply is None:
@@ -168,11 +171,18 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                     "mode": "workspace-write" if write else "read-only"}
             label = f"{spec['provider'].title()} run · {spec['power']}"
             step("task", "route", label, spec["mode"], "run")
-            result = run_task(store, store.add(spec)["id"], config, base, timeout)
-            reply = result.get("answer")
-            detail.update(task=result["task_id"], state=result["state"], brain=spec["provider"])
-            step("task", "route", label, f"{result['task_id']} · {result['state']}",
-                 "done" if reply else "fail")
+            result = _run_waiting(store, spec, config, base, timeout)
+            if result is None:  # every ledger lane stayed busy: answer in-process instead
+                reply, ok = _direct_reply(spec["provider"], text, recall, config, base,
+                                          timeout, detail)
+                detail.update(state="finished" if ok else "failed", brain=spec["provider"])
+                step("task", "route", label, "ledger busy; answered directly" if ok else
+                     detail["lane_error"], "done" if ok else "fail")
+            else:
+                reply = result.get("answer")
+                detail.update(task=result["task_id"], state=result["state"], brain=spec["provider"])
+                step("task", "route", label, f"{result['task_id']} · {result['state']}",
+                     "done" if reply else "fail")
             reply = _failover_reply(reply, detail, spec["provider"])
 
     elif route["tier"] == "medium":
@@ -270,6 +280,64 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
     step("memory", "root", "Remembered", outbound["id"])
     return {"tier": route["tier"], "reasons": route["reasons"], "reply": reply,
             "memory": [inbound["id"], outbound["id"]], **detail}
+
+
+LANE_WAIT = 20  # seconds a fallback task waits for a free ledger lane before going direct
+
+
+def _abandon(store, task_id, why):
+    """Fail a task that never started, so no orphaned `queued` row is left behind."""
+    try:
+        store.transition(task_id, "queued", "failed", {"error_type": "NotRun", "note": why})
+    except ValueError:  # already claimed or finished by someone else
+        pass
+
+
+def _run_waiting(store, spec, config, base, timeout, wait=None):
+    """run_task for a new task, waiting briefly while every ledger lane is busy (an
+    orchestrator wave, another fallback). None when no lane freed up; the task is then
+    failed, not left queued. Any other error also fails the task before it propagates."""
+    import time
+    task_id = store.add(spec)["id"]
+    deadline = time.monotonic() + (LANE_WAIT if wait is None else wait)
+    while True:
+        try:
+            return run_task(store, task_id, config, base, timeout)
+        except ValueError as exc:
+            if "run lane" not in str(exc):
+                _abandon(store, task_id, str(exc))
+                raise
+            if time.monotonic() >= deadline:
+                _abandon(store, task_id, str(exc))
+                return None
+            time.sleep(0.25)
+        except BaseException as exc:
+            _abandon(store, task_id, f"{type(exc).__name__}: {exc}")
+            raise
+
+
+def _fastlane(config, base, timeout):
+    from .fastlane import FastLane
+    return FastLane(config, base, timeout=min(timeout, 90))
+
+
+def _direct_reply(provider, text, recall, config, base, timeout, detail):
+    """Answer without the task ledger: a one-off in-process Claude CLI lane. Returns
+    (reply, ok); the reply is always something the user can read, and a failure is also
+    described in detail["lane_error"]."""
+    if provider != "claude":
+        detail["lane_error"] = "All run lanes are busy; try again in a moment."
+        return "I'm busy with other tasks right now. Ask me again in a moment.", False
+    lane = None
+    try:
+        lane = _fastlane(config, base, timeout)
+        return lane.ask(text, recall), True
+    except (RuntimeError, LookupError, TypeError, ValueError, OSError) as exc:
+        detail["lane_error"] = f"{detail.get('lane_error', '')} {exc}".strip()
+        return f"I couldn't reach a brain: {exc}", False
+    finally:
+        if lane is not None:
+            lane.close()
 
 
 LOGGED_OUT = ("not logged in", "please run /login", "invalid api key", "authentication")
