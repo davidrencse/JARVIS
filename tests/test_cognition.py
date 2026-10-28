@@ -339,10 +339,16 @@ class FastLaneTests(Temp):
     def test_children_never_see_api_keys(self):
         from jarvis.fastlane import subscription_env
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x", "OPENAI_API_KEY": "sk-y",
-                                     "PATH": "keep"}):
+                                     "CODEX_API_KEY": "sk-z", "ANTHROPIC_BASE_URL": "u",
+                                     "CLAUDE_CODE_USE_FOUNDRY": "1", "CLAUDECODE": "1",
+                                     "CLAUDE_CODE_SESSION_ID": "s",
+                                     "CLAUDE_CODE_OAUTH_TOKEN": "sub", "PATH": "keep"}):
             env = subscription_env()
-        self.assertNotIn("ANTHROPIC_API_KEY", env)
-        self.assertNotIn("OPENAI_API_KEY", env)
+        for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY",
+                     "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_FOUNDRY", "CLAUDECODE",
+                     "CLAUDE_CODE_SESSION_ID"):
+            self.assertNotIn(name, env)
+        self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "sub")  # the subscription login stays
         self.assertEqual(env["PATH"], "keep")
 
     def test_fast_lane_answer_never_falls_through_to_planner(self):

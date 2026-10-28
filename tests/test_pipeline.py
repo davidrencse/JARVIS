@@ -15,7 +15,9 @@ DEVICES = {
                 "aliases": ["arch", "arch linux", "archlinux", "asus", "linux",
                             "linux laptop", "zen book"]},
 }
-CONFIG = {"devices": DEVICES, "cluster": {"main_device": "dell"}}
+# The checks themselves are under test here, so the trusted_local shortcut is off.
+CONFIG = {"devices": DEVICES, "cluster": {"main_device": "dell"},
+          "rules": {"trusted_local": {"enabled": False}}}
 
 
 class FakeRemote:
@@ -318,7 +320,8 @@ class AskHookTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.memory = FakeMemory(Path(tmp.name) / "memory.db")
-        self.config = {"devices": DEVICES, "cluster": {"enabled": False}}
+        self.config = {"devices": DEVICES, "cluster": {"enabled": False},
+                       "rules": {"trusted_local": {"enabled": False}}}
         self.done = {"reply": "Opened Chrome.", "commands": [{"id": "c1"}],
                      "outcomes": [{"id": "c1", "state": "acknowledged", "ok": True}],
                      "checks": []}

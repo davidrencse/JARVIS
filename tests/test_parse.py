@@ -91,6 +91,13 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(registry.validate([self.command("open_app", {"name": "x"},
                                                         depends_on=["c9"])], DEVICES))
 
+    def test_dependency_cycles_are_rejected(self):
+        a = {**self.command("open_app", {"name": "x"}), "depends_on": ["c2"]}
+        b = {**self.command("open_app", {"name": "y"}), "id": "c2", "depends_on": ["c1"]}
+        self.assertIn("depends_on has a cycle: c1, c2.", registry.validate([a, b], DEVICES))
+        a["depends_on"] = []
+        self.assertEqual(registry.validate([a, b], DEVICES), [])
+
     def test_risk_comes_from_the_table(self):
         self.assertEqual(registry.risk(self.command("open_app", {"name": "Spotify"})), "allow")
         self.assertEqual(registry.risk(self.command("close_app", {"name": "Word"})), "confirm")

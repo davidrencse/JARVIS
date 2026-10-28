@@ -290,6 +290,37 @@ class TunnelTests(unittest.TestCase):
         self.assertEqual(sum(sleeps), 1)
         self.assertEqual(json.loads((self.state / "cluster-tunnel.json").read_text())["pid"], 0)
 
+    def test_fallback_switches_back_when_first_target_returns(self):
+        from jarvis import cluster_tunnel as tunnel
+        attempts, probes, clock = [], [], [0]
+        dead, live = Mock(), Mock()
+        dead.poll.return_value = dead.returncode = 255
+        live.poll.return_value, live.returncode = None, 0
+        live.terminate.side_effect = lambda: setattr(live.poll, "return_value", 0)
+
+        def popen(argv, **kwargs):
+            attempts.append(argv[-1])
+            if len(attempts) == 3:
+                (self.state / "cluster-tunnel.stop").touch()
+            return live if argv[-1] == "jdoe@192.0.2.2" else dead
+
+        def reachable(target):
+            probes.append((clock[0], target))
+            return clock[0] >= 2 * tunnel.LAN_RETRY
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        with patch.object(tunnel.shutil, "which", return_value="ssh"), \
+                patch.object(tunnel.subprocess, "Popen", side_effect=popen), \
+                patch.object(tunnel, "reachable", side_effect=reachable), \
+                patch.object(tunnel.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(tunnel.time, "sleep", side_effect=sleep):
+            tunnel.run(self.config, self.state)
+        self.assertEqual(attempts, ["jdoe@192.0.2.1", "jdoe@192.0.2.2", "jdoe@192.0.2.1"])
+        self.assertEqual([t for _, t in probes], ["jdoe@192.0.2.1"] * 2)
+        live.terminate.assert_called_once()
+
     def test_http_offline_error_preserves_safe_fallback_signal(self):
         import io
         from jarvis.cluster import NodeOffline
