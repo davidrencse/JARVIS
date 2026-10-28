@@ -313,7 +313,7 @@
   const LEVEL = { up: ["daemons up", "ok"], warn: ["up · with warnings", ""], down: ["down", "warn"] };
   function liveWord(live) {
     if (!live) return `<span class="state-word" title="Not checked yet">checking</span>`;
-    if (live.local) return live.lan_mouse?.running ? `<span class="state-word ok">this laptop</span>` : `<span class="state-word warn">Lan Mouse off</span>`;
+    if (live.local) return live.lan_mouse?.running ? `<span class="state-word ok">this device</span>` : `<span class="state-word warn">Lan Mouse off</span>`;
     if (!live.reachable) return `<span class="state-word warn" title="${esc(live.error || "")}">unreachable</span>`;
     if (!live.ssh) return `<span class="state-word warn" title="${esc(live.error || "")}">ssh failed</span>`;
     return `<span class="state-word ok">online</span>`;
@@ -629,36 +629,42 @@
     const o = state.overview; if (!o) return false;
     const tools = (t) => Object.entries(t || {}).map(([k, v]) => `<span class="state-word ${v ? "ok" : "warn"}" title="${v ? "found on PATH" : "not on PATH (may still be installed elsewhere)"}">${esc(k)}</span>`).join("");
     const live = state.probe?.devices || {};
+    const role = (d) => [d.here ? "this device" : null, d.role === "main" ? "main" : d.role === "node" ? "node" : null].filter(Boolean).join(" · ");
+    const targets = o.devices.filter((d) => d.send);
+    const pick = targets.find((d) => d.id === store.get("jarvis.dropdevice", "")) || targets[0];
     $("#devices-grid").innerHTML = o.devices.map((d) => `<article class="panel ticks">
-        <header class="ph">${icon("laptop-minimal")}<h2>${esc(d.id)}</h2>${liveWord(live[d.id])}<span class="ph-meta mono">${state.probe ? "checked " + ago(state.probe.checked_at) : ""}</span></header>
+        <header class="ph">${icon("laptop-minimal")}<h2>${esc(d.id)}</h2>${role(d) ? `<span class="state-word">${esc(role(d))}</span>` : ""}${liveWord(live[d.id])}<span class="ph-meta mono">${state.probe ? "checked " + ago(state.probe.checked_at) : ""}</span></header>
         ${liveFacts(live[d.id])}
-        <h3>${esc(d.model || d.hostname)}</h3><p class="lede">${esc(d.hostname)} · ${esc(d.platform || "")} · ${esc(d.transport)}</p>
-        <dl class="facts mono"><dt>CPU</dt><dd>${esc(d.cpu || "—")}</dd><dt>Memory</dt><dd>${esc(d.ram || "—")}</dd><dt>GPU</dt><dd>${esc(d.gpu || "—")}</dd>
+        <h3>${esc(d.label || d.model || d.hostname || d.id)}</h3><p class="lede">${[d.hostname, d.platform, d.transport].filter(Boolean).map(esc).join(" · ")}</p>
+        <dl class="facts mono"><dt>Model</dt><dd>${esc(d.model || "—")}</dd><dt>CPU</dt><dd>${esc(d.cpu || "—")}</dd><dt>Memory</dt><dd>${esc(d.ram || "—")}</dd><dt>GPU</dt><dd>${esc(d.gpu || "—")}</dd>
         <dt>Address</dt><dd>${esc(d.address || "—")}</dd><dt>Status</dt><dd>${esc(words(d.status))}</dd><dt>Inventory</dt><dd>${ago(d.collected_at)}</dd></dl>
         <p class="muted" style="font-size:12px;margin-top:14px">Commands on PATH when the inventory was taken:</p><div class="toolmarks">${tools(d.tools)}</div></article>`).join("") +
       `<article class="panel ticks"><header class="ph">${icon("radio")}<h2>Links between them</h2></header>
         <dl class="facts mono">${Object.entries(o.desktop).map(([k, v]) => `<dt>${esc(words(k))}</dt><dd title="${esc(v.status)}">${esc(v.candidate || "")} · ${esc(linkState(v.status)[0])}</dd>`).join("")}
         ${Object.entries(o.network).map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>
         <p class="muted" style="font-size:12px;margin-top:12px">From jarvis.config.json, not a live check.</p></article>` +
-      `<article class="panel ticks"><header class="ph">${icon("arrow-up-right")}<h2>Send to the other laptop</h2></header>
+      `<article class="panel ticks"><header class="ph">${icon("arrow-up-right")}<h2>Send files</h2></header>
+        ${pick ? `<select class="field" id="drop-device" aria-label="Send to">${targets.map((d) =>
+          `<option value="${esc(d.id)}" ${d === pick ? "selected" : ""}>To ${esc(d.id)}${d.hostname ? " (" + esc(d.hostname) + ")" : ""}</option>`).join("")}</select>
         <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Drop files here or press Enter to choose">
-          <p><b>Drop files or images here</b></p><p class="muted">or click to choose. They land in <span class="mono">~/JARVIS-Drop</span> on the Zenbook.</p>
+          <p><b>Drop files or images here</b></p><p class="muted">or click to choose. They land in <span class="mono">~/JARVIS-Drop</span> on the chosen device.</p>
           <input type="file" id="drop-input" multiple hidden></div>
-        <ul class="drop-log mono" id="drop-log" aria-live="polite"></ul></article>` +
+        <ul class="drop-log mono" id="drop-log" aria-live="polite"></ul>`
+        : `<p class="muted">No other device is reachable over SSH from here. Give one <span class="mono">"transport": "ssh"</span> and a <span class="mono">target</span> in jarvis.config.json to send files to it.</p>`}</article>` +
       `<article class="panel ticks"><header class="ph">${icon("activity")}<h2>Personal agents</h2></header>
         <dl class="facts mono">${Object.entries(o.agents).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(words(v.integration))} · ${esc(linkState(v.status)[0])}</dd>`).join("")}</dl>
-        <p class="muted" style="font-size:12.5px;margin-top:12px">Grokbot is driven through its window (below). Muse and Jev get a JARVIS adapter once their interface is known.</p></article>` +
+        <p class="muted" style="font-size:12.5px;margin-top:12px">From personal_agents in jarvis.config.json. Grokbot is driven through its window (below); the others get a JARVIS adapter once their interface is known.</p></article>` +
       `<article class="panel ticks"><header class="ph">${icon("radio")}<h2>Command Grokbot &amp; JARVIS</h2><span class="ph-meta mono" id="gb-state">checking…</span></header>
         <form class="gb-form" id="gb-form" autocomplete="off">
           <select class="field" id="gb-mode" aria-label="Who does it">
             <option value="grokbot">Grokbot: do it</option><option value="grokbot-browser">Grokbot: in its browser</option>
             <option value="jarvis-browser">JARVIS: in its browser</option><option value="browser">Open JARVIS browser at…</option>
             <option value="terminal">Open terminal, run…</option></select>
-          <select class="field" id="gb-device" aria-label="Which laptop's Grokbot"></select>
+          <select class="field" id="gb-device" aria-label="Which device's Grokbot"></select>
           <textarea class="field" id="gb-text" rows="2" placeholder="What to do (Ctrl+Enter sends). /terminal htop · /browser github.com · /jarvis … · /grok …"></textarea>
           <button class="btn" type="submit">Send</button></form>
         <ul class="drop-log mono" id="gb-log" aria-live="polite"></ul>
-        <p class="muted" style="font-size:12px;margin-top:12px">Grokbot has no API: JARVIS focuses its window, pastes and presses Enter, then hands focus and clipboard back. The other laptop's Grokbot is typed to over SSH. Terminal and browser open on this laptop.</p></article>`;
+        <p class="muted" style="font-size:12px;margin-top:12px">Grokbot has no API: JARVIS focuses its window, pastes and presses Enter, then hands focus and clipboard back. Grokbot on another device is reached through the cluster or SSH. Terminal and browser open on this device.</p></article>`;
     wireDropzone(); wireGrokbot();
   }
 
@@ -666,7 +672,7 @@
   async function wireGrokbot() {
     const form = $("#gb-form"); if (!form) return;
     const text = $("#gb-text"), mode = $("#gb-mode"), dev = $("#gb-device"), log = $("#gb-log"), st = $("#gb-state");
-    // Terminal and browser always open here; only Grokbot prompts can go to the other laptop.
+    // Terminal and browser always open here; only Grokbot prompts can go to another device.
     const sync = () => { dev.disabled = !mode.value.startsWith("grokbot"); };
     mode.addEventListener("change", sync);
     mode.value = store.get("jarvis.gbmode", "grokbot");
@@ -676,7 +682,7 @@
     api("/api/grokbot").then((g) => {
       st.textContent = !g.installed ? "not installed" : [g.window ? "window open" : "not running", g.daemon ? "daemon up" : "daemon down", g.can_send ? null : "can't type here"].filter(Boolean).join(" · ");
       st.title = g.why_not || `terminal: ${g.terminal || "none"} · browser: ${g.browser || "none"} · computer use ${g.computer_use ? "on" : "off"}`;
-      dev.innerHTML = (g.devices || []).map((d) => `<option value="${esc(d.id)}" ${d.ok ? "" : "disabled"} title="${esc(d.why_not || "")}">Grokbot on ${esc(d.id)}${d.here ? " (this laptop)" : d.ok ? "" : " — no route"}</option>`).join("");
+      dev.innerHTML = (g.devices || []).map((d) => `<option value="${esc(d.id)}" ${d.ok ? "" : "disabled"} title="${esc(d.why_not || "")}">Grokbot on ${esc(d.id)}${d.here ? " (this device)" : d.ok ? "" : " — no route"}</option>`).join("");
       dev.value = (g.devices || []).find((d) => d.id === store.get("jarvis.gbdevice", ""))?.ok ? store.get("jarvis.gbdevice", "") : (g.here || "");
       sync();
     }).catch((e) => { st.textContent = e.message; });
@@ -696,16 +702,17 @@
     });
   }
 
-  // Files go over the existing SSH link: a drag can't cross between Windows and Wayland.
+  // Files go over the existing SSH link: a drag can't cross from one OS's desktop to another's.
   function wireDropzone() {
-    const zone = $("#dropzone"), input = $("#drop-input"), log = $("#drop-log");
+    const zone = $("#dropzone"), input = $("#drop-input"), log = $("#drop-log"), target = $("#drop-device");
     if (!zone) return;
+    target.addEventListener("change", () => store.set("jarvis.dropdevice", target.value));
     const line = (text, cls) => { const li = document.createElement("li"); li.className = cls || ""; li.textContent = text; log.prepend(li); return li; };
     async function sendAll(files) {
       for (const file of files) {
         const li = line(`Sending ${file.name} …`, "pending");
         try {
-          const r = await api("/api/send?name=" + encodeURIComponent(file.name), file, true);
+          const r = await api("/api/send?name=" + encodeURIComponent(file.name) + "&device=" + encodeURIComponent(target.value), file, true);
           li.textContent = `Sent ${r.sent} (${compact(r.bytes)} bytes)`; li.className = "ok"; announce(li.textContent);
         } catch (e) { li.textContent = `${file.name}: ${e.message}`; li.className = "bad"; }
       }

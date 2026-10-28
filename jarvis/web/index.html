@@ -216,6 +216,31 @@
       <aside class="card assistant col-thread cx-side" aria-label="Assistant">
           <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-audio-lines"/></svg></span><h2>Assistant</h2>
             <button class="ph-action" id="thread-clear" type="button">Clear</button></header>
+          <section class="agent-screen" id="agent-screen" aria-label="Agent browser, live" hidden>
+            <div class="as-bar">
+              <span class="as-live" id="as-live"><i aria-hidden="true"></i>Agent screen</span>
+              <span class="as-url" id="as-url"></span>
+              <button class="ph-action" id="as-expand" type="button">Expand</button>
+            </div>
+            <button class="as-frame" id="as-frame" type="button" title="Expand the agent's screen">
+              <img id="as-img" alt="The agent browser's current page">
+            </button>
+            <div class="as-ctl" role="group" aria-label="Agent browser">
+              <button type="button" data-as="back">Back</button>
+              <button type="button" data-as="reload">Reload</button>
+              <button type="button" data-as="stop">Stop scrolling</button>
+              <button type="button" data-as="close">Close</button>
+              <span class="as-note" id="as-note" role="status" aria-live="polite"></span>
+            </div>
+          </section>
+          <dialog class="as-dialog" id="as-dialog" aria-label="Agent screen, expanded">
+            <div class="as-bar">
+              <span class="as-live"><i aria-hidden="true"></i>Agent screen</span>
+              <span class="as-url" id="as-dlg-url"></span>
+              <button class="ph-action" id="as-shrink" type="button">Shrink</button>
+            </div>
+            <img id="as-dlg-img" alt="The agent browser's current page, large">
+          </dialog>
           <ol class="thread" id="thread" role="log" aria-label="Conversation"></ol>
           <div class="listener-log" id="listener-log"></div>
           <div class="dock-home" id="dock-home"></div>
@@ -456,6 +481,7 @@
 <script src="voice.js"></script>
 <script src="agent.js"></script>
 <script src="app.js"></script>
+<script src="agentscreen.js"></script>
 <script src="dashboard.js"></script>
 <script src="signals.js"></script>
 <script src="run.js"></script>
