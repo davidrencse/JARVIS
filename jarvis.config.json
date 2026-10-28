@@ -14,7 +14,7 @@
   },
   "devices": {
     "dell": {
-      "transport": "local",
+      "transport": "cluster",
       "status": "verified",
       "hostname": "WinLaptop",
       "label": "Dell G15, Windows 11",
@@ -208,6 +208,13 @@
   },
   "memory": {
     "semantic": true
+  },
+  "rules": {
+    "trusted_local": {
+      "enabled": true,
+      "intents": ["open_app", "open_url", "focus_window", "media", "volume", "scroll", "list_apps", "spotify_play"],
+      "skip": ["app_exists", "history", "observe"]
+    }
   },
   "decisions": {
     "shadow": true
