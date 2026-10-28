@@ -35,7 +35,7 @@ STATIONS = [
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "remote", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput"]},
+     "modules": ["actions", "agent_browser", "remote", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by ElevenLabs, falling back to Kokoro, a voice that "
               "runs on this laptop. ElevenLabs' agent also runs live calls from the console.",
@@ -144,15 +144,19 @@ def checks(console):
             out.append(_check("hear", "Microphone reachable", False, str(exc), "check PipeWire is running"))
     vault = console.vault()
     notes = len(vault.notes()) if vault else 0
-    out.append(_check("remember", "Obsidian vault found", vault is not None,
-                      f"{notes} notes at {vault.root}" if vault else "vault.path doesn't point at a folder",
-                      "set vault.path.linux in jarvis.config.json"))
+    vault_off = (config.get("vault") or {}).get("enabled", True) is False
+    if vault_off:
+        out.append(_check("remember", "Obsidian vault off by choice", True, "vault.enabled is false"))
+    else:
+        out.append(_check("remember", "Obsidian vault found", vault is not None,
+                          f"{notes} notes at {vault.root}" if vault else "vault.path doesn't point at a folder",
+                          "set vault.path.linux in jarvis.config.json"))
     snap = console.kb().snapshot()
     stats = snap["stats"]
     out.append(_check("remember", "Wiki built from your sources", stats["sources"] > 0,
                       f"{stats['pages']} pages · {stats['claims']} claims from {stats['sources']} sources"
                       if stats["sources"] else "the wiki is empty",
-                      f"{py} kb sync", warn=True))
+                      f"{py} kb ingest FILE-OR-URL" if vault is None else f"{py} kb sync", warn=True))
     open_conflicts = len(snap.get("open_conflicts") or [])
     out.append(_check("remember", "No contradictions waiting on you", not open_conflicts,
                       "nothing to rule on" if not open_conflicts else f"{open_conflicts} to rule on",

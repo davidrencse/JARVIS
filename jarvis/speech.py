@@ -338,7 +338,12 @@ def play_wav(path, wait=True):
         if shutil.which(player):
             proc = subprocess.Popen([player, str(path)])
             if wait:
-                proc.wait(timeout=120)
+                try:
+                    proc.wait(timeout=120)
+                except BaseException:  # timeout or interrupt: don't leave it sounding
+                    proc.kill()
+                    proc.wait()
+                    raise
             else:
                 _playing = proc
             return

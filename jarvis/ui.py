@@ -251,11 +251,23 @@ class Console:
         }
 
     def devices(self):
+        from .topology import enabled, identity
+        local = main = None
+        if enabled(self.config):
+            try:
+                local, main = identity(self.config)
+            except ValueError:  # unknown identity: show every device as remote
+                pass
         out = []
         for name, device in self.config.get("devices", {}).items():
             inv = _read_json(self.state / "inventory" / f"{name}.json", {})
             hw = inv.get("hardware", {}) if isinstance(inv.get("hardware"), dict) else {}
-            out.append({"id": name, "hostname": device.get("hostname"),
+            out.append({"id": name, "hostname": device.get("hostname"), "label": device.get("label"),
+                        "here": name == local,
+                        "role": None if main is None else "main" if name == main else "node",
+                        # Same rule as transfer.ssh_device: SSH devices other than this one.
+                        "send": device.get("transport") == "ssh" and bool(device.get("target"))
+                                and name != local,
                         "transport": device.get("transport"), "status": device.get("status"),
                         "address": device.get("lan_ip") or device.get("target"),
                         "platform": inv.get("platform"), "collected_at": inv.get("collected_at"),
@@ -852,6 +864,27 @@ class Console:
         self.bus.publish("turn.confirm", {"handled": body["id"]})
         return result
 
+    def agent_screen(self):
+        """The agent browser's page as a JPEG data URL, for the console's live box.
+        {"open": False} while it's closed; looking never launches it."""
+        import base64
+        from .agent_browser import frame
+        shot = frame(self.state)
+        image = shot.pop("image", None)
+        if image:
+            shot["image"] = "data:image/jpeg;base64," + base64.b64encode(image).decode()
+        return shot
+
+    def agent_screen_command(self, body):
+        """The live box's buttons: back, forward, reload, stop (scrolling) or close."""
+        from .agent_browser import browse
+        action = body.get("action")
+        if action not in ("back", "forward", "reload", "stop", "close"):
+            raise ValueError("Choose back, forward, reload, stop or close.")
+        spec = {"action": "scroll", "mode": "stop"} if action == "stop" else {"action": action}
+        ok, text = browse(spec, self.state)
+        return {"ok": ok, "text": text}
+
     def shared_input(self):
         """Both computers' screens and Lan Mouse configs, cross-checked (read-only)."""
         from .sharedinput import overview
@@ -1056,6 +1089,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/agent": lambda: c.agent().status(),
             "/api/agent/voices": lambda: c.agent().voices(refresh=query.get("refresh") == "1"),
             "/api/grokbot": lambda: c.grokbot().status(),
+            "/api/agent-browser": c.agent_screen,
             "/api/history/commands": lambda: c.command_history(query.get("limit", 12)),
             "/api/input/shared": c.shared_input,
             "/api/probe": lambda: c.prober.get(refresh=query.get("refresh") == "1"),
@@ -1163,6 +1197,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.voice_preview())
             if url.path == "/api/agent/ask":
                 return self._send(HTTPStatus.OK, c.agent_ask(body.get("text")))
+            if url.path == "/api/agent-browser":
+                return self._send(HTTPStatus.OK, c.agent_screen_command(body))
             if url.path == "/api/grokbot":
                 return self._send(HTTPStatus.OK, c.grokbot_command(body))
             if url.path == "/api/fs/copy":

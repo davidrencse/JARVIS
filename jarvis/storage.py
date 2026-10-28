@@ -13,7 +13,7 @@ import json
 import os
 import shutil
 import subprocess
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from .transfer import _check_target, _fail, _ssh_args, collision_name, safe_name
 
@@ -48,7 +48,8 @@ if not inside(path):
 if not os.path.exists(path):
     out({"error": "No such file or folder."}); raise SystemExit
 info = os.stat(path)
-res = {"path": path, "dir": os.path.isdir(path), "size": info.st_size, "roots": roots}
+res = {"path": path, "dir": os.path.isdir(path), "size": info.st_size, "roots": roots,
+       "sep": os.sep}
 if req["action"] == "thumbnail":
     try:
         out(thumbnail_payload(path))
@@ -75,6 +76,11 @@ if req["action"] == "list":
     res["entries"] = entries
 out(res)
 ''' % MAX_ENTRIES
+
+
+def _pure(sep):
+    """Path flavour of a remote machine, from the separator it reported for itself."""
+    return PureWindowsPath if sep == "\\" else PurePosixPath
 
 
 def _name_ok(name):
@@ -131,7 +137,7 @@ class Storage:
         if not target.exists():
             raise ValueError("No such file or folder.")
         res = {"path": str(target), "dir": target.is_dir(), "size": target.stat().st_size,
-               "roots": [str(r) for r in roots]}
+               "roots": [str(r) for r in roots], "sep": os.sep}
         if action == "thumbnail":
             if not target.is_file():
                 raise ValueError("Preview requires an image file.")
@@ -199,10 +205,12 @@ class Storage:
 
     def list(self, device_id, path=""):
         res = self.resolve(device_id, path, "list")
-        sep = "/" if self.is_remote(device_id) else os.sep
+        remote = self.is_remote(device_id)
+        # A remote node reports its own separator (the Dell is Windows); fall back to POSIX.
+        sep = res.get("sep") or "/" if remote else os.sep
         parent = None
         if not any(res["path"].rstrip("/\\") == r.rstrip("/\\") for r in res["roots"]):
-            parent = str(PurePosixPath(res["path"]).parent) if self.is_remote(device_id) \
+            parent = str(_pure(sep)(res["path"]).parent) if remote \
                 else str(Path(res["path"]).parent)
             if not any(parent == r or parent.startswith(r.rstrip("/\\") + sep)
                        for r in res["roots"]):
@@ -219,12 +227,19 @@ class Storage:
             raise ValueError("Pick the other laptop: copies go between the two machines.")
         if self.is_remote(src_device) == self.is_remote(dst_device):
             raise ValueError("Copies need one local and one SSH device.")
+        remote_id = src_device if self.is_remote(src_device) else dst_device
+        device = self.device(remote_id)
+        if device.get("transport") != "ssh" or not device.get("target"):
+            label = device.get("label") or remote_id
+            raise ValueError(f"Copying to or from {label} needs SSH, and it is only reachable "
+                             "through the cluster hub. Browsing works; to copy, set it up with "
+                             "an SSH target or move the file another way (shared folder, USB).")
         src = self.resolve(src_device, src_path)
         dst = self.resolve(dst_device, dst_dir)
         if not dst["dir"]:
             raise ValueError("The destination must be a folder.")
         name = Path(src["path"]).name if not self.is_remote(src_device) \
-            else PurePosixPath(src["path"]).name
+            else _pure(src.get("sep"))(src["path"]).name
         if not _name_ok(name):
             raise ValueError("Can't copy a drive or filesystem root; pick something inside it.")
         # Normalize before checking collisions: two Linux names can map to one
@@ -240,8 +255,6 @@ class Storage:
                 raise ValueError(f"{normalized} and {MAX_COLLISIONS} numbered copies of it "
                                  "already exist there; tidy up or pick another folder.")
             final = collision_name(normalized, n, directory=src["dir"])
-        remote_id = src_device if self.is_remote(src_device) else dst_device
-        device = self.device(remote_id)
         _check_target(device.get("target"))
         scp = shutil.which("scp")
         if not scp:

@@ -14,7 +14,6 @@ meter, so nested lanes, fallbacks and agent runs all add up to one figure per re
 import contextlib
 import contextvars
 import json
-import os
 import time
 from pathlib import Path
 

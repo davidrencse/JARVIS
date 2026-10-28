@@ -44,6 +44,7 @@ def make_plan(spec, config, base):
         raise ValueError(f"Install the native {provider} executable; shell shims are not supported.")
     if provider == "codex":
         args = [binary, "exec", "--json", "--color", "never", "--sandbox", mode,
+                "-c", 'forced_login_method="chatgpt"',  # never API-key (per-token) billing
                 "--skip-git-repo-check", "-C", str(root)]
         if tier.get("model"):
             args += ["-m", tier["model"]]
