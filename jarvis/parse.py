@@ -17,6 +17,10 @@ import re
 from . import registry
 
 LEAD = re.compile(r"^\W*(?:(?:hey|ok|okay)\s+)?(?:jarvis|jervis)\b[\s,.!?:-]*", re.I)
+# "hello, open chrome": a greeting before a command is not chat. Only the command after
+# it is parsed; a greeting alone ("hello there") still has no verb and goes to the brain.
+GREETING = re.compile(r"^(?:(?:hello|hi|hey|yo|ok|okay|alright|good (?:morning|afternoon|evening))"
+                      r"(?:\s+(?:jarvis|jervis|there))?[\s,.!?:-]+)+(?=\w)")
 FILLER = re.compile(r"\b(?:(?:can|could|would|will) you|please|for me|go ahead and|"
                     r"i want you to|i'?d like you to|just|quickly|real quick|right now)\b")
 SPLIT = re.compile(r"\s*,\s*(?:and\s+)?(?:then\s+)?|\s+and\s+then\s+|\s+then\s+|"
@@ -61,6 +65,9 @@ SITES = {
     "notion": "https://www.notion.so", "amazon": "https://www.amazon.com",
     "wikipedia": "https://www.wikipedia.org", "twitch": "https://www.twitch.tv",
     "linkedin": "https://www.linkedin.com",
+    "youtube shorts": "https://www.youtube.com/shorts", "yt shorts": "https://www.youtube.com/shorts",
+    "shorts": "https://www.youtube.com/shorts", "tiktok": "https://www.tiktok.com",
+    "instagram reels": "https://www.instagram.com/reels", "reels": "https://www.instagram.com/reels",
 }
 DOMAIN = re.compile(r"(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(/\S*)?\Z")
 
@@ -86,6 +93,39 @@ VOLUME = (
     (re.compile(r"(mute|unmute)(?:\s+(?:the\s+)?(?:volume|sound|audio|it|music))?\Z"),
      lambda m: m.group(1)),
 )
+
+# Scrolling, read before the verb table so "start scrolling" isn't "open scrolling".
+# "in the agent browser" anywhere moves pages and scrolling to JARVIS's own browser
+# (agent_browser.py, shown live in the console) instead of David's.
+AGENT_BROWSER = re.compile(r"(?:\b(?:in|on|with|using|via|through)\s+)?(?:\b(?:the|your|my|"
+                           r"jarvis'?s?)\s+)?\bagent(?:'s)?\s*browser\b")
+CLOSE_AGENT = re.compile(r"(?:close|quit|shut(?:\s+down)?|exit)\Z")
+FEED = r"(?:\s+(?:through\s+)?(?:it|them|this|that|now|(?:the\s+)?(?:shorts|videos|reels|feed|page)))?"
+SCROLL = (
+    (re.compile(r"(?:stop|quit|end|cancel|pause)\s+(?:the\s+)?(?:auto\s*)?scrolling" + FEED + r"\Z"),
+     lambda m: {"mode": "stop"}),
+    (re.compile(r"(?:(?:start|begin|keep|continue|go\s+on|carry\s+on)\s+(?:auto\s*)?scrolling|"
+                r"auto\s*scroll(?:ing)?|scroll\s+(?:automatically|nonstop|continuously))"
+                r"(?:\s+(down|up))?" + FEED + r"\Z"),
+     lambda m: {"mode": "auto", "direction": m.group(1) or "down"}),
+    (re.compile(r"scroll(?:\s+(down|up))?(?:\s+(?:a\s+(?:bit|little)|once|one))?" + FEED + r"\Z"),
+     lambda m: {"mode": "once", "direction": m.group(1) or "down"}),
+)
+# "next short" moves one video, as the arrow key does on Shorts, TikTok and Reels.
+NEXT_VIDEO = re.compile(r"(?:short|video|reel|tiktok)s?\Z")
+
+
+def _spelled(text):
+    """Typed or misheard scroll words ("scorllling") read as the real word."""
+    def fix(match):
+        word = match.group(0)
+        if word in ("scroll", "scrolling", "scrolls"):
+            return word
+        for real, cutoff in (("scrolling", 0.8), ("scroll", 0.85)):
+            if word != real and difflib.SequenceMatcher(None, word, real).ratio() >= cutoff:
+                return real
+        return word
+    return re.sub(r"\bsc[a-z]{3,9}\b", fix, text)
 
 
 class Unsure(ValueError):
@@ -118,10 +158,18 @@ def _parse(text, devices, origin, main, apps):
     if not isinstance(text, str) or not text.strip() or len(text) > 500:
         raise Unsure("empty or too long")
     text = LEAD.sub("", text.replace("’", "'").replace("‘", "'")).lower()
+    text = GREETING.sub("", text.strip())
     text = re.sub(r"[?!.]+$", "", text.strip())
-    text = re.sub(r"\s+", " ", FILLER.sub(" ", text)).strip()
+    # Filler leaves its comma behind ("open chrome, please." -> "open chrome, "): strip it.
+    text = _spelled(re.sub(r"\s+", " ", FILLER.sub(" ", text)).strip(" ,;"))
     if not text:
         raise Unsure("nothing left after the wake word")
+    agent = bool(AGENT_BROWSER.search(text))
+    if agent:
+        text = re.sub(r"\s+", " ", AGENT_BROWSER.sub(" ", text)).strip(" ,;:")
+        if CLOSE_AGENT.match(text):  # "close the agent browser"
+            return [{"id": "c1", "intent": "browse", "device": origin,
+                     "args": {"action": "close"}, "depends_on": []}]
     aliases = _aliases(devices, origin, main)
     catalog = dict(APPS)
     for names in apps.values():
@@ -129,8 +177,10 @@ def _parse(text, devices, origin, main, apps):
             catalog.setdefault(_norm(name), name)
 
     clauses, verb = [], None
-    for raw in SPLIT.split(text):
-        clause = _clause(raw.strip(), aliases, catalog)
+    for raw in (part for piece in SPLIT.split(text) for part in _unglue(piece, aliases, catalog)):
+        if not raw.strip(" ,;"):  # "open chrome, please, and spotify" leaves a hollow clause
+            continue
+        clause = _clause(raw.strip(" ,;"), aliases, catalog, verb)
         if clause["verb"] is None:  # "open spotify ... and chrome on my other pc"
             if verb is None:
                 raise Unsure("no action verb")
@@ -142,6 +192,8 @@ def _parse(text, devices, origin, main, apps):
     for clause in clauses:
         commands.append({**_command(clause, catalog), "device": clause["device"]})
     commands = _merge(commands)
+    if agent:
+        commands = [_in_agent_browser(c) for c in commands]
     _assign_devices(commands, origin)
     for n, command in enumerate(commands, 1):
         command["id"] = f"c{n}"
@@ -150,6 +202,23 @@ def _parse(text, devices, origin, main, apps):
         command["depends_on"] = [ids[id(d)] for d in command.pop("after", [])]
     return [{k: c[k] for k in ("id", "intent", "device", "args", "depends_on")}
             for c in commands]
+
+
+def _in_agent_browser(command):
+    """open_url / scroll as the agent browser's browse; "stop scrolling" stays a scroll
+    (it stops both). Anything else can't happen in a browser. Changed in place: later
+    commands' "after" lists point at these same dicts."""
+    args = command["args"]
+    if command["intent"] == "open_url":
+        command.update(intent="browse", args={"action": "open", "url": args["url"]})
+        return command
+    if command["intent"] == "scroll" and args.get("mode") != "stop":
+        keep = {k: args[k] for k in ("direction", "mode", "every") if k in args}
+        command.update(intent="browse", args={"action": "scroll", **keep})
+        return command
+    if command["intent"] == "scroll":
+        return command
+    raise Unsure(f"the agent browser can't {command['intent'].replace('_', ' ')}")
 
 
 def _norm(name):
@@ -199,6 +268,37 @@ def _device(phrase, aliases):
     return hits.pop() if len(hits) == 1 and None not in hits else None
 
 
+def _known(obj, aliases, catalog):
+    """`obj` names one app or site, optionally "on <device>": safe to end a clause on."""
+    words = obj.split()
+    if "on" in words:
+        cut = len(words) - 1 - words[::-1].index("on")
+        if not _device(" ".join(words[cut + 1:]), aliases):
+            return False
+        obj = " ".join(words[:cut])
+    try:
+        return bool(obj) and bool(_app(obj, catalog) or _site(obj))
+    except Unsure:
+        return False
+
+
+def _unglue(text, aliases, catalog):
+    """Split clauses run together without "and": "open chrome go to youtube" ->
+    ["open chrome", "go to youtube"]. Only after a verb whose object is a known app or
+    site and before another verb or a scroll, so nothing ambiguous is ever cut."""
+    words = text.strip(" ,;").split()
+    verb, rest = _verb(words)
+    if verb is None:
+        return [text]
+    lead = len(words) - len(rest)
+    for k in range(1, len(rest)):
+        tail = " ".join(rest[k:])
+        if (_verb(rest[k:])[0] or any(p.match(tail) for p, _ in SCROLL)) \
+                and _known(" ".join(rest[:k]), aliases, catalog):
+            return [" ".join(words[:lead + k]), *_unglue(tail, aliases, catalog)]
+    return [text]
+
+
 def _verb(words):
     for phrase in VERB_PHRASES:
         size = len(phrase.split())
@@ -207,7 +307,7 @@ def _verb(words):
     return None, words
 
 
-def _clause(text, aliases, catalog):
+def _clause(text, aliases, catalog, inherited=None):
     """{"verb", "object", "device"} for one clause; device None when not named."""
     if not text:
         raise Unsure("empty clause")
@@ -219,8 +319,16 @@ def _clause(text, aliases, catalog):
                 break
         else:
             raise Unsure(f"can't tell which PC {text!r} means")
+    for pattern, spec in SCROLL:
+        if match := pattern.match(" ".join(words)):
+            return {"verb": "scroll", "object": "", "device": device, "scroll": spec(match)}
     # The verb first, so the "on" in "go on youtube" or "focus on" isn't read as a place.
     verb, rest = _verb(words)
+    head = " ".join(words[:words.index("on")] if "on" in words else words)
+    if (verb is None and inherited is None and device is None
+            and not any(p.match(head) for p, _ in VOLUME)):
+        # No verb to act on: chat ("what's on my calendar"), not an unknown place.
+        raise Unsure("no action verb")
     if device is None and "on" in rest:  # suffix: "open chrome on arch"
         cut = len(rest) - 1 - rest[::-1].index("on")
         tail = " ".join(rest[cut + 1:])
@@ -260,6 +368,12 @@ def _site(obj):
 
 def _command(clause, catalog):
     verb, obj = clause["verb"], clause["object"]
+    if verb == "scroll":
+        return {"intent": "scroll", "args": dict(clause["scroll"])}
+    if verb in ("next", "previous") and NEXT_VIDEO.match(
+            re.sub(r"^(?:to\s+)?(?:the\s+)?(?:next|previous|last)?\s*", "", obj)):
+        return {"intent": "scroll", "args": {"mode": "once",
+                                             "direction": "down" if verb == "next" else "up"}}
     if verb == "volume":
         for pattern, level in VOLUME:
             if match := pattern.match(obj):
@@ -308,6 +422,16 @@ def _merge(commands):
     out = []
     for command in commands:
         prev = out[-1] if out else None
+        if prev and prev["intent"] == "open_url" and command["intent"] == "scroll" \
+                and command["args"].get("mode") != "stop" and _compatible(prev, command):
+            # "go to yt shorts and start scrolling": scroll the page just opened, once it is.
+            from .observe import predicate_for
+            target = (predicate_for(prev) or {}).get("text")
+            args = {**command["args"], "url": prev["args"]["url"],
+                    **({"target": target.strip(" /")} if target else {}),
+                    **({"app": prev["args"]["browser"]} if prev["args"].get("browser") else {})}
+            command = {**command, "args": args, "after": [prev],
+                       "device": command["device"] or prev["device"]}
         if prev and prev["intent"] == "open_app" and _compatible(prev, command):
             device = prev["device"] or command["device"]
             if command["intent"] == "open_url" and prev["args"]["name"] in BROWSERS \

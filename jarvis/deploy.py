@@ -13,13 +13,17 @@ so the two can never silently drift apart. `update` closes the gap:
 The node's own config and state are never part of the package.
 """
 
+import base64
 import hashlib
 import io
+import os
 import shlex
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import time
+import zipfile
 from pathlib import Path
 
 PACKAGE = Path(__file__).resolve().parent
@@ -28,7 +32,7 @@ REMOTE_DIR = "~/projects/JARVIS"
 SERVICE = "jarvis-cluster.service"
 WAIT = 40  # seconds for the restarted node to check in with the new code
 
-# Runs on the node: the same fingerprint as code_fingerprint(), for a folder.
+# Runs on the node: the same fingerprint as code_fingerprint(), for a folder (CRLF-blind).
 REMOTE_FINGERPRINT = r"""
 import hashlib, os, sys
 root = sys.argv[1]; h = hashlib.sha256(); found = []
@@ -38,7 +42,7 @@ for base, dirs, files in os.walk(root):
 for rel, path in sorted((os.path.relpath(p, root).replace(os.sep, "/"), p) for p in found):
     h.update(rel.encode() + b"\0")
     with open(path, "rb") as f:
-        h.update(f.read() + b"\0")
+        h.update(f.read().replace(b"\r\n", b"\n") + b"\0")
 print(h.hexdigest()[:16])
 """
 
@@ -62,7 +66,8 @@ def code_fingerprint(root=PACKAGE):
     digest = hashlib.sha256()
     for path in files:
         digest.update(path.relative_to(root).as_posix().encode() + b"\0")
-        digest.update(path.read_bytes() + b"\0")
+        # CRLF -> LF so a Windows checkout with core.autocrlf matches the same commit.
+        digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
     value = digest.hexdigest()[:16]
     if root == PACKAGE:
         _CACHE.update(stamp=stamp, value=value)
@@ -81,12 +86,67 @@ def package():
     return buffer.getvalue()
 
 
+def is_ssh_node(config, node):
+    return ((config.get("devices") or {}).get(node) or {}).get("transport") == "ssh"
+
+
+def code_bundle():
+    """What /v1/code serves: jarvis/ + pyproject.toml as base64 zip, with its fingerprint."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for path in _files(PACKAGE):
+            bundle.write(path, "jarvis/" + path.relative_to(PACKAGE).as_posix())
+        pyproject = PACKAGE.parent / "pyproject.toml"
+        if pyproject.is_file():
+            bundle.write(pyproject, "pyproject.toml")
+    return {"code": code_fingerprint(), "zip": base64.b64encode(buffer.getvalue()).decode("ascii")}
+
+
+def _safe_name(name):
+    parts = name.split("/")
+    if (not name or name.startswith("/") or "\\" in name or ":" in name or
+            any(p in ("", ".", "..") for p in parts) or (parts[0] != "jarvis" and name != "pyproject.toml")):
+        raise ValueError(f"Unsafe path in code package: {name!r}")
+    return parts
+
+
+def apply_bundle(bundle, repo=PACKAGE.parent):
+    """Unpack a /v1/code bundle, check its fingerprint, then replace this checkout's files
+    (tmp + os.replace each, so a crash never leaves a half-written .py). Returns the count."""
+    repo = Path(repo).resolve()
+    with zipfile.ZipFile(io.BytesIO(base64.b64decode(bundle["zip"], validate=True))) as archive:
+        entries = [(i.filename, _safe_name(i.filename)) for i in archive.infolist() if not i.is_dir()]
+        with tempfile.TemporaryDirectory(prefix="jarvis-update-") as stage:
+            stage = Path(stage)
+            for name, parts in entries:
+                target = stage.joinpath(*parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(archive.read(name))
+            got = code_fingerprint(stage / "jarvis")
+            if got != bundle.get("code"):
+                raise ValueError(f"Downloaded code fingerprint {got} != {bundle.get('code')}; not installed.")
+            for name, parts in entries:
+                target = repo.joinpath(*parts).resolve()
+                if repo not in target.parents:
+                    raise ValueError(f"Unsafe path in code package: {name!r}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temporary = target.with_name(f".{target.name}.{os.getpid()}.new")
+                shutil.copyfile(stage.joinpath(*parts), temporary)
+                os.replace(temporary, target)
+            # Files the main no longer has would change the fingerprint: drop them.
+            keep = {repo.joinpath(*parts).resolve() for _, parts in entries}
+            for path in _files(repo / "jarvis"):
+                if path.resolve() not in keep:
+                    path.unlink(missing_ok=True)
+    return len(entries)
+
+
 def _ssh(config, state, node):
     """argv prefix and targets to reach `node` over its pinned SSH link."""
     from .cluster_tunnel import pinned_host
     from .transfer import _check_target, _ssh_args
     machine = (config.get("devices") or {}).get(node)
-    if not machine or machine.get("transport") != "ssh":
+    if not machine or machine.get("transport") != "ssh":  # forward-mode nodes pull instead
         raise ValueError(f"{node!r} is not a configured SSH node.")
     binary = shutil.which("ssh")
     if not binary:
@@ -128,6 +188,12 @@ def update(config, state, node, rollback=False):
         raise ValueError("Run jarvis cluster update on the main PC.")
     if node == main:
         raise ValueError("The main PC already runs this code.")
+    if not is_ssh_node(config, node):
+        if rollback:
+            raise ValueError(f"{node} has no SSH link, so it can't be rolled back remotely.")
+        return {"node": node, "updated": False, "pull": True,
+                "note": f"{node} has no SSH link: it pulls the main's code itself on its next poll "
+                        "(within ~30 s while its node agent runs) and restarts."}
     _, _, folder = _ssh(config, state, node)
     started = time.monotonic()
     _, before = _node_code(state, node)

@@ -26,7 +26,8 @@ from .remote import Remote
 DIRECT = {"open_app": ("open_app", "name"), "open_url": ("open_url", "url"),
           "focus_window": ("focus_window", "name"), "close_app": ("close_app", "name"),
           "media": ("media", "command"), "volume": ("volume", "level"),
-          "list_apps": ("list_apps", "query")}
+          "list_apps": ("list_apps", "query"), "scroll": ("scroll", None),
+          "browse": ("browse", None)}
 # spotify_play is not here on purpose: tested live on 2026-10-26, a freshly opened Spotify
 # has no media session, so neither the media key nor Space starts Liked Songs; it needs a
 # click on the page's Play button. That's UI judgement, so it goes to Grok Bot.
@@ -144,14 +145,19 @@ def run_commands(text, commands, config, state, step=None, origin=None, origin_c
     turn = {"request": uuid.uuid4().hex, "text": text, "origin": origin,
             "origin_class": origin_class, "parse_ms": parse_ms, "history": history}
     result = _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
-                       history, state=state, channel=channel)
+                       history, state=state, channel=channel, request=turn["request"],
+                       rule=gates.trusted_rules(config))
     _record(turn, commands, result, started)
     return result
 
 
 def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step, history,
-              state=None, channel="cli", confirmed=False):
+              state=None, channel="cli", confirmed=False, request=None, rule=None):
     gate_started = time.monotonic()
+    skip = {c["id"]: gates.skips(c, origin, origin_class, rule) for c in commands}
+    for command in commands:  # a step something waits on keeps its on-screen check:
+        for dep in command.get("depends_on", []):  # it says the app is ready for the next
+            skip[dep] = skip.get(dep, frozenset()) - {"observe"}
 
     if app_exists is None:
         def app_exists(device, name):
@@ -165,16 +171,20 @@ def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
     verdicts = []
     for command in commands:
         checked = time.monotonic()
-        verdict = gates.check(command, devices, origin_class, app_exists=app_exists,
-                              confirmed=confirmed)
+        verdict = gates.check(command, devices, origin_class, confirmed=confirmed,
+                              app_exists=None if "app_exists" in skip[command["id"]] else app_exists)
         verdicts.append(verdict)
         step(f"gate:{command['id']}", "parse", f"Gates · {command['intent']}",
              f"{'passed' if verdict['pass'] else verdict['why']} · {_ms(checked)} ms",
              "done" if verdict["pass"] else "fail")
     # H-checks: what happened to these same commands before.
     warnings, alerts = [], False
-    if history and all(v["pass"] for v in verdicts):
-        for command, verdict in zip(commands, verdicts):
+    parkable = [state is not None and not v["pass"] and v["risk"] == "confirm"
+                and not c.get("depends_on") for c, v in zip(commands, verdicts)]
+    if history and all(v["pass"] or p for v, p in zip(verdicts, parkable)):
+        for command, verdict, parked in zip(commands, verdicts, parkable):
+            if parked or "history" in skip[command["id"]]:
+                continue
             try:
                 past = history.check(command, origin_class)
             except Exception:  # an unreadable history never blocks a request
@@ -191,7 +201,8 @@ def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
                  "fail" if past["block"] else "done")
     gates_ms = _ms(gate_started)
     blocked = [(c, v) for c, v in zip(commands, verdicts) if not v["pass"]]
-    if blocked:
+    if blocked and not all(p or v["pass"] for v, p in zip(verdicts, parkable)):
+        # Something hard-failed: hold the whole request, parking only what can be parked.
         from .confirm import ConfirmQueue, prompt
         pending, replies = [], []
         for command, verdict in blocked:
@@ -213,8 +224,38 @@ def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
                 "gates_ms": gates_ms,
                 "outcomes": [{"id": c["id"], "state": "not_sent", "ok": False,
                               "text": v["why"] or ""} for c, v in zip(commands, verdicts)]}
+    if blocked:
+        # Only risky commands are waiting for a yes: park those, hold what depends on
+        # them, and run the rest instead of silently dropping it.
+        from .confirm import ConfirmQueue, prompt
+        held, notes, pending, outcomes = {c["id"] for c, _ in blocked}, [], [], {}
+        for command, _ in blocked:
+            item = ConfirmQueue(state).park(command, origin, channel)
+            pending.append(item)
+            notes.append(prompt(item))
+            outcomes[command["id"]] = {"id": command["id"], "state": "not_sent", "ok": False,
+                                       "text": f"Waiting for your OK ({item['id']})."}
+        grew = True
+        while grew:  # whatever depends on a held command stays held too
+            grew = False
+            for command in commands:
+                if command["id"] not in held and held & set(command["depends_on"]):
+                    held.add(command["id"])
+                    grew = True
+                    outcomes[command["id"]] = {"id": command["id"], "state": "not_sent", "ok": False,
+                                               "text": "Held: it follows a step that needs your OK."}
+                    notes.append(f"I held {command['intent'].replace('_', ' ')} "
+                                 f"{next(iter(command['args'].values()))} until that's confirmed.")
+        runnable = [c for c in commands if c["id"] not in held]
+        outcomes.update(_execute(runnable, remote, step, request, skip))
+        done = _reply(runnable, outcomes, origin) if runnable else ""
+        reply = " ".join(filter(None, [*([" ".join(dict.fromkeys(warnings))] if warnings else []),
+                                       done, *notes]))
+        return {"reply": reply, "commands": commands, "checks": verdicts, "alert": alerts,
+                "confirmations": pending, "gates_ms": gates_ms,
+                "outcomes": [outcomes[c["id"]] for c in commands]}
 
-    outcomes = _execute(commands, remote, step)
+    outcomes = _execute(commands, remote, step, request, skip)
     reply = _reply(commands, outcomes, origin)
     if warnings:
         reply = " ".join(dict.fromkeys(warnings)) + " " + reply
@@ -291,35 +332,38 @@ def _blocked_reply(command, verdict):
     return verdict["why"]
 
 
-def _execute(commands, remote, step):
-    """Run commands in dependency waves; independent ones run at the same time."""
-    outcomes, lock = {}, threading.Lock()
+def _execute(commands, remote, step, request=None, skip=None):
+    """Run commands in dependency waves; independent ones run at the same time.
+    skip: {command id: checks it may skip} from the trusted_local rule."""
+    outcomes, lock, skip = {}, threading.Lock(), skip or {}
 
     def run(command):
         action, arg = DIRECT[command["intent"]]
         label = f"{command['intent']} · {command['device']}"
-        if not INFLIGHT.claim(command):
+        skipped = skip.get(command["id"], frozenset())
+        if "dedupe" not in skipped and not INFLIGHT.claim(command, request):
             outcome = {"id": command["id"], "state": "merged", "ok": True,
                        "text": "Already doing that."}
         else:
             step(f"run:{command['id']}", "parse", label, "sending", "run")
             sent, ok = time.monotonic(), False
             try:
-                value = command["args"][arg]
+                value = json.dumps(command["args"]) if arg is None else command["args"][arg]
                 if action == "open_url" and command["args"].get("browser"):
                     value = json.dumps(command["args"])
                 ok, text = remote.call(command["device"], action, value)
             except Exception as exc:  # the executor must never take the turn down
                 ok, text = False, f"{type(exc).__name__}: {exc}"
             finally:
-                INFLIGHT.release(command, ok)
+                if "dedupe" not in skipped:  # only what claimed the merge window holds it
+                    INFLIGHT.release(command, ok, request)
             state = "acknowledged" if ok else (
                 "uncertain" if any(u in text.lower() for u in UNCERTAIN) else "pre_effect_failure")
             outcome = {"id": command["id"], "state": state, "ok": ok, "text": text,
                        "run_ms": _ms(sent)}
             step(f"run:{command['id']}", "parse", label, f"{text} · {outcome['run_ms']} ms",
                  "done" if ok else "fail")
-            if ok:
+            if ok and "observe" not in skipped:
                 watched = time.monotonic()
                 seen = _observe(command, remote, step, label)
                 if seen:

@@ -45,7 +45,7 @@ def infer_with_chatgpt(prompt, config, base):
     """Use a separate tool-free lane; the action lane may be busy handling this call."""
     from .chatgpt import ChatGPTLane
     lane = ChatGPTLane(config, base, max_turns=1, timeout=20,
-                       instructions=INSTRUCTIONS)
+                       instructions=INSTRUCTIONS, overrides=['web_search="disabled"'])
     try:
         return lane.ask(prompt)
     finally:

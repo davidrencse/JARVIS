@@ -28,13 +28,21 @@ PERSONA = ("You are JARVIS, David's personal assistant, speaking with him live (
 
 
 # Never let a CLI fall back to pay-per-token API billing: subscription login only.
-API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY",
-                "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+API_KEY_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_BASE_URL", "OPENAI_API_KEY",
+                "OPENAI_BASE_URL", "CODEX_API_KEY", "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_API_KEY_HELPER_TTL_MS")
+# A parent Claude Code session's own variables (session id, messaging token, effort,
+# CLAUDECODE) must not leak into child CLIs; the subscription login and config dir stay.
+KEEP_CLAUDE_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+                    "CLAUDE_CONFIG_DIR")
 SENTENCE_END = re.compile(r"(.+?[.!?])(\s+|$)", re.S)
 
 
 def subscription_env():
-    return {k: v for k, v in os.environ.items() if k not in API_KEY_VARS}
+    return {k: v for k, v in os.environ.items() if k.upper() not in API_KEY_VARS and (
+        not k.upper().startswith("CLAUDE") or k.upper() in KEEP_CLAUDE_VARS)}
 
 
 def now_line():

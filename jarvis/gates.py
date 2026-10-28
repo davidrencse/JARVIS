@@ -30,25 +30,60 @@ class InFlight:
         return (command["device"], command["intent"],
                 tuple(sorted((k, str(v)) for k, v in command["args"].items())))
 
-    def claim(self, command):
+    def claim(self, command, request=None):
         """True if this caller now owns the command; False if an identical one is running
-        or finished within DUPLICATE_WINDOW."""
+        or finished within DUPLICATE_WINDOW. Commands of the same `request` are never
+        merged ("next and next" means twice); only another request's duplicate is."""
         key, now = self.key(command), time.monotonic()
         with self._lock:
-            started = self._items.get(key)
-            if started is not None and now - started < DUPLICATE_WINDOW:
+            started, owner = self._items.get(key, (None, None))
+            if (started is not None and now - started < DUPLICATE_WINDOW
+                    and (request is None or owner is None or owner != request)):
                 return False
-            self._items[key] = now
+            self._items[key] = (now, request)
             return True
 
-    def release(self, command, ok=True):
+    def release(self, command, ok=True, request=None):
         """Done. A success keeps the merge window (a double trigger stays merged); a
         failure clears it, so retrying right away runs instead of "already doing that"."""
         with self._lock:
             if ok:
-                self._items[self.key(command)] = time.monotonic()
+                self._items[self.key(command)] = (time.monotonic(), request)
             else:
                 self._items.pop(self.key(command), None)
+
+
+# rules.trusted_local in jarvis.config.json: David's own low-risk actions on the PC he is
+# using skip the checks that cost time (the installed-app lookup, history, the on-screen
+# wait). Schema validation and the risk policy still run: they cost microseconds and are
+# what keep a bad argument or a risky command (close_app, agent tasks) from being sent.
+TRUSTED_LOCAL = {"enabled": True,
+                 "intents": ["open_app", "open_url", "focus_window", "media", "volume",
+                             "scroll", "list_apps", "spotify_play"],
+                 "skip": ["app_exists", "history", "observe"]}
+SKIPPABLE = frozenset({"app_exists", "history", "observe", "dedupe"})
+
+
+def trusted_rules(config):
+    """The trusted_local rule, defaults filled in from TRUSTED_LOCAL."""
+    rule = {**TRUSTED_LOCAL, **((config or {}).get("rules") or {}).get("trusted_local", {})}
+    rule["skip"] = [s for s in rule.get("skip") or () if s in SKIPPABLE]
+    return rule
+
+
+def skips(command, origin, origin_class, rule):
+    """The checks this command may skip: none unless it's the owner's own request, runs
+    on the PC it came from, is a trusted intent and needs no confirmation."""
+    if (not rule or not rule.get("enabled") or origin_class != "owner"
+            or command.get("device") != origin
+            or command.get("intent") not in (rule.get("intents") or ())):
+        return frozenset()
+    try:
+        if registry.risk(command) != "allow":
+            return frozenset()
+    except KeyError:
+        return frozenset()
+    return frozenset(rule["skip"])
 
 
 def _result(name, ok, why=""):

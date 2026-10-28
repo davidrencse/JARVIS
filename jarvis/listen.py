@@ -157,33 +157,96 @@ def _collect(read, is_speech, block, max_seconds, max_silence, wait_seconds, min
 
 
 def record_utterance(max_seconds=20, max_silence=0.8, calibrate=0.5, wait_seconds=None,
-                     min_voiced=0.2):
+                     min_voiced=0.2, mic=None):
     """Block until one spoken utterance ends; return float32 mono 16 kHz audio or None.
-    Uses Silero VAD when faster-whisper is installed, else a loudness threshold."""
-    np = _np()
+    Uses Silero VAD when faster-whisper is installed, else a loudness threshold.
+    `mic` is a LiveMic held open between calls; without one the mic opens per call."""
+    vad = _vad_model()
+    block = VAD_CHUNK if vad else FRAME
+    if mic is not None:
+        return _utterance(mic.read, block, vad, max_seconds, max_silence, calibrate,
+                          wait_seconds, min_voiced)
     try:
         import sounddevice as sd
     except ImportError:
         raise RuntimeError(INSTALL_HINT) from None
-    vad = _vad_model()
-    block = VAD_CHUNK if vad else FRAME
     with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=block,
-                        device=_input_device(sd)) as mic:
+                        device=_input_device(sd)) as stream:
         def read():
-            return mic.read(block)[0][:, 0]
-        if vad:
-            # Two positive blocks avoid triggering on a single click; the lower
-            # cutoff and 384 ms of preroll catch quiet speech without clipping its start.
-            return _collect(read, _SpeechGate(vad), block, max_seconds, max_silence,
-                            wait_seconds, min_voiced, onset=2, preroll=12)
-        calibration = [read() for _ in range(max(1, int(calibrate * RATE / block)))]
-        floor_rms = [float(np.sqrt(np.mean(chunk ** 2))) for chunk in calibration]
-        threshold = speech_threshold(floor_rms)
-        # 2 frames of sound start an utterance; preserve calibration frames so an
-        # immediately spoken wake word isn't cut off while the noise floor is measured.
-        return _collect(read, lambda b: float(np.sqrt(np.mean(b ** 2))) > threshold, block,
-                        max_seconds, max_silence, wait_seconds, min_voiced, onset=2,
-                        preroll=12, initial=calibration)
+            return stream.read(block)[0][:, 0]
+        return _utterance(read, block, vad, max_seconds, max_silence, calibrate,
+                          wait_seconds, min_voiced)
+
+
+def _utterance(read, block, vad, max_seconds, max_silence, calibrate, wait_seconds,
+               min_voiced):
+    np = _np()
+    if vad:
+        # Two positive blocks avoid triggering on a single click; the lower
+        # cutoff and 384 ms of preroll catch quiet speech without clipping its start.
+        return _collect(read, _SpeechGate(vad), block, max_seconds, max_silence,
+                        wait_seconds, min_voiced, onset=2, preroll=12)
+    calibration = [read() for _ in range(max(1, int(calibrate * RATE / block)))]
+    floor_rms = [float(np.sqrt(np.mean(chunk ** 2))) for chunk in calibration]
+    threshold = speech_threshold(floor_rms)
+    # 2 frames of sound start an utterance; preserve calibration frames so an
+    # immediately spoken wake word isn't cut off while the noise floor is measured.
+    return _collect(read, lambda b: float(np.sqrt(np.mean(b ** 2))) > threshold, block,
+                    max_seconds, max_silence, wait_seconds, min_voiced, onset=2,
+                    preroll=12, initial=calibration)
+
+
+class LiveMic:
+    """The mic held open for the always-on listener. Opening it per utterance left it
+    deaf while the last clip was checked and transcribed (about 1.3 s on CPU, after every
+    clip of music or other voices too), so a "Jarvis" said then was lost or clipped.
+    A PortAudio callback queues every block instead; at most `backlog` seconds wait."""
+
+    def __init__(self, backlog=15.0, stream=None):
+        import queue
+        self._queue = queue
+        self.block = VAD_CHUNK if _vad_model() else FRAME
+        self.blocks = queue.Queue(maxsize=max(1, int(backlog * RATE / self.block)))
+        if stream is None:
+            try:
+                import sounddevice as sd
+            except ImportError:
+                raise RuntimeError(INSTALL_HINT) from None
+            stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
+                                    blocksize=self.block, device=_input_device(sd),
+                                    callback=self._callback)
+        self.stream = stream
+        self.stream.start()
+
+    def _callback(self, data, frames, time_info, status):
+        chunk = data[:, 0].copy()
+        while True:
+            try:
+                self.blocks.put_nowait(chunk)
+                return
+            except self._queue.Full:  # keep the newest audio, drop the oldest
+                try:
+                    self.blocks.get_nowait()
+                except self._queue.Empty:
+                    pass
+
+    def read(self):
+        try:
+            return self.blocks.get(timeout=5)
+        except self._queue.Empty:
+            raise RuntimeError("The microphone stopped sending audio.") from None
+
+    def flush(self):
+        """Drop queued audio, e.g. what the mic heard while JARVIS was talking."""
+        while True:
+            try:
+                self.blocks.get_nowait()
+            except self._queue.Empty:
+                return
+
+    def close(self):
+        self.stream.stop()
+        self.stream.close()
 
 
 def save_wav(path, audio):

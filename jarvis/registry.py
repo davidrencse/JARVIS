@@ -32,6 +32,10 @@ MAX_TEXT = 4000
 SPOTIFY = re.compile(r"(?:liked|(?:playlist|album|track|artist):[A-Za-z0-9]{1,64})\Z")
 URL = re.compile(r"(?:https?://[^\s\"'<>]{1,2000}|spotify:[A-Za-z0-9:]{1,200})\Z")
 LEVEL = re.compile(r"(?:up|down|mute|unmute|\d{1,3})\Z")
+SCROLL_DIRECTIONS = ("down", "up")
+SCROLL_MODES = ("once", "auto", "stop")
+EVERY = re.compile(r"\d{1,3}(?:\.\d)?\Z")
+BROWSE_ACTIONS = ("open", "scroll", "back", "forward", "reload", "close")
 
 
 def _name(value):
@@ -45,6 +49,10 @@ def _text(value):
 def _url(value):
     return isinstance(value, str) and bool(URL.match(value)) and \
         (value.startswith(("http://", "https://")) or value.split(":", 1)[0] in DEEP_LINKS)
+
+
+def _http(value):
+    return _url(value) and value.startswith(("http://", "https://"))
 
 
 def _level(value):
@@ -81,6 +89,21 @@ INTENTS = {i.name: i for i in (
            "playback state matches", 3, escalate=True),
     Intent("volume", "direct", "allow", {"level": (_level, True)},
            "the volume reads back", 1),
+    # auto keeps scrolling a window on its own until "stop", the window closes or 30 min.
+    Intent("scroll", "direct", "allow",
+           {"direction": (lambda v: v in SCROLL_DIRECTIONS, False),
+            "mode": (lambda v: v in SCROLL_MODES, False), "target": (_name, False),
+            "app": (_name, False), "url": (_url, False),
+            "every": (lambda v: isinstance(v, str) and bool(EVERY.match(v))
+                      and 2 <= float(v) <= 300, False)}, None, None),
+    # The agent browser (agent_browser.py): JARVIS's own Chrome, shown in the console.
+    # Its executor reads the page back itself, so there is no window to observe.
+    Intent("browse", "direct", "allow",
+           {"action": (lambda v: v in BROWSE_ACTIONS, True), "url": (_http, False),
+            "direction": (lambda v: v in SCROLL_DIRECTIONS, False),
+            "mode": (lambda v: v in SCROLL_MODES, False),
+            "every": (lambda v: isinstance(v, str) and bool(EVERY.match(v))
+                      and 2 <= float(v) <= 300, False)}, None, None),
     Intent("list_apps", "direct", "allow", {"query": (_name, True)}, None, None),
     Intent("spotify_play", "direct", "allow",
            {"target": (lambda v: isinstance(v, str) and bool(SPOTIFY.match(v)), True)},
@@ -148,4 +171,13 @@ def validate(commands, devices):
             if not isinstance(deps, list) or any(d not in ids or d == command.get("id")
                                                  for d in deps):
                 errors.append(f"command {command.get('id')}: bad depends_on.")
+    if not errors:  # a dependency cycle never becomes runnable and would hang the turn
+        deps = {c.get("id"): set(c.get("depends_on", [])) for c in commands}
+        while deps:
+            ready = [i for i, d in deps.items() if not d & deps.keys()]
+            if not ready:
+                errors.append("depends_on has a cycle: " + ", ".join(sorted(map(str, deps))) + ".")
+                break
+            for i in ready:
+                del deps[i]
     return errors

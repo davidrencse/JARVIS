@@ -26,7 +26,40 @@ KINDS = ("window", "title", "focused", "gone", "playback", "volume")
 MAX_SETTLE = 15.0
 POLL = 0.25
 # Sites whose window titles don't contain their domain name.
-TITLE_WORDS = {"mail.google.com": "gmail", "x.com": "x", "www.youtube.com": "youtube"}
+# JARVIS's own console runs as a Chromium --app window (class "chrome-127.0.0.1__-Default"),
+# which must not count as Chrome: "close chrome" would close the console instead.
+CONSOLE_CLASS = re.compile(r"^(?:chrome|chromium|msedge|brave)-(?:127\.0\.0\.1|localhost)", re.I)
+
+
+def app_class(name):
+    """A window class as JARVIS matches it: the console's app window becomes "localconsole"."""
+    return "localconsole" if CONSOLE_CLASS.match(name or "") else (name or "")
+
+
+# X's tab titles are "Home / X" (logged out: "... / X"), never "x" or "twitter": a bare "x"
+# fails validate's 2-char minimum and would match any title, so the predicate is the
+# "/ X" suffix, matched on the raw title (see matches) rather than flattened.
+TITLE_WORDS = {"mail.google.com": "gmail", "x.com": "/ X", "twitter.com": "/ X",
+               "www.youtube.com": "youtube"}
+
+# "open <site>" is only seen in a browser window: a terminal titled "vim github.py" or the
+# "- Google Chrome" tail on every Chrome title must not satisfy it.
+BROWSER_APP = re.compile(r"(?:^|[\s.\-_])(?:google-?chrome|chrome|chromium|firefox|zen|"
+                         r"brave|msedge|microsoft-?edge|safari|vivaldi|opera)(?:$|[\s.\-_])")
+BROWSER_SUFFIX = re.compile(r"\s+[-\u2014\u2013|]\s+(?:google chrome|chromium|mozilla firefox|"
+                            r"zen(?: browser)?|brave|microsoft.? edge|safari|vivaldi|opera)\b.*$", re.I)
+
+
+def is_browser(app):
+    app = str(app or "").lower()
+    if CONSOLE_CLASS.match(app) or "localconsole" in app:  # JARVIS's own console isn't a browser
+        return False
+    return any(BROWSER_APP.search(token) for token in [app, *app.split()])
+
+
+def page_title(title):
+    """A browser window's title without the trailing browser name."""
+    return BROWSER_SUFFIX.sub("", str(title or "")).strip()
 
 
 def _flat(text):
@@ -76,7 +109,10 @@ def validate(predicate):
         return predicate
     key = "text" if predicate["kind"] == "title" else "app"
     value = predicate.get(key)
-    if not isinstance(value, str) or not 2 <= len(_flat(value)) <= 100:
+    # "/ X" (X's title suffix) is one letter once flattened, but is matched raw, so it's valid.
+    size = len(_flat(value)) + 1 if key == "text" and str(value).strip().startswith("/") \
+        else len(_flat(value))
+    if not isinstance(value, str) or not 2 <= size <= 100:
         raise ValueError(f"The predicate needs a {key}.")
     return predicate
 
@@ -127,7 +163,7 @@ def _windows_hyprland():
         return json.loads(out or "null")
 
     active = (query("activewindow") or {}).get("address")
-    return [{"app": f"{c.get('class', '')} {c.get('initialClass', '')}",
+    return [{"app": f"{app_class(c.get('class'))} {app_class(c.get('initialClass'))}",
              "title": c.get("title", ""), "focused": c.get("address") == active}
             for c in query("clients") or []]
 
@@ -467,8 +503,13 @@ def matches(predicate, listed):
             return not state["muted"], None
         return True, None  # relative adjustments are confirmed by a successful readback
     if kind == "title":
-        query = _flat(predicate["text"])
-        hit = next((w for w in listed if query in _flat(w["title"])), None)
+        text = predicate["text"].strip()
+        titles = [(w, page_title(w["title"])) for w in listed if is_browser(w["app"])]
+        if text.startswith("/"):  # "/ X": the end of the page title, compared as written
+            hit = next((w for w, t in titles if t.lower().endswith(text.lower())), None)
+        else:
+            query = _flat(text)
+            hit = next((w for w, t in titles if query in _flat(t)), None)
         return bool(hit), hit["app"].split()[0] if hit and hit["app"] else None
     query = _flat(predicate["app"])
     hits = [w for w in listed if _is_app(w, query)]
