@@ -15,8 +15,10 @@
    `"cluster": {"tunnel": "forward"}` so the Dell (node) dials the Zenbook's sshd — Windows needs
    no SSH server then. Give `devices.zenbook` `transport: ssh` and a `target` the Dell can reach.
 6. **Autostart:** `python -m jarvis cluster autostart on` on each machine (systemd user unit on
-   Arch, Startup .vbs on Windows). Then `cluster update dell` to push matching code to the node.
+   Arch, Startup .vbs on Windows). Then `cluster update dell` to push matching code to the node (SSH nodes), or just leave a
+   forward-mode node (no sshd, e.g. the Dell) running: it pulls and verifies the main's code over its own
+   authenticated hub channel on its next poll and restarts itself.
 7. **Vault:** `vault.path.linux` in config points at `~/Documents/obsidian-vault`; make sure it syncs there.
 8. **Claude context:** this repo's `CLAUDE.md`, `JARVIS.md` and `docs/` travel with git. The memory notes are also
    in `jarvis-memory/` (committed) and were copied to `~/.claude/projects/-home-<user>-projects-JARVIS/memory/`.
-9. **Check:** `python -m jarvis selftest` and `python -m jarvis cluster status`.
+9. **Check:** `python -m jarvis selftest keyboard` (Windows only; it skips elsewhere) and `python -m jarvis cluster status`.

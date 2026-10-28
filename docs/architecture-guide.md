@@ -74,7 +74,7 @@ a module is not listed, so add new modules to `sysview.py`.
 | Decide | router, assistant, instant, briefing, parse, registry, gates, pipeline, confirm, decide, interpret, selfmodel | turn words into checked actions or a conversation |
 | Remember | vault, knowledge, memory, vault_mcp, tasks, history, embed | memory heap, semantic recall, David's vault, tasks, action history |
 | Think | chatgpt, fastlane, runner, orchestrator, prompts, adapters, claude_auth, grok_preflight | model lanes, failover, agent runs |
-| Act | actions, remote, grokbot, transfer, storage, clipsync, showcase, observe, sharedinput | executors per OS, cross-machine calls, Grok Bot, files, clipboard, Lan Mouse |
+| Act | actions, agent_browser, remote, grokbot, transfer, storage, clipsync, showcase, observe, sharedinput | executors per OS, cross-machine calls, Grok Bot, files, clipboard, Lan Mouse |
 | Speak | speech, voice, agent | Kokoro TTS (local), speech queue, ElevenLabs live agent |
 | Log | store, events, locking, cluster_store | task ledger, event feed, file locks, cluster job store |
 | Console / ops | ui, __main__, sysview, cluster_cli, cluster_proxy, cluster_tunnel, deploy, node, platforms, autostart | CLI, web console, cluster control, code deploy, OS detection, login startup |
@@ -86,6 +86,15 @@ Key files in plain words:
 - `remote.py`: `call(target, action, args)`; a local target runs here (`run_here`), others go
   to the cluster. Also `session_env()` borrows the Linux desktop's DISPLAY/WAYLAND vars for SSH.
 - `actions.py` / `observe.py`: per-OS executors and their read-back checks (see §5).
+- `agent_browser.py`: JARVIS's own Chrome (agent-browser CLI, pinned). It shares the session
+  `jarvis` and `.jarvis/agent-browser-profile` with the act lane's agent-browser MCP server, so
+  the console's **Agent screen** box (top of the Assistant panel, `web/agentscreen.js`, polling
+  `GET /api/agent-browser`) shows whatever the model or a `browse` command is doing there.
+  Saying "in the agent browser" turns open_url/scroll into the direct `browse` intent
+  ("in the agent browser go to instagram and keep scrolling"), with no model involved. Without
+  the phrase, scrolling still means David's own browser window. `frame()` never launches
+  Chrome: it checks the session's Chrome process first. The box's buttons (`POST
+  /api/agent-browser`) are back, reload, stop scrolling and close.
 - `cluster.py`: the hub (main) and node client; long polling; liveness; code-mismatch refusal.
 - `deploy.py`: code fingerprint, `cluster update` (tar over SSH, keeps the previous copy for `--rollback`).
 
@@ -119,7 +128,9 @@ rest, and run `jarvis cluster update <node>` so nodes get matching code.
 - `cluster.tunnel: "forward"`: each node runs `ssh -L` to the main. Only the main needs an
   SSH server (best when the main is Linux/macOS and a node is Windows).
 - Host keys are pinned (`host_key` / `host_key_alias` per device). `fallback_targets` lists
-  other addresses (for example the Tailscale IP) tried in order.
+  other addresses (for example the Tailscale IP) tried in order. While the cluster tunnel is on a
+  fallback, it checks the earlier targets' port 22 every 60 s (backing off to 30 min if a
+  switch back fails) and returns to the first one that answers.
 
 Identity: `cluster.local_device: "auto"` matches this machine's hostname against
 `devices.<id>.hostname`; set an explicit id on nodes if hostnames are ambiguous.
@@ -257,7 +268,7 @@ Cluster actions: `configure`, `main`, `roles`, `status`, `run` (main), `node`, `
 `python -m unittest discover -s tests` with an interpreter that has the voice extras
 (on the Dell: `~/MiniConda3/python.exe`). About 880 tests, all mocked: none touch the real
 desktop, microphone or accounts. Test configs turn off semantic recall, shadow mode and the
-interpreter. Live checks are `jarvis selftest` and `jarvis doctor`.
+interpreter. Live checks are `jarvis selftest keyboard` and `jarvis doctor`.
 
 ## 14 Known limits and open work
 

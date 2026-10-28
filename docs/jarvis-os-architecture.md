@@ -87,6 +87,7 @@ never disagree.
 | `media` | play / pause / next | direct | allow | playback state (MPRIS on Linux, SMTC on Windows) | 3 s | escalate to `agent_task` once (e.g. no player is running) |
 | `volume` | level | direct | allow | the sink volume reads back | 1 s | report |
 | `list_apps` | query | direct | allow | result returned | n/a | report |
+| `scroll` | direction, mode (once/auto/stop), target, app, url, every | direct | allow | none (auto: presses only while the window is focused; ends on stop, window gone, or 30 min) | n/a | report |
 | `agent_task` | free text | grokbot | **ratchet** (see L3) | optional predicate; else agent claim | per task deadline | never re-run |
 | `answer` | question | brain | allow | n/a: no observable effect | n/a | report |
 | `vault_write` | text, target | vault tools (additive) | allow | the file contains the text | 1 s | report |
