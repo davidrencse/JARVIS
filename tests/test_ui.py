@@ -346,5 +346,45 @@ class HttpTests(Temp):
         self.assertGreater(float(np.sqrt(np.mean(sent_audio ** 2))), 0.01)
 
 
+class DevicesTests(Temp):
+    DEVICES = {
+        "box_a": {"hostname": "a-host", "label": "Box A", "transport": "local"},
+        "box_b": {"hostname": "b-host", "label": "Box B", "transport": "ssh", "target": "me@b"},
+        "box_c": {"hostname": "c-host", "transport": "cluster"},
+    }
+
+    def devices(self, cluster):
+        config = {**CONFIG, "devices": self.DEVICES, "cluster": cluster}
+        console = Console({**CONFIG, "cluster": {"enabled": False}}, ROOT, self.base)
+        console.config = config  # a node can't build a Console; the view only reads config
+        return {d["id"]: d for d in console.devices()}
+
+    def test_cluster_enabled_marks_here_role_and_send(self):
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_a"})
+        self.assertTrue(out["box_a"]["here"])
+        self.assertFalse(out["box_a"]["send"])
+        self.assertEqual(out["box_a"]["role"], "main")
+        self.assertEqual(out["box_a"]["label"], "Box A")
+        self.assertFalse(out["box_b"]["here"])
+        self.assertTrue(out["box_b"]["send"])
+        self.assertEqual(out["box_b"]["role"], "node")
+
+    def test_local_ssh_device_is_not_a_send_target(self):
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_b"})
+        self.assertTrue(out["box_b"]["here"])
+        self.assertFalse(out["box_b"]["send"])
+
+    def test_cluster_disabled_has_no_roles(self):
+        out = self.devices({"enabled": False})
+        for d in out.values():
+            self.assertIsNone(d["role"])
+            self.assertFalse(d["here"])
+        self.assertTrue(out["box_b"]["send"])
+
+    def test_cluster_transport_is_not_sendable(self):
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_a"})
+        self.assertFalse(out["box_c"]["send"])
+
+
 if __name__ == "__main__":
     unittest.main()

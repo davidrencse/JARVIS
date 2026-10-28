@@ -387,6 +387,7 @@ class VoiceWorkflowTests(Temp):
         brain.warm = MagicMock()
 
         with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
                 patch("jarvis.listen.VoicePrint", return_value=ears), \
                 patch("jarvis.listen.Transcriber", return_value=stt), \
                 patch("jarvis.speech.Voice", return_value=voice), \
@@ -435,6 +436,7 @@ class VoiceWorkflowTests(Temp):
         brain = Brain()
         brain.warm = MagicMock()
         with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
                 patch("jarvis.listen.VoicePrint", return_value=ears), \
                 patch("jarvis.listen.Transcriber", return_value=stt), \
                 patch("jarvis.speech.Voice", return_value=MagicMock(limit=350)), \
@@ -448,6 +450,67 @@ class VoiceWorkflowTests(Temp):
         self.assertNotIn("turn that up", feed)  # near miss, no wake word: unread
         self.assertNotIn("million", feed)  # far below: never transcribed
         ears.learn.assert_not_called()  # an unconfirmed voice never trains the print
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_bare_wake_word_takes_the_next_utterance_as_the_request(self):
+        from jarvis import daemon
+        heard = {"wake": "Jarvis.", "rest": "open the calendar", "late": "close the door",
+                 "wake2": "Jarvis", "stranger": "wire me a million dollars",
+                 "near-wake": "Jarvis?", "near-rest": "delete my downloads"}
+        score = {"wake": (True, 0.6), "rest": (True, 0.5), "late": (True, 0.5),
+                 "wake2": (True, 0.6), "stranger": (False, 0.05),
+                 "near-wake": (False, 0.2), "near-rest": (False, 0.2)}
+        queue_ = ["wake", "rest", "late", "wake2", "stranger", "near-wake", "near-rest",
+                  KeyboardInterrupt]
+        # One clock read per utterance, at the moment it was recorded.
+        clock = iter([0.0, 1.0, 2.0, 200.0, 201.0, 300.0, 301.0])
+
+        def record_utterance(**_):
+            item = queue_.pop(0)
+            if item is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return item
+
+        ears = MagicMock()
+        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
+            audio, str) else "")
+        stt.device = "cpu"
+        brain = Brain()
+        brain.warm = MagicMock()
+        real_monotonic = time.monotonic
+        with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
+                patch("jarvis.listen.VoicePrint", return_value=ears), \
+                patch("jarvis.listen.Transcriber", return_value=stt), \
+                patch("jarvis.speech.Voice", return_value=MagicMock(limit=350)), \
+                patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
+                patch("jarvis.chatgpt.make_lane", return_value=brain), \
+                patch.object(daemon.time, "monotonic",
+                             side_effect=lambda: next(clock, None) or real_monotonic()), \
+                patch.object(daemon, "foreground_priority"):
+            with self.assertRaises(KeyboardInterrupt):
+                daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        feed = (self.base / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("open the calendar", feed)  # within the follow-up window: answered
+        self.assertNotIn("close the door", feed)  # the window is one request only
+        self.assertNotIn("million", feed)  # a stranger never fills the window
+        self.assertNotIn("downloads", feed)  # two near misses never make a request
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_live_mic_keeps_audio_between_reads_and_drops_the_oldest(self):
+        import numpy as np
+        from jarvis import listen
+        stream = MagicMock()
+        with patch.object(listen, "_vad_model", return_value=None):
+            mic = listen.LiveMic(backlog=2 * listen.FRAME / listen.RATE, stream=stream)
+        stream.start.assert_called_once()
+        for n in (1, 2, 3):
+            mic._callback(np.full((listen.FRAME, 1), n, dtype="float32"), listen.FRAME, None, None)
+        self.assertEqual([mic.read()[0], mic.read()[0]], [2, 3])  # oldest dropped, order kept
+        mic._callback(np.zeros((listen.FRAME, 1), dtype="float32"), listen.FRAME, None, None)
+        mic.flush()
+        self.assertTrue(mic.blocks.empty())
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_listener_survives_a_failed_turn_and_keeps_listening(self):
@@ -476,6 +539,7 @@ class VoiceWorkflowTests(Temp):
 
         brain.ask = flaky
         with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
                 patch("jarvis.listen.VoicePrint", return_value=ears), \
                 patch("jarvis.listen.Transcriber", return_value=stt), \
                 patch("jarvis.speech.Voice", return_value=voice), \
@@ -567,8 +631,14 @@ class LocalServerWorkflowTests(Temp):
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
-        proc = subprocess.Popen([sys.executable, "-m", "jarvis", "--state", str(self.base),
-                                 "ui", "--port", str(port)], cwd=ROOT,
+        # The repo config may make this PC the cluster main, whose live hub already holds
+        # listen_port; the test's own hub must not collide with it.
+        config = json.loads((Path(ROOT) / "jarvis.config.json").read_text(encoding="utf-8"))
+        config.setdefault("cluster", {})["enabled"] = False
+        config_path = Path(self.base) / "jarvis.config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        proc = subprocess.Popen([sys.executable, "-m", "jarvis", "--config", str(config_path),
+                                 "--state", str(self.base), "ui", "--port", str(port)], cwd=ROOT,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self.addCleanup(proc.stdout.close)
         self.addCleanup(proc.wait)

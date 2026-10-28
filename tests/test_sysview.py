@@ -41,6 +41,13 @@ class SystemDesignTests(unittest.TestCase):
         self.assertTrue(all(c["fix"] for c in self.data["checks"] if c["state"] == "fail"))
         self.assertTrue(all(not c["fix"] for c in self.data["checks"] if c["state"] == "ok"))
 
+    def test_vault_off_by_choice_is_not_a_failure(self):
+        config = dict(self.console.config, vault={"enabled": False, "path": str(Path(self.tmp.name, "no-vault"))})
+        checks = {c["label"]: c for c in design(Console(config, ROOT, self.tmp.name))["checks"]}
+        self.assertNotIn("Obsidian vault found", checks)
+        self.assertEqual(checks["Obsidian vault off by choice"]["state"], "ok")
+        self.assertIn("kb ingest", checks["Wiki built from your sources"]["fix"])
+
     def test_stores_and_setup(self):
         names = {s["name"] for s in self.data["stores"]}
         self.assertIn("Wiki", names)

@@ -180,6 +180,34 @@ class ActionsWindowTests(unittest.TestCase):
         self.assertIn(["swaymsg", "[con_id=11]", "focus"], fake.calls)
         self.assertIn(["swaymsg", "[con_id=13]", "kill"], fake.calls)
 
+    def test_hyprland_focus_tries_lua_then_classic(self):
+        clients = json.dumps([{"address": "0xabc", "class": "kitty", "initialClass": "kitty",
+                               "title": "shell"}])
+        for lua_ok in (True, False):  # 0.56+ takes Lua only; older Hyprland only classic
+            def handler(a, lua_ok=lua_ok):
+                if a[:3] == ["hyprctl", "clients", "-j"]:
+                    return done(clients)
+                if a[:2] == ["hyprctl", "dispatch"]:
+                    return done("ok" if a[2].startswith("hl.dsp.") == lua_ok else "error: bad syntax")
+                return done()
+            fake = Fake(handler)
+            with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake):
+                self.assertEqual(actions.focus_window("kitty"), (True, "Switched to shell."))
+            self.assertEqual(fake.calls[1], ["hyprctl", "dispatch",
+                                             'hl.dsp.focus({ window = "address:0xabc" })'])
+            self.assertEqual(len(fake.calls), 2 if lua_ok else 3)
+
+    def test_hyprland_console_app_window_is_not_chrome(self):
+        clients = json.dumps([{"address": "0xc0", "class": "chrome-127.0.0.1__-Default",
+                               "initialClass": "chrome-127.0.0.1__-Default", "title": "JARVIS"}])
+        fake = Fake(lambda a: done(clients) if a[:3] == ["hyprctl", "clients", "-j"] else done("ok"))
+        with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake):
+            self.assertFalse(actions.close_app("chrome")[0])
+        self.assertFalse(any(a[:2] == ["hyprctl", "dispatch"] for a in fake.calls))
+        self.assertFalse(observe.matches({"kind": "window", "app": "chrome"},
+                                         [{"app": "localconsole localconsole", "title": "JARVIS",
+                                           "focused": True}])[0])
+
     def test_wmctrl_focus_and_close_use_window_id(self):
         fake = Fake(lambda a: done(WMCTRL) if a[:2] == ["wmctrl", "-lx"] else done())
         with posix(), detect("x11"), which("wmctrl"), \
