@@ -106,6 +106,14 @@ class Broker:
                  "seen": r["seen"], "online": bool(r["seen"] and time.time() - r["seen"] < ONLINE),
                  **json.loads(r["info"])} for r in rows]
 
+    def delivery(self, node, hours=24):
+        """How the last day's jobs to `node` ended: every one should be done or failed.
+        expired = never picked up; uncertain = picked up, result never came back."""
+        with self.db() as db:
+            rows = db.execute("SELECT state, COUNT(*) FROM jobs WHERE node=? AND created>? "
+                              "GROUP BY state", (node, time.time() - hours * 3600)).fetchall()
+        return {state: count for state, count in rows}
+
     def enqueue(self, node, requester, kind, payload, timeout=60, job_id=None):
         job_id = job_id or uuid.uuid4().hex
         if not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):

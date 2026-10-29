@@ -48,7 +48,7 @@ STATIONS = [
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay.",
-     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_proxy", "cluster_tunnel", "deploy", "node", "platforms", "autostart", "settings"]},
+     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "node", "platforms", "autostart", "settings"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",

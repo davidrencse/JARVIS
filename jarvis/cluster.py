@@ -423,7 +423,8 @@ def make_server(hub, host, port):
                         return Handler.do_POST(self) if post else Handler.do_GET(self)
                 node, caps = hub.authenticate(self.headers)
                 if self.path == "/v1/status" and not post:
-                    return self._send(200, {"main_device": hub.main, "nodes": hub.broker.nodes()})
+                    return self._send(200, {"main_device": hub.main, "code": code_fingerprint(),
+                                            "nodes": hub.broker.nodes()})
                 if self.path == "/v1/code" and not post and "owner" not in caps:
                     from .deploy import code_bundle  # nodes pull the main's code over their own channel
                     return self._send(200, code_bundle())
@@ -530,6 +531,18 @@ class NodeWorker:
         self.outbox = self.state / "cluster-outbox.json"
         self.thread = None
         self.restarting = False  # set once new code is installed; run() then re-execs
+        # Link health for `cluster doctor`: polls that reached the main or didn't, and
+        # results that needed resending from the outbox.
+        self.stats = {"started": time.time(), "polls_ok": 0, "polls_failed": 0,
+                      "results_sent": 0, "results_resent": 0, "last_ok": None, "last_error": None}
+
+    def _record(self, **change):
+        for key, value in change.items():
+            self.stats[key] = self.stats[key] + value if isinstance(value, int) else value
+        try:
+            save_json(self.state / "cluster-link-stats.json", self.stats)
+        except OSError:
+            pass  # health notes must never stop the node
 
     def _send_result(self, message):
         """Deliver a saved result. Only the main's final answer (unknown or no-longer-running
@@ -566,10 +579,16 @@ class NodeWorker:
             if note.get("main_device") != self.client.main:
                 raise ValueError("An unsent result belongs to the previous main PC; inspect cluster-outbox.json.")
             self._send_result(note["message"])
-        response = self.client.request("/v1/poll", {"hostname": platform.node(),
-                            "platform": platform.system(), "version": __version__,
-                            "code": code_fingerprint()},
-                            timeout=POLL_WAIT + 10)
+            self._record(results_resent=1)
+        try:
+            response = self.client.request("/v1/poll", {"hostname": platform.node(),
+                                "platform": platform.system(), "version": __version__,
+                                "code": code_fingerprint()},
+                                timeout=POLL_WAIT + 10)
+        except (OSError, ValueError, RuntimeError) as exc:
+            self._record(polls_failed=1, last_error=f"{time.strftime('%H:%M:%S')} {exc}"[:300])
+            raise
+        self._record(polls_ok=1, last_ok=time.time())
         received = time.monotonic()
         want = response.get("code")
         if want and want != code_fingerprint():
@@ -596,6 +615,7 @@ class NodeWorker:
             message = {"id": job["id"], "result": {"error": str(exc)}, "failed": True}
         save_json(self.outbox, {"main_device": self.client.main, "message": message})
         self._send_result(message)
+        self._record(results_sent=1)
         return True
 
     def run(self):

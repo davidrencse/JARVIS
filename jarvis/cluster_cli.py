@@ -11,10 +11,19 @@ from .topology import DEVICE_ID, enabled, endpoint, identity
 
 
 def parser(sub):
-    command = sub.add_parser("cluster", help="Configure the main PC and its lightweight nodes")
-    command.add_argument("action", choices=("configure", "enroll", "join", "revoke", "status",
+    command = sub.add_parser("cluster", help="Configure the main PC and its lightweight nodes",
+        description="Setup: on the main `jarvis cluster init` then `jarvis cluster invite NODE`; "
+                    "on each node `jarvis cluster join CODE`. `jarvis cluster doctor` on either "
+                    "says what is wrong and how to fix it.")
+    command.add_argument("action", choices=("init", "invite", "join", "leave", "doctor",
+                                           "configure", "enroll", "revoke", "status",
                                            "run", "serve", "node", "request", "autostart", "tunnel", "update", "main", "roles"))
-    command.add_argument("value", nargs="?", help="node ID, pairing file, request ID, or on/off")
+    command.add_argument("value", nargs="?", help="node ID, invite code or file, request ID, or on/off")
+    command.add_argument("--id", dest="device_id", help="init: this PC's device ID (default: from its hostname)")
+    command.add_argument("--address", action="append", default=[],
+                         help="invite: an address nodes can reach this main at (repeatable; LAN and Tailscale are found)")
+    command.add_argument("--no-autostart", action="store_true", help="init/join: don't start at login")
+    command.add_argument("--no-start", action="store_true", help="join: save the link without connecting")
     command.add_argument("--main", dest="main_device", help="device ID of the main PC")
     command.add_argument("--local", dest="local_device", help="this PC's device ID, or auto")
     command.add_argument("--url", help="main HTTPS origin, or loopback HTTP through SSH")
@@ -74,9 +83,28 @@ def run(args, config, base):
         save_json(path, proposed)
         return {"configured": True, "local_device": local, "main_device": main,
                 "role": "main" if local == main else "node", "main_url": endpoint(proposed)}
+    if action == "init":
+        from .cluster_setup import init
+        return init(config, path, state, args.device_id, autostart=not args.no_autostart)
+    if action == "doctor":
+        from .cluster_setup import doctor
+        report = doctor(config, path, state)
+        if not sys.stdout.isatty():
+            return report
+        for check in report["checks"]:  # a checklist for people; JSON when piped
+            print(f"{'ok  ' if check['ok'] else 'FAIL'}  {check['check']}: {check['detail']}")
+            if check.get("fix"):
+                print(f"      fix: {check['fix']}")
+        print("All good." if report["ok"] else "Fix the first FAIL, then run jarvis cluster doctor again.")
+        return None
     if action == "join":
         if not args.value:
-            raise ValueError("Usage: jarvis cluster join PAIRING_FILE")
+            raise ValueError("Usage: jarvis cluster join INVITE_CODE  (from jarvis cluster invite on the main)")
+        from .cluster_setup import decode, join
+        invite = decode(args.value)
+        if invite is not None:
+            return join(config, path, state, invite, autostart=not args.no_autostart,
+                        start=not args.no_start)
         note = json.loads(Path(args.value).expanduser().read_text(encoding="utf-8"))
         for key in ("node_id", "main_device"):
             if not isinstance(note.get(key), str) or not DEVICE_ID.fullmatch(note[key]):
@@ -135,6 +163,14 @@ def run(args, config, base):
         if args.value == "start":
             return cluster_tunnel.start(path, state)
         return getattr(cluster_tunnel, args.value)(state)
+    if action == "leave":
+        if local == main:
+            raise ValueError("This PC is the main; nodes leave, the main revokes them.")
+        from .cluster_setup import leave
+        return leave(config, path, state)
+    if action == "invite":
+        from .cluster_setup import invite
+        return invite(config, path, state, args.value, args.address, args.capability, args.output)
     if action in ("enroll", "revoke"):
         if local != main:
             raise ValueError("Enroll or revoke nodes on the main PC.")
@@ -142,8 +178,8 @@ def run(args, config, base):
         if not DEVICE_ID.fullmatch(node) or node == main:
             raise ValueError("Name a valid node other than the main PC.")
         if action == "revoke":
-            Broker(state).revoke(node)
-            return {"revoked": node}
+            from .cluster_setup import revoke
+            return revoke(state, node)
         if not args.output:
             raise ValueError("enroll needs --output PAIRING_FILE; it contains the node's credential.")
         output = Path(args.output).expanduser()

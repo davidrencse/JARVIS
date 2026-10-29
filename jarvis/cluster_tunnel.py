@@ -65,13 +65,34 @@ def mode(config):
     return value
 
 
-def peer(config):
+def link(config, state):
+    """The SSH link `jarvis cluster join` saved for this node (forward mode), as a device
+    entry; None if the node was paired the old way and its link lives in the config."""
+    try:
+        note = json.loads((Path(state) / "cluster-node.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    saved = note.get("link") if isinstance(note, dict) else None
+    if not isinstance(saved, dict) or note.get("main_device") != identity(config)[1]:
+        return None
+    targets = [t for t in saved.get("targets", []) if isinstance(t, str)]
+    if not targets:
+        return None
+    return {"transport": "ssh", "target": targets[0], "fallback_targets": targets[1:],
+            "host_key": saved.get("host_key"), "hostname": saved.get("hostname") or "main",
+            "identity_file": saved.get("identity_file")}
+
+
+def peer(config, state=None):
     """The machine this end opens SSH to: a node (reverse, run on the main) or the main
-    (forward, run on a node)."""
+    (forward, run on a node; the joined link in `state` wins over the config)."""
     local, main = identity(config)
     if mode(config) == "forward":
         if local == main:
             raise ValueError("With cluster.tunnel = forward, each node runs the tunnel to the main.")
+        joined = link(config, state) if state is not None else None
+        if joined:
+            return joined
         machine = (config.get("devices") or {}).get(main) or {}
         if machine.get("transport") != "ssh" or not machine.get("target"):
             raise ValueError(f"Give devices.{main} an SSH target (transport ssh) so this node can reach it.")
@@ -82,7 +103,7 @@ def peer(config):
 
 
 def command(config, state, target):
-    machine = peer(config)
+    machine = peer(config, state)
     _check_target(target)
     binary = shutil.which("ssh")
     if not binary:
@@ -111,7 +132,7 @@ def status(state):
 def run(config, state):
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True)
-    machine = peer(config)
+    machine = peer(config, state)
     targets = list(dict.fromkeys(t for t in [machine.get("target"), *machine.get("fallback_targets", [])] if t))
     if not targets:
         raise ValueError("No cluster tunnel targets configured.")
