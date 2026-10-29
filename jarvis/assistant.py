@@ -133,6 +133,9 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
     claims = kb_recall(config, memory.path.parent, text)
     heap = memory.context(text)
     recall = notes + claims + heap
+    talk = memory.conversation(skip={inbound["id"]}) if hasattr(memory, "conversation") else []
+    if talk:  # earlier turns, so "go check" knows what it refers to
+        recall.insert(0, "Recent conversation, oldest first (any channel):\n  " + "\n  ".join(talk))
     from .topology import ORIGIN, enabled, identity
     if enabled(config) and ORIGIN.get():
         recall.insert(0, f"This request originates on {ORIGIN.get()}. The JARVIS main PC is {identity(config)[1]}. "

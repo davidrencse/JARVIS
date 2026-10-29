@@ -899,6 +899,16 @@ class Console:
             raise ValueError("limit must be a number.")
         return {"requests": History(self.state).requests(limit)}
 
+    def screen(self, device):
+        """Devices view: a snapshot of a device's screen, as (bytes, mime)."""
+        import base64
+        from .remote import Remote
+        ok, text = Remote(self.config, self.state).call(device or None, "screen", "")
+        if not ok:
+            raise RuntimeError(text or "No picture came back.")
+        shot = json.loads(text)
+        return base64.b64decode(shot["b64"], validate=True), shot["mime"]
+
     def grokbot_command(self, body):
         """Devices view: a command for Grokbot, a terminal, or a browser."""
         result = self.grokbot().command(str(body.get("text", "")), body.get("mode") or None,
@@ -1112,6 +1122,9 @@ class Handler(BaseHTTPRequestHandler):
                 import base64
                 result = c.storage().resolve(query.get("device"), query.get("path") or "", "thumbnail")
                 return self._send(HTTPStatus.OK, base64.b64decode(result["image"], validate=True), "image/png")
+            if url.path == "/api/screen":
+                data, mime = c.screen(query.get("device"))
+                return self._send(HTTPStatus.OK, data, mime)
             if url.path in routes:
                 return self._send(HTTPStatus.OK, routes[url.path]())
             if url.path == "/api/export":

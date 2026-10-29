@@ -30,6 +30,19 @@ def vbs(line):
             f'shell.Run "{line}", 0, False\n')
 
 
+def interpreter(argv):
+    """argv with the project's own .venv Python when there is one and argv runs whichever
+    Python happened to call install(): the venv has the voice deps, a bare system Python
+    may not (installing from such a shell once left the main without voice input)."""
+    argv = list(argv)
+    venv = [ROOT / ".venv/Scripts/python.exe", ROOT / ".venv/bin/python"]
+    found = next((v for v in venv if v.is_file()), None)
+    if found and argv and Path(argv[0]).resolve() == Path(sys.executable).resolve() \
+            and not Path(sys.executable).resolve().is_relative_to((ROOT / ".venv").resolve()):
+        argv[0] = str(found)
+    return argv
+
+
 def system():
     if os.name == "nt":
         return "windows"
@@ -52,6 +65,7 @@ def install(name, title, argv, enable=True):
     if any("\n" in arg or "\r" in arg for arg in argv):
         raise ValueError("Newlines are not allowed in startup paths.")
     kind, target = system(), path(name, title)
+    argv = interpreter(argv)
     if kind == "windows":
         if enable:
             argv = list(argv)

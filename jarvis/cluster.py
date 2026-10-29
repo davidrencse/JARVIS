@@ -36,7 +36,7 @@ class NodeOffline(ConnectionError):
 
 # Queries that change nothing, allowed even when a node's code is out of date, so Settings
 # and status can still say what it is.
-READ_ONLY_DESKTOP = frozenset({"input_info", "list_apps"})
+READ_ONLY_DESKTOP = frozenset({"input_info", "list_apps", "screen"})
 
 
 def _read_only(kind, payload):
@@ -254,6 +254,21 @@ class Hub:
             return True
         return self.broker.running(node) > 0
 
+    def _await_poll(self, node, status, seconds=3):
+        """Seen lately but between polls (it just sent a result and is reconnecting): give
+        it a moment to open the next poll instead of calling it offline. Nothing is queued
+        yet, so waiting can't run anything twice."""
+        if not status.get("online"):
+            return False
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not self.stop_event.is_set():
+            with self._condition:
+                self._condition.wait(0.2)
+            fresh = next((n for n in self.broker.nodes() if n["id"] == node), status)
+            if self.alive(node, fresh):
+                return True
+        return False
+
     def dispatch(self, node, kind, payload, timeout=45):
         validate_action(kind, payload)
         if node not in self.config.get("devices", {}):
@@ -264,7 +279,7 @@ class Hub:
         capability = "files" if kind == "storage" else kind
         if not status or capability not in status["capabilities"]:
             raise ValueError(f"Node {node} is not enrolled for {kind} actions.")
-        if not self.alive(node, status):
+        if not self.alive(node, status) and not self._await_poll(node, status):
             raise NodeOffline(f"Node {node} is offline. Start jarvis cluster node on that PC.")
         if not _read_only(kind, payload) and status.get("code") != code_fingerprint():
             # Mismatched code can misread a newer job; refuse rather than guess.
@@ -463,6 +478,7 @@ def make_server(hub, host, port):
                 if self.path == "/v1/result" and "owner" not in caps:
                     with hub._condition:
                         hub.broker.finish(data.get("id"), node, data.get("result"), bool(data.get("failed")))
+                        hub.broker.touch(node)
                         hub._condition.notify_all()
                     return self._send(200, {"accepted": True})
                 if ((self.path == "/v1/action" and "owner" in caps) or
@@ -592,6 +608,15 @@ class NodeWorker:
         received = time.monotonic()
         want = response.get("code")
         if want and want != code_fingerprint():
+            job = response.get("job")
+            if job:
+                # This poll also claimed a job, built for code we're about to replace. Say
+                # so at once (not run, safe to ask again) instead of dropping it, which left
+                # the caller waiting out its timeout with an uncertain outcome.
+                message = {"id": job["id"], "failed": True, "result": {
+                    "error": "Not run: this node was updating its code. Try again in a minute."}}
+                save_json(self.outbox, {"main_device": self.client.main, "message": message})
+                self._send_result(message)
             try:
                 if self._pull_update(want):
                     self.restarting = True

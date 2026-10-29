@@ -8,7 +8,8 @@ DesktopTools directly. The other laptop is reached the same way Grokbot prompts 
 - Zenbook -> Dell: Windows OpenSSH sessions can't reach the desktop, so the Dell's JARVIS
   keeps `grokbot tunnel` running; its loopback relay takes /desktop calls with the token.
 Only the actions below travel (open_page: a console page, e.g. the knowledge page, as a window;
-close_app, media and volume: close an app's windows, play/pause/skip, speaker volume);
+close_app, media and volume: close an app's windows, play/pause/skip, speaker volume;
+screen: a downscaled snapshot of the screen, for the Devices view);
 arguments go as base64 or JSON data, never as code.
 A laptop can be named by its key, hostname, configured `aliases` ("arch", "asus"...) or
 "the other laptop".
@@ -26,11 +27,12 @@ import urllib.request
 from pathlib import Path
 
 ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media",
-           "volume", "scroll", "browse", "observe", "input_info")
+           "volume", "scroll", "browse", "observe", "input_info", "screen")
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
        "focus_window": "name", "close_app": "name", "media": "command", "volume": "level",
-       "scroll": "spec", "browse": "spec", "observe": "predicate", "input_info": "query"}
+       "scroll": "spec", "browse": "spec", "observe": "predicate", "input_info": "query",
+       "screen": "spec"}
 # Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
 SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
@@ -92,6 +94,9 @@ def run_here(action, arg, tools=None):
         return open_page(arg)
     if action == "observe":  # read-only: did the last action's window appear?
         from .observe import run
+        return run(arg)
+    if action == "screen":  # read-only: a snapshot for the Devices view's screen viewer
+        from .screen import run
         return run(arg)
     if action == "input_info":  # read-only: screens and Lan Mouse, for Settings
         from .sharedinput import run

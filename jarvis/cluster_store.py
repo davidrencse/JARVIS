@@ -93,6 +93,11 @@ class Broker:
         with self.db() as db:
             db.execute("UPDATE nodes SET seen=?,info=? WHERE id=?", (time.time(), json.dumps(safe), node))
 
+    def touch(self, node):
+        """A node just talked to us (e.g. delivered a result): it is alive right now."""
+        with self.db() as db:
+            db.execute("UPDATE nodes SET seen=? WHERE id=?", (time.time(), node))
+
     def running(self, node):
         """Jobs this node has claimed and not yet finished."""
         with self.db() as db:

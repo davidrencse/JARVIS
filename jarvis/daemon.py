@@ -250,15 +250,23 @@ def _is_listener(pid):
 
 def status(state):
     log_path = Path(state).resolve() / "logs" / "voice.log"
-    tail = []
+    tail, ignored, last_ignored = [], 0, None
     if log_path.is_file():
-        tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-8:]
+        # Background voices log a line each and would push everything else out of a plain
+        # tail: keep the last lines that say something, and count the ignored ones.
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]:
+            if "ignored another voice" in line:
+                ignored, last_ignored = ignored + 1, line[:16]
+            elif line.strip():
+                tail.append(line)
+        tail = tail[-8:]
     pid = _pid(state)
     voice = Path(state).resolve() / "voice"
     return {"listening": pid is not None, "pid": pid,
             "enrolled": (voice / "voiceprint.json").is_file(),
             "autostart": _startup_file().is_file(),
-            "log": str(log_path), "recent": tail}
+            "log": str(log_path), "recent": tail,
+            "ignored": {"count": ignored, "last": last_ignored}}
 
 
 NOT_ENROLLED = ("No voiceprint on this machine, so every voice would be rejected. "

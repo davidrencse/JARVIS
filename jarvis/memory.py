@@ -16,7 +16,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 KIND = re.compile(r"[a-z][a-z0-9_-]{0,23}")
@@ -220,6 +220,24 @@ class Memory:
                 "SELECT src, dst, rel FROM links WHERE src=? OR dst=? ORDER BY created_at",
                 (item_id, item_id))]
         return item
+
+    def conversation(self, minutes=20, limit=8, skip=()):
+        """The last few exchanges, oldest first, from every channel (voice, console, a
+        node): what "go check" or "do that" refers to. Relevance recall can't find those,
+        and voice and console each keep their own model thread."""
+        since = (_now() - timedelta(minutes=minutes)).isoformat()
+        with self.connect() as db:
+            rows = db.execute("SELECT id, kind, body FROM items WHERE kind IN ('message','reply') "
+                              "AND created_at >= ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                              (since, limit + len(skip))).fetchall()
+        lines = []
+        for row in reversed(rows):
+            if row["id"] in skip:
+                continue
+            who = "David" if row["kind"] == "message" else "JARVIS"
+            text = " ".join(row["body"].split())
+            lines.append(f"{who}: {text[:300]}{'…' if len(text) > 300 else ''}")
+        return lines[-limit:]
 
     def search(self, text="", kind=None, tag=None, since=None, limit=10):
         """Ranked search. Empty text lists newest items matching the filters."""

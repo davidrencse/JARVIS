@@ -49,7 +49,7 @@ VERBS = (r"open|launch|start|run|bring\s+up|pull\s+up|fire\s+up|go\s+to|navigate
          r"(?:raise|lower)\s+the\s+volume|next\s+(?:song|track)")
 ACTION = re.compile(
     r"^\W*(?:hey\s+|ok(?:ay)?\s+)?(?:(?:jarvis|claude)\W+)?(?:(?:can|could|would|will)\s+you\s+"
-    r"(?:please\s+)?|please\s+|go\s+ahead\s+and\s+|i\s+(?:want|need)\s+you\s+to\s+)?"
+    r"(?:please\s+)?|please\s+|go\s+ahead\s+and\s+|go\s+(?:and\s+)?|i\s+(?:want|need)\s+you\s+to\s+)?"
     rf"(?:{VERBS})\b", re.I)
 # Voice runs sentences together: any matching action clause counts.
 CLAUSE = re.compile(r"[.!?;,:]+|\b(?:and|then|also)\b", re.I)
@@ -57,6 +57,10 @@ CLAUSE = re.compile(r"[.!?;,:]+|\b(?:and|then|also)\b", re.I)
 DEVICEISH = re.compile(r"\bon\s+(?:the\s+|my\s+)?(?:arch|asus|zenbook|linux|dell|windows|"
                        r"other\s+(?:laptop|computer|pc|one))\b", re.I)
 VERB = re.compile(rf"\b(?:{VERBS})\b", re.I)
+# Questions about what's installed are answered by list_apps, a tool only the action brain has.
+APPISH = re.compile(r"\b(?:what|which|list|any)\b.{0,40}\b(?:apps?|applications|programs|software)\b|"
+                    r"\b(?:installed|have)\b.{0,30}\bon\s+(?:the\s+|my\s+)?\w+\s+(?:laptop|pc|computer)\b|"
+                    r"\bis\s+\w[\w .+-]{0,30}\binstalled\b", re.I)
 
 INSTRUCTIONS = (
     f"You are JARVIS operating David's computer ({MACHINE}) on his behalf. Tools: open_app "
@@ -100,7 +104,7 @@ def is_action(text):
     text = text.replace("\u2019", "'")  # curly apostrophes from Whisper
     return bool(any(ACTION.match(part) for part in CLAUSE.split(text))
                 or (DEVICEISH.search(text) and VERB.search(text))
-                or BROWSERISH.search(text) or GROKISH.search(text))
+                or BROWSERISH.search(text) or GROKISH.search(text) or APPISH.search(text))
 
 
 class DesktopTools:
@@ -130,7 +134,8 @@ class DesktopTools:
              "inputSchema": {"type": "object", "required": ["name"], "additionalProperties": False,
                              "properties": {"name": {"type": "string"}}}},
             {"type": "function", "name": "list_apps",
-             "description": "List installed applications whose names match a query.",
+             "description": "List installed applications whose names match a query; an empty "
+                            "query lists all of them (for \"what apps are on ...\").",
              "inputSchema": {"type": "object", "required": ["query"], "additionalProperties": False,
                              "properties": {"query": {"type": "string"}}}},
             {"type": "function", "name": "open_url",
@@ -188,7 +193,15 @@ class DesktopTools:
             if name == "open_app":
                 return self.open_app(str(args.get("name", "")))
             if name == "list_apps":
-                hits = self.match(str(args.get("query", "")), limit=15)
+                query = str(args.get("query", "")).strip()
+                if not query:  # "what apps are on my laptop": all of them, by name
+                    names = sorted({a["Name"] for a in self.apps()}, key=str.casefold)
+                    if not names:
+                        return False, "Couldn't read this laptop's installed apps."
+                    shown = names[:200]
+                    more = f" (and {len(names) - len(shown)} more)" if len(names) > len(shown) else ""
+                    return True, f"{len(names)} apps: " + ", ".join(shown) + more
+                hits = self.match(query, limit=15)
                 return True, ", ".join(a["Name"] for a in hits) or "No matching apps."
             if name == "open_url":
                 url, browser = str(args.get("url", "")), args.get("browser")
