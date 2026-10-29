@@ -248,8 +248,9 @@ def start(config_path, state):
     argv = launcher(config_path, state)
     if os.name == "nt":
         script = state / f"{NAME}-launch.vbs"
+        from .autostart import vbs
         line = subprocess.list2cmdline(argv).replace('"', '""')
-        script.write_text(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n', encoding="utf-8")
+        script.write_text(vbs(line), encoding="utf-8")
         subprocess.Popen(["explorer.exe", str(script)], creationflags=subprocess.CREATE_NO_WINDOW)
     else:
         subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

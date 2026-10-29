@@ -644,7 +644,12 @@ class NodeWorker:
         its ports first."""
         import subprocess
         import sys
-        argv = [sys.executable, *sys.argv]
+        # Under `python -m jarvis`, argv[0] is jarvis/__main__.py; run as a plain script its
+        # relative imports fail, so a self-update would leave the node dead. Restart as -m.
+        if Path(sys.argv[0]).name == "__main__.py" and Path(sys.argv[0]).parent.name == "jarvis":
+            argv = [sys.executable, "-m", "jarvis", *sys.argv[1:]]
+        else:
+            argv = [sys.executable, *sys.argv]
         wrapper = "import subprocess,sys,time; time.sleep(2); sys.exit(subprocess.call(sys.argv[1:]))"
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                  | getattr(subprocess, "CREATE_NO_WINDOW", 0))

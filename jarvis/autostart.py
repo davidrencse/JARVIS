@@ -18,6 +18,16 @@ import sys
 from pathlib import Path
 
 NAME = re.compile(r"[a-z][a-z0-9-]{1,40}\Z")
+# Every startup runs `python -m jarvis`, which needs the checkout as its working folder
+# (JARVIS isn't pip-installed). Login managers start elsewhere (systemd: $HOME).
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def vbs(line):
+    """A hidden Windows launcher for one command line (already "" -escaped), run from ROOT."""
+    folder = str(ROOT).replace('"', '""')
+    return (f'Set shell = CreateObject("WScript.Shell")\nshell.CurrentDirectory = "{folder}"\n'
+            f'shell.Run "{line}", 0, False\n')
 
 
 def system():
@@ -50,7 +60,7 @@ def install(name, title, argv, enable=True):
                 argv[0] = str(windowless)
             line = subprocess.list2cmdline(argv).replace('"', '""')
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n', encoding="utf-8")
+            target.write_text(vbs(line), encoding="utf-8")
         else:
             target.unlink(missing_ok=True)
     elif kind == "macos":
@@ -58,6 +68,7 @@ def install(name, title, argv, enable=True):
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("wb") as stream:
                 plistlib.dump({"Label": f"com.jarvis.{name}", "ProgramArguments": list(argv),
+                               "WorkingDirectory": str(ROOT),
                                "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}}, stream)
             subprocess.run(["launchctl", "unload", str(target)], capture_output=True, timeout=15)
             subprocess.run(["launchctl", "load", "-w", str(target)], check=True, timeout=15)
@@ -69,7 +80,7 @@ def install(name, title, argv, enable=True):
             target.parent.mkdir(parents=True, exist_ok=True)
             command = " ".join(json.dumps(arg).replace("%", "%%") for arg in argv)
             target.write_text(f"[Unit]\nDescription={title}\nAfter=graphical-session.target network-online.target\n"
-                              f"[Service]\nExecStart={command}\nRestart=on-failure\nRestartSec=5\n"
+                              f"[Service]\nWorkingDirectory={str(ROOT).replace('%', '%%')}\nExecStart={command}\nRestart=on-failure\nRestartSec=5\n"
                               "[Install]\nWantedBy=default.target\n", encoding="utf-8")
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
         subprocess.run(["systemctl", "--user", "enable" if enable else "disable", "--now", target.name],

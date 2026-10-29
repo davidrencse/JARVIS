@@ -152,10 +152,6 @@ def _local_ips():
             found.append(probe.getsockname()[0])
     except OSError:
         pass
-    try:
-        found += [info[4][0] for info in socket.getaddrinfo(_hostname(), None, socket.AF_INET)]
-    except OSError:
-        pass
     tailscale = shutil.which("tailscale")
     if tailscale:
         try:
@@ -268,6 +264,11 @@ def decode(value):
             candidate = Path(text).expanduser()
             text = candidate.read_text(encoding="utf-8").strip() if candidate.is_file() else text
         except (OSError, ValueError):
+            pass
+        try:  # an `invite --output` file: {"code": "jarvis-invite-1:..."}
+            saved = json.loads(text)
+            text = saved["code"] if isinstance(saved, dict) and isinstance(saved.get("code"), str) else text
+        except ValueError:
             pass
     if not text.startswith(PREFIX):
         return None
@@ -407,8 +408,9 @@ def _launch_agent(path, state):
             "--state", str(Path(state).resolve()), "cluster", "run"]
     if os.name == "nt":  # through Explorer, so it outlives this shell (see cluster_tunnel.start)
         script = Path(state) / "cluster-node-launch.vbs"
+        from .autostart import vbs
         line = subprocess.list2cmdline(argv).replace('"', '""')
-        script.write_text(f'CreateObject("WScript.Shell").Run "{line}", 0, False\n', encoding="utf-8")
+        script.write_text(vbs(line), encoding="utf-8")
         subprocess.Popen(["explorer.exe", str(script)], creationflags=FLAGS)
     else:
         subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
