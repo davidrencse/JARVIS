@@ -111,29 +111,85 @@ is a node.
 - Liveness: a node is online while a poll is held open and its socket is still connected, or
   it was seen in the last 10 s, or it is running a job. The broker gives up after 75 s.
 
-Change or inspect roles:
+### Setting up (two commands per machine)
+
+On the **main** (the machine that will run the brain):
+
+```
+jarvis cluster init               # registers this PC by hostname, forward tunnel, hub at login
+jarvis cluster invite dell        # one secret line: jarvis-invite-1:...
+```
+
+The main needs an SSH server (`init` and `doctor` print the per-OS fix if it is off). `invite`
+finds this PC's addresses itself (default-route LAN IP, other IPv4s, `tailscale ip -4`, then
+the configured targets); add more with `--address`.
+
+On each **node**, in its JARVIS folder:
+
+```
+jarvis cluster join "jarvis-invite-1:..."   # or a file holding the code
+```
+
+`join` saves the link, starts the tunnel and the node agent, installs both at login
+(`--no-autostart` / `--no-start` to skip), and waits for the hub to answer. Then on either side:
+
+```
+jarvis cluster doctor             # every check in order; each FAIL carries its fix
+```
+
+What the invite contains, and why it is safe to paste once:
+- the node's hub credential (rotates any earlier one for that node),
+- the main's SSH host key, pinned by the node (no trust-on-first-use),
+- a fresh ed25519 key made for this node only. On the main it is one line in
+  `~/.ssh/authorized_keys` (comment `jarvis-node:<id>`) with
+  `restrict,port-forwarding,permitopen="127.0.0.1:<port>",permitlisten="127.0.0.1:1",command="echo jarvis-node-link"`:
+  no shell, no forward to anything but the hub, no reverse forwards (checked on OpenSSH 10).
+  Windows mains with an admin account use `C:\ProgramData\ssh\administrators_authorized_keys`
+  (run `invite` elevated).
+
+The node keeps the link in `.jarvis/cluster-node.json` + `.jarvis/cluster-node.key`, never in
+`jarvis.config.json`, so the config is the same committed file on every machine. Treat the
+code like a password; `jarvis cluster revoke dell` on the main removes the credential and the
+SSH key line, `jarvis cluster leave` on the node stops and forgets its side.
+
+### Delivery: how we know everything made it
+
+Transport integrity is SSH's job (encrypted, MAC per packet, TCP retransmits underneath); a
+packet sniffer could not see inside it and would only add a privileged daemon. What matters
+is whether each *job* arrived and answered, and that is tracked end to end:
+- every job is acknowledged; a result is kept in the node's outbox until the main accepts it,
+  and a job is never re-run automatically (at most once);
+- `doctor` on the main counts the last 24 h of jobs per node: anything `expired` (never
+  picked up) or `uncertain` (picked up, no result) fails the check;
+- `doctor` on a node reads `.jarvis/cluster-link-stats.json`: polls that reached the main vs
+  failed, results delivered vs resent, and the last error.
+
+### Roles and other commands
 
 ```
 jarvis cluster roles              # every device, its role, and which one is this PC
 jarvis cluster main zenbook       # make zenbook the main; all others become nodes
-jarvis cluster configure --main zenbook --local auto   # same, plus local identity / URL
+jarvis cluster status             # this PC's role and the hub's view of the nodes
+jarvis cluster update dell        # push code to an SSH node (forward nodes pull it themselves)
 ```
 
-After switching, the same `jarvis.config.json` must be on every machine (commit it, or
-copy it), then restart `jarvis cluster run` on the new main and `jarvis cluster node` on the
-rest, and run `jarvis cluster update <node>` so nodes get matching code.
+After switching the main, put the same `jarvis.config.json` on every machine, run
+`jarvis cluster init` on the new main and invite the nodes again (their links point at the
+old main).
 
 **The SSH link** (`cluster_tunnel.py`) carries hub traffic; nothing listens on the network.
-- `cluster.tunnel: "reverse"` (default): the main runs `ssh -R` into each node. Nodes need an SSH server.
-- `cluster.tunnel: "forward"`: each node runs `ssh -L` to the main. Only the main needs an
-  SSH server (best when the main is Linux/macOS and a node is Windows).
-- Host keys are pinned (`host_key` / `host_key_alias` per device). `fallback_targets` lists
-  other addresses (for example the Tailscale IP) tried in order. While the cluster tunnel is on a
-  fallback, it checks the earlier targets' port 22 every 60 s (backing off to 30 min if a
-  switch back fails) and returns to the first one that answers.
+- `cluster.tunnel: "forward"` (what `init` sets): each node runs `ssh -L` to the main. Only the
+  main needs an SSH server, so Windows nodes need none.
+- `cluster.tunnel: "reverse"` (advanced, manual): the main runs `ssh -R` into each node, which
+  needs an SSH server, a `target`, `host_key` and `identity_file` in config, and pairing with
+  `jarvis cluster enroll NODE --output FILE` + `jarvis cluster join FILE`.
+- Fallback addresses are tried in order. While on a fallback, the tunnel checks the earlier
+  targets' port 22 every 60 s (backing off to 30 min if a switch back fails) and returns to the
+  first one that answers.
 
 Identity: `cluster.local_device: "auto"` matches this machine's hostname against
-`devices.<id>.hostname`; set an explicit id on nodes if hostnames are ambiguous.
+`devices.<id>.hostname`; `join` sets an explicit id only if the shared config names another
+hostname for this node.
 
 ## 5 OS support
 

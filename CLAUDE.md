@@ -25,6 +25,8 @@ Local decider (`decide.py`, MiniLM embeddings, shadow mode) and semantic memory 
   (Windows Startup .vbs / macOS LaunchAgent / Linux systemd user unit). Add new OS branches
   there, not scattered `os.name` checks. The overlay is Windows-only by design.
 - Switch the main with `jarvis cluster main <id>`; list roles with `jarvis cluster roles`.
+- Setup: main `jarvis cluster init` + `jarvis cluster invite <node>`; node `jarvis cluster join <code>`;
+  `jarvis cluster doctor` diagnoses either side (`cluster_setup.py`). Node links live in `.jarvis/`, not config.
 - After code changes, nodes refuse mismatched code: run `jarvis cluster update <node>`.
 
 ## Hard rules (David's)
