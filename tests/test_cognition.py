@@ -184,6 +184,13 @@ class AssistantTests(Temp):
         self.assertIsNone(wake_word("Travis, did you see the game?"))  # a real name
         self.assertIsNone(wake_word("Jarvis's voice is too quiet"))  # about it, not to it
         self.assertIsNone(wake_word("Good. Thank you. Thank you."))
+        self.assertEqual(wake_word("Hello, Jarvis, what apps are on my laptop?"),
+                         "what apps are on my laptop?")  # a greeting before the name
+        self.assertEqual(wake_word("Hello, Jarvis."), "")  # waits for the request
+        self.assertEqual(wake_word("What time is it, Jarvis?"), "What time is it")
+        self.assertIsNone(wake_word("I was talking to Jarvis"))  # no comma: about it
+        self.assertEqual(wake_word("What's the weather today Jarvis?"),
+                         "What's the weather today")  # Whisper dropped the comma
 
 
 class SpeechTests(Temp):

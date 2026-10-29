@@ -72,8 +72,14 @@ def wait_for(predicate, timeout=10):
 
 
 def jarvis(state, *args, check=True):
-    """Run the real CLI in a subprocess against an isolated state folder."""
-    done = subprocess.run([sys.executable, "-m", "jarvis", "--state", str(state), *args],
+    """Run the real CLI in a subprocess against an isolated state folder and the test config
+    (never the repo's own: with it, anything the instant lane misses reaches the real brain)."""
+    config = Path(state) / "test-config.json"
+    if not config.is_file():
+        config.write_text(json.dumps({**CONFIG, "cluster": {"enabled": False},
+                                      "vault": {"enabled": False}}), encoding="utf-8")
+    done = subprocess.run([sys.executable, "-m", "jarvis", "--config", str(config),
+                           "--state", str(state), *args],
                           cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if check:
         assert done.returncode == 0, (args, done.stdout, done.stderr)
@@ -450,6 +456,51 @@ class VoiceWorkflowTests(Temp):
         self.assertNotIn("turn that up", feed)  # near miss, no wake word: unread
         self.assertNotIn("million", feed)  # far below: never transcribed
         ears.learn.assert_not_called()  # an unconfirmed voice never trains the print
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_a_short_answer_to_jarvis_needs_no_wake_word(self):
+        from jarvis import daemon
+        heard = {"ask": "Jarvis, what apps are on my Windows laptop?", "yes": "Then check it.",
+                 "chatter": "so anyway I was saying to him", "near-yes": "Yes please.",
+                 "late": "Go ahead."}
+        score = {"ask": (True, 0.6), "yes": (True, 0.5), "chatter": (True, 0.6),
+                 "near-yes": (False, 0.2), "late": (True, 0.5)}
+        queue_ = ["ask", "yes", "chatter", "near-yes", "late", KeyboardInterrupt]
+        asked = []
+
+        def record_utterance(**_):
+            item = queue_.pop(0)
+            if item is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            if item == "late":  # long after the last reply: the window has closed
+                clock[0] += daemon.REPLY_FOLLOW_UP + 5
+            return item
+
+        def ask(text, *a, **k):
+            asked.append(text)
+            return {"tier": "simple", "reply": "I can check it if you want."}
+
+        clock = [1000.0]
+        ears = MagicMock()
+        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
+            audio, str) else "")
+        stt.device = "cpu"
+        brain = Brain()
+        with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
+                patch("jarvis.listen.VoicePrint", return_value=ears), \
+                patch("jarvis.listen.Transcriber", return_value=stt), \
+                patch("jarvis.speech.Voice", return_value=MagicMock(limit=350)), \
+                patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
+                patch("jarvis.chatgpt.make_lane", return_value=brain), \
+                patch("jarvis.assistant.ask", ask), \
+                patch.object(daemon.time, "time", side_effect=lambda: clock[0]), \
+                patch.object(daemon, "foreground_priority"):
+            with self.assertRaises(KeyboardInterrupt):
+                daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        # Answering JARVIS's offer counts; chatter, a near miss and a late reply don't.
+        self.assertEqual(asked, ["what apps are on my Windows laptop?", "Then check it."])
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_bare_wake_word_takes_the_next_utterance_as_the_request(self):

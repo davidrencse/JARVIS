@@ -86,6 +86,11 @@ class ChooseTests(DecideBase):
         self.assertEqual(decide.choose("mode", "check my email")["winner"], "agent")
         self.assertEqual(decide.choose("mode", "tell me a joke")["winner"], "converse")
 
+    def test_wake_word_is_ignored(self):
+        self.assertEqual(decide.choose("mode", "Jarvis, open spotify now")["probs"],
+                         decide.choose("mode", "open spotify now")["probs"])
+        self.assertIsNotNone(decide.choose("mode", "jarvis"))  # a bare wake word still classifies
+
     def test_options_restrict(self):
         got = decide.choose("mode", "open spotify now", options=["converse", "agent", "nope"])
         self.assertEqual(set(got["probs"]), {"converse", "agent"})
