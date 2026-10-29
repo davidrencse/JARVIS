@@ -19,6 +19,7 @@
 <link rel="stylesheet" href="lab.css">
 <link rel="stylesheet" href="settings.css">
 <link rel="stylesheet" href="files.css">
+<link rel="stylesheet" href="voicesetup.css">
 <script src="theme.js"></script>
 </head>
 <body>
@@ -44,7 +45,7 @@
     <div class="profile">
       <span class="avatar" aria-hidden="true">D</span>
       <span class="profile-name">David</span>
-      <span class="profile-sub" id="profile-sub">Dell · Alt+1 overlay</span>
+      <span class="profile-sub" id="profile-sub">—</span>
     </div>
   </aside>
 
@@ -343,92 +344,107 @@
     <section class="view" id="view-devices" data-title="Devices" hidden>
       <div class="devices-grid" id="devices-grid"></div>
     </section>
-    <section class="view voice-settings st" id="view-settings" data-title="Settings" hidden>
+    <section class="view st" id="view-settings" data-title="Settings" hidden>
       <div class="st-shell">
         <nav class="st-rail" aria-label="Settings sections"><div role="tablist" aria-orientation="vertical" id="st-tabs">
           <button type="button" role="tab" id="st-tab-machines" aria-controls="st-panel-machines" data-sec="machines"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Machines</span></button>
           <button type="button" role="tab" id="st-tab-voice" aria-controls="st-panel-voice" data-sec="voice"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-audio-lines"/></svg><span>Voice</span></button>
+          <button type="button" role="tab" id="st-tab-calls" aria-controls="st-panel-calls" data-sec="calls"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-mic"/></svg><span>Calls</span></button>
           <button type="button" role="tab" id="st-tab-intelligence" aria-controls="st-panel-intelligence" data-sec="intelligence"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-sparkles"/></svg><span>Intelligence</span></button>
           <button type="button" role="tab" id="st-tab-memory" aria-controls="st-panel-memory" data-sec="memory"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></button>
           <button type="button" role="tab" id="st-tab-input" aria-controls="st-panel-input" data-sec="input"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-keyboard"/></svg><span>Input</span></button>
         </div></nav>
         <div class="st-main">
           <div class="st-notice" id="st-notice" role="status" hidden></div>
-      <section class="st-panel" id="st-panel-machines" role="tabpanel" aria-labelledby="st-tab-machines" data-sec="machines" tabindex="-1" hidden>
-        <header class="st-head"><h2>Machines</h2><p>Which computer runs JARVIS, and how the others connect to it.</p></header>
-        <div class="st-machines" id="st-machines"></div>
-        <div class="st-group" id="st-rows-machines" aria-live="polite"><p class="st-loading">Loading settings</p></div>
-      </section>
-      <section class="st-panel" id="st-panel-voice" role="tabpanel" aria-labelledby="st-tab-voice" data-sec="voice" tabindex="-1" hidden>
-        <header class="st-head"><h2>Voice</h2><p>How JARVIS listens and speaks.</p></header>
-        <div class="st-group" id="st-rows-voice" aria-live="polite"><p class="st-loading">Loading settings</p></div>
-        <div class="voice-settings-grid st-legacy">
-        <article class="card settings-card">
-          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-mic"/></svg></span><h2>Microphone</h2><span class="ph-meta" id="mic-settings-status">Ready when you are</span></header>
-          <label class="vp-row"><span>Input device</span><select class="field" id="agent-mic-device"><option value="">System default</option></select></label>
-          <label class="vp-row"><span>Auto-select clearest microphone</span><input type="checkbox" id="agent-mic-all"></label>
-          <p class="settings-hint">When enabled, JARVIS compares available microphones during speech and switches to a clearer input. Replies still play through your system output.</p>
-          <label class="vp-row"><span>Input level <output id="agent-mic-gain-out" for="agent-mic-gain">100%</output></span><input type="range" id="agent-mic-gain" min="0.7" max="1.8" step="0.05" value="1"></label>
-          <p class="settings-hint">Gain applies immediately during a call. Device and processing choices apply on the next call; device names may appear after microphone permission is granted.</p>
-          <div class="settings-toggles">
-            <label><input type="checkbox" id="agent-echo" checked><span><b>Echo cancellation</b><small>Reduces JARVIS playback leaking back into the mic.</small></span></label>
-            <label><input type="checkbox" id="agent-noise" checked><span><b>Noise suppression</b><small>Filters steady room and fan noise.</small></span></label>
-            <label><input type="checkbox" id="agent-agc" checked><span><b>Automatic mic level</b><small>Lets the browser balance input volume.</small></span></label>
-          </div>
-          <button class="btn ghost settings-refresh" id="agent-mic-refresh" type="button">Refresh devices</button>
-        </article>
-        <article class="card settings-card">
-          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-audio-lines"/></svg></span><h2>JARVIS's voice</h2></header>
-          <label class="vp-row"><span>Voice</span><select class="field" id="voice-select"></select></label>
-          <label class="vp-row"><span>Speaking speed <output id="voice-speed-out" for="voice-speed"></output></span><input type="range" id="voice-speed" min="0.7" max="1.2" step="0.05" value="1"></label>
-          <label class="vp-row"><span>Steadiness <output id="voice-stability-out" for="voice-stability"></output></span><input type="range" id="voice-stability" min="0" max="1" step="0.05" value="0.5"></label>
-          <p class="settings-hint" id="voice-note"></p>
-          <button type="button" class="vp-preview" id="voice-preview"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-play"/></svg>Preview this voice</button>
-        </article>
-        </div>
-      </section>
-      <section class="st-panel" id="st-panel-intelligence" role="tabpanel" aria-labelledby="st-tab-intelligence" data-sec="intelligence" tabindex="-1" hidden>
-        <header class="st-head"><h2>Intelligence</h2><p>Models, routing and how much effort JARVIS spends.</p></header>
-        <div class="st-group" id="st-rows-intelligence" aria-live="polite"><p class="st-loading">Loading settings</p></div>
-      </section>
-      <section class="st-panel" id="st-panel-memory" role="tabpanel" aria-labelledby="st-tab-memory" data-sec="memory" tabindex="-1" hidden>
-        <header class="st-head"><h2>Memory</h2><p>What JARVIS remembers and for how long.</p></header>
-        <div class="st-group" id="st-rows-memory" aria-live="polite"><p class="st-loading">Loading settings</p></div>
-      </section>
-      <section class="st-panel" id="st-panel-input" role="tabpanel" aria-labelledby="st-tab-input" data-sec="input" tabindex="-1" hidden>
-        <header class="st-head"><h2>Input</h2><p>Share one mouse and keyboard across your computers.</p></header>
-                <div class="voice-settings-grid st-legacy">
-        <article class="card settings-card settings-input-card">
-          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-keyboard"/></svg></span><h2>Computers and peripherals</h2><span class="ph-meta" id="input-settings-checked">Checking connection</span></header>
-          <div class="input-settings-status">
-            <p class="input-status-word" id="input-settings-status" role="status">Checking</p>
-            <ul id="input-settings-lines"><li>Checking every configured Lan Mouse service and UDP socket.</li></ul>
-          </div>
-          <div class="input-settings-facts" id="input-settings-facts"></div>
-          <section class="input-peripheral-manager" aria-labelledby="input-peripheral-title">
-            <header><h3 id="input-peripheral-title">Peripheral list</h3><p>Keep track of multiple mice, keyboards, displays, and other devices. Saved in this browser.</p></header>
-            <form class="input-peripheral-form" id="input-peripheral-form">
-              <label><span>Name</span><input class="field" name="name" maxlength="60" placeholder="e.g. Travel mouse" required></label>
-              <label><span>Type</span><select class="field" name="type"><option>Mouse</option><option>Keyboard</option><option>Display</option><option>Controller</option><option>Other</option></select></label>
-              <label><span>Connected to</span><select class="field" name="device" id="input-peripheral-device"></select></label>
-              <button class="btn ghost" type="submit">Add peripheral</button>
-            </form>
-            <ul class="input-peripheral-list" id="input-peripheral-list" aria-live="polite"></ul>
-            <p class="settings-hint">This is a personal inventory. Pairing and hardware detection are managed by each computer and Lan Mouse.</p>
+
+          <section class="st-panel" id="st-panel-machines" role="tabpanel" aria-labelledby="st-tab-machines" data-sec="machines" tabindex="-1" hidden>
+            <header class="st-head"><h2>Machines</h2><p>Which computer runs JARVIS, and whether the others can reach it.</p></header>
+            <div class="st-group st-machines" id="st-machines" aria-live="polite"><p class="st-loading">Loading machines</p></div>
+            <p class="st-foot">Add a computer: on the main run <code>jarvis cluster invite &lt;name&gt;</code>, then <code>jarvis cluster join &lt;code&gt;</code> on the new one. <code>jarvis cluster doctor</code> explains any problem.</p>
+            <details class="st-adv">
+              <summary>Advanced</summary>
+              <div class="st-group" id="st-rows-machines"><p class="st-loading">Loading settings</p></div>
+            </details>
           </section>
-          <p class="settings-hint input-settings-hint" id="input-settings-hint">Add computers under devices and screen edges under desktop.input.layout in jarvis.config.json. Mouse and keyboard sharing runs through Lan Mouse; individual USB devices are managed by each computer’s operating system. This check reads service and socket status, not cursor movement or key presses.</p>
-          <button class="btn ghost settings-refresh" id="input-probe-refresh" type="button">Check connection</button>
-        </article>
-        <article class="card settings-card shared-input-card" id="shared-input" aria-labelledby="shared-input-title">
-          <header class="ph"><span class="ph-icon"><svg class="i i-sm"><use href="icons.svg?v=2#i-monitor"/></svg></span><h2 id="shared-input-title">Shared mouse and keyboard</h2><span class="ph-meta" id="si-checked">Not checked yet</span></header>
-          <figure class="si-layout" id="si-layout" aria-label="Screens drawn to physical scale"><p class="si-empty">Open this view to read both computers’ screens and Lan Mouse settings.</p></figure>
-          <ul class="si-checks" id="si-checks" role="status" aria-live="polite"></ul>
-          <div class="si-machines" id="si-machines"></div>
-          <p class="settings-hint">Read-only. JARVIS reads each computer’s screens and Lan Mouse config.toml; it never starts, stops or changes Lan Mouse. The keyboard follows the mouse: keys go to whichever screen has the cursor.</p>
-          <button class="btn ghost settings-refresh" id="si-refresh" type="button">Check again</button>
-        </article>
-        </div>
-      </section>
+
+          <section class="st-panel" id="st-panel-voice" role="tabpanel" aria-labelledby="st-tab-voice" data-sec="voice" tabindex="-1" hidden>
+            <header class="st-head"><h2>Voice</h2><p>The always-on listener: who it answers, and how it talks back.</p></header>
+            <div class="vs-card-row" id="vs-entry" aria-live="polite">
+              <span class="vs-mini off" aria-hidden="true"><svg class="i"><use href="icons.svg?v=2#i-mic"/></svg></span>
+              <div><b>Your voice</b><small>Checking…</small></div>
+              <button type="button" class="st-btn st-btn-strong" data-voicesetup>Set up voice</button>
+            </div>
+            <div class="st-group" id="st-rows-voice" aria-live="polite"><p class="st-loading">Loading settings</p></div>
+          </section>
+
+          <section class="st-panel" id="st-panel-calls" role="tabpanel" aria-labelledby="st-tab-calls" data-sec="calls" tabindex="-1" hidden>
+            <header class="st-head"><h2>Calls</h2><p>Live voice calls in this browser. Saved on this computer only.</p></header>
+            <div class="st-sub"><h3>Microphone</h3><span class="st-meta" id="mic-settings-status">Ready when you are</span><button class="st-btn" id="agent-mic-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Refresh</button></div>
+            <div class="st-group">
+              <div class="st-row"><label class="st-label" for="agent-mic-device"><b>Input device</b><small>Device names appear after the browser is allowed to use the microphone.</small></label>
+                <div class="st-ctl"><select class="st-select" id="agent-mic-device"><option value="">System default</option></select></div></div>
+              <div class="st-row" data-kind="bool"><label class="st-label" for="agent-mic-all"><b>Pick the clearest microphone</b><small>Compares every microphone while you speak and switches to the clearest one.</small></label>
+                <div class="st-ctl"><input class="st-check" type="checkbox" role="switch" id="agent-mic-all"></div></div>
+              <div class="st-row"><label class="st-label" for="agent-mic-gain"><b>Input level</b><small>Applies immediately, even mid-call.</small></label>
+                <div class="st-ctl st-slider"><input type="range" id="agent-mic-gain" min="0.7" max="1.8" step="0.05" value="1"><output id="agent-mic-gain-out" for="agent-mic-gain">100%</output></div></div>
+              <div class="st-row" data-kind="bool"><label class="st-label" for="agent-echo"><b>Echo cancellation</b><small>Keeps JARVIS's own voice out of the mic.</small></label>
+                <div class="st-ctl"><input class="st-check" type="checkbox" role="switch" id="agent-echo" checked></div></div>
+              <div class="st-row" data-kind="bool"><label class="st-label" for="agent-noise"><b>Noise suppression</b><small>Filters steady room and fan noise.</small></label>
+                <div class="st-ctl"><input class="st-check" type="checkbox" role="switch" id="agent-noise" checked></div></div>
+              <div class="st-row" data-kind="bool"><label class="st-label" for="agent-agc"><b>Automatic mic level</b><small>Lets the browser balance input volume.</small></label>
+                <div class="st-ctl"><input class="st-check" type="checkbox" role="switch" id="agent-agc" checked></div></div>
+            </div>
+            <p class="st-foot">Device and processing changes apply on the next call.</p>
+            <div class="st-sub"><h3>Call voice</h3><button type="button" class="st-btn" id="voice-preview"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-play"/></svg>Preview</button></div>
+            <div class="st-group">
+              <div class="st-row"><label class="st-label" for="voice-select"><b>Voice</b><small id="voice-note"></small></label>
+                <div class="st-ctl"><select class="st-select" id="voice-select"></select></div></div>
+              <div class="st-row"><label class="st-label" for="voice-speed"><b>Speaking speed</b></label>
+                <div class="st-ctl st-slider"><input type="range" id="voice-speed" min="0.7" max="1.2" step="0.05" value="1"><output id="voice-speed-out" for="voice-speed"></output></div></div>
+              <div class="st-row"><label class="st-label" for="voice-stability"><b>Steadiness</b><small>Higher is calmer and more even; lower is more expressive.</small></label>
+                <div class="st-ctl st-slider"><input type="range" id="voice-stability" min="0" max="1" step="0.05" value="0.5"><output id="voice-stability-out" for="voice-stability"></output></div></div>
+            </div>
+          </section>
+
+          <section class="st-panel" id="st-panel-intelligence" role="tabpanel" aria-labelledby="st-tab-intelligence" data-sec="intelligence" tabindex="-1" hidden>
+            <header class="st-head"><h2>Intelligence</h2><p>Which model answers, and how much effort JARVIS spends.</p></header>
+            <div class="st-group" id="st-rows-intelligence" aria-live="polite"><p class="st-loading">Loading settings</p></div>
+          </section>
+
+          <section class="st-panel" id="st-panel-memory" role="tabpanel" aria-labelledby="st-tab-memory" data-sec="memory" tabindex="-1" hidden>
+            <header class="st-head"><h2>Memory</h2><p>What JARVIS remembers and where it looks.</p></header>
+            <div class="st-group" id="st-rows-memory" aria-live="polite"><p class="st-loading">Loading settings</p></div>
+          </section>
+
+          <section class="st-panel" id="st-panel-input" role="tabpanel" aria-labelledby="st-tab-input" data-sec="input" tabindex="-1" hidden>
+            <header class="st-head"><h2>Input</h2><p>One mouse and keyboard across your computers, through Lan Mouse. Read-only: JARVIS never changes it.</p></header>
+            <div class="st-sub"><h3>Shared mouse and keyboard</h3><span class="st-meta" id="si-checked">Not checked yet</span><button class="st-btn" id="si-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check again</button></div>
+            <div class="st-block shared-input-card" id="shared-input" aria-label="Shared mouse and keyboard">
+              <figure class="si-layout" id="si-layout" aria-label="Screens drawn to physical scale"><p class="si-empty">Open this view to read both computers’ screens and Lan Mouse settings.</p></figure>
+              <ul class="si-checks" id="si-checks" role="status" aria-live="polite"></ul>
+              <div class="si-machines" id="si-machines"></div>
+              <p class="st-foot">The keyboard follows the mouse: keys go to whichever screen has the cursor.</p>
+            </div>
+            <div class="st-sub"><h3>Connection</h3><span class="st-meta" id="input-settings-checked">Checking connection</span><button class="st-btn" id="input-probe-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check</button></div>
+            <div class="st-block settings-input-card">
+              <div class="input-settings-status">
+                <p class="input-status-word" id="input-settings-status" role="status">Checking</p>
+                <ul id="input-settings-lines"><li>Checking every configured Lan Mouse service and UDP socket.</li></ul>
+              </div>
+              <div class="input-settings-facts" id="input-settings-facts"></div>
+              <p class="st-foot" id="input-settings-hint">Reads service and socket status only, never cursor movement or key presses. Computers live under devices, screen edges under desktop.input.layout in jarvis.config.json.</p>
+            </div>
+            <div class="st-sub"><h3 id="input-peripheral-title">Peripherals</h3><span class="st-meta">Saved in this browser</span></div>
+            <section class="st-block input-peripheral-manager" aria-labelledby="input-peripheral-title">
+              <form class="input-peripheral-form" id="input-peripheral-form">
+                <label><span>Name</span><input class="field" name="name" maxlength="60" placeholder="e.g. Travel mouse" required></label>
+                <label><span>Type</span><select class="field" name="type"><option>Mouse</option><option>Keyboard</option><option>Display</option><option>Controller</option><option>Other</option></select></label>
+                <label><span>Connected to</span><select class="field" name="device" id="input-peripheral-device"></select></label>
+                <button class="st-btn" type="submit"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-plus"/></svg>Add</button>
+              </form>
+              <ul class="input-peripheral-list" id="input-peripheral-list" aria-live="polite"></ul>
+            </section>
+          </section>
         </div>
       </div>
     </section>
@@ -479,6 +495,7 @@
 <script src="console.js"></script>
 <script src="graph.js"></script>
 <script src="voice.js"></script>
+<script src="voicesetup.js"></script>
 <script src="agent.js"></script>
 <script src="app.js"></script>
 <script src="agentscreen.js"></script>

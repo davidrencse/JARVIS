@@ -409,7 +409,9 @@
     set("lab-s-runs", runsToday ? `${runsToday} today` : `${Object.values(tasks).reduce((a, b) => a + (+b || 0), 0)} total`);
     set("lab-s-memory", (o.memory?.items ?? "—").toLocaleString());
     const devs = o.devices || [], ok = devs.filter((x) => /verified|online|ok/i.test(x.status || "")).length;
-    set("lab-s-machines", `${ok}/${devs.length} · main ${o.cluster?.main_device || "—"}`);
+    set("lab-s-machines", `${ok}/${devs.length} online`);
+    const here = devs.find((x) => x.id === o.cluster?.local_device);
+    if (here) set("profile-sub", `${(here.label || here.id).split(",")[0]} · ${o.cluster?.role || "main"}`);
     set("lab-s-voice", o.voice?.listening ? "listening" : "off");
     set("lab-s-brain", `${o.brain?.name || "—"}${o.brain?.warm ? " · warm" : ""}`);
     if (tangle && Math.abs((tangle.items || 0) - (o.memory?.items || 0)) > 50) { tangle.items = o.memory?.items; drawTangle(); }

@@ -184,7 +184,7 @@
     if ($("#credit-table .ct-edit") || $("#credit-table").contains(document.activeElement)) return; // never wipe a half-typed entry
     $("#credits-legend").innerHTML = `<span class="legend">${legend(["live", "local", "manual", "none", "error"])}</span>`;
     const groups = {};
-    list.forEach((r) => (groups[r.group] = groups[r.group] || []).push(r));
+    list.filter((r) => r.group !== "Model APIs").forEach((r) => (groups[r.group] = groups[r.group] || []).push(r));  // pay-per-token APIs are off-limits
     $("#credit-table").innerHTML = Object.entries(groups).map(([g, rows]) => `<section class="ct-group"><h3>${esc(g)}</h3>${rows.map((r) => `
       <div class="ct-row" data-id="${r.id}">${srcMark(r)}
         <div><div class="cr-name">${esc(r.name)}<small>${esc(r.blurb)}</small></div></div>
@@ -316,9 +316,9 @@
   const LEVEL = { up: ["daemons up", "ok"], warn: ["up · with warnings", ""], down: ["down", "warn"] };
   function liveWord(live) {
     if (!live) return `<span class="state-word" title="Not checked yet">checking</span>`;
-    if (live.local) return live.lan_mouse?.running ? `<span class="state-word ok">this device</span>` : `<span class="state-word warn">Lan Mouse off</span>`;
+    if (live.local) return !live.lan_mouse || live.lan_mouse.running ? `<span class="state-word ok">this device</span>` : `<span class="state-word warn">Lan Mouse off</span>`;
     if (!live.reachable) return `<span class="state-word warn" title="${esc(live.error || "")}">unreachable</span>`;
-    if (!live.ssh) return `<span class="state-word warn" title="${esc(live.error || "")}">ssh failed</span>`;
+    if (live.ssh === false) return `<span class="state-word warn" title="${esc(live.error || "")}">ssh failed</span>`;
     return `<span class="state-word ok">online</span>`;
   }
   function liveFacts(live) {
@@ -335,6 +335,9 @@
       rows.push(["Load · up", `${live.load} · ${Math.round(live.uptime_s / 3600)} h`]);
       if (live.wifi_power_save) rows.push(["Wi-Fi power save", live.wifi_power_save]);
       if (live.ip) rows.push(["IP now", live.ip]);
+    } else if (live.via === "node") {
+      rows.push(["Platform", `${live.platform || "—"} · v${live.version || "—"}`]);
+      if (live.seen) rows.push(["Checked in", `${Math.max(0, Math.round(Date.now() / 1000 - live.seen))} s ago`]);
     } else if (live.error) rows.push(["Error", live.error]);
     return `<dl class="facts mono live-facts">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>`;
   }
@@ -365,6 +368,7 @@
       if (!device) return "Not configured";
       const value = device[1], lm = value.lan_mouse || {};
       if (value.local) return lm.running ? `Running · ${lm.listening ? `UDP ${input.port || 4242} listening` : "socket not detected"}` : "Not running";
+      if (value.via === "node") return value.reachable ? "Online · input sharing not reported by nodes" : "Offline";
       if (!value.ssh) return value.reachable ? "SSH unavailable" : "Unreachable";
       return lm.running ? `${lm.fallback === "active" ? "Fallback build" : "Running"} · ${lm.listening ? `UDP ${input.port || 4242} listening` : "socket not detected"}` : "Not running";
     };

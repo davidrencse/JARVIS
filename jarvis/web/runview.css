@@ -37,6 +37,7 @@
 .rv-head .rv-spacer { margin-left: auto; }
 .rv-head .rv-state { color: var(--rv-accent); }
 .rv-head .rv-state[data-state="finished"] { color: var(--rv-ok); }
+.rv-head .rv-state[data-state=""] { color: var(--ink-3); }
 
 /* ---------- body: inputs | graph | stages ---------- */
 .rv-body { display: grid; grid-template-columns: 172px 128px minmax(0, 1fr); gap: var(--rv-gap); min-height: 0; }

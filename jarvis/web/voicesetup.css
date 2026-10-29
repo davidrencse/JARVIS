@@ -1,0 +1,105 @@
+/* Voice setup dialog. Reuses the app's theme tokens and the Settings controls
+   (.st-btn, .st-select, .st-switch). The orb follows the live mic level via --lvl (0–1). */
+.vs { --vs-ease: cubic-bezier(.16, 1, .3, 1); width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); padding: 0; border: 0; border-radius: 24px; background: transparent; color: var(--ink); overflow: visible; }
+.vs::backdrop { background: rgba(4, 5, 6, .62); backdrop-filter: blur(10px) saturate(.9); animation: vs-fade 260ms ease both; }
+.vs[open] .vs-card { animation: vs-in 380ms var(--vs-ease) both; }
+.vs-card { display: flex; flex-direction: column; max-height: calc(100dvh - 32px); border-radius: 24px; background: var(--glass-strong); background-image: var(--sheen); border: 1px solid var(--line-2); box-shadow: var(--shadow); backdrop-filter: blur(24px) saturate(1.2); overflow: hidden; }
+@keyframes vs-in { from { opacity: 0; transform: translateY(10px) scale(.985); } to { opacity: 1; transform: none; } }
+@keyframes vs-fade { from { opacity: 0; } to { opacity: 1; } }
+
+/* header: label, step rail, close */
+.vs-top { display: flex; align-items: center; gap: 14px; padding: 16px 16px 0 22px; }
+.vs-kicker { display: inline-flex; align-items: center; gap: 8px; font: 650 11.5px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2); white-space: nowrap; }
+.vs-kicker .i { width: 15px; height: 15px; }
+.vs-steps { display: flex; gap: 6px; margin: 0 0 0 auto; padding: 0; list-style: none; }
+.vs-steps li { display: flex; align-items: center; gap: 6px; padding: 4px 8px; white-space: nowrap; border-radius: 999px; color: var(--ink-3); font: 600 11.5px var(--sans); transition: color 200ms, background 200ms; }
+.vs-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--line-2); transition: background 200ms, transform 300ms var(--vs-ease); }
+.vs-steps li.done .vs-dot { background: var(--ink-2); }
+.vs-steps li.now { color: var(--ink); background: var(--hover); }
+.vs-steps li.now .vs-dot { background: var(--ink); transform: scale(1.35); }
+.vs-step { display: none; }
+.vs-steps li.now .vs-step { display: inline; }
+.vs-x { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--ink-2); transition: background 160ms, color 160ms; }
+.vs-x:hover { background: var(--hover); color: var(--ink); }
+.vs[data-screen="run"] .vs-x { visibility: hidden; }
+
+/* body */
+.vs-body { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px 32px 8px; text-align: center; overflow: auto; min-height: 340px; }
+.vs-body h2 { margin: 4px 0 0; font: 650 26px/1.15 var(--sans); letter-spacing: -.02em; text-wrap: balance; }
+.vs-lede { margin: 0; max-width: 44ch; color: var(--ink-2); font: 500 15px/1.5 var(--sans); text-wrap: pretty; }
+.vs-msg { margin: 6px 0 0; font: 600 17px/1.4 var(--sans); color: var(--ink); text-wrap: balance; }
+.vs-msg.vs-wait::after { content: ""; display: inline-block; width: 1.2em; text-align: left; animation: vs-dots 1.2s steps(4) infinite; }
+@keyframes vs-dots { 0% { content: ""; } 25% { content: "."; } 50% { content: ".."; } 75% { content: "..."; } }
+.vs-phrase { margin: 2px 0 0; max-width: 22ch; font: 650 clamp(22px, 4.6vw, 30px)/1.25 var(--sans); letter-spacing: -.015em; text-wrap: balance; animation: vs-in 360ms var(--vs-ease) both; }
+.vs-note { margin: 0; color: var(--ink-3); font-size: 13px; }
+.vs-hint { margin-right: auto; color: var(--ink-3); font-size: 12.5px; text-align: left; }
+.vs-warn { display: inline-flex; align-items: flex-start; gap: 8px; margin: 2px 0 0; padding: 8px 12px; border-radius: 12px; background: var(--card-sunk); color: var(--warn, var(--ink)); font: 600 13px/1.4 var(--sans); text-align: left; max-width: 46ch; }
+.vs-warn[hidden] { display: none; }
+.vs-warn .i { flex: none; width: 15px; height: 15px; margin-top: 1px; }
+
+/* the orb: three rings breathe with the mic level */
+.vs-orb { --lvl: 0; position: relative; display: grid; place-items: center; width: 132px; height: 132px; margin: 6px 0 4px; }
+.vs-orb i { position: absolute; inset: 0; border-radius: 50%; border: 1px solid var(--line-2); transform: scale(calc(.62 + var(--lvl) * .38)); transition: transform 110ms linear, opacity 160ms; opacity: calc(.35 + var(--lvl) * .65); }
+.vs-orb i:nth-child(2) { inset: 14px; transform: scale(calc(.7 + var(--lvl) * .3)); border-color: var(--line-ctl); }
+.vs-orb i:nth-child(3) { inset: 28px; background: var(--hover); transform: scale(calc(.82 + var(--lvl) * .18)); border-color: var(--tick); }
+.vs-orb b { position: relative; display: grid; place-items: center; width: 52px; height: 52px; border-radius: 50%; background: var(--inv-bg); color: var(--inv-ink); box-shadow: 0 0 0 calc(var(--lvl) * 10px) var(--hover); transition: box-shadow 110ms linear; }
+.vs-orb b .i { width: 22px; height: 22px; }
+.vs:not([data-screen="run"]) .vs-orb i { animation: vs-breathe 3.2s ease-in-out infinite; }
+.vs:not([data-screen="run"]) .vs-orb i:nth-child(2) { animation-delay: -1s; }
+.vs:not([data-screen="run"]) .vs-orb i:nth-child(3) { animation-delay: -2s; }
+@keyframes vs-breathe { 50% { transform: scale(.92); opacity: .5; } }
+
+/* enrollment progress: one segment per line */
+.vs-bar { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 5px; width: min(320px, 100%); margin-top: 6px; }
+.vs-bar span { height: 4px; border-radius: 999px; background: var(--track); transition: background 300ms; }
+.vs-bar span.on { background: var(--fill); }
+.vs-bar span.now { background: var(--fill-2); animation: vs-pulse 1.4s ease-in-out infinite; }
+@keyframes vs-pulse { 50% { opacity: .45; } }
+.vs-count { margin: -4px 0 0; color: var(--ink-3); font: 600 11.5px var(--mono); letter-spacing: .06em; }
+
+/* intro + error: mic picker, points */
+.vs-field { display: grid; gap: 6px; width: min(340px, 100%); margin-top: 4px; text-align: left; }
+.vs-field > span { font: 650 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+.vs-select { width: 100%; }
+.vs-points { display: grid; gap: 8px; margin: 4px 0 0; padding: 0; list-style: none; text-align: left; color: var(--ink-2); font: 500 13.5px/1.45 var(--sans); max-width: 42ch; }
+.vs-points li { display: flex; gap: 10px; }
+.vs-points .i { flex: none; width: 15px; height: 15px; margin-top: 2px; color: var(--ink); }
+
+/* done / failed */
+.vs-ok { display: grid; place-items: center; width: 72px; height: 72px; margin-top: 18px; border-radius: 50%; background: var(--inv-bg); color: var(--inv-ink); animation: vs-pop 520ms var(--vs-ease) both; }
+.vs-ok .i { width: 30px; height: 30px; }
+.vs-ok.vs-meh { background: var(--hover); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line-2); }
+.vs-ok.vs-bad { background: var(--hover); color: var(--alert, var(--ink)); box-shadow: inset 0 0 0 1px var(--line-2); }
+@keyframes vs-pop { from { transform: scale(.6); opacity: 0; } to { transform: none; opacity: 1; } }
+.vs-facts { display: grid; width: min(380px, 100%); margin: 6px 0 0; border-top: 1px solid var(--line); text-align: left; }
+.vs-facts div { display: flex; justify-content: space-between; gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.vs-facts dt { color: var(--ink-2); font: 500 13.5px var(--sans); }
+.vs-facts dd { margin: 0; min-width: 0; font: 600 13.5px var(--sans); text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vs-facts small { color: var(--ink-3); font: 500 12px var(--mono); margin-left: 6px; }
+.vs-toggle { display: flex; align-items: center; justify-content: space-between; gap: 18px; width: min(380px, 100%); margin-top: 2px; text-align: left; cursor: pointer; }
+.vs-toggle b { display: block; font: 650 14px var(--sans); }
+.vs-toggle small { display: block; color: var(--ink-2); font: 500 12.5px/1.4 var(--sans); }
+
+/* footer */
+.vs-foot { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 16px 22px 20px; }
+.vs-foot .st-btn { min-height: 38px; padding: 0 18px; font-size: 13.5px; }
+.vs .st-btn:focus-visible, .vs .st-select:focus-visible, .vs .st-switch:focus-visible, .vs-x:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+
+/* Settings > Voice: the "Your voice" card that opens setup */
+.vs-card-row { display: flex; align-items: center; gap: 16px; margin: 0 0 26px; padding: 18px 20px; border-radius: 18px; background: var(--card-sunk); box-shadow: inset 0 0 0 1px var(--line); }
+.vs-card-row .vs-mini { flex: none; display: grid; place-items: center; width: 44px; height: 44px; border-radius: 50%; background: var(--inv-bg); color: var(--inv-ink); }
+.vs-card-row .vs-mini.off { background: var(--hover); color: var(--ink-2); box-shadow: inset 0 0 0 1px var(--line-2); }
+.vs-card-row div { flex: 1; min-width: 0; }
+.vs-card-row b { display: block; font: 650 15px var(--sans); }
+.vs-card-row small { display: block; margin-top: 2px; color: var(--ink-2); font: 500 13px/1.45 var(--sans); }
+
+@media (max-width: 560px) {
+  .vs-body { padding: 14px 18px 6px; min-height: 0; }
+  .vs-top { padding-left: 16px; }
+  .vs-steps li:not(.now) { padding: 4px 3px; }
+  .vs-foot { padding: 14px 16px 16px; }
+  .vs-card-row { flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vs *, .vs::backdrop, .vs[open] .vs-card { animation: none !important; transition: none !important; }
+}
