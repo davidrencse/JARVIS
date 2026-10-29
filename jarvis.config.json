@@ -212,8 +212,21 @@
   "rules": {
     "trusted_local": {
       "enabled": true,
-      "intents": ["open_app", "open_url", "focus_window", "media", "volume", "scroll", "list_apps", "spotify_play"],
-      "skip": ["app_exists", "history", "observe"]
+      "intents": [
+        "open_app",
+        "open_url",
+        "focus_window",
+        "media",
+        "volume",
+        "scroll",
+        "list_apps",
+        "spotify_play"
+      ],
+      "skip": [
+        "app_exists",
+        "history",
+        "observe"
+      ]
     }
   },
   "decisions": {
