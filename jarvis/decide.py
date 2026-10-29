@@ -16,6 +16,7 @@ the existing rules decide, and the decider can only ever restrict, never approve
 
 import json
 import math
+import re
 import threading
 import time
 import uuid
@@ -77,7 +78,8 @@ def choose(job, text, temperature=None, options=None):
     embedding model is unavailable."""
     from .embed import embed
     protos = _vectors(job)
-    query = embed([text])
+    # A leading wake word says nothing about the request and drags it toward "converse".
+    query = embed([re.sub(r"^\W*jarvis\b\W*", "", str(text), flags=re.I) or text])
     if protos is None or query is None:
         return None
     names = [o for o in (options or protos) if o in protos]

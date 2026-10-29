@@ -34,7 +34,12 @@ class Runtime:
             self.console.close()
 
 
-def proxy_handler(client, overlay=None):
+VOICE_SETUP = ("/api/voice/setup", "/api/voice/devices")
+
+
+def proxy_handler(client, overlay=None, setup=None):
+    """`setup` is this laptop's own VoiceSetup: a voiceprint belongs to the mic it was
+    recorded on, so voice setup is answered here, never forwarded to the main."""
     from .ui import Handler
 
     class ProxyHandler(Handler):
@@ -43,6 +48,12 @@ def proxy_handler(client, overlay=None):
         def do_GET(self):
             if not self._allowed():
                 return self._send(403, {"error": "Local console requests only."})
+            if setup is not None and self.path in VOICE_SETUP:
+                try:
+                    return self._send(200, setup.status() if self.path == VOICE_SETUP[0]
+                                      else {"devices": setup.devices()})
+                except Exception as exc:
+                    return self._send(500, {"error": str(exc)})
             if self.path.startswith("/api/"):
                 return self._forward(False)
             return self._static(self.path.split("?", 1)[0])
@@ -60,6 +71,22 @@ def proxy_handler(client, overlay=None):
                     body = json.loads(self.rfile.read(length))
                     return self._send(200, overlay.request(body.get("action") or "hide"))
                 except (ValueError, AttributeError) as exc:
+                    return self._send(400, {"error": str(exc)})
+            if setup is not None and self.path == VOICE_SETUP[0]:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 8192:
+                        raise ValueError("Invalid voice setup request length.")
+                    body = json.loads(self.rfile.read(length))
+                    action = body.get("action")
+                    if action == "start":
+                        return self._send(200, setup.start(body.get("device") or None))
+                    if action == "cancel":
+                        return self._send(200, setup.cancel())
+                    if action == "autostart":
+                        return self._send(200, setup.autostart(bool(body.get("on"))))
+                    raise ValueError("action must be start, cancel or autostart.")
+                except (ValueError, AttributeError, RuntimeError) as exc:
                     return self._send(400, {"error": str(exc)})
             if not self.path.startswith("/api/"):
                 return self._send(404, {"error": "Unknown console endpoint."})
@@ -115,8 +142,10 @@ def local_server(config, base, state, port, overlay=None):
         client = Client(config, state)
         worker = NodeWorker(config, state).start()
         runtime = Runtime(worker=worker)
+        from .onboard import VoiceSetup
         try:
-            return ConsoleServer(("127.0.0.1", port), proxy_handler(client, overlay)), runtime
+            return ConsoleServer(("127.0.0.1", port), proxy_handler(
+                client, overlay, VoiceSetup(state, config))), runtime
         except BaseException:
             runtime.close()
             raise

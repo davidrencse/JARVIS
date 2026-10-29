@@ -18,7 +18,7 @@ STATIONS = [
     {"id": "hear", "title": "Hear", "verb": "listens",
      "plain": "The listener records your voice through PipeWire, checks it is you against "
               "your voiceprint, and turns the speech into text with Whisper on this laptop.",
-     "modules": ["listen", "daemon", "overlay"]},
+     "modules": ["listen", "onboard", "daemon", "overlay"]},
     {"id": "decide", "title": "Decide", "verb": "routes",
      "plain": "Simple rules, no AI, pick the cheapest way to answer: the clock or your vault "
               "instantly, a quick chat, a web task, or a multi-step plan.",

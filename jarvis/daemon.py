@@ -9,6 +9,7 @@ systemd user unit that runs `voice start` at login.
 
 import atexit
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -53,6 +54,20 @@ class InstanceLock:
 
 
 FOLLOW_UP = 6.0  # seconds after a bare "Jarvis" in which the next utterance is the request
+REPLY_FOLLOW_UP = 8.0  # seconds after JARVIS finishes talking in which David can answer it
+# What answering JARVIS sounds like ("Then check it." "Yes please." "No, stop."). Anything
+# else right after a reply is the room talking, and still needs "Jarvis".
+REPLY_WORDS = frozenset("""yes yeah yep yup sure ok okay alright please no nope nah do it go
+    ahead for check then sounds good that's fine cancel stop never mind thanks thank you
+    jarvis right now that one this""".split())
+
+
+def answers_jarvis(text):
+    """A short reply to what JARVIS just said or offered."""
+    words = re.findall(r"[a-z']+", text.lower().replace("\u2019", "'"))
+    return 0 < len(words) <= 6 and all(w in REPLY_WORDS for w in words)
+
+
 BORDERLINE = 0.10  # live mic scores dropped to 0.11-0.28 on 2026-10-26; the wake word gates the rest
 
 
@@ -63,7 +78,7 @@ def listen_loop(state, config, base, threshold=None):
 
     from .events import Turn, emit, feed_sender
     from .instant import answer as instant_answer
-    from .listen import RATE, LiveMic, Transcriber, VoicePrint, _np, record_utterance
+    from .listen import RATE, LiveMic, Transcriber, VoicePrint, _np, mic_settings, record_utterance
     from .memory import Memory
     from .speech import SpeechQueue, Voice, spoken
     from .store import Store, lanes_from
@@ -98,10 +113,10 @@ def listen_loop(state, config, base, threshold=None):
             memory.warm_vectors()  # meaning-based recall index, in the background
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device)
-        failures, mic, armed, armed_by_owner = 0, None, 0.0, False
+        failures, mic, armed, armed_by_owner, chatting = 0, None, 0.0, False, 0.0
         while True:
             try:
-                mic = mic or LiveMic()
+                mic = mic or LiveMic(tuning=mic_settings(state))  # device + cutoffs from setup
                 audio = record_utterance(mic=mic)
                 failures = 0  # the mic works again; only consecutive failures back off
                 if audio is None:  # 30 s of silence: keep the brain warm
@@ -133,10 +148,16 @@ def listen_loop(state, config, base, threshold=None):
                 if request is None and heard.strip() and began < armed and (
                         is_owner or armed_by_owner):
                     request = heard.strip()  # the rest of "Jarvis, ... <pause> ..."
-                armed = 0.0
+                # Answering JARVIS ("I can check it if you want." "Then check it.") needs
+                # no wake word, but only a full voice match and a short reply count.
+                # Wall clock: the reply's end is read once, after JARVIS stops talking.
+                if request is None and is_owner and answers_jarvis(heard) and \
+                        time.time() - len(audio) / RATE < chatting:
+                    request = heard.strip()
+                armed = chatting = 0.0
                 if not request:  # not addressed to JARVIS: never answered
                     if near:  # still unconfirmed as David: discarded unread
-                        log(f"ignored another voice (similarity {score})")
+                        log(f"ignored another voice (similarity {score}, near miss)")
                     elif heard:  # David's own voice without the wake word: say so, briefly
                         log(f"no wake word ({score}): {' '.join(heard.split()[:3])}...")
                     continue
@@ -170,6 +191,7 @@ def listen_loop(state, config, base, threshold=None):
                     speaker.put(spoken(result["reply"], voice.limit))
                 speaker.drain()  # finish talking before listening again
                 mic.flush()  # and don't treat JARVIS's own reply as something heard
+                chatting = time.time() + REPLY_FOLLOW_UP
                 failures = 0
             except KeyboardInterrupt:
                 raise
@@ -264,6 +286,7 @@ def status(state):
     voice = Path(state).resolve() / "voice"
     return {"listening": pid is not None, "pid": pid,
             "enrolled": (voice / "voiceprint.json").is_file(),
+            "mic_tuned": (voice / "mic.json").is_file(),
             "autostart": _startup_file().is_file(),
             "log": str(log_path), "recent": tail,
             "ignored": {"count": ignored, "last": last_ignored}}

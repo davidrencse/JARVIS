@@ -84,6 +84,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class Client:
     def __init__(self, config, state, owner=False):
         self.config, self.state = config, Path(state)
+        # The real pairing lives in the checkout's .jarvis; under tests it would let an ask
+        # reach the live main and its ChatGPT brain (see jarvis/__init__.py).
+        if os.environ.get("JARVIS_NO_MODELS") == "1" and \
+                self.state.resolve() == (Path(__file__).resolve().parent.parent / ".jarvis").resolve():
+            raise PermissionError("Tests may not use this PC's real cluster credentials (JARVIS_NO_MODELS).")
         self.local, self.main = identity(config)
         self.url = endpoint(config)
         if owner:

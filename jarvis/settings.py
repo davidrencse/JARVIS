@@ -89,10 +89,35 @@ def read(config, state):
                       "kind": "number", "value": threshold, "min": VOICE_THRESHOLD[0],
                       "max": VOICE_THRESHOLD[1], "step": 0.01, "disabled": threshold is None})
     from .platforms import label
+    return {"fields": fields, "machines": machines(config, state), "this_os": label()}
+
+
+def machines(config, state):
+    """Every configured computer with its role, plus live link status when this PC is the
+    main: whether the node is paired, online, when it last checked in, and if it runs our code."""
+    from .topology import identity
     main = _get(config, "cluster.main_device")
-    machines = [{"id": key, "label": (d or {}).get("label") or key, "role": "main" if key == main else "node"}
-                for key, d in (config.get("devices") or {}).items()]
-    return {"fields": fields, "machines": machines, "this_os": label()}
+    try:
+        local = identity(config)[0]
+    except ValueError:
+        local = None
+    nodes, code = {}, None
+    if local and local == main and (Path(state) / "cluster.sqlite3").is_file():
+        from .cluster_store import Broker
+        from .deploy import code_fingerprint
+        nodes, code = {n["id"]: n for n in Broker(state).nodes()}, code_fingerprint()
+    out = []
+    for key, d in (config.get("devices") or {}).items():
+        item = {"id": key, "label": (d or {}).get("label") or key,
+                "role": "main" if key == main else "node", "this": key == local}
+        if key != main and (d or {}).get("transport") == "cluster" and local == main:
+            node = nodes.get(key)
+            item["paired"] = bool(node)
+            if node:
+                item.update(online=node["online"], seen=node["seen"],
+                            same_code=bool(node.get("code")) and node.get("code") == code)
+        out.append(item)
+    return out
 
 
 def _valid(config, path, value):

@@ -592,9 +592,22 @@ def _with_tools(lane, step, call):
         lane.on_tool = None
 
 
-def wake_word(text, words=("jarvis", "jervis", "jarvas", "javis")):
-    """Strip a leading wake word; None if absent. "Jervis" is Whisper mishearing 'Jarvis';
-    'Travis' is a real name, and "Jarvis's ..." is talking about JARVIS, not to it."""
-    match = re.match(r"^\W*(?:hey\s+|ok\s+|okay\s+)?(" + "|".join(words) +
-                     r")\b(?!['’]s\b)[\s,.!?:-]*(.*)", text, re.I | re.S)
-    return match.group(2).strip() if match else None
+WAKE_WORDS = ("jarvis", "jervis", "jarvas", "javis", "jarvus", "jarviss", "jarves")
+# Filler Whisper keeps before the name: "Hello, Jarvis, ...", "Okay so Jarvis ...".
+WAKE_LEAD = r"(?:(?:hey|hi|hello|yo|ok|okay|oh|so|um|uh|and|alright)[\s,.!?]+)*"
+
+
+def wake_word(text, words=WAKE_WORDS):
+    """Strip the wake word; None if absent. "Jervis" is Whisper mishearing 'Jarvis';
+    'Travis' is a real name, and "Jarvis's ..." is talking about JARVIS, not to it.
+    The name may open the request after a greeting, or close it after a comma or as a
+    question ("what time is it, Jarvis?" - Whisper often drops that comma); "I was talking
+    to Jarvis" is neither and doesn't count."""
+    names = "|".join(words)
+    match = re.match(r"^\W*" + WAKE_LEAD + r"(?:" + names + r")\b(?!['’]s\b)[\s,.!?:-]*(.*)",
+                     text, re.I | re.S)
+    if match:
+        return match.group(1).strip()
+    match = re.match(r"^\W*(.*?\w.*?)(?:\s*,\s*(?:" + names + r")\W*|\s+(?:" + names +
+                     r")\s*\?\W*)$", text, re.I | re.S)
+    return match.group(1).strip() if match else None

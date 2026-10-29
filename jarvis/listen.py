@@ -70,13 +70,66 @@ def segment(samples, noise_floor, start_ratio=3.0, min_speech=0.25, max_silence=
     return [(s * FRAME, e * FRAME) for s, e in segments if e - s >= keep]
 
 
-def _input_device(sd):
-    """On Linux, ALSA's "default" is the raw sound card unless pipewire-alsa is installed,
-    and a DSP mic read that way is pure silence. Go through PipeWire (or Pulse) instead."""
+def _input_device(sd, preferred=None):
+    """The mic chosen in voice setup if it is still plugged in. Otherwise, on Linux, ALSA's
+    "default" is the raw sound card unless pipewire-alsa is installed, and a DSP mic read
+    that way is pure silence. Go through PipeWire (or Pulse) instead."""
+    names = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
+    if preferred and preferred in names:
+        return preferred
     if os.name == "nt":
         return None
-    names = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
     return next((n for n in ("pipewire", "pulse") if n in names), None)
+
+
+def input_devices():
+    """Microphones the setup screen can offer. Raw ALSA hw: endpoints are left out on
+    Linux: on these laptops they are the DSP mic read around PipeWire, i.e. silence."""
+    try:
+        import sounddevice as sd
+    except ImportError:
+        raise RuntimeError(INSTALL_HINT) from None
+    seen, out = set(), []
+    for d in sd.query_devices():
+        name = d["name"]
+        if d["max_input_channels"] < 1 or name in seen or (os.name != "nt" and "(hw:" in name):
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+MIC_FILE = "mic.json"
+
+
+def mic_settings(state_dir):
+    """What voice setup measured for this machine's mic: the device, and the speech
+    cutoffs fitted to the room. {} before setup has run."""
+    try:
+        return json.loads((Path(state_dir) / "voice" / MIC_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_mic_settings(state_dir, data):
+    path = Path(state_dir) / "voice" / MIC_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def fit_cutoffs(noise_probs, speech_probs):
+    """Speech cutoffs for this mic and room, from Silero scores of quiet-room blocks and of
+    the owner speaking. Starting needs a score clearly above the room's noise; once speech
+    has started, a lower score holds it so soft word endings and short pauses aren't cut.
+    The start comes down for a quiet voice or a far mic, never below the room's own noise."""
+    np = _np()
+    noise = float(np.percentile(noise_probs, 95)) if len(noise_probs) else 0.0
+    voiced = [p for p in speech_probs if p > 0.1]
+    speech = float(np.percentile(voiced, 30)) if voiced else 1.0
+    start = min(START_CUTOFF, speech * 0.6)
+    start = round(min(0.6, max(start, noise + 0.12, 0.15)), 3)
+    hold = round(min(HOLD_CUTOFF, max(0.1, start * 0.45)), 3)
+    return start, hold
 
 
 def speech_threshold(floor_rms):
@@ -103,20 +156,32 @@ def _vad_model():
 
 _VAD = None
 VAD_CHUNK = 512  # 32 ms: the block size Silero VAD scores
+# Silero scored David's enrolled speech at a median of 0.97 and room noise under 0.04
+# (2026-10-29). A single 0.18 cutoff let TV and music open ~1,600 clips in two days;
+# starting at 0.4 and holding at 0.18 keeps soft speech without the junk.
+START_CUTOFF, HOLD_CUTOFF = 0.4, 0.18
 
 
 class _SpeechGate:
     """Is this block speech? Scores the newest block with ~1 s of context, so fans,
-    keyboards and room hum don't count the way they do for a loudness threshold."""
+    keyboards and room hum don't count the way they do for a loudness threshold.
+    Hysteresis: two blocks in a row above `start` engage it, then anything above `hold`
+    stays speech until a block falls below; a lone click never reaches the lower bar."""
 
-    def __init__(self, model, context=32, cutoff=0.18):
-        self.model, self.cutoff, self.recent = model, cutoff, []
-        self.context = context
+    def __init__(self, model, context=32, start=START_CUTOFF, hold=HOLD_CUTOFF):
+        self.model, self.start, self.hold, self.recent = model, start, min(hold, start), []
+        self.context, self.run, self.engaged, self.last = context, 0, False, 0.0
 
     def __call__(self, block):
         np = _np()
         self.recent = (self.recent + [block])[-self.context:]
-        return float(self.model(np.concatenate(self.recent)).reshape(-1)[-1]) > self.cutoff
+        self.last = p = float(self.model(np.concatenate(self.recent)).reshape(-1)[-1])
+        self.run = self.run + 1 if p > self.start else 0
+        if self.run >= 2:
+            self.engaged = True
+        elif p <= self.hold:
+            self.engaged = False
+        return p > self.start or (self.engaged and p > self.hold)
 
 
 def _collect(read, is_speech, block, max_seconds, max_silence, wait_seconds, min_voiced,
@@ -157,34 +222,40 @@ def _collect(read, is_speech, block, max_seconds, max_silence, wait_seconds, min
 
 
 def record_utterance(max_seconds=20, max_silence=0.8, calibrate=0.5, wait_seconds=None,
-                     min_voiced=0.2, mic=None):
+                     min_voiced=0.2, mic=None, tuning=None, gate=None):
     """Block until one spoken utterance ends; return float32 mono 16 kHz audio or None.
     Uses Silero VAD when faster-whisper is installed, else a loudness threshold.
-    `mic` is a LiveMic held open between calls; without one the mic opens per call."""
+    `mic` is a LiveMic held open between calls; without one the mic opens per call.
+    `tuning` is mic_settings() (device and cutoffs; a LiveMic carries its own), and
+    `gate` replaces the speech check outright (voice setup watches the scores)."""
     vad = _vad_model()
     block = VAD_CHUNK if vad else FRAME
+    tuning = tuning if tuning is not None else getattr(mic, "tuning", None) or {}
+    if vad and gate is None:
+        gate = _SpeechGate(vad, start=tuning.get("vad_start", START_CUTOFF),
+                           hold=tuning.get("vad_hold", HOLD_CUTOFF))
     if mic is not None:
-        return _utterance(mic.read, block, vad, max_seconds, max_silence, calibrate,
+        return _utterance(mic.read, block, gate, max_seconds, max_silence, calibrate,
                           wait_seconds, min_voiced)
     try:
         import sounddevice as sd
     except ImportError:
         raise RuntimeError(INSTALL_HINT) from None
     with sd.InputStream(samplerate=RATE, channels=1, dtype="float32", blocksize=block,
-                        device=_input_device(sd)) as stream:
+                        device=_input_device(sd, tuning.get("device"))) as stream:
         def read():
             return stream.read(block)[0][:, 0]
-        return _utterance(read, block, vad, max_seconds, max_silence, calibrate,
+        return _utterance(read, block, gate, max_seconds, max_silence, calibrate,
                           wait_seconds, min_voiced)
 
 
-def _utterance(read, block, vad, max_seconds, max_silence, calibrate, wait_seconds,
+def _utterance(read, block, gate, max_seconds, max_silence, calibrate, wait_seconds,
                min_voiced):
     np = _np()
-    if vad:
-        # Two positive blocks avoid triggering on a single click; the lower
+    if gate:
+        # Two positive blocks avoid triggering on a single click; the gate's low hold
         # cutoff and 384 ms of preroll catch quiet speech without clipping its start.
-        return _collect(read, _SpeechGate(vad), block, max_seconds, max_silence,
+        return _collect(read, gate, block, max_seconds, max_silence,
                         wait_seconds, min_voiced, onset=2, preroll=12)
     calibration = [read() for _ in range(max(1, int(calibrate * RATE / block)))]
     floor_rms = [float(np.sqrt(np.mean(chunk ** 2))) for chunk in calibration]
@@ -202,9 +273,11 @@ class LiveMic:
     clip of music or other voices too), so a "Jarvis" said then was lost or clipped.
     A PortAudio callback queues every block instead; at most `backlog` seconds wait."""
 
-    def __init__(self, backlog=15.0, stream=None):
+    def __init__(self, backlog=15.0, stream=None, tuning=None):
         import queue
         self._queue = queue
+        self.tuning = tuning or {}
+        self.level = 0.0  # RMS of the newest block, for the setup screen's meter
         self.block = VAD_CHUNK if _vad_model() else FRAME
         self.blocks = queue.Queue(maxsize=max(1, int(backlog * RATE / self.block)))
         if stream is None:
@@ -213,13 +286,15 @@ class LiveMic:
             except ImportError:
                 raise RuntimeError(INSTALL_HINT) from None
             stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
-                                    blocksize=self.block, device=_input_device(sd),
+                                    blocksize=self.block,
+                                    device=_input_device(sd, self.tuning.get("device")),
                                     callback=self._callback)
         self.stream = stream
         self.stream.start()
 
     def _callback(self, data, frames, time_info, status):
         chunk = data[:, 0].copy()
+        self.level = float((chunk ** 2).mean()) ** 0.5
         while True:
             try:
                 self.blocks.put_nowait(chunk)

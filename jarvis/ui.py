@@ -79,7 +79,7 @@ class Console:
         self._ears = self._stt = None
         self._voice_lock = threading.Lock()
         self.bus, self.watcher = Bus(), None
-        self._lane = self._speaker = self._agent = None
+        self._lane = self._speaker = self._agent = self._setup = None
         self._lane_lock = threading.Lock()
 
     # ---- live: event stream, warm brain, speech ---------------------------------------
@@ -785,16 +785,20 @@ class Console:
         with self._voice_lock:
             if self._stt is None:
                 self._stt, self._ears = Transcriber(self.config), VoicePrint(self.state, self.config)
-            owner, score = True, None
+            owner, score, near = True, None, False
             if verify and (self.state / "voice" / "voiceprint.json").is_file():
                 owner, score = self._ears.verify(audio)
-                if not owner and not wake:
-                    # Push-to-talk is a deliberate key press at this computer, so a near miss
-                    # (far from the mic, quieter) still counts, like the listener's "Jarvis" rule.
+                if not owner:
+                    # A near miss (far from the mic, quieter) counts for push-to-talk, a
+                    # deliberate key press here; always-on needs "Jarvis" too, like the listener.
                     from .daemon import BORDERLINE
-                    owner = score >= (self.config.get("voice") or {}).get("near_miss", BORDERLINE)
-            text = self._stt(audio) if owner else ""
+                    near = score >= (self.config.get("voice") or {}).get("near_miss", BORDERLINE)
+                    owner = near and not wake
+            text = self._stt(audio) if owner or near else ""
         request = wake_word(text)
+        if near and wake:
+            owner = request is not None
+            text = text if owner else ""
         heard = {"owner": owner, "score": score, "addressed": request is not None,
                  "device": getattr(self._stt, "device", None), "seconds": seconds}
         if request is not None and listener:
@@ -917,6 +921,24 @@ class Console:
             result["job"] = self.submit(result.pop("ask"))
         self.bus.publish("grokbot.command", {k: v for k, v in result.items() if k != "job"})
         return result
+
+    def voice_setup(self):
+        """The guided mic check + enrollment (onboard.py), one per console."""
+        with self._lane_lock:
+            if self._setup is None:
+                from .onboard import VoiceSetup
+                self._setup = VoiceSetup(self.state, self.config)
+            return self._setup
+
+    def voice_setup_action(self, body):
+        setup, action = self.voice_setup(), body.get("action")
+        if action == "start":
+            return setup.start(body.get("device") or None)
+        if action == "cancel":
+            return setup.cancel()
+        if action == "autostart":
+            return setup.autostart(bool(body.get("on")))
+        raise ValueError("action must be start, cancel or autostart.")
 
     def daemon(self, action):
         from . import daemon
@@ -1095,6 +1117,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/memory/item": lambda: c.memory.get(query.get("id", "")),
             "/api/route": lambda: c.route(query.get("text", ""), query.get("tier") or None),
             "/api/voice": lambda: c.daemon("status"),
+            "/api/voice/setup": lambda: c.voice_setup().status(),
+            "/api/voice/devices": lambda: {"devices": c.voice_setup().devices()},
             "/api/settings": lambda: __import__("jarvis.settings", fromlist=["read"]).read(c.config, c.state),
             "/api/agent": lambda: c.agent().status(),
             "/api/agent/voices": lambda: c.agent().voices(refresh=query.get("refresh") == "1"),
@@ -1196,6 +1220,8 @@ class Handler(BaseHTTPRequestHandler):
                                                           body.get("case") or None))
             if url.path == "/api/voice":
                 return self._send(HTTPStatus.OK, c.daemon(body.get("action")))
+            if url.path == "/api/voice/setup":
+                return self._send(HTTPStatus.OK, c.voice_setup_action(body))
             if url.path == "/api/settings":
                 from .settings import write
                 return self._send(HTTPStatus.OK, write(c.config, c.base / "jarvis.config.json",
