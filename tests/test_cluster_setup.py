@@ -106,6 +106,9 @@ class SetupTests(unittest.TestCase):
         stored = self.tmp / "invite.txt"
         stored.write_text(code + "\n", encoding="utf-8")
         self.assertEqual(cluster_setup.decode(str(stored))["x"], 1)
+        written = self.tmp / "dell.invite"  # what invite --output writes
+        written.write_text(json.dumps({"code": code}), encoding="utf-8")
+        self.assertEqual(cluster_setup.decode(str(written))["x"], 1)
         self.assertIsNone(cluster_setup.decode('{"node_id": "dell"}'))  # an old pairing bundle
         with self.assertRaises(ValueError):
             cluster_setup.decode(code[:-6])
