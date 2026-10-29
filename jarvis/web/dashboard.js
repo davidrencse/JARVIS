@@ -55,6 +55,22 @@
   on("view", onView);
   addEventListener("resize", placeDock);
 
+  // The assistant column is sticky: below the header at rest, 22px from the top once the
+  // page scrolls. Size it from where it sits now so the prompt never runs off the bottom.
+  const side = $(".cx-side");
+  let fitting = 0;
+  function fitSide() {
+    fitting = 0;
+    if (!side || !side.offsetParent || getComputedStyle(side).position !== "sticky") return;
+    const top = Math.max(side.getBoundingClientRect().top, 22);
+    side.style.setProperty("--side-h", Math.max(420, Math.floor(innerHeight - top - 16)) + "px");
+  }
+  const queueFit = () => { if (!fitting) fitting = requestAnimationFrame(fitSide); };
+  addEventListener("resize", queueFit);
+  addEventListener("scroll", queueFit, { capture: true, passive: true });
+  on("view", queueFit);
+  queueFit();
+
   // ---------- header pills ----------
   $("#hero-search").addEventListener("submit", (e) => {
     e.preventDefault();

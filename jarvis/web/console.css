@@ -216,7 +216,7 @@ body { background: var(--bg); font: 400 14px/1.5 var(--sans); }
 #view-console button, #view-console input, #view-console .field { border-radius: 2px; }
 
 /* ---------- assistant: a column on the right, scrolling on its own ---------- */
-.cx-side { grid-column: 2; grid-row: 1; position: sticky; top: 22px; height: calc(100dvh - 120px); min-height: 420px; max-height: none; display: flex; flex-direction: column;
+.cx-side { grid-column: 2; grid-row: 1; position: sticky; top: 22px; height: var(--side-h, calc(100dvh - 145px)); min-height: 420px; max-height: none; display: flex; flex-direction: column;
   border-top: 0; border-left: 1px solid var(--line); padding: 0 0 0 22px; color: var(--ink); }
 .cx-side .ph { padding-top: 10px; border-top: 1px solid var(--line-2); }
 .cx-side .thread { flex: 1; min-height: 0; overflow: auto; gap: 14px; }
@@ -236,6 +236,7 @@ body { background: var(--bg); font: 400 14px/1.5 var(--sans); }
 .cx-side .seg button { height: 24px; padding: 0 9px; border-radius: 1px; font: 400 12px var(--mono); }
 .cx-side #prompt { height: 40px; padding: 10px 12px; border-radius: 2px; font: 400 13.5px var(--sans); background: none; border-color: var(--line-2); }
 .cx-side #prompt:focus { border-color: var(--ink-3); outline: 0; }
+.cx-side #prompt::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .cx-side .send { width: 40px; height: 40px; border-radius: 2px; }
 .cx-side .trace { font: 400 11.5px var(--mono); }
 
@@ -247,7 +248,7 @@ body { background: var(--bg); font: 400 14px/1.5 var(--sans); }
 }
 @media (max-width: 1080px) {
   .cx { grid-template-columns: minmax(0, 1fr); gap: 32px; }
-  .cx-side { grid-column: 1; grid-row: auto; position: relative; top: 0; height: 70dvh; order: -1; border-left: 0; padding-left: 0; }
+  .cx-side { grid-column: 1; grid-row: auto; position: relative; top: 0; height: 70dvh !important; order: -1; border-left: 0; padding-left: 0; }
 }
 @media (max-width: 720px) {
   .cx-grid, #view-console .signals { grid-template-columns: minmax(0, 1fr); }

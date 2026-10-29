@@ -276,10 +276,13 @@
       `<span class="chip">${icon("audio-lines")} ${o.voice.voiceprint ? "voiceprint enrolled" : "no voiceprint"}</span>`,
     ].join("");
     lastOverview = Date.now();
-    $("#listener-log").innerHTML = (o.voice.recent || []).filter((l) => !/ignored another voice/.test(l)).slice(-5).map((l) => {
+    const heardLines = (o.voice.recent || []).filter((l) => !/ignored another voice/.test(l)).slice(-5).map((l) => {
       const m = l.match(/^(\S+ \S+)\s+(.*)$/); const text = m ? m[2] : l;
       return `<div title="${esc(l)}"><b>${esc(m ? m[1].slice(11, 16) : "")}</b> ${esc(text)}</div>`;
-    }).join("") || "Listener log is empty.";
+    }).join("");
+    const ign = o.voice.ignored || {};
+    const ignLine = ign.count ? `<div class="muted" title="Voices that didn't match your voiceprint are dropped unread">${ign.count} other voice${ign.count === 1 ? "" : "s"} ignored${ign.last ? ` · last ${esc(ign.last.slice(11, 16))}` : ""}</div>` : "";
+    $("#listener-log").innerHTML = heardLines + ignLine || (o.voice.listening ? "Listening. Nothing heard yet; start with “Jarvis…”." : "Listener is off.");
     const auto = $(".dock [data-tier='']");
     auto.title = o.routing.auto_escalate ? "Let the router pick from your words" : `Conversation: the ${o.brain?.name || "ChatGPT"} brain answers. Pick Tools or Plan for more.`;
     renderRouter(o); renderMachines(o); renderHeapFacts(o);
@@ -632,7 +635,7 @@
     const role = (d) => [d.here ? "this device" : null, d.role === "main" ? "main" : d.role === "node" ? "node" : null].filter(Boolean).join(" · ");
     const targets = o.devices.filter((d) => d.send);
     const pick = targets.find((d) => d.id === store.get("jarvis.dropdevice", "")) || targets[0];
-    $("#devices-grid").innerHTML = o.devices.map((d) => `<article class="panel ticks">
+    $("#devices-grid").innerHTML = screenPanel(o) + o.devices.map((d) => `<article class="panel ticks">
         <header class="ph">${icon("laptop-minimal")}<h2>${esc(d.id)}</h2>${role(d) ? `<span class="state-word">${esc(role(d))}</span>` : ""}${liveWord(live[d.id])}<span class="ph-meta mono">${state.probe ? "checked " + ago(state.probe.checked_at) : ""}</span></header>
         ${liveFacts(live[d.id])}
         <h3>${esc(d.label || d.model || d.hostname || d.id)}</h3><p class="lede">${[d.hostname, d.platform, d.transport].filter(Boolean).map(esc).join(" · ")}</p>
@@ -653,53 +656,86 @@
         : `<p class="muted">No other device is reachable over SSH from here. Give one <span class="mono">"transport": "ssh"</span> and a <span class="mono">target</span> in jarvis.config.json to send files to it.</p>`}</article>` +
       `<article class="panel ticks"><header class="ph">${icon("activity")}<h2>Personal agents</h2></header>
         <dl class="facts mono">${Object.entries(o.agents).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(words(v.integration))} · ${esc(linkState(v.status)[0])}</dd>`).join("")}</dl>
-        <p class="muted" style="font-size:12.5px;margin-top:12px">From personal_agents in jarvis.config.json. Grokbot is driven through its window (below); the others get a JARVIS adapter once their interface is known.</p></article>` +
-      `<article class="panel ticks"><header class="ph">${icon("radio")}<h2>Command Grokbot &amp; JARVIS</h2><span class="ph-meta mono" id="gb-state">checking…</span></header>
-        <form class="gb-form" id="gb-form" autocomplete="off">
-          <select class="field" id="gb-mode" aria-label="Who does it">
-            <option value="grokbot">Grokbot: do it</option><option value="grokbot-browser">Grokbot: in its browser</option>
-            <option value="jarvis-browser">JARVIS: in its browser</option><option value="browser">Open JARVIS browser at…</option>
-            <option value="terminal">Open terminal, run…</option></select>
-          <select class="field" id="gb-device" aria-label="Which device's Grokbot"></select>
-          <textarea class="field" id="gb-text" rows="2" placeholder="What to do (Ctrl+Enter sends). /terminal htop · /browser github.com · /jarvis … · /grok …"></textarea>
-          <button class="btn" type="submit">Send</button></form>
-        <ul class="drop-log mono" id="gb-log" aria-live="polite"></ul>
-        <p class="muted" style="font-size:12px;margin-top:12px">Grokbot has no API: JARVIS focuses its window, pastes and presses Enter, then hands focus and clipboard back. Grokbot on another device is reached through the cluster or SSH. Terminal and browser open on this device.</p></article>`;
-    wireDropzone(); wireGrokbot();
+        <p class="muted" style="font-size:12.5px;margin-top:12px">From personal_agents in jarvis.config.json. Grokbot is driven through its window; the others get a JARVIS adapter once their interface is known.</p></article>`;
+    wireDropzone(); wireScreen();
   }
 
-  // ---------- Grokbot, terminal and browser commands ----------
-  async function wireGrokbot() {
-    const form = $("#gb-form"); if (!form) return;
-    const text = $("#gb-text"), mode = $("#gb-mode"), dev = $("#gb-device"), log = $("#gb-log"), st = $("#gb-state");
-    // Terminal and browser always open here; only Grokbot prompts can go to another device.
-    const sync = () => { dev.disabled = !mode.value.startsWith("grokbot"); };
-    mode.addEventListener("change", sync);
-    mode.value = store.get("jarvis.gbmode", "grokbot");
-    mode.addEventListener("change", () => store.set("jarvis.gbmode", mode.value));
-    dev.addEventListener("change", () => store.set("jarvis.gbdevice", dev.value));
-    const line = (msg, cls) => { const li = document.createElement("li"); li.className = cls || ""; li.textContent = msg; log.prepend(li); return li; };
-    api("/api/grokbot").then((g) => {
-      st.textContent = !g.installed ? "not installed" : [g.window ? "window open" : "not running", g.daemon ? "daemon up" : "daemon down", g.can_send ? null : "can't type here"].filter(Boolean).join(" · ");
-      st.title = g.why_not || `terminal: ${g.terminal || "none"} · browser: ${g.browser || "none"} · computer use ${g.computer_use ? "on" : "off"}`;
-      dev.innerHTML = (g.devices || []).map((d) => `<option value="${esc(d.id)}" ${d.ok ? "" : "disabled"} title="${esc(d.why_not || "")}">Grokbot on ${esc(d.id)}${d.here ? " (this device)" : d.ok ? "" : " — no route"}</option>`).join("");
-      dev.value = (g.devices || []).find((d) => d.id === store.get("jarvis.gbdevice", ""))?.ok ? store.get("jarvis.gbdevice", "") : (g.here || "");
-      sync();
-    }).catch((e) => { st.textContent = e.message; });
-    text.addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); form.requestSubmit(); } });
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const li = line(`${mode.selectedOptions[0].text} ${text.value.trim()}`.trim() + " …", "pending");
-      try {
-        const r = await api("/api/grokbot", { text: text.value, mode: mode.value, device: dev.value || undefined });
-        li.textContent = r.preflight ? r.reply
-          : r.mode === "terminal" ? `Terminal (${r.terminal})${r.command ? ": " + r.command : ""}`
-          : r.mode === "browser" ? `JARVIS browser${r.url ? ": " + r.url : ""}`
-          : r.mode === "jarvis-browser" ? `JARVIS is on it (reply in the console)`
-          : `Typed to Grokbot on ${r.device}${r.workspace ? " (workspace " + r.workspace + ")" : ""}`;
-        li.className = "ok"; announce(li.textContent); text.value = "";
-      } catch (err) { li.textContent = err.message; li.className = "bad"; }
-    });
+  // ---------- screens ----------
+  // Read-only snapshots through the `screen` desktop action. Each device keeps its last
+  // picture; Live re-takes one every few seconds while Devices is open and the tab visible.
+  const screenView = { device: store.get("jarvis.scrdevice", ""), live: false, shots: {}, busy: new Set(), error: "", timer: 0, seen: false };
+  function screenPanel(o) {
+    const d = o.devices.find((x) => x.id === screenView.device) || o.devices.find((x) => !x.here) || o.devices[0];
+    if (!d) return "";
+    screenView.device = d.id;
+    return `<article class="panel ticks screen-panel"><header class="ph">${icon("monitor")}<h2>Screens</h2><span class="ph-meta mono">view only</span></header>
+      <div class="scr-bar">
+        <div class="scr-tabs" role="tablist" aria-label="Whose screen">${o.devices.map((x) =>
+          `<button type="button" role="tab" data-dev="${esc(x.id)}" aria-selected="${x.id === d.id}">${icon("laptop-minimal")}<span>${esc(x.id)}</span>${x.here ? `<small>this device</small>` : ""}</button>`).join("")}</div>
+        <div class="scr-actions">
+          <button class="scr-btn" type="button" id="scr-live" aria-pressed="${screenView.live}"><i aria-hidden="true"></i>Live</button>
+          <button class="scr-btn" type="button" id="scr-refresh">${icon("refresh-cw")}<span>Snapshot</span></button>
+          <button class="scr-btn" type="button" id="scr-full" aria-label="Full screen">${icon("arrow-up-right")}</button></div></div>
+      <div class="scr-frame" id="scr-frame"></div></article>`;
+  }
+  function paintScreen() {
+    const frame = $("#scr-frame"); if (!frame) return;
+    const shot = screenView.shots[screenView.device];
+    const busy = screenView.busy.has(screenView.device);
+    frame.classList.toggle("busy", busy);
+    frame.innerHTML = (shot ? `<img src="${shot.url}" alt="Screen of ${esc(screenView.device)}">` : "") +
+      (screenView.error ? `<div class="scr-empty"><b>Couldn't get ${esc(screenView.device)}'s screen</b><p>${esc(screenView.error)}</p><button class="scr-btn" type="button" data-scr-snap>Try again</button></div>`
+        : !shot ? `<div class="scr-empty">${busy ? `<b>Capturing ${esc(screenView.device)}…</b>`
+          : `<b>${esc(screenView.device)}</b><button class="scr-btn" type="button" data-scr-snap>${icon("monitor")}<span>Show its screen</span></button>`}</div>` : "") +
+      (shot ? `<span class="scr-stamp mono">${screenView.live ? `<i aria-hidden="true"></i>` : ""}${esc(screenView.device)} · ${esc(shot.at)}${shot.w ? ` · ${shot.w}×${shot.h}` : ""}${busy ? " · updating…" : ""}</span>` : "");
+    frame.querySelector("[data-scr-snap]")?.addEventListener("click", snapScreen);
+  }
+  async function snapScreen() {
+    const device = screenView.device;
+    if (screenView.busy.has(device)) return;
+    screenView.busy.add(device); screenView.error = ""; paintScreen();
+    try {
+      const res = await fetch("/api/screen?device=" + encodeURIComponent(device));
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `HTTP ${res.status}`);
+      // A data: URL, not blob: — the console's CSP allows only 'self' and data: images.
+      const blob = await res.blob();
+      const url = await new Promise((ok, fail) => { const r = new FileReader(); r.onload = () => ok(r.result); r.onerror = () => fail(r.error); r.readAsDataURL(blob); });
+      const img = new Image(); img.src = url;
+      await img.decode().catch(() => { throw new Error("The picture that came back can't be shown."); });
+      screenView.shots[device] = { url, at: new Date().toLocaleTimeString(), w: img.naturalWidth, h: img.naturalHeight };
+    } catch (e) {
+      if (device === screenView.device) screenView.error = e.message;
+      setLive(false);
+    } finally {
+      screenView.busy.delete(device);
+      if (device === screenView.device) paintScreen();
+    }
+  }
+  function setLive(on) {
+    screenView.live = on; clearTimeout(screenView.timer);
+    $("#scr-live")?.setAttribute("aria-pressed", String(on));
+    if (!on) return paintScreen();
+    const tick = async () => {
+      if (!screenView.live) return;
+      if (!$("#view-devices").hidden && document.visibilityState === "visible") await snapScreen();
+      if (screenView.live) screenView.timer = setTimeout(tick, 3000);
+    };
+    tick();
+  }
+  function wireScreen() {
+    if (!$("#scr-frame")) return;
+    paintScreen();
+    $$(".scr-tabs button").forEach((b) => b.addEventListener("click", () => {
+      if (b.dataset.dev === screenView.device) return;
+      screenView.device = b.dataset.dev; screenView.error = ""; store.set("jarvis.scrdevice", b.dataset.dev);
+      $$(".scr-tabs button").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
+      paintScreen(); snapScreen();
+    }));
+    $("#scr-refresh").addEventListener("click", snapScreen);
+    $("#scr-live").addEventListener("click", () => setLive(!screenView.live));
+    $("#scr-full").addEventListener("click", () => $("#scr-frame").requestFullscreen?.().catch(() => {}));
+    // First visit to Devices: show the chosen screen without waiting for a click.
+    if (!screenView.seen && !$("#view-devices").hidden) { screenView.seen = true; snapScreen(); }
   }
 
   // Files go over the existing SSH link: a drag can't cross from one OS's desktop to another's.
