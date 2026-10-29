@@ -240,6 +240,17 @@ first words..." means your voice was accepted but the transcript didn't start wi
 `jarvis voice test` prints live scores; `jarvis voice recalibrate` rebuilds the print from
 the saved clips; `jarvis voice enroll` records new ones (do this on a new mic or machine).
 
+Voice setup (`onboard.py`, Settings > Voice, or opens by itself when a machine has no
+voiceprint): JARVIS speaks each cue while the server records through the listener's own mic
+path. It checks two seconds of room (a mic sending pure silence fails here), measures a
+"Hey Jarvis, can you hear me?" to fit the Silero start/hold cutoffs to this mic and room
+(`.jarvis/voice/mic.json`, with the chosen device), enrolls the seven phrases into
+`enroll.new/` (swapped in only on success, so cancelling changes nothing), scores one test
+phrase, then restarts the listener. The listener is paused for the run. On a node the
+console answers `/api/voice/setup` itself: a voiceprint belongs to the mic it came from.
+The speech gate starts at 0.4 and holds at 0.18 by default (hysteresis); "ignored another
+voice (…, near miss)" marks clips that scored above `near_miss` but lacked the wake word.
+
 ## 7 Models and cost
 
 | Path | Tokens | Engine |

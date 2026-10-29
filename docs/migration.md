@@ -6,7 +6,7 @@
    tar-synced by the cluster deployer, so it isn't a clean git tree. Either
    `mv ~/projects/JARVIS ~/projects/JARVIS.old && git clone <remote> ~/projects/JARVIS`, or
    inside it `git fetch && git reset --hard origin/main` (a backup `.tgz` already exists).
-3. **Python deps:** create a venv and `pip install -e .` (pyproject.toml); the MiniLM ONNX model downloads on first semantic use.
+3. **Python deps:** create a venv and `pip install -e .` (pyproject.toml); JARVIS never downloads at run time, so fetch the MiniLM ONNX model once: `python -c "from huggingface_hub import hf_hub_download as d; M='sentence-transformers/all-MiniLM-L6-v2'; d(M,'onnx/model.onnx'); d(M,'tokenizer.json')"`. Without it the decider and semantic memory silently stay off.
 4. **State for continuity:** done on 2026-10-26. Consistent snapshots (SQLite backup API,
    safe while running) of the Dell's `memory.sqlite3` and `history.sqlite3` are on the
    Zenbook in `~/projects/JARVIS/.jarvis/from-dell/`. When the Zenbook becomes main, stop

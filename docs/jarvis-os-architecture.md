@@ -719,7 +719,3 @@ back to SSH within ~10 s instead of a 45 s timeout. "online" (75 s) only means s
 the tunnel cycled through its targets and recovered over Tailscale (48 s offline; next action
 observed in 0.6 s). Fixed on the way: the tunnel worker died when its status file was read
 during a write (Windows refuses the replace); writes now retry and skip instead.
-
-**Known gap:** once on Tailscale the tunnel stays there until that link drops, even when the
-LAN is back. A periodic LAN retry would save a hop.
-
