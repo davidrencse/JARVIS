@@ -23,6 +23,8 @@
   let loading = false, confirmFor = "", confirmT;
   const pending = new Set();
   const restart = new Set();
+  const savedAt = new Map();   // path -> ms of last successful save, for the inline "Saved" tag
+  let voiceInfo = null;        // /api/voice/setup, for the Voice status line
 
   async function api(path, body) {
     const opts = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-JARVIS": "1" }, body: JSON.stringify(body) };
@@ -66,9 +68,10 @@
 
   function rowHtml(f) {
     const help = f.disabled && f.path === "voiceprint.threshold" ? "Enroll your voice first: jarvis voice enroll." : f.help;
-    return `<div class="st-row" data-path="${esc(f.path)}" data-kind="${f.kind}"${f.disabled ? ' data-disabled="1"' : ""}>
-      <div class="st-label"><b>${esc(f.label)}</b>${help ? `<small>${esc(help)}</small>` : ""}<span class="st-err" role="alert" hidden></span></div>
-      <div class="st-ctl">${control(f)}</div></div>`;
+    const rs = restart.has(f.path), fresh = Date.now() - (savedAt.get(f.path) || 0) < 2500;
+    return `<div class="st-row" data-path="${esc(f.path)}" data-kind="${f.kind}"${f.disabled ? ' data-disabled="1"' : ""}${rs ? ' data-restart="1"' : ""}>
+      <div class="st-label"><b>${esc(f.label)}${rs ? '<span class="st-badge st-badge-warn">Restart needed</span>' : ""}</b>${help ? `<small>${esc(help)}</small>` : ""}<span class="st-err" role="alert" hidden></span></div>
+      <div class="st-ctl"><span class="st-state" role="status">${pending.has(f.path) ? "Saving" : fresh ? "Saved" : ""}</span>${control(f)}</div></div>`;
   }
 
   function sectionHtml(sec, fs) {
@@ -91,6 +94,58 @@
       box.innerHTML = sectionHtml(sec, fs);
     }
     renderMachines();
+    renderStats();
+    applyFilter();
+  }
+
+  const chip = (t, tone) => `<span class="st-chip"${tone ? ` data-tone="${tone}"` : ""}><i aria-hidden="true"></i>${esc(t)}</span>`;
+  const fieldText = (f) => {
+    if (!f || f.value == null) return "";
+    const c = (f.choices || []).map((x) => (x && typeof x === "object" ? x : { value: x, label: NAMES[x] || x })).find((x) => String(x.value) === String(f.value));
+    return c ? String(c.label) : f.kind === "bool" ? (f.value ? "on" : "off") : f.kind === "number" ? fmt(f, f.value) : String(f.value);
+  };
+  function renderStats() {
+    const put = (sec, html) => { const b = $("#st-stat-" + sec); if (b) b.innerHTML = html; };
+    const ms = state.machines || [], main = ms.find((m) => m.role === "main");
+    const nodes = ms.filter((m) => m.role !== "main"), on = nodes.filter((m) => m.online).length;
+    const tun = byPath("cluster.tunnel");
+    put("machines", main ? chip("main " + (main.label || main.id), "ok") + chip(nodes.length ? `${on}/${nodes.length} nodes online` : "no nodes", nodes.length && on < nodes.length ? "warn" : "") + (tun ? chip("tunnel " + fieldText(tun).toLowerCase()) : "") : chip("no computers configured", "warn"));
+    const v = voiceInfo;
+    put("voice", !v ? chip("status unavailable") : chip(v.enrolled ? "enrolled" : "not enrolled", v.enrolled ? "ok" : "warn") + chip(v.listening ? "listening" : "listener off", v.listening ? "ok" : "") + (v.mic?.device ? chip(v.mic.device) : ""));
+    const vs = $("#voice-select");
+    put("calls", chip("this browser only") + (vs && vs.selectedOptions[0] ? chip("voice " + vs.selectedOptions[0].textContent) : ""));
+    for (const sec of ["intelligence", "memory"]) {
+      const fs = state.fields.filter((f) => f.section === sec && !HIDDEN.has(f.path)).slice(0, 3);
+      put(sec, fs.map((f) => chip(f.label.toLowerCase() + " " + fieldText(f))).join(""));
+    }
+    put("input", chip("read-only") + chip("Lan Mouse"));
+    tabs.forEach((t) => {
+      const has = state.fields.some((f) => f.section === t.dataset.sec && restart.has(f.path));
+      t.classList.toggle("st-has-restart", has);
+    });
+  }
+
+  // Filter every section's rows by label/help text; sections with no hit are hidden.
+  function applyFilter() {
+    const q = ($("#st-search")?.value || "").trim().toLowerCase();
+    const panels = [...view.querySelectorAll(".st-panel")];
+    view.classList.toggle("st-filtering", !!q);
+    let total = 0;
+    for (const p of panels) {
+      let hits = 0;
+      p.querySelectorAll(".st-row, .st-block, .st-point").forEach((r) => {
+        const ok = !q || r.textContent.toLowerCase().includes(q) || (r.dataset.path || "").includes(q);
+        r.hidden = !ok; if (ok) hits++;
+      });
+      p.querySelectorAll(".st-sub").forEach((h) => { h.hidden = !!q; });
+      p.dataset.hits = hits; total += hits;
+    }
+    const cur = tabs.find((t) => t.getAttribute("aria-selected") === "true")?.dataset.sec;
+    panels.forEach((p) => { p.hidden = q ? !+p.dataset.hits : p.dataset.sec !== cur; });
+    tabs.forEach((t) => { const p = $("#st-panel-" + t.dataset.sec); t.dataset.hits = q ? p.dataset.hits : ""; });
+    const nm = $("#st-nomatch");
+    nm.hidden = !q || total > 0; nm.textContent = q && !total ? `No settings match “${q}”.` : "";
+    view.querySelectorAll(".st-adv").forEach((d) => { if (q && d.querySelector(".st-row:not([hidden])")) d.open = true; });
   }
 
   function machineStatus(m) {
@@ -130,14 +185,18 @@
   async function save(path, value, prev) {
     if (pending.has(path)) return;
     pending.add(path);
-    const row = rowOf(path); if (row) row.dataset.busy = "1";
+    const row = rowOf(path); if (row) { row.dataset.busy = "1"; const s = $(".st-state", row); if (s) s.textContent = "Saving"; }
     fieldErr(path, "");
     const f = byPath(path); if (f) f.value = value;
     let failed = "";
     try {
       const d = await api("/api/settings", { changes: { [path]: value } });
-      applyState(d);
+      // Before applyState: it redraws the rows, and the row reads "Saved" from savedAt.
+      savedAt.set(path, Date.now()); pending.delete(path);
       (d.restart || []).forEach((p) => restart.add(p));
+      applyState(d);
+      // A newer save of this row restarts the 2.5 s; an older timer must not clear its "Saved".
+      setTimeout(() => { if (!pending.has(path) && Date.now() - (savedAt.get(path) || 0) >= 2500) { const r = rowOf(path); const s = r && $(".st-state", r); if (s) s.textContent = ""; } }, 2600);
       toast("Saved");
     } catch (e) {
       failed = "Not saved: " + e.message;
@@ -217,7 +276,7 @@
       await api("/api/voice", { action: "stop" });
       await api("/api/voice", { action: "start" });
       [...restart].filter((p) => p.startsWith("voice")).forEach((p) => restart.delete(p));
-      toast("Voice listener restarted"); showNotice();
+      toast("Voice listener restarted"); showNotice(); render(); loadVoice();
     } catch (err) { btn.disabled = false; btn.textContent = "Restart voice listener"; toast("Restart failed: " + err.message); }
   }
 
@@ -227,6 +286,7 @@
     tabs.forEach((t) => { const on = t.dataset.sec === sec; t.setAttribute("aria-selected", on); t.tabIndex = on ? 0 : -1; if (on && focus) t.focus(); });
     view.querySelectorAll(".st-panel").forEach((p) => { p.hidden = p.dataset.sec !== sec; });
     view.querySelectorAll(".st-slider input").forEach(fill);
+    applyFilter();
     try { localStorage.setItem("jarvis.settings.sec", sec); } catch (e) {}
   }
   tabs.forEach((t) => t.addEventListener("click", () => select(t.dataset.sec)));
@@ -239,9 +299,25 @@
     if (n >= 0) { e.preventDefault(); select(tabs[n].dataset.sec, true); }
   });
 
+  async function loadVoice() {
+    try { voiceInfo = await api("/api/voice/setup"); } catch (e) { voiceInfo = null; }
+    renderStats();
+  }
+  const search = $("#st-search");
+  search.addEventListener("input", applyFilter);
+  search.addEventListener("keydown", (e) => { if (e.key === "Escape" && search.value) { search.value = ""; applyFilter(); e.stopPropagation(); } });
+  document.addEventListener("keydown", (e) => {
+    if (view.hidden || e.key !== "/" || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.target.closest("input, textarea, select, [contenteditable]")) return;
+    e.preventDefault(); search.focus();
+  });
+  // Calls rows are static markup: keep their status chips in step.
+  view.addEventListener("change", (e) => { if (e.target.id === "voice-select") renderStats(); });
+  document.addEventListener("voicesetup:closed", loadVoice);
+
   async function load() {
     if (loading) return; loading = true;
-    try { applyState(await api("/api/settings")); render(); }
+    try { applyState(await api("/api/settings")); render(); loadVoice(); }
     catch (e) {
       const msg = '<p class="st-empty">Couldn’t load settings: ' + esc(e.message) + ' <button type="button" class="st-btn" data-retry>Retry</button></p>';
       SECS.forEach((s) => { const b = $("#st-rows-" + s); if (b) b.innerHTML = msg; });

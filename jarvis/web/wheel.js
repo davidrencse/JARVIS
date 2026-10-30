@@ -139,7 +139,8 @@
   // ---------- drawing ----------
   function frame(now) {
     pending = false;
-    if (!G) return;
+    // A hidden or collapsed canvas lays out with no room for the ring: arc() would throw.
+    if (!G || G.r < 4) return;
     const c = ctx, time = (now - t0) / 1000;
     c.setTransform(dpr, 0, 0, dpr, 0, 0);
     c.globalAlpha = 1;

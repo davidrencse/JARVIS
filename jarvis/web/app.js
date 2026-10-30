@@ -341,69 +341,8 @@
     } else if (live.error) rows.push(["Error", live.error]);
     return `<dl class="facts mono live-facts">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>`;
   }
-  function renderInputSettings() {
-    const checked = $("#input-settings-checked"), status = $("#input-settings-status");
-    const facts = $("#input-settings-facts"), lines = $("#input-settings-lines");
-    const p = state.probe, input = state.overview?.desktop?.input || {};
-    if (!p) {
-      checked.textContent = "Checking connection";
-      status.textContent = "Checking";
-      status.dataset.level = "checking";
-      renderPeripheralInventory();
-      return;
-    }
-    const level = p.input_link?.level || "down";
-    status.textContent = level === "up" ? "Services online" : level === "warn" ? "Needs attention" : "Connection unavailable";
-    status.dataset.level = level;
-    checked.textContent = "Checked " + ago(p.checked_at);
-    lines.innerHTML = (p.input_link?.lines || ["No input status was returned."]).map((line) => `<li>${esc(line)}</li>`).join("");
-
-    const devices = Object.entries(p.devices || {});
-    const inventory = state.overview?.devices || [];
-    const nameFor = (id) => {
-      const item = inventory.find((device) => device.id === id);
-      return item?.hostname || item?.label || words(id) || "Device";
-    };
-    const serviceFor = (device) => {
-      if (!device) return "Not configured";
-      const value = device[1], lm = value.lan_mouse || {};
-      if (value.local) return lm.running ? `Running · ${lm.listening ? `UDP ${input.port || 4242} listening` : "socket not detected"}` : "Not running";
-      if (value.via === "node") return value.reachable ? "Online · input sharing not reported by nodes" : "Offline";
-      if (!value.ssh) return value.reachable ? "SSH unavailable" : "Unreachable";
-      return lm.running ? `${lm.fallback === "active" ? "Fallback build" : "Running"} · ${lm.listening ? `UDP ${input.port || 4242} listening` : "socket not detected"}` : "Not running";
-    };
-    const rows = devices.map(([id, value]) => {
-      const item = inventory.find((device) => device.id === id);
-      const edge = input.layout?.[id];
-      const facts = [
-        ["Lan Mouse", serviceFor([id, value])],
-        ["Screen edge", edge || (value.local ? "This is the local screen" : "No edge configured")],
-      ];
-      if (value.lan_mouse?.peers?.length) facts.push(["Peers", value.lan_mouse.peers.join(", ")]);
-      return `<section class="input-device" aria-label="${esc(nameFor(id))}">
-        <header><b>${esc(nameFor(id))}</b><span>${value.local ? "Local" : esc(item?.transport || "Remote")}</span></header>
-        <dl>${facts.map(([label, text]) => `<div><dt>${esc(label)}</dt><dd>${esc(text)}</dd></div>`).join("")}</dl>
-      </section>`;
-    });
-    if (Array.isArray(input.peripherals) && input.peripherals.length) {
-      rows.push(...input.peripherals.map((peripheral) => {
-        const title = peripheral.name || peripheral.label || peripheral.type || "Peripheral";
-        const host = peripheral.device || peripheral.host || peripheral.computer;
-        return `<section class="input-device" aria-label="${esc(title)}">
-          <header><b>${esc(title)}</b><span>Configured peripheral</span></header>
-          <dl><div><dt>Connected to</dt><dd>${esc(host ? nameFor(host) : "Not assigned")}</dd></div>
-          <div><dt>Type</dt><dd>${esc(peripheral.type || "Peripheral")}</dd></div></dl>
-        </section>`;
-      }));
-    }
-    rows.push(`<section class="input-device input-shared-facts">
-      <header><b>Shared input</b><span>Lan Mouse</span></header>
-      <dl><div><dt>UDP port</dt><dd>UDP ${esc(input.port || 4242)}</dd></div>
-      <div><dt>Release chord</dt><dd>Left Ctrl + Shift + Super + Alt</dd></div></dl>
-    </section>`);
-    facts.innerHTML = rows.length ? rows.join("") : `<p class="input-empty">No computers are configured for input sharing yet.</p>`;
-    renderPeripheralInventory();
-  }
+  // Live Lan Mouse status moved to the Devices view; Settings > Input only keeps the peripheral list.
+  function renderInputSettings() { renderPeripheralInventory(); }
   let peripheralInventory = store.get("jarvis.input.peripherals", []);
   if (!Array.isArray(peripheralInventory)) peripheralInventory = [];
   function renderPeripheralInventory() {
@@ -450,22 +389,17 @@
   async function refreshProbe(force) {
     if (probing) return;
     probing = true;
-    const buttons = [$("#probe-refresh"), $("#input-probe-refresh")];
+    const buttons = [$("#probe-refresh")].filter(Boolean);
     buttons.forEach((button) => { button.disabled = true; });
     if (force) $("#probe-checked").textContent = "checking…";
     try { state.probe = await api("/api/probe" + (force ? "?refresh=1" : "")); renderProbe(); emit("probe", state.probe); if (force) announce("Machines checked: " + state.probe.input_link.lines[0]); }
     catch (e) {
       $("#probe-checked").textContent = "check failed";
       $("#link-status").innerHTML = `<div class="empty"><b>Couldn't run the live check.</b>${esc(plainError(e.message))}</div>`;
-      $("#input-settings-checked").textContent = "Check failed";
-      $("#input-settings-status").textContent = "Couldn't refresh";
-      $("#input-settings-status").dataset.level = "down";
-      $("#input-settings-lines").innerHTML = `<li>${esc(plainError(e.message))}</li>`;
     }
     finally { probing = false; buttons.forEach((button) => { button.disabled = false; }); }
   }
   $("#probe-refresh").addEventListener("click", () => refreshProbe(true));
-  $("#input-probe-refresh").addEventListener("click", () => refreshProbe(true));
 
   function renderMachines(o) {
     const live = state.probe?.devices || {};
@@ -631,45 +565,204 @@
     } catch (err) { toast(plainError(err.message)); }
   });
 
-  // ---------- devices ----------
-  function renderDevices() {
-    const o = state.overview; if (!o) return false;
-    const tools = (t) => Object.entries(t || {}).map(([k, v]) => `<span class="state-word ${v ? "ok" : "warn"}" title="${v ? "found on PATH" : "not on PATH (may still be installed elsewhere)"}">${esc(k)}</span>`).join("");
-    const live = state.probe?.devices || {};
-    const role = (d) => [d.here ? "this device" : null, d.role === "main" ? "main" : d.role === "node" ? "node" : null].filter(Boolean).join(" · ");
+  // ---------- devices: live connections ----------
+  // Computers (node links from the broker) and this computer's listener and drop folder
+  // come from /api/connections (~20 ms, no network); hardware from the overview's
+  // inventory. Lan Mouse, clipboard and pairing are peripherals.js ("Connect & share"),
+  // drawn between #devices-top and #devices-grid. Re-read every 8 s while visible.
+  const conn = { data: null, error: "", busy: new Set(), timer: 0 };
+  async function loadConnections() {
+    try { conn.data = await api("/api/connections"); conn.error = ""; }
+    catch (e) { conn.error = e.message; }
+    if (!$("#view-devices").hidden) renderDevices();
+  }
+  function pollConnections() {
+    clearTimeout(conn.timer);
+    conn.timer = setTimeout(async () => {
+      if ($("#view-devices").hidden) return;
+      if (document.visibilityState === "visible") await loadConnections();
+      pollConnections();
+    }, 8000);
+  }
+  const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
+  const pill = (text, cls = "", tip = "") => `<span class="cx-pill ${cls}"${tip ? ` title="${esc(tip)}"` : ""}>${esc(text)}</span>`;
+  const dot = (on) => `<i class="cx-dot ${on === true ? "on" : on === false ? "off" : ""}" aria-hidden="true"></i>`;
+  function silent(s) {
+    if (s == null) return "never";
+    if (s < 60) return "just now";
+    if (s < 3600) return Math.round(s / 60) + " min ago";
+    if (s < 86400) return Math.round(s / 3600) + " h ago";
+    return Math.round(s / 86400) + " d ago";
+  }
+  function btn(target, part, action, label, opts = {}) {
+    const key = `${target}:${part}:${action}`;
+    const busy = conn.busy.has(key);
+    return `<button type="button" class="cx-btn${opts.strong ? " strong" : ""}" data-cx="${esc(key)}"${opts.off || busy ? " disabled" : ""}${opts.tip ? ` title="${esc(opts.tip)}"` : ""}>${busy ? `<i class="cx-spin" aria-hidden="true"></i>` : opts.icon ? icon(opts.icon) : ""}<span>${esc(label)}</span></button>`;
+  }
+  function hwLine(d) { return [d.model, d.cpu, d.ram, d.gpu].filter(Boolean).map(esc).join(" · "); }
+  function hwDetails(d) {
+    if (!d) return "";
+    const tools = Object.entries(d.tools || {}).map(([k, v]) => `<span class="cx-tool ${v ? "ok" : ""}" title="${v ? "found on PATH" : "not on PATH when the inventory was taken"}">${esc(k)}</span>`).join("");
+    return `<details class="cx-more"><summary>Hardware and tools</summary>
+      <dl class="cx-facts"><dt>Model</dt><dd>${esc(d.model || "—")}</dd><dt>CPU</dt><dd>${esc(d.cpu || "—")}</dd><dt>Memory</dt><dd>${esc(d.ram || "—")}</dd><dt>GPU</dt><dd>${esc(d.gpu || "—")}</dd>
+      <dt>Address</dt><dd>${esc(d.address || "—")}</dd><dt>Inventory</dt><dd>${esc(ago(d.collected_at))}</dd></dl>
+      ${tools ? `<div class="cx-tools">${tools}</div>` : ""}</details>`;
+  }
+
+  function hubCard(c, here, inv) {
+    const d = inv[c.local] || {};
+    return `<article class="cx-node cx-hub" aria-label="${esc(c.local)}, the main PC">
+      <header>${icon("laptop-minimal", "i")}<div><h3>${esc(c.local)}</h3><p>${esc(d.label || d.hostname || "")}</p></div>${pill(c.role === "main" ? "main · this PC" : "this PC", "ok")}</header>
+      <p class="cx-line">${dot(true)}Hub running${c.code ? ` · code <span class="mono">${esc(c.code.slice(0, 8))}</span>` : ""}</p>
+      ${hwLine(d) ? `<p class="cx-sub">${hwLine(d)}</p>` : ""}
+      ${hwDetails(d)}</article>`;
+  }
+
+  function nodeCard(n, inv) {
+    const d = inv[n.id] || {};
+    const jobs = n.jobs_24h || {};
+    const failed = (jobs.failed || 0) + (jobs.expired || 0) + (jobs.uncertain || 0);
+    const jobLine = [jobs.done ? `${jobs.done} done` : "", failed ? `${failed} failed` : "", n.running ? `${n.running} running` : ""].filter(Boolean).join(" · ") || "no jobs";
+    let hint = "";
+    if (!n.online) hint = `Its node agent isn't polling the main. On ${esc(n.hostname || n.id)}, start JARVIS's node agent (or <code>jarvis cluster doctor</code>).`;
+    else if (!n.code_ok) hint = "Runs older code. It pulls the main's code by itself on its next poll and restarts.";
+    return `<article class="cx-node ${n.online ? "on" : "off"}" aria-label="${esc(n.id)}, node">
+      <header>${icon("laptop-minimal", "i")}<div><h3>${esc(n.id)}</h3><p>${esc(n.label !== n.id ? n.label : n.hostname || "")}</p></div>
+        ${pill(n.online ? "online" : "offline", n.online ? "ok" : "warn", n.seen ? "last heard " + new Date(n.seen * 1000).toLocaleString() : "")}</header>
+      <p class="cx-line">${dot(n.online)}${n.online ? "Polling now" : "Last heard " + silent(n.silent_for)}${n.platform ? ` · ${esc(n.platform)}` : ""}${n.hostname ? ` · <span class="mono">${esc(n.hostname)}</span>` : ""}</p>
+      <div class="cx-chips">${pill(n.code_ok ? "same code" : "older code", n.code_ok ? "ok" : "warn", "node code " + (n.code || "unknown"))}${pill("24 h: " + jobLine, failed ? "warn" : "")}</div>
+      <div class="cx-caps" aria-label="What the main may ask it">${n.capabilities.map((c) => `<span title="${esc(c.does)}">${esc(c.id)}</span>`).join("")}</div>
+      ${hint ? `<p class="cx-hint">${hint}</p>` : ""}
+      <div class="cx-actions"><button type="button" class="cx-btn" data-cx-screen="${esc(n.id)}"${n.online ? "" : " disabled"}>${icon("monitor")}<span>Screen</span></button>
+        <button type="button" class="cx-btn" data-cx-send="${esc(n.id)}">${icon("arrow-up-right")}<span>Send files</span></button></div>
+      ${hwDetails(d)}</article>`;
+  }
+
+  function linksPanel(o, inv) {
+    const c = conn.data?.cluster;
+    if (!c) return `<section class="panel cx-panel cx-links"><p class="cx-empty">${conn.error ? "Couldn't read connections: " + esc(conn.error) : "Reading connections…"}</p></section>`;
+    if (!c.enabled) return `<section class="panel cx-panel cx-links"><header class="cx-h"><h2>Computers</h2></header>
+      <p class="cx-empty">The cluster isn't set up, so this computer works alone. On the main PC run <code>jarvis cluster init</code>, then <code>jarvis cluster invite NAME</code>.</p></section>`;
+    const nodes = c.nodes || [];
+    const online = nodes.filter((n) => n.online).length;
+    return `<section class="panel cx-panel cx-links" aria-labelledby="cx-links-h">
+      <header class="cx-h"><h2 id="cx-links-h">Computers</h2><span class="cx-meta">${plural(nodes.length, "node")} · ${online} online</span></header>
+      <div class="cx-map">${hubCard(c, conn.data.here, inv)}
+        <div class="cx-wires" aria-hidden="true">${nodes.map((n) => `<i class="${n.online ? "on" : "off"}"></i>`).join("")}</div>
+        <div class="cx-nodes">${nodes.map((n) => nodeCard(n, inv)).join("") ||
+          `<p class="cx-empty">No node PCs yet. Run <code>jarvis cluster invite NAME</code> here, then <code>jarvis cluster join CODE</code> on the other computer.</p>`}</div></div></section>`;
+  }
+
+  function tile(id, iconName, title, on, line, sub, buttons, extra = "") {
+    return `<article class="cx-tile ${on === true ? "on" : on === false ? "off" : ""}" aria-labelledby="cx-t-${id}">
+      <header>${icon(iconName, "i")}<h3 id="cx-t-${id}">${esc(title)}</h3>${on == null ? "" : pill(on ? "on" : "off", on ? "ok" : "")}</header>
+      <p class="cx-line">${line}</p>${sub ? `<p class="cx-sub">${sub}</p>` : ""}${extra}
+      <div class="cx-actions">${buttons}</div></article>`;
+  }
+
+  function herePanel() {
+    const h = conn.data?.here;
+    if (!h) return "";
+    const v = h.voice || {}, drop = h.drop || {};
+    const voice = v.error ? tile("voice", "mic", "Voice listener", null, esc(v.error), "", "") :
+      tile("voice", "mic", "Voice listener", v.running,
+        v.running ? `Listening · pid <span class="mono">${esc(v.pid)}</span>` : v.enrolled ? "Not listening" : "No voiceprint yet: set up voice in Settings",
+        v.supervised ? "Restarts by itself if it crashes; starts at login." : "Not supervised. Turn on autostart to have it restarted after a crash.",
+        v.running ? btn("here", "voice", "restart", "Restart", { icon: "rotate-ccw" }) + btn("here", "voice", "stop", "Stop")
+                  : btn("here", "voice", "start", "Start", { strong: true, off: !v.enrolled }),
+        (v.recent || []).length ? `<p class="cx-answer bad">${esc(v.recent.at(-1))}</p>` : "");
+    const files = (drop.latest || []).map((f) => `<li><span>${esc(f.name)}${f.dir ? "/" : ""}</span><small class="mono">${f.dir ? "folder" : compact(f.bytes) + " B"} · ${esc(ago(f.at))}</small></li>`).join("");
+    const inbox = drop.error ? tile("drop", "download", "Received files", null, esc(drop.error), "", "") :
+      tile("drop", "download", "Received files", null,
+        drop.count ? `${plural(drop.count, "item")} in <span class="mono">${esc(drop.folder)}</span>` : `Nothing yet in <span class="mono">${esc(drop.folder)}</span>`,
+        "", "", files ? `<ul class="cx-files">${files}</ul>` : "");
+    return `<section class="panel cx-panel cx-here" aria-labelledby="cx-here-h">
+      <header class="cx-h"><h2 id="cx-here-h">On this computer${h.device ? ` <span class="cx-meta">${esc(h.device)}</span>` : ""}</h2></header>
+      <div class="cx-tiles">${voice}${inbox}</div></section>`;
+  }
+
+  function sendPanel(o) {
     const targets = o.devices.filter((d) => d.send);
     const pick = targets.find((d) => d.id === store.get("jarvis.dropdevice", "")) || targets[0];
-    $("#devices-grid").innerHTML = screenPanel(o) + o.devices.map((d) => `<article class="panel ticks">
-        <header class="ph">${icon("laptop-minimal")}<h2>${esc(d.id)}</h2>${role(d) ? `<span class="state-word">${esc(role(d))}</span>` : ""}${liveWord(live[d.id])}<span class="ph-meta mono">${state.probe ? "checked " + ago(state.probe.checked_at) : ""}</span></header>
-        ${liveFacts(live[d.id])}
-        <h3>${esc(d.label || d.model || d.hostname || d.id)}</h3><p class="lede">${[d.hostname, d.platform, d.transport].filter(Boolean).map(esc).join(" · ")}</p>
-        <dl class="facts mono"><dt>Model</dt><dd>${esc(d.model || "—")}</dd><dt>CPU</dt><dd>${esc(d.cpu || "—")}</dd><dt>Memory</dt><dd>${esc(d.ram || "—")}</dd><dt>GPU</dt><dd>${esc(d.gpu || "—")}</dd>
-        <dt>Address</dt><dd>${esc(d.address || "—")}</dd><dt>Status</dt><dd>${esc(words(d.status))}</dd><dt>Inventory</dt><dd>${ago(d.collected_at)}</dd></dl>
-        <p class="muted" style="font-size:12px;margin-top:14px">Commands on PATH when the inventory was taken:</p><div class="toolmarks">${tools(d.tools)}</div></article>`).join("") +
-      `<article class="panel ticks"><header class="ph">${icon("radio")}<h2>Links between them</h2></header>
-        <dl class="facts mono">${Object.entries(o.desktop).map(([k, v]) => `<dt>${esc(words(k))}</dt><dd title="${esc(v.status)}">${esc(v.candidate || "")} · ${esc(linkState(v.status)[0])}</dd>`).join("")}
-        ${Object.entries(o.network).map(([k, v]) => `<dt>${esc(k)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>
-        <p class="muted" style="font-size:12px;margin-top:12px">From jarvis.config.json, not a live check.</p></article>` +
-      `<article class="panel ticks"><header class="ph">${icon("arrow-up-right")}<h2>Send files</h2></header>
-        ${pick ? `<select class="field" id="drop-device" aria-label="Send to">${targets.map((d) =>
-          `<option value="${esc(d.id)}" ${d === pick ? "selected" : ""}>To ${esc(d.id)}${d.hostname ? " (" + esc(d.hostname) + ")" : ""}</option>`).join("")}</select>
-        <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Drop files here or press Enter to choose">
-          <p><b>Drop files or images here</b></p><p class="muted">or click to choose. They land in <span class="mono">~/JARVIS-Drop</span> on the chosen device.</p>
-          <input type="file" id="drop-input" multiple hidden></div>
-        <ul class="drop-log mono" id="drop-log" aria-live="polite"></ul>`
-        : `<p class="muted">No other device is reachable over SSH from here. Give one <span class="mono">"transport": "ssh"</span> and a <span class="mono">target</span> in jarvis.config.json to send files to it.</p>`}</article>` +
-      `<article class="panel ticks"><header class="ph">${icon("activity")}<h2>Personal agents</h2></header>
-        <dl class="facts mono">${Object.entries(o.agents).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(words(v.integration))} · ${esc(linkState(v.status)[0])}</dd>`).join("")}</dl>
-        <p class="muted" style="font-size:12.5px;margin-top:12px">From personal_agents in jarvis.config.json. Grokbot is driven through its window; the others get a JARVIS adapter once their interface is known.</p></article>`;
-    wireDropzone(); wireScreen();
+    return `<section class="panel cx-panel cx-send" aria-labelledby="cx-send-h"><header class="cx-h"><h2 id="cx-send-h">Send files</h2></header>
+      ${pick ? `<select class="field" id="drop-device" aria-label="Send to">${targets.map((d) =>
+        `<option value="${esc(d.id)}" ${d === pick ? "selected" : ""}>To ${esc(d.id)}${d.hostname ? " (" + esc(d.hostname) + ")" : ""}</option>`).join("")}</select>
+      <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Drop files here or press Enter to choose">
+        <p><b>Drop files or images here</b></p><p class="muted">or click to choose. They go over the cluster link and land in <span class="mono">~/JARVIS-Drop</span> on the chosen computer.</p>
+        <input type="file" id="drop-input" multiple hidden></div>
+      <ul class="drop-log mono" id="drop-log" aria-live="polite"></ul>`
+      : `<p class="cx-empty">No other computer to send to. Add a node PC to the cluster first.</p>`}</section>`;
+  }
+
+  function agentsPanel(o) {
+    const rows = Object.entries(o.agents || {});
+    if (!rows.length) return "";
+    return `<section class="panel cx-panel cx-agents" aria-labelledby="cx-agents-h"><header class="cx-h"><h2 id="cx-agents-h">Personal agents</h2><span class="cx-meta">from jarvis.config.json</span></header>
+      <ul class="cx-list">${rows.map(([k, v]) => { const [label, cls] = linkState(v.status); return `<li><b>${esc(k)}</b><span>${esc(words(v.integration))}</span>${pill(label, cls, words(v.status))}</li>`; }).join("")}</ul></section>`;
+  }
+
+  function summary() {
+    const d = conn.data; if (!d) return "";
+    const nodes = d.cluster?.nodes || [], h = d.here || {};
+    const parts = [
+      [nodes.length ? `${nodes.filter((n) => n.online).length}/${nodes.length} nodes online` : "no nodes", nodes.length && nodes.every((n) => n.online)],
+      ["voice listener " + (h.voice?.running ? "on" : "off"), h.voice?.running],
+      [(h.drop?.count || 0) + " received", null]];
+    return parts.map(([t, ok]) => `<span>${ok == null ? "" : dot(!!ok)}${esc(t)}</span>`).join("");
+  }
+
+  function renderDevices() {
+    const o = state.overview; if (!o) return false;
+    const inv = Object.fromEntries((o.devices || []).map((d) => [d.id, d]));
+    const open = new Set($$("#view-devices details.cx-more[open]").map((el) => el.closest("[aria-label]")?.getAttribute("aria-label")));
+    $("#devices-top").innerHTML = `
+      <header class="cx-top"><p class="cx-summary" aria-live="polite">${summary()}</p>
+        <div class="cx-top-actions"><span class="cx-meta">${conn.data ? "checked " + ago(conn.data.checked_at) : conn.error ? "not reachable" : "checking…"}</span>
+        <button type="button" class="cx-btn" id="cx-refresh">${icon("refresh-cw")}<span>Check now</span></button></div></header>
+      ${linksPanel(o, inv)}`;
+    $("#devices-grid").innerHTML = `${herePanel()}
+      <div class="cx-pair">${screenPanel(o)}${sendPanel(o)}</div>
+      ${agentsPanel(o)}`;
+    $$("#view-devices details.cx-more").forEach((el) => { if (open.has(el.closest("[aria-label]")?.getAttribute("aria-label"))) el.open = true; });
+    wireDropzone(); wireScreen(); wireConnections();
+    if (!conn.data && !conn.error && !conn.loading) { conn.loading = true; loadConnections().finally(() => (conn.loading = false)); }
+    pollConnections();
+  }
+
+  function wireConnections() {
+    $("#cx-refresh")?.addEventListener("click", () => { conn.data = null; renderDevices(); loadConnections(); });
+    $$("#devices-grid [data-cx]").forEach((b) => b.addEventListener("click", async () => {
+      const key = b.dataset.cx, [target, part, action] = key.split(":");
+      conn.busy.add(key); renderDevices();
+      try {
+        const r = await api("/api/connections", { target, part, action });
+        const note = r.result?.note; if (note) toast(note); else announce(`${words(part)}: ${action} done`);
+      } catch (e) { toast(plainError(e.message)); } finally { conn.busy.delete(key); await loadConnections(); }
+    }));
+    $$("#view-devices [data-cx-screen]").forEach((b) => b.addEventListener("click", () => {
+      screenView.device = b.dataset.cxScreen; store.set("jarvis.scrdevice", screenView.device);
+      renderDevices(); $(".screen-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }); snapScreen();
+    }));
+    $$("#view-devices [data-cx-send]").forEach((b) => b.addEventListener("click", () => {
+      store.set("jarvis.dropdevice", b.dataset.cxSend);
+      const sel = $("#drop-device"); if (sel) sel.value = b.dataset.cxSend;
+      $("#dropzone")?.scrollIntoView({ behavior: "smooth", block: "center" }); $("#dropzone")?.focus({ preventScroll: true });
+    }));
   }
 
   // ---------- screens ----------
   // Read-only snapshots through the `screen` desktop action. Each device keeps its last
   // picture; Live re-takes one every few seconds while Devices is open and the tab visible.
   const screenView = { device: store.get("jarvis.scrdevice", ""), live: false, shots: {}, busy: new Set(), error: "", timer: 0, seen: false };
+  function reachable(id) {
+    const c = conn.data?.cluster;
+    if (!c) return !!state.overview?.devices?.find((d) => d.id === id)?.here; // not read yet
+    if (!c.enabled || id === c.local) return true;
+    return !!(c.nodes || []).find((n) => n.id === id)?.online;
+  }
   function screenPanel(o) {
-    const d = o.devices.find((x) => x.id === screenView.device) || o.devices.find((x) => !x.here) || o.devices[0];
+    const d = o.devices.find((x) => x.id === screenView.device) || o.devices.find((x) => !x.here && reachable(x.id))
+      || o.devices.find((x) => x.here) || o.devices[0];
     if (!d) return "";
     screenView.device = d.id;
     return `<article class="panel ticks screen-panel"><header class="ph">${icon("monitor")}<h2>Screens</h2><span class="ph-meta mono">view only</span></header>
@@ -739,7 +832,9 @@
     $("#scr-live").addEventListener("click", () => setLive(!screenView.live));
     $("#scr-full").addEventListener("click", () => $("#scr-frame").requestFullscreen?.().catch(() => {}));
     // First visit to Devices: show the chosen screen without waiting for a click.
-    if (!screenView.seen && !$("#view-devices").hidden) { screenView.seen = true; snapScreen(); }
+    // Only a reachable one: a capture of an offline node hangs until it times out and holds
+    // one of the browser's few connections to the console meanwhile.
+    if (!screenView.seen && !$("#view-devices").hidden && reachable(screenView.device)) { screenView.seen = true; snapScreen(); }
   }
 
   // Files go over the existing SSH link: a drag can't cross from one OS's desktop to another's.
@@ -1245,6 +1340,7 @@
     // A note changed, in Obsidian or by JARVIS; the to-do board refetches (dashboard.js).
     "vault.changed"(d) { emit("vault", d); },
     "brain.state"(d) { state.brain = d; if (state.overview) renderRouter(state.overview); },
+    "connections.changed"() { if (!$("#view-devices").hidden) loadConnections(); },
     "turn.start"(d, e) {
       if (!d.message) return;
       const t = { channel: d.channel, job: d.job, text: d.text, tier: d.tier, reasons: d.reasons, sentences: [],

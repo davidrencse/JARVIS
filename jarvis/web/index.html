@@ -15,10 +15,12 @@
 <link rel="stylesheet" href="runview.css">
 <link rel="stylesheet" href="flow.css">
 <link rel="stylesheet" href="sharedinput.css">
+<link rel="stylesheet" href="peripherals.css">
 <link rel="stylesheet" href="console.css">
 <link rel="stylesheet" href="lab.css">
 <link rel="stylesheet" href="settings.css">
 <link rel="stylesheet" href="files.css">
+<link rel="stylesheet" href="connections.css">
 <link rel="stylesheet" href="voicesetup.css">
 <script src="theme.js"></script>
 </head>
@@ -39,7 +41,7 @@
       <a href="#memory" data-view="memory" title="Memory (5)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
       <a href="#run" data-view="run" title="Run: a plan on one screen (6)"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Run</span></a>
       <a href="#files" data-view="files" title="Files across both laptops (7)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
-      <a href="#devices" data-view="devices" title="Devices (8)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Devices</span></a>
+      <a href="#devices" data-view="devices" title="Connections: computers and peripherals (8)"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Connections</span></a>
       <a href="#settings" data-view="settings" title="Voice and input settings"><svg class="i"><use href="icons.svg?v=2#i-audio-lines"/></svg><span>Settings</span></a>
     </nav>
     <div class="profile">
@@ -341,8 +343,10 @@
     <section class="view" id="view-files" data-title="Files" hidden>
       <div class="files-wrap" id="files-wrap"></div>
     </section>
-    <section class="view" id="view-devices" data-title="Devices" hidden>
-      <div class="devices-grid" id="devices-grid"></div>
+    <section class="view" id="view-devices" data-title="Connections" hidden>
+      <div class="devices-grid cx-stack" id="devices-top"></div>
+      <div id="peripherals"></div>
+      <div class="devices-grid cx-stack" id="devices-grid"></div>
     </section>
     <section class="view st" id="view-settings" data-title="Settings" hidden>
       <div class="st-shell">
@@ -355,10 +359,15 @@
           <button type="button" role="tab" id="st-tab-input" aria-controls="st-panel-input" data-sec="input"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-keyboard"/></svg><span>Input</span></button>
         </div></nav>
         <div class="st-main">
+          <div class="st-bar">
+            <label class="st-search"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-search"/></svg><span class="sr">Filter settings</span><input type="search" id="st-search" placeholder="Filter settings in every section" autocomplete="off" spellcheck="false"><kbd aria-hidden="true">/</kbd></label>
+          </div>
           <div class="st-notice" id="st-notice" role="status" hidden></div>
+          <p class="st-nomatch" id="st-nomatch" role="status" hidden></p>
 
           <section class="st-panel" id="st-panel-machines" role="tabpanel" aria-labelledby="st-tab-machines" data-sec="machines" tabindex="-1" hidden>
-            <header class="st-head"><h2>Machines</h2><p>Which computer runs JARVIS, and whether the others can reach it.</p></header>
+            <header class="st-head"><h2>Machines</h2><p>Which computer runs JARVIS. Live link state and start/stop controls are in <a class="st-link" href="#devices">Devices</a>.</p></header>
+            <div class="st-stat" id="st-stat-machines" aria-live="polite"></div>
             <div class="st-group st-machines" id="st-machines" aria-live="polite"><p class="st-loading">Loading machines</p></div>
             <p class="st-foot">Add a computer: on the main run <code>jarvis cluster invite &lt;name&gt;</code>, then <code>jarvis cluster join &lt;code&gt;</code> on the new one. <code>jarvis cluster doctor</code> explains any problem.</p>
             <details class="st-adv">
@@ -369,6 +378,7 @@
 
           <section class="st-panel" id="st-panel-voice" role="tabpanel" aria-labelledby="st-tab-voice" data-sec="voice" tabindex="-1" hidden>
             <header class="st-head"><h2>Voice</h2><p>The always-on listener: who it answers, and how it talks back.</p></header>
+            <div class="st-stat" id="st-stat-voice" aria-live="polite"></div>
             <div class="vs-card-row" id="vs-entry" aria-live="polite">
               <span class="vs-mini off" aria-hidden="true"><svg class="i"><use href="icons.svg?v=2#i-mic"/></svg></span>
               <div><b>Your voice</b><small>Checking…</small></div>
@@ -379,6 +389,7 @@
 
           <section class="st-panel" id="st-panel-calls" role="tabpanel" aria-labelledby="st-tab-calls" data-sec="calls" tabindex="-1" hidden>
             <header class="st-head"><h2>Calls</h2><p>Live voice calls in this browser. Saved on this computer only.</p></header>
+            <div class="st-stat" id="st-stat-calls" aria-live="polite"></div>
             <div class="st-sub"><h3>Microphone</h3><span class="st-meta" id="mic-settings-status">Ready when you are</span><button class="st-btn" id="agent-mic-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Refresh</button></div>
             <div class="st-group">
               <div class="st-row"><label class="st-label" for="agent-mic-device"><b>Input device</b><small>Device names appear after the browser is allowed to use the microphone.</small></label>
@@ -408,16 +419,19 @@
 
           <section class="st-panel" id="st-panel-intelligence" role="tabpanel" aria-labelledby="st-tab-intelligence" data-sec="intelligence" tabindex="-1" hidden>
             <header class="st-head"><h2>Intelligence</h2><p>Which model answers, and how much effort JARVIS spends.</p></header>
+            <div class="st-stat" id="st-stat-intelligence" aria-live="polite"></div>
             <div class="st-group" id="st-rows-intelligence" aria-live="polite"><p class="st-loading">Loading settings</p></div>
           </section>
 
           <section class="st-panel" id="st-panel-memory" role="tabpanel" aria-labelledby="st-tab-memory" data-sec="memory" tabindex="-1" hidden>
             <header class="st-head"><h2>Memory</h2><p>What JARVIS remembers and where it looks.</p></header>
+            <div class="st-stat" id="st-stat-memory" aria-live="polite"></div>
             <div class="st-group" id="st-rows-memory" aria-live="polite"><p class="st-loading">Loading settings</p></div>
           </section>
 
           <section class="st-panel" id="st-panel-input" role="tabpanel" aria-labelledby="st-tab-input" data-sec="input" tabindex="-1" hidden>
             <header class="st-head"><h2>Input</h2><p>One mouse and keyboard across your computers, through Lan Mouse. Read-only: JARVIS never changes it.</p></header>
+            <div class="st-stat" id="st-stat-input" aria-live="polite"></div>
             <div class="st-sub"><h3>Shared mouse and keyboard</h3><span class="st-meta" id="si-checked">Not checked yet</span><button class="st-btn" id="si-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check again</button></div>
             <div class="st-block shared-input-card" id="shared-input" aria-label="Shared mouse and keyboard">
               <figure class="si-layout" id="si-layout" aria-label="Screens drawn to physical scale"><p class="si-empty">Open this view to read both computers’ screens and Lan Mouse settings.</p></figure>
@@ -425,15 +439,7 @@
               <div class="si-machines" id="si-machines"></div>
               <p class="st-foot">The keyboard follows the mouse: keys go to whichever screen has the cursor.</p>
             </div>
-            <div class="st-sub"><h3>Connection</h3><span class="st-meta" id="input-settings-checked">Checking connection</span><button class="st-btn" id="input-probe-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check</button></div>
-            <div class="st-block settings-input-card">
-              <div class="input-settings-status">
-                <p class="input-status-word" id="input-settings-status" role="status">Checking</p>
-                <ul id="input-settings-lines"><li>Checking every configured Lan Mouse service and UDP socket.</li></ul>
-              </div>
-              <div class="input-settings-facts" id="input-settings-facts"></div>
-              <p class="st-foot" id="input-settings-hint">Reads service and socket status only, never cursor movement or key presses. Computers live under devices, screen edges under desktop.input.layout in jarvis.config.json.</p>
-            </div>
+            <p class="st-point"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg><span>Live status and controls are in <a class="st-link" href="#devices">Devices</a>.</span></p>
             <div class="st-sub"><h3 id="input-peripheral-title">Peripherals</h3><span class="st-meta">Saved in this browser</span></div>
             <section class="st-block input-peripheral-manager" aria-labelledby="input-peripheral-title">
               <form class="input-peripheral-form" id="input-peripheral-form">
@@ -506,6 +512,7 @@
 <script src="files.js"></script>
 <script src="flow.js"></script>
 <script src="sharedinput.js"></script>
+<script src="peripherals.js"></script>
 <script src="field.js"></script>
 <script src="wheel.js"></script>
 <script src="layout.js"></script>
