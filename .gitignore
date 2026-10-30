@@ -11,3 +11,4 @@ jarvis.egg-info/
 *.mp3
 .playwright-mcp/
 jarvis.config.json.pre-*
+jarvis.prev/

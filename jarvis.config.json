@@ -191,12 +191,12 @@
     "llm_model": "haiku"
   },
   "vault": {
-    "enabled": false,
+    "enabled": true,
     "path": {
       "windows": "C:\\Users\\jdoe\\Documents\\Vault",
       "linux": "~/Documents/obsidian-vault"
     },
-    "recall": false,
+    "recall": true,
     "write": false,
     "calendar": "calendar.md",
     "protected": [
