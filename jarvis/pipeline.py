@@ -34,6 +34,8 @@ DIRECT = {"open_app": ("open_app", "name"), "open_url": ("open_url", "url"),
 # Failure texts that mean "it may have run": never pre_effect_failure (which allows
 # escalation). The cluster says "Node action <id> is uncertain; do not automatically retry."
 UNCERTAIN = ("timed out", "no confirmed result", "may have run", "uncertain")
+# Executors that read the state first and found nothing to do say so this way.
+ALREADY = ("Already playing.", "Already paused.")
 INFLIGHT = gates.InFlight()
 _TOOLS, _TOOLS_LOCK = None, threading.Lock()
 
@@ -345,6 +347,7 @@ def _execute(commands, remote, step, request=None, skip=None):
             outcome = {"id": command["id"], "state": "merged", "ok": True,
                        "text": "Already doing that."}
         else:
+            before = None if "observe" in skipped else _snapshot(command, remote)
             step(f"run:{command['id']}", "parse", label, "sending", "run")
             sent, ok = time.monotonic(), False
             try:
@@ -363,13 +366,19 @@ def _execute(commands, remote, step, request=None, skip=None):
                        "run_ms": _ms(sent)}
             step(f"run:{command['id']}", "parse", label, f"{text} · {outcome['run_ms']} ms",
                  "done" if ok else "fail")
-            if ok and "observe" not in skipped:
+            if ok and text.startswith(ALREADY):
+                # The executor read the state first and did nothing ("Already paused."):
+                # true, but not a change it caused, so it never counts as observed.
+                outcome["state"] = "unchanged"
+            elif ok and "observe" not in skipped:
                 watched = time.monotonic()
-                seen = _observe(command, remote, step, label)
+                seen = _observe(command, remote, step, label, before)
                 if seen:
                     outcome.update(seen, observe_ms=_ms(watched))
                 if outcome["state"] == "unconfirmed":
                     outcome["text"] += " I couldn't confirm it on screen yet."
+                elif outcome["state"] == "unchanged":
+                    outcome["text"] += " Nothing changed on screen, though: it already looked like that."
         with lock:
             outcomes[command["id"]] = outcome
 
@@ -396,9 +405,27 @@ def _execute(commands, remote, step, request=None, skip=None):
     return outcomes
 
 
-def _observe(command, remote, step, label):
-    """observed / unconfirmed from the acting machine's own check; {} when the effect
-    can't be seen as a window, or the check itself couldn't run (stays acknowledged).
+def _snapshot(command, remote):
+    """The acting machine's digest of the state the observer will look at, taken before
+    the action runs; None when there is nothing to compare or it couldn't be read."""
+    from . import registry
+    from .observe import predicate_for, wants_snapshot
+    predicate = predicate_for(command)
+    if predicate is None or not registry.get(command["intent"]).settle \
+            or not wants_snapshot(predicate):
+        return None
+    try:
+        ok, text = remote.call(command["device"], "observe", json.dumps({"snapshot": predicate}))
+        before = (json.loads(text) or {}).get("before") if ok else None
+    except Exception:
+        return None
+    return before if isinstance(before, str) else None
+
+
+def _observe(command, remote, step, label, before=None):
+    """observed / unchanged / unconfirmed from the acting machine's own check; {} when
+    the effect can't be seen as a window, or the check itself couldn't run (stays
+    acknowledged). unchanged: the predicate holds but already did before the action.
     Never a retry: an unconfirmed action is reported, not repeated."""
     from . import registry
     from .observe import predicate_for
@@ -407,16 +434,19 @@ def _observe(command, remote, step, label):
     if predicate is None or not settle:
         return {}
     step(f"obs:{command['id']}", f"run:{command['id']}", "Observe", f"up to {settle:g} s", "run")
+    body = {"predicate": predicate, "settle": settle}
+    if before:
+        body["before"] = before
     try:
-        ok, text = remote.call(command["device"], "observe",
-                               json.dumps({"predicate": predicate, "settle": settle}))
+        ok, text = remote.call(command["device"], "observe", json.dumps(body))
         seen = json.loads(text) if ok else None
     except Exception:
         ok, seen = False, None
     if not isinstance(seen, dict) or "match" not in seen:
         step(f"obs:{command['id']}", f"run:{command['id']}", "Observe", "couldn't check", "fail")
         return {}
-    state = "observed" if seen["match"] else "unconfirmed"
+    state = ("unconfirmed" if not seen["match"] else
+             "unchanged" if seen.get("changed") is False else "observed")
     step(f"obs:{command['id']}", f"run:{command['id']}", "Observe",
          f"{state} after {seen.get('after_ms', '?')} ms", "done" if seen["match"] else "fail")
     return {"state": state, "observed_ms": seen.get("after_ms")}

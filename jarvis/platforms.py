@@ -108,3 +108,15 @@ def is_windows():
 
 def is_macos():
     return detect()["os"] == "macos"
+
+
+def private_dir(path):
+    """Make JARVIS's state folder (secrets, tokens, memory, voiceprint) readable by this
+    account only. On Linux and macOS that's mode 700 on the folder, which closes every file
+    inside to other local accounts whatever their own modes. Windows keeps it under the
+    user's profile, whose ACL already does this."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if _os() != "windows" and path.stat().st_mode & 0o077:
+        path.chmod(0o700)
+    return path

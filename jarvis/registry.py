@@ -24,8 +24,9 @@ SAFE_TO_CLOSE = frozenset({"spotify", "calculator", "grok bot"})
 # Outcome states (L5). Only pre_effect_failure is certain enough to escalate.
 # partial_effect: a multi-step action changed something, then a later step failed
 # (Spotify opened, play failed). It failed, but not "nothing happened": never escalated.
-OUTCOMES = ("pre_effect_failure", "partial_effect", "acknowledged", "observed", "unconfirmed",
-            "uncertain", "agent_claimed", "user_confirmed", "user_rejected")
+# unchanged: the requested state holds, but it already did before the action ran.
+OUTCOMES = ("pre_effect_failure", "partial_effect", "acknowledged", "observed", "unchanged",
+            "unconfirmed", "uncertain", "agent_claimed", "user_confirmed", "user_rejected")
 CERTAIN = frozenset({"pre_effect_failure", "observed", "user_confirmed", "user_rejected"})
 
 MAX_TEXT = 4000

@@ -3,15 +3,21 @@
 What each computer's Lan Mouse is configured to do, its screens, and whether the two
 configurations agree: which edge leads where, whether the peer addresses are current, and
 whether motion_scale keeps hand travel identical across screens of different pixel
-density. It reads configs, processes and monitor geometry; it never starts, stops or
-edits Lan Mouse.
+density. It reads configs, processes and monitor geometry.
+
+control() is the one part that acts: the `lan_mouse` desktop action starts, stops or
+pairs Lan Mouse on this computer, so `jarvis lanmouse start|stop|pair` reach the other
+laptop over the cluster with that computer's own OS paths (no SSH, no ~/.config on
+Windows). Starting runs the same daemon as before, whose release_bind shortcut is the
+fail-safe for captured input; nothing here changes login autostart.
 
 Screens, processes and addresses are read per OS and desktop (Windows, macOS, Hyprland, sway,
 X11); platforms.detect() says which.
 
 Each computer reports itself through the read-only `input_info` desktop action
 (local_info), so the Zenbook answers over the cluster or SSH like any other action.
-Certificate fingerprints and authorized keys are never read out of the configs.
+It includes this computer's own certificate fingerprint (public; pairing needs it), but
+authorized fingerprints and keys are never read out of the configs.
 """
 
 import json
@@ -243,6 +249,11 @@ def lan_mouse_status():
     for unit, build in (("lan-mouse.service", "patched"), ("lan-mouse-fallback.service", "official")):
         if shutil.which("systemctl") and _run("systemctl", "--user", "is-active", unit).stdout.strip() == "active":
             return {"running": True, "build": build}
+    if shutil.which("pgrep"):  # started by hand, outside the units ("lan-mouse-jarvis" -> 15 chars)
+        if _run("pgrep", "-x", "lan-mouse-jarvi").returncode == 0:
+            return {"running": True, "build": "patched"}
+        if _run("pgrep", "-x", "lan-mouse").returncode == 0:
+            return {"running": True, "build": "official"}
     return {"running": False, "build": None}
 
 
@@ -271,12 +282,166 @@ def local_info():
     return {"hostname": socket.gethostname(), "os": "windows" if os.name == "nt" else platforms.detect()["os"],
             "monitors": safely(monitors, []), "addresses": safely(addresses, []),
             "lan_mouse": {**safely(lan_mouse_status, {"running": False, "build": None}),
-                          "config": safely(read_config, None)}}
+                          "config": safely(read_config, None),
+                          "fingerprint": safely(_fingerprint, None)}}
+
+
+def _fingerprint():
+    from .desktop import local_fingerprint
+    return local_fingerprint()
 
 
 def run(_arg=""):
     """The read-only `input_info` desktop action: (ok, json text)."""
     return True, json.dumps(local_info())
+
+
+# -- starting, stopping and pairing this computer's Lan Mouse ------------------------------------
+UNITS = ("lan-mouse.service", "lan-mouse-ipwatch.service")
+STARTUP_NAME = "JARVIS Lan Mouse.vbs"
+
+
+def _units():
+    """The JARVIS systemd user units that exist here (none on a hand-made setup)."""
+    if not shutil.which("systemctl"):
+        return []
+    listed = _run("systemctl", "--user", "list-unit-files", "--no-legend", *UNITS, "lan-mouse-fallback.service").stdout
+    return [line.split()[0] for line in listed.splitlines() if line.strip()]
+
+
+def _windows_launcher():
+    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
+            / "Programs" / "Startup" / STARTUP_NAME)
+
+
+def _binary():
+    if os.name == "nt":
+        patched = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "lan-mouse" / "bin" / "lan-mouse.exe"
+        return str(patched) if patched.is_file() else shutil.which("lan-mouse")
+    patched = Path.home() / ".local" / "bin" / "lan-mouse-jarvis"
+    return str(patched) if patched.is_file() else shutil.which("lan-mouse")
+
+
+def start():
+    if lan_mouse_status()["running"]:
+        return {"started": False, "note": "Lan Mouse is already running.", **lan_mouse_status()}
+    if _desktop() == "macos":
+        raise ValueError("Start Lan Mouse from its app on macOS.")
+    units = _units()
+    if os.name != "nt" and "lan-mouse.service" in units:
+        wanted = [u for u in UNITS if u in units]
+        done = _run("systemctl", "--user", "start", *wanted, timeout=30)
+        if done.returncode:
+            raise RuntimeError("systemctl couldn't start Lan Mouse: " + (done.stderr.strip()[-200:] or "no detail"))
+    elif os.name == "nt" and _windows_launcher().is_file():
+        # The startup launcher also raises its priority and keeps its log, as at login.
+        subprocess.Popen(["wscript.exe", str(_windows_launcher())], creationflags=FLAGS, close_fds=True)
+    else:
+        binary = _binary()
+        if not binary:
+            raise ValueError("Lan Mouse isn't installed on this computer.")
+        log = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".cache") / (
+            "lan-mouse/daemon.log" if os.name == "nt" else "lan-mouse.log")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "ab") as out:
+            subprocess.Popen([binary, "daemon"], stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                             close_fds=True, creationflags=FLAGS | getattr(subprocess, "DETACHED_PROCESS", 0),
+                             start_new_session=os.name != "nt")
+    import time
+    for _ in range(20):
+        time.sleep(0.25)
+        status = lan_mouse_status()
+        if status["running"]:
+            return {"started": True, **status}
+    return {"started": False, "note": "Lan Mouse didn't come up; check its log.", **lan_mouse_status()}
+
+
+def stop():
+    if os.name == "nt":
+        _run("taskkill", "/IM", "lan-mouse.exe", "/F", timeout=15)
+    else:
+        units = _units()
+        if units:
+            _run("systemctl", "--user", "stop", *units, timeout=30)
+        if shutil.which("pkill"):
+            _run("pkill", "-x", "lan-mouse")
+            _run("pkill", "-x", "lan-mouse-jarvi")
+    return {"stopped": not lan_mouse_status()["running"], **lan_mouse_status()}
+
+
+def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None):
+    """Write this computer's config for one peer; the old file is kept as a dated backup.
+    The release shortcut, port and motion_scale already chosen here carry over."""
+    import time
+    from .desktop import lan_mouse_config
+    path = Path(path or config_path())
+    old = read_config(path) or {}
+    backend = old.get("capture_backend") or ("layer-shell" if _desktop() == "hyprland" else None)
+    text = lan_mouse_config(peer_name, peer_ips, position, peer_fingerprint,
+                            release_bind=old.get("release_bind") or
+                            ("KeyLeftCtrl", "KeyLeftShift", "KeyLeftMeta", "KeyLeftAlt"),
+                            port=old.get("port") or 4242, capture_backend=backend,
+                            motion_scale=old.get("motion_scale"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if path.is_file():
+        backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        backup.write_bytes(path.read_bytes())
+    path.write_text(text, encoding="utf-8")
+    restarted = False
+    if lan_mouse_status()["running"]:  # it reads the config only at startup
+        stop()
+        restarted = bool(start().get("running"))
+    return {"written": str(path), "backup": str(backup) if backup else None, "restarted": restarted}
+
+
+PAIR_KEYS = ("peer_name", "peer_ips", "position", "peer_fingerprint")
+
+
+def control(arg):
+    """The `lan_mouse` desktop action: (ok, json text). arg: start, stop, status, or
+    {"pair": {peer_name, peer_ips, position, peer_fingerprint}} as JSON."""
+    try:
+        if arg in ("start", "stop"):
+            result = start() if arg == "start" else stop()
+        elif arg == "status":
+            result = {**lan_mouse_status(), "config": read_config()}
+        else:
+            request = json.loads(arg)
+            spec = request.get("pair") if isinstance(request, dict) else None
+            if not isinstance(spec, dict) or set(spec) != set(PAIR_KEYS):
+                raise ValueError("Use start, stop, status or a pairing request.")
+            result = write_pairing(*(spec[k] for k in PAIR_KEYS))
+    except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    return True, json.dumps(result)
+
+
+def pair(config, state, device, position, remote=None):
+    """Pair this computer's Lan Mouse with `device`, which sits on our `position` side:
+    exchange certificate fingerprints and addresses over the cluster (or SSH), then
+    have each side write its own config. Both must have run Lan Mouse once."""
+    from .remote import Remote
+    if position not in OPPOSITE:
+        raise ValueError(f"position must be one of {', '.join(OPPOSITE)}.")
+    remote = remote or Remote(config, state)
+    ok, text = remote.call(device, "input_info", "")
+    if not ok:
+        raise RuntimeError(f"{device} didn't answer: {text}")
+    theirs, mine = json.loads(text), local_info()
+    for who, info in ((device, theirs), ("this computer", mine)):
+        if not (info.get("lan_mouse") or {}).get("fingerprint"):
+            raise ValueError(f"Lan Mouse has no certificate on {who} yet; start it there once "
+                             "(jarvis lanmouse start), then pair again.")
+    ok, text = remote.call(device, "lan_mouse", json.dumps({"pair": {
+        "peer_name": mine["hostname"].split(".")[0], "peer_ips": mine["addresses"],
+        "position": OPPOSITE[position], "peer_fingerprint": mine["lan_mouse"]["fingerprint"]}}))
+    if not ok:
+        raise RuntimeError(f"{device} couldn't write its Lan Mouse config: {text}")
+    there = json.loads(text)
+    here = write_pairing(theirs["hostname"].split(".")[0], theirs["addresses"], position,
+                         theirs["lan_mouse"]["fingerprint"])
+    return {"device": device, "position": position, "here": here, "there": there}
 
 
 # -- both computers ----------------------------------------------------------------------------

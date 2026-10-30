@@ -9,7 +9,8 @@ DesktopTools directly. The other laptop is reached the same way Grokbot prompts 
   keeps `grokbot tunnel` running; its loopback relay takes /desktop calls with the token.
 Only the actions below travel (open_page: a console page, e.g. the knowledge page, as a window;
 close_app, media and volume: close an app's windows, play/pause/skip, speaker volume;
-screen: a downscaled snapshot of the screen, for the Devices view);
+screen: a downscaled snapshot of the screen, for the Devices view; lan_mouse: start, stop
+or pair Lan Mouse there);
 arguments go as base64 or JSON data, never as code.
 A laptop can be named by its key, hostname, configured `aliases` ("arch", "asus"...) or
 "the other laptop".
@@ -26,13 +27,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+# ssh stderr that means no session ever opened, so the command can't have run there.
+PRE_SESSION = re.compile(r"ssh: connect to host|Could not resolve hostname|kex_exchange_identification|"
+                         r"banner exchange|Host key verification failed|Permission denied \(", re.I)
+
 ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media",
-           "volume", "scroll", "browse", "observe", "input_info", "screen")
+           "volume", "scroll", "browse", "observe", "input_info", "screen", "lan_mouse")
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
        "focus_window": "name", "close_app": "name", "media": "command", "volume": "level",
        "scroll": "spec", "browse": "spec", "observe": "predicate", "input_info": "query",
-       "screen": "spec"}
+       "screen": "spec", "lan_mouse": "command"}
 # Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
 SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
@@ -101,6 +106,9 @@ def run_here(action, arg, tools=None):
     if action == "input_info":  # read-only: screens and Lan Mouse, for Settings
         from .sharedinput import run
         return run(arg)
+    if action == "lan_mouse":  # start / stop / status / pair this computer's Lan Mouse
+        from .sharedinput import control
+        return control(arg)
     if tools is None:
         from .actions import DesktopTools
         tools = DesktopTools()
@@ -227,13 +235,18 @@ class Remote:
             _check_target(target)
             out = subprocess.run([*args, target, remote], capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", timeout=45, creationflags=FLAGS)
-            if out.returncode == 255:  # ssh itself failed: try the next address
+            if out.returncode == 255:
                 last = out.stderr.strip()[-200:]
-                continue
+                if PRE_SESSION.search(out.stderr):  # never got a session: try the next address
+                    continue
+                # ssh also exits 255 when the link drops mid-command; resending on another
+                # address could repeat it (close_app, media next).
+                return False, f"Lost the SSH link to {device} mid-command ({last}); it may have run."
             try:
                 body = json.loads(out.stdout.strip().splitlines()[-1])
             except (ValueError, IndexError):
-                return False, (out.stderr or out.stdout).strip()[-300:] or f"{device} said nothing."
+                said = (out.stderr or out.stdout).strip()[-300:] or f"{device} said nothing"
+                return False, f"{said} (no result from {device}; it may have run)"
             return bool(body.get("ok")), str(body.get("text", ""))
         raise ConnectionError(last or "no address answered")
 
@@ -248,6 +261,8 @@ class Remote:
             data=json.dumps({"action": action, "arg": arg}).encode(),
             headers={"Content-Type": "application/json", "X-JARVIS-Token": note["token"]})
         try:
+            # urlopen wraps connect/send errors in URLError; reading the reply raises plain
+            # OSError, and by then the node has the command.
             with urllib.request.urlopen(req, timeout=45) as res:
                 body = _loads(res.read())
         except urllib.error.HTTPError as exc:
@@ -256,6 +271,8 @@ class Remote:
                 return False, body.get("error") or f"{device} refused ({exc.code})."
             finally:
                 exc.close()
-        except (urllib.error.URLError, OSError):
+        except urllib.error.URLError:
             raise ConnectionError(f"the tunnel from {device} is down")
+        except OSError as exc:
+            return False, f"{device} got the command but no reply came back ({exc}); it may have run."
         return bool(body.get("ok")), str(body.get("text", ""))

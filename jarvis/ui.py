@@ -77,6 +77,7 @@ class Console:
         self.jobs, self._jobs_lock = {}, threading.Lock()
         self.max_jobs = 200  # the page only ever polls recent ones; older entries are dropped
         self._ears = self._stt = None
+        self._ears_used = 0.0
         self._voice_lock = threading.Lock()
         self.bus, self.watcher = Bus(), None
         self._lane = self._speaker = self._agent = self._setup = None
@@ -258,6 +259,9 @@ class Console:
                 local, main = identity(self.config)
             except ValueError:  # unknown identity: show every device as remote
                 pass
+        # Who this one can send files to: over the cluster, its peers (transfer.peers).
+        reachable = ([n for n in self.config.get("devices", {}) if n != local] if local == main
+                     else [main]) if main else []
         out = []
         for name, device in self.config.get("devices", {}).items():
             inv = _read_json(self.state / "inventory" / f"{name}.json", {})
@@ -265,9 +269,9 @@ class Console:
             out.append({"id": name, "hostname": device.get("hostname"), "label": device.get("label"),
                         "here": name == local,
                         "role": None if main is None else "main" if name == main else "node",
-                        # Same rule as transfer.ssh_device: SSH devices other than this one.
-                        "send": device.get("transport") == "ssh" and bool(device.get("target"))
-                                and name != local,
+                        # Same rule as transfer.peers / ssh_device.
+                        "send": name != local and (name in reachable if main else
+                                device.get("transport") == "ssh" and bool(device.get("target"))),
                         "transport": device.get("transport"), "status": device.get("status"),
                         "address": device.get("lan_ip") or device.get("target"),
                         "platform": inv.get("platform"), "collected_at": inv.get("collected_at"),
@@ -783,8 +787,10 @@ class Console:
         if wake and listener:
             return {"text": "", "listener": True, "seconds": seconds}
         with self._voice_lock:
+            self._ears_used = time.monotonic()
             if self._stt is None:
                 self._stt, self._ears = Transcriber(self.config), VoicePrint(self.state, self.config)
+                self._free_ears_later()
             owner, score, near = True, None, False
             if verify and (self.state / "voice" / "voiceprint.json").is_file():
                 owner, score = self._ears.verify(audio)
@@ -807,6 +813,22 @@ class Console:
             request = "" if wake else text
         return {**heard, "text": request}
 
+    EARS_IDLE = 300  # seconds of no page audio before Whisper and speaker ID are freed
+
+    def _free_ears_later(self):
+        """The hub mostly serves; Whisper + speaker ID (~1 GB) are only needed while the
+        page is the one hearing (no background listener, or push-to-talk)."""
+        def check():
+            with self._voice_lock:
+                idle = time.monotonic() - self._ears_used
+                if idle >= self.EARS_IDLE:
+                    self._stt = self._ears = None
+                    return
+            self._free_ears_later()
+        timer = threading.Timer(self.EARS_IDLE, check)
+        timer.daemon = True
+        timer.start()
+
     def send_file(self, stream, length, name, device=None):
         """Receive an uploaded file from the page and push it to the other laptop."""
         import tempfile
@@ -815,7 +837,6 @@ class Console:
             raise ValueError("That file is empty.")
         if length > transfer.MAX_BYTES:
             raise ValueError("That file is too large to send this way.")
-        target = transfer.ssh_device(self.config, device or None)
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / transfer.safe_name(name)
             left = length
@@ -826,8 +847,7 @@ class Console:
                         raise ValueError("The upload ended early.")
                     out.write(block)
                     left -= len(block)
-            result = transfer.send(target.get("target"), target.get("identity_file"), path,
-                                   path.name)
+            result = transfer.send_file(self.config, self.state, path, device or None, path.name)
         self.bus.publish("transfer.sent", {"name": result["sent"], "bytes": result["bytes"]})
         return result
 
@@ -847,8 +867,7 @@ class Console:
 
     def inbox(self, device=None):
         from . import transfer
-        target = transfer.ssh_device(self.config, device or None)
-        return transfer.inbox(target.get("target"), target.get("identity_file"))
+        return transfer.list_inbox(self.config, self.state, device or None)
 
     def grokbot(self):
         from .grokbot import Grokbot
@@ -1343,11 +1362,37 @@ class ConsoleServer(ThreadingHTTPServer):
     request_queue_size = 64
     daemon_threads = True
 
+    def handle_error(self, request, client_address):
+        """A page that reloads or navigates away mid-poll closes its socket before the
+        reply is written; that is routine, not worth a traceback in the console log."""
+        import sys
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError,
+                                           ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def focus_app_window():
+    """Bring an open console app window forward (its title is "JARVIS · <view>", with no
+    " — Browser" suffix, unlike a tab). True if one was found and focused."""
+    try:
+        from .actions import open_windows, raise_window
+        found = [w for w in open_windows() if (w["title"].startswith("JARVIS · ")
+                 or w["title"] == "JARVIS Console") and " — " not in w["title"]]
+        return len(found) == 1 and raise_window(found[0])
+    except (LookupError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+
 
 def serve(config, base, state, port=7777, open_browser=False, app=False):
     url = f"http://127.0.0.1:{port}/"
     profile = Path(state).resolve() / "app-window"
     if app and listening(port):
+        # A hotkey (Hyprland's SUPER+SHIFT+J) runs this each press: raise the open window
+        # rather than stack up copies.
+        if focus_app_window():
+            print("JARVIS console window brought forward.", flush=True)
+            return 0
         print(f"JARVIS console is already running on {url}; opening its window.", flush=True)
         app_window(url, profile=profile)
         return 0
