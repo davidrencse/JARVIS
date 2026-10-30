@@ -490,8 +490,11 @@ def _brief(task):
 
 class TaskTools:
     def __init__(self, tasks, write=True, channel="jarvis"):
-        self.tasks, self.channel = tasks, channel
-        self.write = write and tasks.vault.writable
+        self.tasks, self.channel, self._write = tasks, channel, write
+
+    @property
+    def write(self):
+        return bool(self._write and self.tasks.vault.writable)
 
     def specs(self):
         specs = [{"type": "function", "name": "task_list",

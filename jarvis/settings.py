@@ -62,6 +62,37 @@ def _get(config, path):
     return value
 
 
+_SEEN = {}  # config file -> mtime refresh() last copied from
+
+
+def refresh(config, path):
+    """Pick up the console's saves in another process (the voice listener keeps its own
+    config): every field that needs no restart is copied from disk into `config` in place,
+    so e.g. vault.write switched off in the console reaches the voice brain too. Cheap: the
+    file is reread only when its mtime changes. True when something was reread."""
+    try:
+        stamp = Path(path).stat().st_mtime_ns
+        if _SEEN.get(str(path)) == stamp:
+            return False
+        disk = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    _SEEN[str(path)] = stamp
+    for key in FIELDS:
+        if key.startswith(("cluster.", "voice.")):  # these say "restart needed" in the console
+            continue
+        *parents, leaf = key.split(".")
+        node = config
+        for part in parents:
+            node = node.setdefault(part, {})
+        value = _get(disk, key)
+        if value is None:
+            node.pop(leaf, None)
+        else:
+            node[leaf] = value
+    return True
+
+
 def _voiceprint(state):
     return Path(state) / "voice" / "voiceprint.json"
 
@@ -104,8 +135,8 @@ def machines(config, state):
     nodes, code = {}, None
     if local and local == main and (Path(state) / "cluster.sqlite3").is_file():
         from .cluster_store import Broker
-        from .deploy import code_fingerprint
-        nodes, code = {n["id"]: n for n in Broker(state).nodes()}, code_fingerprint()
+        from .release import served_code
+        nodes, code = {n["id"]: n for n in Broker(state).nodes()}, served_code(state)
     out = []
     for key, d in (config.get("devices") or {}).items():
         item = {"id": key, "label": (d or {}).get("label") or key,

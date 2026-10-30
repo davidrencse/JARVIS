@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 ORIGIN = ContextVar("jarvis_origin_device", default=None)
 DEVICE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+# The hub's port. 7778 is taken by the Grok Bot tunnel's forward, so never default to it.
+DEFAULT_PORT = 7780
 
 
 def enabled(config):
@@ -38,7 +40,7 @@ def is_node(config):
 
 
 def endpoint(config):
-    value = str(config.get("cluster", {}).get("main_url", "http://127.0.0.1:7778")).rstrip("/")
+    value = str(config.get("cluster", {}).get("main_url", f"http://127.0.0.1:{DEFAULT_PORT}")).rstrip("/")
     parts = urlsplit(value)
     if (parts.username or parts.password or parts.query or parts.fragment
             or parts.path or not parts.hostname or parts.port == 0

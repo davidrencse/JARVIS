@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import threading
+import time
 import shutil
 import subprocess
 import sys
@@ -245,10 +246,30 @@ class SpeechQueue:
             finally:
                 self.wavs.task_done()
 
-    def drain(self):
-        """Block until everything queued has been spoken."""
-        self.texts.join()
-        self.wavs.join()
+    def drain(self, timeout=None):
+        """Block until everything queued has been spoken, or `timeout` seconds pass (a
+        stalled synthesis must not hang the listener). True when all of it was spoken."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for pending in (self.texts, self.wavs):
+            with pending.all_tasks_done:
+                while pending.unfinished_tasks:
+                    left = None if deadline is None else deadline - time.monotonic()
+                    if left is not None and left <= 0:
+                        return False
+                    pending.all_tasks_done.wait(left)
+        return True
+
+    def clear(self, timeout=None):
+        """Drop what hasn't started playing, then wait (up to `timeout`) for the line
+        playing now."""
+        for pending in (self.texts, self.wavs):
+            while True:
+                try:
+                    pending.get_nowait()
+                except queue.Empty:
+                    break
+                pending.task_done()
+        return self.drain(timeout)
 
 
 def list_voices(key):

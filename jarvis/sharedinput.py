@@ -29,6 +29,7 @@ import socket
 import subprocess
 from pathlib import Path
 
+from .platforms import NO_WINDOW
 from . import platforms
 
 try:
@@ -38,12 +39,11 @@ except ModuleNotFoundError:  # Python 3.10
 
 OPPOSITE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 SCALE_TOLERANCE = 0.03  # relative error in motion_scale that still feels identical
-FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+FLAGS = NO_WINDOW
 
 
 def _run(*args, timeout=5):
-    return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=timeout, creationflags=FLAGS)
+    return platforms.run_quiet(args, timeout)
 
 
 # -- this computer ---------------------------------------------------------------------------

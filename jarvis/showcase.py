@@ -8,6 +8,8 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 PAGES = {"wiki": "knowledge.html", "system": "design.html", "console": ""}
 PORTS = (7777, *range(7790, 7800))
 REPO = Path(__file__).resolve().parent.parent
@@ -30,7 +32,7 @@ def console_port(ports=PORTS):
 
 def start_console(port=7777, wait=25):
     """Start `jarvis ui` in the background (no window) and wait until it serves."""
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+    flags = NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0)
     subprocess.Popen([sys.executable, "-m", "jarvis", "ui", "--port", str(port)], cwd=REPO,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags,

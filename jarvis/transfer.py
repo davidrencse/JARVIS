@@ -343,7 +343,8 @@ def call(config, state, device, payload, timeout=120):
         return dispatch(config, state, device, "transfer", payload, timeout=timeout)
     from .cluster import Client
     return Client(config, state).request("/v1/control", {
-        "node": main, "kind": "transfer", "payload": payload}, timeout=timeout)
+        "node": main, "kind": "transfer", "payload": payload,
+        "timeout": max(1, timeout - 5)}, timeout=timeout)
 
 
 def push(config, state, device, source, size, name=None, dest="drop", kind=None):

@@ -61,6 +61,39 @@ EXTERNALS = (
 )
 
 
+_MODULES = {}  # str(path) -> ((mtime_ns, size), text, node or None, import targets)
+_MODULES_LOCK = threading.Lock()
+
+
+def _parse_module(path):
+    """(text, graph node, relative-import targets) for one module; re-parsed only when it changed."""
+    key = str(path)
+    st = path.stat()
+    stamp = (st.st_mtime_ns, st.st_size)
+    with _MODULES_LOCK:
+        hit = _MODULES.get(key)
+    if hit and hit[0] == stamp:
+        return hit[1], hit[2], hit[3]
+    text = path.read_text(encoding="utf-8")
+    node, imports = None, []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        doc = (ast.get_docstring(tree) or "").strip().splitlines()
+        defs = [n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+                and not n.name.startswith("_")]
+        node = {"id": f"mod:{path.stem}", "label": f"{path.stem}.py", "kind": "module",
+                "loc": text.count("\n") + 1, "doc": doc[0] if doc else "", "defs": defs[:12]}
+        for found in ast.walk(tree):
+            if isinstance(found, ast.ImportFrom) and found.level == 1:
+                imports += [found.module] if found.module else [a.name for a in found.names]
+    with _MODULES_LOCK:
+        _MODULES[key] = (stamp, text, node, imports)
+    return text, node, imports
+
+
 class Console:
     """Everything the HTTP layer exposes, kept separate so tests can call it directly."""
 
@@ -555,27 +588,21 @@ class Console:
         """Module graph from the real import statements, plus what each module touches."""
         package = self.base / "jarvis"
         nodes, edges, sources = [], [], {}
-        for path in sorted(package.glob("*.py")):
+        paths = sorted(package.glob("*.py"))
+        live = {str(p) for p in paths}
+        with _MODULES_LOCK:
+            for key in [k for k in _MODULES if k.startswith(f"{package}{os.sep}") and k not in live]:
+                del _MODULES[key]  # deleted modules drop out of the cache
+        for path in paths:
             name = path.stem
-            text = path.read_text(encoding="utf-8")
+            text, node, imports = _parse_module(path)
             sources[name] = text
-            try:
-                tree = ast.parse(text)
-            except SyntaxError:
+            if node is None:
                 continue
-            doc = (ast.get_docstring(tree) or "").strip().splitlines()
-            defs = [n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
-                    and not n.name.startswith("_")]
-            nodes.append({"id": f"mod:{name}", "label": f"{name}.py", "kind": "module",
-                          "loc": text.count("\n") + 1, "doc": doc[0] if doc else "",
-                          "defs": defs[:12]})
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom) and node.level == 1:
-                    targets = [node.module] if node.module else [a.name for a in node.names]
-                    for target in targets:
-                        if (package / f"{target}.py").is_file() and target != name:
-                            edges.append({"src": f"mod:{name}", "dst": f"mod:{target}",
-                                          "rel": "imports"})
+            nodes.append(node)
+            for target in imports:
+                if (package / f"{target}.py").is_file() and target != name:
+                    edges.append({"src": f"mod:{name}", "dst": f"mod:{target}", "rel": "imports"})
         for ext_id, label, kind, pattern in EXTERNALS:
             # ui.py holds this pattern table itself, so it would match everything.
             users = [m for m, text in sources.items() if m != "ui" and re.search(pattern, text)]
@@ -677,7 +704,7 @@ class Console:
         from .router import pick_adapter
         if tier not in (None, "", "simple", "medium", "complex"):
             raise ValueError("tier must be simple, medium or complex.")
-        route = decide(text or "", self.config, tier or None, conversational=True)
+        route = decide(text or "", self.config, tier or None, conversational=True, state=self.state)
         if route["tier"] == "simple":
             route["handler"] = f"{self.brain()['name']} brain"
         elif route["tier"] == "medium":
@@ -964,7 +991,7 @@ class Console:
     def voice_setup_action(self, body):
         setup, action = self.voice_setup(), body.get("action")
         if action == "start":
-            return setup.start(body.get("device") or None)
+            return setup.start(body.get("device"))  # "" is the system default
         if action == "cancel":
             return setup.cancel()
         if action == "autostart":

@@ -23,6 +23,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 FIX_MARKER = b"keyboard event dropped: capture queue stayed full"
 ACK_MARKER = b"did not acknowledge Enter within"  # stuck-capture guard
 GUARD_RELEASED = r"did not acknowledge Enter"  # its log line (also "...: no connection within")
@@ -155,7 +157,7 @@ def _processes(pattern):
          "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,ExecutablePath,CommandLine"
          " | ConvertTo-Json -Compress"],
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        creationflags=NO_WINDOW)
     import json
     rows = json.loads(out.stdout or "[]")
     rows = rows if isinstance(rows, list) else [rows]
@@ -191,7 +193,7 @@ def check_lan_mouse():
         prio = subprocess.run(["powershell.exe", "-NoProfile", "-Command",
                                f"(Get-Process -Id {procs[0]['ProcessId']}).PriorityClass"],
                               capture_output=True, text=True, timeout=20,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+                              creationflags=NO_WINDOW).stdout.strip()
         out.append(result("lan-mouse priority", "PASS" if prio == "High" else "WARN", prio or "unknown"))
     except Exception as exc:
         out.append(result("lan-mouse priority", "WARN", str(exc)))
@@ -242,7 +244,7 @@ def check_peer(config):
     # Windows ping: -n count, -w milliseconds; elsewhere: -c count, -W seconds.
     flags = ["-n", "1", "-w", "1500"] if os.name == "nt" else ["-c", "1", "-W", "2"]
     ok = subprocess.run(["ping", *flags, host], capture_output=True,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+                        creationflags=NO_WINDOW).returncode == 0
     return result(f"{name} reachable", "PASS" if ok else "WARN",
                   f"{host} {'answers ping' if ok else 'no ping reply (asleep? IP changed?)'}")
 

@@ -26,7 +26,7 @@ STATIONS = [
     {"id": "remember", "title": "Remember", "verb": "recalls",
      "plain": "Before answering it gathers what it already knows: your Obsidian notes, wiki "
               "claims with their sources and dates, and past conversations.",
-     "modules": ["vault", "knowledge", "memory", "vault_mcp", "tasks", "history", "embed"]},
+     "modules": ["vault", "knowledge", "memory", "vault_mcp", "tasks", "history", "embed", "stemming"]},
     {"id": "think", "title": "Think", "verb": "answers",
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",
@@ -43,12 +43,12 @@ STATIONS = [
     {"id": "log", "title": "Log", "verb": "records",
      "plain": "Everything is written down: the conversation in memory, agent runs in the "
               "task ledger, and live events to this console.",
-     "modules": ["store", "events", "locking", "cluster_store"]},
+     "modules": ["store", "events", "locking", "cluster_store", "fsio"]},
 ]
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay.",
-     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "node", "platforms", "autostart", "settings"]},
+     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "release", "node", "platforms", "autostart", "settings"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",
