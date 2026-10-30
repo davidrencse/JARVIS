@@ -15,9 +15,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 MAX_WIDTH = 1600
 QUALITY = 60
-FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+FLAGS = NO_WINDOW
 
 
 def _shrink(data, width, quality):

@@ -4,15 +4,14 @@ runs them in dependency order. Each subtask agent may spawn its own subagents
 """
 
 import json
-import os
 import re
 import secrets
-import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .router import specialists
 from .runner import POWERS, final_message, run_task
+from .fsio import atomic_write
 from .locking import exclusive_lock
 from .vault import recall as vault_recall
 
@@ -175,20 +174,7 @@ class Orchestrator:
         return self.dir / f"{plan_id}.json"
 
     def _save(self, record):
-        path = self._path(record["id"])
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.dir,
-                                             prefix=path.stem + "-", suffix=".tmp",
-                                             delete=False) as stream:
-                temporary = Path(stream.name)
-                json.dump(record, stream, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        atomic_write(self._path(record["id"]), json.dumps(record, indent=2), fsync=True)
 
     def load(self, plan_id):
         path = self._path(plan_id)

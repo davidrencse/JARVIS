@@ -135,7 +135,8 @@ def risk(command):
         return "allow"
     if intent.name == "terminal":
         from .terminal import read_only
-        return "allow" if read_only(command["args"]["command"]) else "confirm"
+        args = command["args"]
+        return "allow" if read_only(args["command"], args.get("cwd")) else "confirm"
     return intent.risk
 
 

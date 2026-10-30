@@ -95,6 +95,16 @@ class _Vectors:
         self.buf = None     # (capacity, dim) float32; rows [0, len(ids)) are valid
 
 
+
+# The recall item holding conversation() lines; a model lane drops the lines its own thread
+# already holds (chatgpt.ChatGPTLane), so these two must agree on the format.
+CONVERSATION = "Recent conversation, oldest first (any channel):"
+
+
+def exchange_line(who, text):
+    text = " ".join(str(text).split())
+    return f"{who}: {text[:300]}{'…' if len(text) > 300 else ''}"
+
 class Memory:
     def __init__(self, directory, semantic=False):
         """semantic: also rank by meaning with local embeddings (jarvis/embed.py), merged
@@ -230,13 +240,8 @@ class Memory:
             rows = db.execute("SELECT id, kind, body FROM items WHERE kind IN ('message','reply') "
                               "AND created_at >= ? ORDER BY created_at DESC, rowid DESC LIMIT ?",
                               (since, limit + len(skip))).fetchall()
-        lines = []
-        for row in reversed(rows):
-            if row["id"] in skip:
-                continue
-            who = "David" if row["kind"] == "message" else "JARVIS"
-            text = " ".join(row["body"].split())
-            lines.append(f"{who}: {text[:300]}{'…' if len(text) > 300 else ''}")
+        lines = [exchange_line("David" if row["kind"] == "message" else "JARVIS", row["body"])
+                 for row in reversed(rows) if row["id"] not in skip]
         return lines[-limit:]
 
     def search(self, text="", kind=None, tag=None, since=None, limit=10):

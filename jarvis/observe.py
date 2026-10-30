@@ -21,6 +21,7 @@ import ctypes
 import uuid
 from urllib.parse import urlsplit
 
+from .platforms import NO_WINDOW
 from . import platforms
 
 KINDS = ("window", "title", "focused", "gone", "playback", "volume")
@@ -175,9 +176,7 @@ def _windows_hyprland():
 
 def _run(*args, timeout=5):
     """Argument-list subprocess (never a shell); no console window on Windows."""
-    return subprocess.run(list(args), capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=timeout,
-                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return platforms.run_quiet(args, timeout)
 
 
 def backend():
@@ -300,7 +299,7 @@ try {
 '''
     out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                          capture_output=True, text=True, timeout=8,
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                         creationflags=NO_WINDOW)
     if out.returncode:
         raise LookupError(out.stderr.strip() or "Windows media session is unavailable")
     try:

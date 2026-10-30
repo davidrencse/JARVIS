@@ -15,10 +15,19 @@ none (a headless session, e.g. reached over SSH with no desktop to borrow).
 import functools
 import os
 import platform
+import subprocess
 import sys
 from pathlib import Path
 
 OSES = ("windows", "macos", "linux")
+# creationflags for a child process that must not flash a console window (0 off Windows).
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def run_quiet(args, timeout=5, **kw):
+    """Argument-list subprocess (never a shell), text out, no console window on Windows."""
+    return subprocess.run(list(args), capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=timeout, creationflags=NO_WINDOW, **kw)
 
 
 def _os():

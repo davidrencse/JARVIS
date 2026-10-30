@@ -22,6 +22,8 @@ import threading
 import time
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 PORT = 4242
 REMOTE_SCRIPT = r"""
 echo "host=$(cat /proc/sys/kernel/hostname)"
@@ -39,10 +41,8 @@ echo "ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut 
 
 
 def _run(args, timeout, **kw):
-    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    return subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                          errors="replace", timeout=timeout, shell=False,
-                          creationflags=flags, **kw)
+    from .platforms import run_quiet
+    return run_quiet(args, timeout, **kw)
 
 
 def parse_kv(text):
@@ -116,7 +116,7 @@ def probe_ssh(target, identity_file=None):
         # Bytes, not text: Windows text mode would turn the script's \n into \r\n for bash.
         result = subprocess.run([*args, target, "bash -s"], input=REMOTE_SCRIPT.encode(),
                                 capture_output=True, timeout=15, shell=False,
-                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                                creationflags=NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:
         out["error"] = f"SSH timed out or failed to start: {exc}"
         return out

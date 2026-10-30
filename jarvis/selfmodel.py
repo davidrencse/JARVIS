@@ -11,6 +11,12 @@ from pathlib import Path
 
 FILE = "JARVIS.md"
 MAX_CHARS = 6000
+# JARVIS.md's "only act on speech that starts with Jarvis" is enforced by the listener, which
+# strips the name before the text gets here; read literally, the model refused requests
+# ("Say 'Jarvis, how many apps are on my Dell?' so I can check.").
+ADDRESSED = ("Every request you receive is already addressed to JARVIS: the listener checked "
+             "the wake word and David's voice and removed \"Jarvis\" from the text, and typed "
+             "requests need none. Act on it; never ask him to say \"Jarvis\" first.")
 
 
 def path(base):
@@ -65,6 +71,8 @@ def brief(config, base):
         parts.append(f"This computer{f' ({here})' if here else ''} runs {label()}.")
     except Exception:
         pass
+    if parts:
+        parts.append(ADDRESSED)
     problems = mismatches(text, config) if text else []
     if problems:
         parts.append("Note: " + " ".join(problems) + " Follow the configuration.")

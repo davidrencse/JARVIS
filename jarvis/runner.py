@@ -7,6 +7,7 @@ import signal
 import subprocess
 from pathlib import Path
 
+from .platforms import NO_WINDOW
 from .fastlane import subscription_env
 from .prompts import build_prompt, normalize_task
 
@@ -144,7 +145,7 @@ def run_task(store, task_id, config, base, timeout=900):
                 plan["argv"], cwd=plan["workspace"], stdin=subprocess.PIPE,
                 stdout=stdout, stderr=stderr, shell=False,
                 start_new_session=os.name != "nt", env=subscription_env(),
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+                creationflags=NO_WINDOW)
             try:
                 process.communicate(plan["prompt"].encode("utf-8"), timeout=timeout)
                 state = "finished" if process.returncode == 0 else "failed"

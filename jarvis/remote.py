@@ -29,6 +29,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 # ssh stderr that means no session ever opened, so the command can't have run there.
 PRE_SESSION = re.compile(r"ssh: connect to host|Could not resolve hostname|kex_exchange_identification|"
                          r"banner exchange|Host key verification failed|Permission denied \(", re.I)
@@ -45,7 +47,7 @@ SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XA
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
                 "DBUS_SESSION_BUS_ADDRESS")
 REMOTE_DIR = "~/projects/JARVIS"  # where the other laptop's checkout lives, by default
-FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+FLAGS = NO_WINDOW
 
 
 def systemd_env(env=None):

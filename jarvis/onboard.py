@@ -81,13 +81,14 @@ class VoiceSetup:
 
     # ---- control ---------------------------------------------------------------------
     def start(self, device=None):
+        """device: a mic name, "" for the system default, None to keep the saved choice."""
         with self._lock:
             if self.view["running"]:
                 raise RuntimeError("Voice setup is already running.")
             self._cancel.clear()
             self.view = {**self._idle(), "running": True, "step": "starting",
                          "device": device or None, "message": "Getting the microphone ready"}
-            self._thread = threading.Thread(target=self._run, args=(device or None,),
+            self._thread = threading.Thread(target=self._run, args=(device,),
                                             name="voice-setup", daemon=True)
             self._thread.start()
         return self.status()
@@ -147,7 +148,9 @@ class VoiceSetup:
                         break
                     time.sleep(0.25)
             from .listen import mic_settings
-            tuning = {**mic_settings(self.state), "device": device}
+            tuning = mic_settings(self.state)
+            if device is not None:  # no choice given (`jarvis voice enroll`): keep the saved mic
+                tuning["device"] = device or None
             mic = self._mic = self._open(tuning)
             self._speak(INTRO, mic)
             noise_rms, noise_probs = self._quiet(mic)
