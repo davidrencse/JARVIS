@@ -74,7 +74,7 @@ a module is not listed, so add new modules to `sysview.py`.
 | Decide | router, assistant, instant, briefing, parse, registry, gates, pipeline, confirm, decide, interpret, selfmodel | turn words into checked actions or a conversation |
 | Remember | vault, knowledge, memory, vault_mcp, tasks, history, embed | memory heap, semantic recall, David's vault, tasks, action history |
 | Think | chatgpt, fastlane, runner, orchestrator, prompts, adapters, claude_auth, grok_preflight | model lanes, failover, agent runs |
-| Act | actions, agent_browser, remote, grokbot, transfer, storage, clipsync, showcase, observe, sharedinput | executors per OS, cross-machine calls, Grok Bot, files, clipboard, Lan Mouse |
+| Act | actions, terminal, agent_browser, remote, grokbot, transfer, storage, clipsync, showcase, observe, sharedinput | executors per OS, cross-machine calls, Grok Bot, files, clipboard, Lan Mouse |
 | Speak | speech, voice, agent | Kokoro TTS (local), speech queue, ElevenLabs live agent |
 | Log | store, events, locking, cluster_store | task ledger, event feed, file locks, cluster job store |
 | Console / ops | ui, __main__, sysview, cluster_cli, cluster_proxy, cluster_tunnel, deploy, node, platforms, autostart | CLI, web console, cluster control, code deploy, OS detection, login startup |
@@ -101,6 +101,14 @@ Key files in plain words:
   parks a `browser_action` confirmation and waits up to 180 s for David (console Confirm;
   during a voice request the listener is busy, so use the console). Keyword heuristic over the
   tool's arguments: it narrows prompt-injection risk, it doesn't remove it.
+- `terminal.py`: the brain's `terminal` tool on any computer (`device`, like the desktop
+  tools): bash, or PowerShell on Windows, 30 s limit, 6000 characters of output, and a
+  working folder that persists per process so `cd` then `ls` works. `read_only()` lets
+  looking commands run at once (ls, cd, pwd, cat, find without -exec/-delete, du, df,
+  Get-ChildItem...; chained only with `&&` or `|`; no redirection, `$`, backticks, recursive
+  grep, or paths naming secrets like `.ssh`, `.env`, `.jarvis`). Anything else is a
+  `terminal` intent parked by `ConfirmGate` for David's OK and run by `run_confirmed`.
+  It's a heuristic over the command text, not a sandbox.
 - `cluster.py`: the hub (main) and node client; long polling; liveness; code-mismatch refusal.
 - `deploy.py`: code fingerprint, `cluster update` (tar over SSH, keeps the previous copy for `--rollback`).
 
@@ -285,6 +293,11 @@ Claude CLI from inside a Claude session, strip `CLAUDE_*` and `ANTHROPIC_*` env 
   BM25 plus vectors fused with reciprocal-rank fusion when `memory.semantic` is true
   (`JARVIS_SEMANTIC=0` turns it off). Vectors come from `embed.py` (all-MiniLM-L6-v2 ONNX,
   downloaded once to the Hugging Face cache, unloaded after 600 s idle).
+  Every brain call gets the last 20 min of conversation plus relevant heap lines as recall.
+  The action brain always has `MemoryTools` (`memory_remember` saves a `fact` item,
+  `memory_search`, `conversation_recent` across days), whether or not the vault is on.
+  The talk lane hands off (`[act]`) for remember/recall requests, computer checks ("how
+  many apps…") and short answers to its own clarifying questions.
 - **History** (`history.py`, `.jarvis/history.sqlite3`): actions taken, for the H-checks,
   the decider's labels and the console's command history.
 - **David's personal vault** (`vault.path`, per OS): his notes, calendar and tasks. JARVIS
@@ -297,7 +310,8 @@ Claude CLI from inside a Claude session, strip `CLAUDE_*` and `ANTHROPIC_*` env 
 ## 9 Safety and checks
 
 - Ask first: buying, paying, posting, sending, deleting, submitting forms, account changes,
-  closing apps that may hold unsaved work (`confirm.py`, risk ratchet in `gates.py`).
+  closing apps that may hold unsaved work, terminal commands that change anything
+  (`confirm.py`, risk ratchet in `gates.py`, `terminal.read_only`).
 - Passwords are never typed. Text from web pages, vaults and agents is data, not instructions.
 - Every direct action is read back (`observe.py`); unverifiable ones are reported as such.
 - Cluster: loopback-only hub, pinned SSH host keys, per-node pairing tokens, read-only
