@@ -94,6 +94,30 @@ class GraphTests(Temp):
         self.assertIn("agent:scout", ids)
         self.assertTrue(all(e["src"] in ids and e["dst"] in ids for e in graph["edges"]))
 
+    def test_system_graph_reparses_only_changed_modules(self):
+        import os
+        package = self.base / "jarvis"
+        package.mkdir()
+        (package / "alpha.py").write_text('"""Alpha."""\nfrom .beta import x\n', encoding="utf-8")
+        (package / "beta.py").write_text('"""Beta."""\nx = 1\n', encoding="utf-8")
+        console = Console(CONFIG, self.base, self.base)
+        with patch("jarvis.ui.ast.parse", wraps=__import__("ast").parse) as parse:
+            first = console.system_graph()
+            self.assertEqual(parse.call_count, 2)
+            self.assertEqual(console.system_graph(), first)
+            self.assertEqual(parse.call_count, 2)  # unchanged: served from the cache
+            path = package / "beta.py"
+            path.write_text('"""Beta two."""\ndef f(): pass\n', encoding="utf-8")
+            os.utime(path, ns=(1, 1))
+            graph = console.system_graph()
+            self.assertEqual(parse.call_count, 3)  # only the changed module
+            beta = next(n for n in graph["nodes"] if n["id"] == "mod:beta")
+            self.assertEqual((beta["doc"], beta["defs"]), ("Beta two.", ["f"]))
+            (package / "beta.py").unlink()
+            graph = console.system_graph()
+            self.assertEqual([n["id"] for n in graph["nodes"] if n["kind"] == "module"], ["mod:alpha"])
+            self.assertEqual(graph["edges"], [])
+
     def test_heap_graph_has_items_hubs_and_links(self):
         console = Console(CONFIG, ROOT, self.base)
         a = console.memory.add("message", "hello", tags=["inbound", "lan-mouse"])

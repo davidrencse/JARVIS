@@ -22,7 +22,7 @@ class MachineStatusTests(unittest.TestCase):
         broker = Broker(self.state)
         broker.enroll("dell")
         broker.heartbeat("dell", {"code": "abc"})
-        with mock.patch("jarvis.deploy.code_fingerprint", return_value="abc"):
+        with mock.patch("jarvis.release.served_code", return_value="abc"):  # the release nodes get
             out = {m["id"]: m for m in settings.machines(CONFIG, self.state)}
         self.assertEqual(out["zenbook"]["role"], "main")
         self.assertTrue(out["zenbook"]["this"])
@@ -59,6 +59,24 @@ class RestartMarkerTests(unittest.TestCase):
         out = self.save({"voice": {"max_spoken_chars": 350}}, 350)
         self.assertEqual(out["saved"], ["voice.max_spoken_chars"])
         self.assertEqual(out["restart"], [])
+
+    def test_refresh_brings_console_saves_into_another_process(self):
+        import json
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        path = folder / "jarvis.config.json"
+        path.write_text(json.dumps({"vault": {"path": "v", "write": True}, "voice": {"near_miss": 0.2}}))
+        running = {"vault": {"path": "v", "write": True}, "voice": {"near_miss": 0.2}}
+        vault_settings = running["vault"]  # what a Vault holds on to
+        settings.refresh(running, path)
+        path.write_text(json.dumps({"vault": {"path": "v", "write": False}, "voice": {"near_miss": 0.3}}))
+        import os
+        os.utime(path, ns=(1, 1))  # a different mtime, however fast the test runs
+        self.assertTrue(settings.refresh(running, path))
+        self.assertIs(running["vault"], vault_settings)
+        self.assertFalse(vault_settings["write"])
+        self.assertEqual(running["voice"]["near_miss"], 0.2)  # needs a restart: left alone
+        self.assertFalse(settings.refresh(running, path))  # unchanged file: not reread
 
 
 if __name__ == "__main__":

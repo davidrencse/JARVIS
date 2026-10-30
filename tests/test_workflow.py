@@ -461,13 +461,50 @@ class VoiceWorkflowTests(Temp):
         ears.learn.assert_not_called()  # an unconfirmed voice never trains the print
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_a_far_voice_below_the_floor_still_counts_with_the_wake_word(self):
+        from jarvis import daemon
+        heard = {"far-owner": "Jarvis, what time is it", "far-chatter": "turn that up a bit"}
+        score = {"far-owner": (False, 0.15), "far-chatter": (False, 0.15), "noise": (False, 0.02)}
+        queue_ = ["far-owner", "far-chatter", "noise", KeyboardInterrupt]
+
+        def record_utterance(**_):
+            item = queue_.pop(0)
+            if item is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return item
+
+        ears = MagicMock()
+        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
+            audio, str) else "")
+        stt.device = "cpu"
+        brain = Brain()
+        brain.warm = MagicMock()
+        with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
+                patch("jarvis.listen.VoicePrint", return_value=ears), \
+                patch("jarvis.listen.Transcriber", return_value=stt), \
+                patch("jarvis.speech.Voice", return_value=MagicMock(limit=350)), \
+                patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
+                patch("jarvis.chatgpt.make_lane", return_value=brain), \
+                patch.object(daemon, "foreground_priority"):
+            with self.assertRaises(KeyboardInterrupt):
+                daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        feed = (self.base / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("what time is it", feed)  # opens with "Jarvis": a near miss
+        self.assertNotIn("turn that up", feed)  # no wake word: dropped unread
+        self.assertNotIn("noise", [c.args[0] for c in stt.call_args_list
+                                   if isinstance(c.args[0], str)])  # under the floor: never transcribed
+        ears.learn.assert_not_called()
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_a_short_answer_to_jarvis_needs_no_wake_word(self):
         from jarvis import daemon
         heard = {"ask": "Jarvis, what apps are on my Windows laptop?", "yes": "Then check it.",
                  "chatter": "so anyway I was saying to him", "near-yes": "Yes please.",
                  "late": "Go ahead."}
         score = {"ask": (True, 0.6), "yes": (True, 0.5), "chatter": (True, 0.6),
-                 "near-yes": (False, 0.2), "late": (True, 0.5)}
+                 "near-yes": (False, 0.28), "late": (True, 0.5)}
         queue_ = ["ask", "yes", "chatter", "near-yes", "late", KeyboardInterrupt]
         asked = []
 
@@ -568,7 +605,7 @@ class VoiceWorkflowTests(Temp):
                  "near-wake": "Jarvis?", "near-rest": "delete my downloads"}
         score = {"wake": (True, 0.6), "rest": (True, 0.5), "late": (True, 0.5),
                  "wake2": (True, 0.6), "stranger": (False, 0.05),
-                 "near-wake": (False, 0.2), "near-rest": (False, 0.2)}
+                 "near-wake": (False, 0.28), "near-rest": (False, 0.28)}
         queue_ = ["wake", "rest", "late", "wake2", "stranger", "near-wake", "near-rest",
                   KeyboardInterrupt]
         # One clock read per utterance, at the moment it was recorded.
@@ -605,6 +642,62 @@ class VoiceWorkflowTests(Temp):
         self.assertNotIn("close the door", feed)  # the window is one request only
         self.assertNotIn("million", feed)  # a stranger never fills the window
         self.assertNotIn("downloads", feed)  # two near misses never make a request
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_misheard_request_is_asked_again_not_answered(self):
+        from jarvis import daemon
+        heard = {"mumble": ("Jarvis, for the day.", {"logprob": -1.4, "no_speech": 0.2}),
+                 "repeat": ("remind me to push the branch", {"logprob": -0.2, "no_speech": 0.0})}
+        queue_ = ["mumble", "repeat", KeyboardInterrupt]
+
+        def record_utterance(**_):
+            item = queue_.pop(0)
+            if item is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return item
+
+        def transcribe(audio):
+            if not isinstance(audio, str):  # the warm-up clip
+                return ""
+            text, stats = heard.get(audio, ("", None))
+            confidence[audio] = stats
+            return text
+
+        confidence = {}
+
+        ears = MagicMock()
+        ears.verify.side_effect = lambda audio, threshold=None: (True, 0.7)
+        stt = MagicMock(side_effect=transcribe)
+        stt.stats.side_effect = lambda audio: confidence.pop(audio, None)
+        stt.device = "cpu"
+        voice = MagicMock(limit=350)
+        brain = Brain()
+        brain.warm = MagicMock()
+        with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
+                patch("jarvis.listen.VoicePrint", return_value=ears), \
+                patch("jarvis.listen.Transcriber", return_value=stt), \
+                patch("jarvis.speech.Voice", return_value=voice), \
+                patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
+                patch("jarvis.chatgpt.make_lane", return_value=brain), \
+                patch.object(daemon, "foreground_priority"):
+            with self.assertRaises(KeyboardInterrupt):
+                daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        said = [c.args[0] for c in voice.say.call_args_list]
+        self.assertIn(daemon.UNCLEAR, said)
+        self.assertEqual([c[0] for c in brain.calls], ["remind me to push the branch"])
+        feed = (self.base / "events.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("for the day", feed)  # the guess is never answered
+        self.assertIn("voice.unclear", feed)
+
+    def test_unsure_thresholds(self):
+        from jarvis.listen import unsure
+        self.assertTrue(unsure({"logprob": -1.3, "no_speech": 0.1}))
+        self.assertTrue(unsure({"logprob": -0.8, "no_speech": 0.7}))  # mostly silence
+        self.assertFalse(unsure({"logprob": -0.3, "no_speech": 0.7}))  # quiet but clear
+        self.assertFalse(unsure({"logprob": -0.4, "no_speech": 0.1}))
+        for nothing in (None, {}, {"logprob": None}, MagicMock()):
+            self.assertFalse(unsure(nothing))
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_live_mic_keeps_audio_between_reads_and_drops_the_oldest(self):

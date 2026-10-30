@@ -34,7 +34,7 @@ class McpCase(unittest.TestCase):
         (self.top / "outside.md").write_text(SECRET, encoding="utf-8")
         (self.top / "outside-dir").mkdir()
         (self.top / "outside-dir" / "x.md").write_text(SECRET, encoding="utf-8")
-        self.vault = Vault(self.root, self.top / "state", {"protected": ["calendar.md", "Secret/Locked.md"]})
+        self.vault = Vault(self.root, self.top / "state", {"write": True, "protected": ["calendar.md", "Secret/Locked.md"]})
         self.tools = Toolbox(VaultTools(self.vault, None, write=self.write, channel="mcp"),
                              TaskTools(tasks_for(self.vault), write=self.write, channel="mcp"))
 

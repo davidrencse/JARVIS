@@ -69,6 +69,12 @@ class BriefTests(unittest.TestCase):
         self.assertLess(out.index("I am David"), out.index("Configured machines"))
         self.assertNotIn("Note:", out)
 
+    def test_says_the_wake_word_was_already_checked(self):
+        self.write("Only act on speech that starts with \"Jarvis\".")
+        out = selfmodel.brief(CONFIG, self.base)
+        self.assertIn(selfmodel.ADDRESSED, out)
+        self.assertGreater(out.index(selfmodel.ADDRESSED), out.index("Only act on speech"))
+
     def test_mismatch_adds_note(self):
         self.write("The zenbook is the main PC.")
         out = selfmodel.brief(CONFIG, self.base)

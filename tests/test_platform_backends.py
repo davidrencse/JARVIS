@@ -171,6 +171,18 @@ class ObserveMediaVolumeTests(unittest.TestCase):
 
 
 class ActionsWindowTests(unittest.TestCase):
+    def test_close_prefers_the_exact_app_over_one_inside_its_name(self):
+        windows = [{"id": 1, "app": "code", "title": "VS Code"}, {"id": 2, "app": "codex", "title": "Codex"}]
+        with mock.patch.object(actions, "open_windows", return_value=windows), \
+                mock.patch.object(actions, "_close", return_value=True) as close:
+            self.assertTrue(actions.close_app("codex")[0])
+        close.assert_called_once_with(windows[1])
+        with mock.patch.object(actions, "open_windows", return_value=windows[:1]), \
+                mock.patch.object(actions, "_close", return_value=True) as close:
+            self.assertFalse(actions.close_app("codex")[0])  # no Codex open: VS Code stays
+            self.assertTrue(actions.close_app("vs code")[0])  # a whole word of the request
+        close.assert_called_once_with(windows[0])
+
     def test_sway_focus_and_close_use_con_id(self):
         fake = Fake(lambda a: done(json.dumps(SWAY_TREE)) if a[:2] == ["swaymsg", "-t"] else done())
         with posix(), detect("sway"), which("swaymsg"), \

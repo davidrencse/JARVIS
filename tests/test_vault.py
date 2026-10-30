@@ -77,7 +77,7 @@ class VaultCase(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8", newline="")
         self.state = Path(temp.name, "state")
-        self.vault = Vault(self.root, self.state)
+        self.vault = Vault(self.root, self.state, {"write": True})
 
     def read(self, rel):
         return (self.root / rel).read_text(encoding="utf-8")
@@ -246,6 +246,38 @@ class WriteTests(VaultCase):
             locked.log("nope", when=NOW)
         self.assertEqual(VaultTools(locked).names(), {"vault_search", "vault_read",
                                                       "vault_backlinks", "vault_world"})
+
+    def test_write_setting_applies_while_running(self):
+        from jarvis.vault import vault_for
+        config = {"vault": {"path": str(self.root), "write": True}}
+        vault = vault_for(config, self.state / "live")
+        tools = VaultTools(vault)
+        self.assertIn("vault_log", tools.names())
+        config["vault"]["write"] = False  # what the console's settings.write does
+        self.assertIs(vault_for(config, self.state / "live"), vault)
+        self.assertFalse(vault.writable)
+        self.assertNotIn("vault_log", tools.names())
+        with self.assertRaisesRegex(ValueError, "writes are off"):
+            vault.log("nope", when=NOW)
+        config["vault"] = {"path": str(self.root), "write": True}  # a reloaded config
+        vault_for(config, self.state / "live")
+        self.assertIn("vault_log", tools.names())
+
+    def test_index_pages_rank_below_the_note_they_list(self):
+        (self.root / "courses").mkdir(exist_ok=True)
+        (self.root / "courses" / "_index.md").write_text(
+            "---\ntitle: Courses\ntype: index\n---\n- [[kernels]] kernels kernels scheduling\n", "utf-8")
+        (self.root / "courses" / "kernels.md").write_text(
+            "---\ntitle: Kernels\ntype: course\n---\nScheduling and kernels.\n", "utf-8")
+        hits = [h["path"] for h in self.vault.search("kernels scheduling")]
+        self.assertLess(hits.index("courses/kernels.md"), hits.index("courses/_index.md"))
+
+    def test_world_brief_keeps_deadlines_when_trimmed(self):
+        with mock.patch.object(Vault, "_calendar", return_value=(["2026-11-02 OS exam"], [])), \
+                mock.patch.object(Vault, "_section_bullets", return_value=["x" * 200] * 6):
+            brief = self.vault.world(max_chars=400)
+        self.assertLessEqual(len(brief), 400)
+        self.assertIn("Deadlines in the next 14 days: 2026-11-02 OS exam.", brief)
 
 
 class HealthTests(VaultCase):

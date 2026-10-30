@@ -158,6 +158,27 @@ class BrokerBulkTests(unittest.TestCase):
         self.assertEqual((row["payload"], row["result"]), ("{}", "{}"))
 
 
+    def test_chunk_bytes_never_reach_sqlite(self):
+        job = self.broker.enqueue("node", "main", "transfer", {"data": "QUJD" * 50_000})
+        claimed = self.broker.claim("node", {"transfer"})
+        self.assertEqual(claimed["payload"], {"data": "QUJD" * 50_000})
+        self.broker.finish(job, "node", {"data": "WFla" * 50_000})
+        self.broker.finish(job, "node", {"data": "WFla" * 50_000})  # lost ack: repeat is accepted
+        self.assertEqual(self.broker.get(job)["result"], {"data": "WFla" * 50_000})
+        raw = b"".join(p.read_bytes() for p in Path(self.broker.path).parent.glob("cluster.sqlite3*"))
+        self.assertNotIn(b"QUJDQUJD", raw)
+        self.assertNotIn(b"WFlaWFla", raw)
+        self.assertLess(len(raw), 100_000)
+        self.broker.compact(job)
+        self.assertEqual(self.broker.get(job)["result"], {})
+
+    def test_queued_chunk_is_expired_not_replayed_after_a_hub_restart(self):
+        job = self.broker.enqueue("node", "main", "transfer", {"data": "x"})
+        restarted = Broker(self.broker.path.parent)
+        self.assertIsNone(restarted.claim("node", {"transfer"}))
+        self.assertEqual(restarted.get(job)["state"], "expired")
+
+
 class FakeBoard:
     def __init__(self, items):
         self.items, self.written = list(items), []

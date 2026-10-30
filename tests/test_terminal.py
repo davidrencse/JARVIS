@@ -29,11 +29,47 @@ class ReadOnlyTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(terminal.read_only(command))
 
+    def test_secrets_behind_wildcards_quotes_or_proc_need_ok(self):
+        for command in ("cat ~/.s?h/id_*", "cd ~/.s* && cat *", "cat x*", "ls '*'",
+                        "cat ~/.s''sh/id_ed25519", "cat ~/.s\\sh/x", "find ~ -name id_*",
+                        "cat /proc/self/environ", "cd / && cd proc && cat self/environ",
+                        "ps eww", "ps auxe", "ps e", "gc '~/.s*/x'",
+                        "grep -d recurse key /home/jdoe", "grep -drecurse key /home/jdoe",
+                        "grep -nd recurse key /home/jdoe", "grep --directories=recurse key /home/jdoe",
+                        "grep --dir recurse key /home/jdoe", "grep --dereference-recursive key /h",
+                        "gci -r /home/jdoe | sls key", "ls -r C:/Users | cat", "dir -Recurse | gc"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+        for command in ("find . -name '*.lnk'", "grep 'a.*b' notes.txt", "ps aux", "ps -ef",
+                        "ls | grep notes", "grep -n key notes.txt"):
+            with self.subTest(command=command):
+                self.assertTrue(terminal.read_only(command))
+
+    def test_writing_flags_need_ok(self):
+        for command in ("sort -o ~/.bashrc x", "sort -uo ~/.bashrc x", "sort --output=x y",
+                        "sort --compress-program=sh x", "uniq a ~/.bashrc", "uniq -f 1 a b",
+                        "tree -o x", "date -s 10:00", "hostname evil", "file -C -m x"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+        for command in ("sort -k2 -r x", "uniq -c x", "uniq -f 1 x", "tree -L 2", "hostname -I"):
+            with self.subTest(command=command):
+                self.assertTrue(terminal.read_only(command))
+
+    def test_cwd_is_checked(self):
+        for folder in ("~/.ssh", "/proc/self", "~/.s*", "$HOME/.ssh", "%USERPROFILE%"):
+            with self.subTest(folder=folder):
+                self.assertFalse(terminal.read_only("ls", folder))
+        self.assertTrue(terminal.read_only("ls", "~/Desktop"))
+
     def test_registry_risk_follows_read_only(self):
         def risk(cmd):
             return registry.risk({"intent": "terminal", "device": "dell", "args": {"command": cmd}})
         self.assertEqual(risk("ls"), "allow")
         self.assertEqual(risk("rm x"), "confirm")
+        self.assertEqual(registry.risk({"intent": "terminal", "device": "dell",
+                                        "args": {"command": "cat *", "cwd": "~/.ssh"}}), "confirm")
+        self.assertEqual(registry.risk({"intent": "terminal", "device": "dell",
+                                        "args": {"command": "ls", "cwd": "~/.ssh"}}), "confirm")
 
 
 @unittest.skipIf(os.name == "nt", "bash")
@@ -60,6 +96,11 @@ class RunTests(unittest.TestCase):
         ok, text = terminal.run("ls no-such-thing")
         self.assertFalse(ok)
         self.assertRegex(text, r"\[exit [1-9]")
+
+    def test_cd_into_a_secret_folder_is_not_remembered(self):
+        (self.root / ".ssh").mkdir()
+        terminal.run("cd .ssh")
+        self.assertEqual(terminal.cwd(), str(self.root))
 
     def test_explicit_cwd(self):
         ok, text = terminal.run('{"command": "ls", "cwd": "Desktop"}')
@@ -91,6 +132,13 @@ class GateTests(unittest.TestCase):
         self.assertEqual(self.gate.call("terminal", {"command": "ls ~/Desktop", "device": "dell"}),
                          (True, "ran"))
         self.assertEqual(ConfirmQueue(self.state).pending(), [])
+
+    def test_secret_cwd_is_parked(self):
+        ok, _ = self.gate.call("terminal", {"command": "ls", "cwd": "~/.ssh", "device": "dell"})
+        self.assertFalse(ok)
+        self.assertEqual(self.tools.calls, [])
+        [item] = ConfirmQueue(self.state).pending()
+        self.assertEqual(item["command"]["args"]["cwd"], "~/.ssh")
 
     def test_changing_command_is_parked(self):
         ok, text = self.gate.call("terminal", {"command": "rm old.txt", "device": "dell"})

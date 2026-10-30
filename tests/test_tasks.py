@@ -86,7 +86,7 @@ class TaskCase(unittest.TestCase):
         for rel, text in FILES.items():
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.root / rel).write_text(text, encoding="utf-8", newline="")
-        self.vault = Vault(self.root, Path(temp.name, "state"))
+        self.vault = Vault(self.root, Path(temp.name, "state"), {"write": True})
         self.tasks = Tasks(self.vault)
 
     def read(self, rel):
