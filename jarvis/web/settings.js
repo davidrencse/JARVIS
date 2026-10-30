@@ -6,7 +6,7 @@
   if (!view) return;
   const $ = (s, r = view) => r.querySelector(s);
   const SECS = ["machines", "voice", "calls", "intelligence", "memory", "input"];
-  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const esc = window.JarvisEsc;
   // Fields shown elsewhere (the machine list picks the main) stay out of the generic rows.
   const HIDDEN = new Set(["cluster.main_device"]);
   // Sub-headings inside a section, in order; fields not listed go under the first.

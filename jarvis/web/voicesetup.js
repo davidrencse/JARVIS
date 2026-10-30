@@ -7,7 +7,7 @@
   const STEPS = [["quiet", "Room"], ["level", "Mic"], ["enroll", "Your voice"], ["test", "Check"], ["done", "Ready"]];
   const ORDER = { starting: 0, quiet: 0, level: 1, enroll: 2, learning: 3, test: 3, done: 4 };
   const LATER = "jarvis.voicesetup.later";
-  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const esc = window.JarvisEsc;
   const icon = (n) => `<svg class="i" aria-hidden="true"><use href="icons.svg?v=2#i-${n}"/></svg>`;
 
   async function api(path, body) {

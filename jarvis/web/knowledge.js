@@ -24,7 +24,7 @@ const MAXC = 32;
 const view = {
   kbNodes: [], kbEdges: [], memNodes: [], memEdges: [], heapSig: "",
   nodes: [], edges: [], byId: new Map(), pages: [], notes: [], claimsOf: new Map(),
-  layers: { wiki: true, vault: false, claims: true },
+  layers: { wiki: true, vault: true, claims: true },
   selected: null, hover: null, pulses: [], snap: null, started: performance.now(), last: "reader :: idle",
   scn: "all", activeUntil: 0, dirty: true,
 };
@@ -48,7 +48,7 @@ function rng(seed) {  // mulberry32: stable positions for the same record across
   };
 }
 const pad = (n, w = 3) => String(n).padStart(w, "0");
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = window.JarvisEsc;
 const clip = (s, n) => (String(s).length > n ? String(s).slice(0, n - 1) + "…" : String(s));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 async function api(path, body) {
@@ -1224,7 +1224,7 @@ const vaultWanted = () => !view.vaultFailed || Date.now() - view.vaultFailed > 6
 async function refresh(withGraph) {
   try {
     const [snap, graph, vault, heap] = await Promise.all([api("/api/kb/state"), withGraph ? api("/api/kb/graph") : null,
-      null /* David's Obsidian vault is off limits to JARVIS (2026-10-27): never fetched */, withGraph ? api("/api/graph/heap").catch(() => null) : null]);
+      withGraph && vaultWanted() ? api("/api/vault/graph").catch(() => { view.vaultFailed = Date.now(); return null; }) : null, withGraph ? api("/api/graph/heap").catch(() => null) : null]);
     if (graph) { ingestKB(graph, vault); if (heap) ingestHeap(heap); }
     view.snap = snap; view.loaded = true;
     if (graph) { buildScene(); renderTabs(); }

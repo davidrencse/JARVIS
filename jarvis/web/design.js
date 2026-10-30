@@ -3,7 +3,7 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const esc = window.JarvisEsc;
 const bytes = (n) => (n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : n >= 1e6 ? (n / 1e6).toFixed(1) + " MB" : n >= 1e3 ? Math.round(n / 1e3) + " KB" : n + " B");
 const RANK = { fail: 2, warn: 1, ok: 0 };
 const MARK = { ok: "✓", warn: "!", fail: "✕" };
