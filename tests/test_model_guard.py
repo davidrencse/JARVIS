@@ -28,6 +28,24 @@ class ModelGuardTests(unittest.TestCase):
                 with self.assertRaises(PermissionError, msg=name):
                     subprocess.Popen(["anything"], executable=str(Path(d) / name))
 
+    def test_launchers_and_os_process_calls_are_caught(self):
+        for start in (lambda: subprocess.Popen(["env", "codex", "exec", "hi"]),
+                      lambda: subprocess.Popen(["npx", "@anthropic-ai/claude-code"]),
+                      lambda: subprocess.Popen(["node", "/lib/node_modules/codex/bin/codex.js"]),
+                      lambda: subprocess.Popen(["ssh", "dell", "claude --print hi"]),
+                      lambda: subprocess.Popen(["/opt/codex-x86_64-unknown-linux-musl"]),
+                      lambda: os.system("codex exec hi"),
+                      lambda: os.execvp("claude", ["claude", "--print", "hi"]),
+                      lambda: os.posix_spawnp("codex", ["codex"], dict(os.environ))):
+            with self.assertRaises(PermissionError):
+                start()
+
+    def test_a_child_given_its_own_environment_is_still_guarded(self):
+        env = {"PATH": os.environ.get("PATH", "")}
+        done = subprocess.run([sys.executable, "-c", "import os; print(os.environ.get('JARVIS_NO_MODELS'))"],
+                              env=env, capture_output=True, text=True)
+        self.assertEqual(done.stdout.strip(), "1")
+
     def test_fakes_still_run(self):
         done = subprocess.run([sys.executable, "-c", "print('ok')"], capture_output=True, text=True)
         self.assertEqual(done.stdout.strip(), "ok")

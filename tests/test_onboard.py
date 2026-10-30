@@ -100,7 +100,9 @@ class VoiceSetupTest(unittest.TestCase):
             self.assertFalse((voice / "enroll.new").exists())
             tuned = json.loads((voice / "mic.json").read_text())
             self.assertGreater(tuned["snr_db"], 20)  # a 0.1 tone over 0.002 noise
-            self.assertEqual(daemon.calls, ["stop", "start"])  # paused, then back with the new print
+            # paused, set to start at login, then back with the new print
+            self.assertEqual(daemon.calls, ["stop", "autostart:True", "start"])
+            self.assertTrue(view["autostart"] or setup.status()["autostart"])
             self.assertTrue(mic.closed)
             self.assertIn("JARVIS", said[0])
 
@@ -117,6 +119,31 @@ class VoiceSetupTest(unittest.TestCase):
             self.assertFalse((voice / "enroll.new").exists())
             self.assertEqual(daemon.calls, ["stop", "start"])  # it was on before, so it's on again
 
+    def test_cancel_after_the_voiceprint_is_made_still_changes_nothing(self):
+        from jarvis.listen import ENROLL_PHRASES
+        with tempfile.TemporaryDirectory() as d:
+            voice = Path(d) / "voice"
+            (voice / "enroll").mkdir(parents=True)
+            (voice / "enroll" / "01.wav").write_bytes(b"old")
+            (voice / "voiceprint.json").write_text('{"old": true}')
+            (voice / "mic.json").write_text('{"device": "old mic"}')
+            # intro, level, enroll, then the test prompt: cancelled after the print is written
+            setup, _, daemon = self.run_setup(d, FakeMic(), cancel_after=4)
+            self.assertEqual(setup.status()["step"], "cancelled")
+            self.assertEqual((voice / "voiceprint.json").read_text(), '{"old": true}')
+            self.assertEqual((voice / "mic.json").read_text(), '{"device": "old mic"}')
+            self.assertEqual([p.name for p in (voice / "enroll").iterdir()], ["01.wav"])
+            self.assertFalse((voice / "setup.old").exists())
+            self.assertEqual(daemon.calls, ["stop", "start"])
+
+    def test_a_first_run_cancelled_leaves_no_mic_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            setup, _, _ = self.run_setup(d, FakeMic(), listening=False, cancel_after=3)
+            self.assertEqual(setup.status()["step"], "cancelled")
+            voice = Path(d) / "voice"
+            for name in ("mic.json", "voiceprint.json", "enroll", "setup.old"):
+                self.assertFalse((voice / name).exists(), name)
+
     def test_a_silent_mic_is_named_and_nothing_starts(self):
         with tempfile.TemporaryDirectory() as d:
             setup, _, daemon = self.run_setup(d, FakeMic(silent=True), listening=False)
@@ -125,6 +152,24 @@ class VoiceSetupTest(unittest.TestCase):
             self.assertIn("pure silence", view["error"])
             self.assertFalse(view["enrolled"])
             self.assertEqual(daemon.calls, [])  # it wasn't listening and setup didn't finish
+
+    def test_terminal_run_prints_each_line_and_reports(self):
+        import io
+        from jarvis.listen import ENROLL_PHRASES
+        from jarvis.onboard import VoiceSetup, run_terminal
+        with tempfile.TemporaryDirectory() as d:
+            mic, daemon = FakeMic(), FakeDaemon(False, d)
+            setup = VoiceSetup(d, {}, say=lambda line: None, open_mic=lambda t: mic, daemon=daemon)
+            out = io.StringIO()
+            with mock.patch("jarvis.listen._vad_model", return_value=None), \
+                    mock.patch("jarvis.listen.VoicePrint._embed", fake_embed):
+                report = run_terminal(d, {}, out=out, poll=0.01, setup=setup)
+            self.assertEqual(report["step"], "done")
+            self.assertTrue(report["test_passed"] and report["listening"] and report["autostart"])
+            text = out.getvalue()
+            for phrase in ENROLL_PHRASES:
+                self.assertIn(phrase, text)
+            self.assertIn(f"[{len(ENROLL_PHRASES)}/{len(ENROLL_PHRASES)}]", text)
 
     def test_one_run_at_a_time_and_autostart_toggle(self):
         from jarvis.onboard import VoiceSetup

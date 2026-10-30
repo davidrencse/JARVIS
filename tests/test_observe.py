@@ -315,5 +315,60 @@ class RunHereTests(unittest.TestCase):
         tools.assert_not_called()
 
 
+class SnapshotTests(unittest.TestCase):
+    """A predicate that already held before the action proves nothing: with a `before`
+    digest the state must also change, and only a digest crosses the wire."""
+    P = {"kind": "window", "app": "Spotify"}
+
+    def test_already_open_and_untouched_is_unchanged(self):
+        listed = [win("Spotify", "Spotify Premium", focused=True)]
+        before = observe.snapshot(self.P, lister=lambda: listed)["before"]
+        self.assertRegex(before, r"^[0-9a-f]{16}$")
+        clock = Clock()
+        got = observe.check(self.P, 5, lister=lambda: listed, clock=clock, sleep=clock.sleep,
+                            before=before)
+        self.assertEqual((got["match"], got["changed"]), (True, False))
+        self.assertLess(got["after_ms"], 5000)  # a short grace, not the whole settle
+
+    def test_raising_an_open_window_is_a_change(self):
+        before = observe.snapshot(self.P, lister=lambda: [win("Spotify", "S")])["before"]
+        got = observe.check(self.P, 5, lister=lambda: [win("Spotify", "S", focused=True)],
+                            before=before)
+        self.assertEqual((got["match"], got["changed"]), (True, True))
+
+    def test_new_window_is_a_change(self):
+        before = observe.snapshot(self.P, lister=lambda: [])["before"]
+        got = observe.check(self.P, 5, lister=lambda: [win("Spotify", "S")], before=before)
+        self.assertEqual((got["match"], got["changed"]), (True, True))
+
+    def test_skip_needs_a_new_track(self):
+        p = {"kind": "playback", "command": "next"}
+        before = observe.snapshot(p, lister=lambda: {"status": "Playing", "track": "a"})["before"]
+        clock = Clock()
+        same = observe.check(p, 3, lister=lambda: {"status": "Playing", "track": "a"},
+                             clock=clock, sleep=clock.sleep, before=before)
+        moved = observe.check(p, 3, lister=lambda: {"status": "Playing", "track": "b"},
+                              before=before)
+        self.assertFalse(same["changed"])
+        self.assertTrue(moved["changed"])
+
+    def test_no_snapshot_where_it_cannot_tell(self):
+        for p in ({"kind": "playback", "command": "pause"}, {"kind": "volume", "level": "30"},
+                  {"kind": "gone", "app": "Spotify"}):
+            self.assertEqual(observe.snapshot(p, lister=lambda: 1 / 0), {"before": None})
+        p = {"kind": "playback", "command": "next"}  # no track identity on this player
+        self.assertEqual(observe.snapshot(p, lister=lambda: {"status": "Playing"}),
+                         {"before": None})
+
+    def test_run_answers_snapshot_and_rejects_bad_digest(self):
+        _, stack, defaults = fake_windows(return_value=[win("Spotify", "S")])
+        with stack, defaults:
+            ok, text = observe.run(json.dumps({"snapshot": self.P}))
+            self.assertTrue(ok)
+            self.assertRegex(json.loads(text)["before"], r"^[0-9a-f]{16}$")
+            ok, _ = observe.run(json.dumps({"predicate": self.P, "settle": 0, "before": "x"}))
+            self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

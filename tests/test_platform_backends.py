@@ -322,7 +322,14 @@ class ActionsMediaVolumeTests(unittest.TestCase):
             with self.subTest(command), posix(), detect("macos"), which("nowplaying-cli"), \
                     mock.patch.object(actions, "_run", fake):
                 self.assertTrue(actions.media(command)[0])
-            self.assertEqual(fake.calls, [["nowplaying-cli", verb]])
+            # play and pause read the rate first (unreadable here, so they go ahead).
+            self.assertEqual(fake.calls[-1], ["nowplaying-cli", verb])
+
+    def test_macos_already_paused_presses_nothing(self):
+        fake = Fake(lambda a: done("0\n"))
+        with posix(), detect("macos"), which("nowplaying-cli"), mock.patch.object(actions, "_run", fake):
+            self.assertEqual(actions.media("pause"), (True, "Already paused."))
+        self.assertEqual(fake.calls, [["nowplaying-cli", "get", "playbackRate"]])
 
     def test_macos_media_without_nowplaying(self):
         with posix(), detect("macos"), which():
@@ -333,7 +340,29 @@ class ActionsMediaVolumeTests(unittest.TestCase):
         fake = Fake(lambda a: done())
         with posix(), detect("gnome"), which("playerctl"), mock.patch.object(actions, "_run", fake):
             self.assertEqual(actions.media("play_pause"), (True, "Toggled play/pause."))
-        self.assertEqual(fake.calls, [["playerctl", "play-pause"]])
+        self.assertEqual(fake.calls, [["playerctl", "-p", "spotify,%any", "play-pause"]])
+
+    def test_linux_play_pause_read_the_pinned_player_first(self):
+        def handler(status):
+            return lambda a: done(status + "\n") if a[-1] == "status" else done()
+        cases = (("pause", "Paused", (True, "Already paused."), False),
+                 ("pause", "Stopped", (True, "Already paused."), False),
+                 ("play", "Playing", (True, "Already playing."), False),
+                 ("pause", "Playing", (True, "Paused."), True),
+                 ("play", "Paused", (True, "Playing."), True))
+        for command, status, said, pressed in cases:
+            fake = Fake(handler(status))
+            with self.subTest(command=command, status=status), posix(), detect("gnome"), \
+                    which("playerctl"), mock.patch.object(actions, "_run", fake):
+                self.assertEqual(actions.media(command), said)
+            self.assertEqual(fake.calls[0], ["playerctl", "-p", "spotify,%any", "status"])
+            self.assertEqual(["playerctl", "-p", "spotify,%any", command] in fake.calls, pressed)
+
+    def test_linux_unreadable_state_lets_the_player_decide(self):
+        fake = Fake(lambda a: done(returncode=1, stderr="No players found") if a[-1] == "status" else done())
+        with posix(), detect("gnome"), which("playerctl"), mock.patch.object(actions, "_run", fake):
+            self.assertEqual(actions.media("play"), (True, "Playing."))
+        self.assertIn(["playerctl", "-p", "spotify,%any", "play"], fake.calls)
 
     def test_pactl_volume_levels(self):
         def handler(a):

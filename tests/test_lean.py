@@ -6,7 +6,7 @@ from pathlib import Path
 
 from jarvis import gates
 from jarvis.chatgpt import ChatGPTLane, lean_prompt
-from jarvis.interpret import parse_reply
+from jarvis.interpret import normalize, parse_reply
 from jarvis.memory import Memory
 from jarvis.pipeline import fast_path
 
@@ -38,6 +38,18 @@ class LeanPromptTests(unittest.TestCase):
 
 
 class InterpreterReplyTests(unittest.TestCase):
+    def test_model_named_steps_keep_their_dependencies(self):
+        got = normalize({"commands": [
+            {"id": "open_browser", "intent": "open_app", "device": "dell", "args": {"name": "chrome"}},
+            {"id": "go", "intent": "open_url", "device": "dell", "args": {"url": "https://x.org"},
+             "depends_on": ["open_browser"]}]})
+        self.assertEqual([c["id"] for c in got], ["c1", "c2"])
+        self.assertEqual(got[1]["depends_on"], ["c1"])
+        from jarvis import registry
+        self.assertEqual(registry.validate(got, DEVICES), [])
+        plain = normalize({"commands": [{"intent": "open_app"}, {"intent": "open_url", "depends_on": ["c1"]}]})
+        self.assertEqual(plain[1]["depends_on"], ["c1"])
+
     def test_mode_as_key_is_read(self):
         got = parse_reply('{"act":{"commands":[{"intent":"open_app"}]}}')
         self.assertEqual(got["mode"], "act")
@@ -89,17 +101,17 @@ class TrustedLocalTests(unittest.TestCase):
 
     def test_other_pc_keeps_every_check(self):
         _, calls, looked = self.run_it("open chrome on dell")
-        self.assertEqual([a for _, a in calls], ["open_app", "observe"])
+        self.assertEqual([a for _, a in calls], ["observe", "open_app", "observe"])
         self.assertEqual(looked, ["Chrome"])
 
     def test_a_step_something_waits_on_keeps_its_screen_check(self):
         _, calls, _ = self.run_it("open spotify and play")
-        self.assertEqual([a for _, a in calls], ["open_app", "observe", "media"])
+        self.assertEqual([a for _, a in calls], ["observe", "open_app", "observe", "media"])
 
     def test_rule_can_be_turned_off(self):
         _, calls, looked = self.run_it("open chrome",
                                        {"rules": {"trusted_local": {"enabled": False}}})
-        self.assertEqual([a for _, a in calls], ["open_app", "observe"])
+        self.assertEqual([a for _, a in calls], ["observe", "open_app", "observe"])
 
     def test_agents_and_risky_intents_never_skip(self):
         rule = gates.trusted_rules({})

@@ -22,14 +22,16 @@ CONFIG = {"devices": DEVICES, "cluster": {"main_device": "dell"},
 
 class FakeRemote:
     """Answers "observe" itself (default: the window matched) so `respond` only sees the
-    action calls; `calls` holds everything, `acts` only the non-observe calls."""
+    action calls; `calls` holds everything but before-action snapshots (`snapshots`),
+    `acts` only the non-observe calls."""
 
     MATCH = (True, json.dumps({"match": True, "after_ms": 250, "app": "x"}))
 
-    def __init__(self, here="dell", respond=None, observe=None):
-        self._here, self.calls = here, []
+    def __init__(self, here="dell", respond=None, observe=None, before=None):
+        self._here, self.calls, self.snapshots = here, [], []
         self.respond = respond or (lambda device, action, arg: (True, f"{action} {arg} ok"))
         self.observe = observe or (lambda device, arg: self.MATCH)
+        self.before = before  # the digest a before-action snapshot answers with
 
     @property
     def acts(self):
@@ -43,6 +45,9 @@ class FakeRemote:
         return self._here
 
     def call(self, device, action, arg):
+        if action == "observe" and "snapshot" in json.loads(arg):
+            self.snapshots.append((device, json.loads(arg)["snapshot"]))
+            return True, json.dumps({"before": self.before})
         self.calls.append((device, action, arg))
         if action == "observe":
             return self.observe(device, arg)
@@ -186,6 +191,29 @@ class ObserveTests(Base):
         body = json.loads(remote.observes[0][2])
         self.assertEqual(body["predicate"], {"kind": "window", "app": "Chrome"})
         self.assertGreater(body["settle"], 0)
+
+    def test_snapshot_is_taken_before_the_action_and_sent_back(self):
+        order = []
+        remote = FakeRemote(before="0123456789abcdef", respond=lambda d, a, r: (
+            order.append(a) or (True, "Opened Chrome.")))
+        got, remote = self.run_fast("open chrome", remote=remote)
+        self.assertEqual(remote.snapshots, [("dell", {"kind": "window", "app": "Chrome"})])
+        self.assertEqual(json.loads(remote.observes[0][2])["before"], "0123456789abcdef")
+        self.assertEqual(got["outcomes"][0]["state"], "observed")
+
+    def test_already_true_is_unchanged_not_observed(self):
+        got, _ = self.run_fast("open chrome", remote=FakeRemote(
+            before="0123456789abcdef",
+            observe=self.obs({"match": True, "changed": False, "after_ms": 1500, "app": "x"})))
+        out = got["outcomes"][0]
+        self.assertEqual((out["state"], out["ok"]), ("unchanged", True))
+        self.assertIn("already looked like that", out["text"])
+
+    def test_executor_already_state_is_unchanged_without_observing(self):
+        got, remote = self.run_fast("pause", remote=FakeRemote(
+            respond=lambda d, a, r: (True, "Already paused.")))
+        self.assertEqual(got["outcomes"][0]["state"], "unchanged")
+        self.assertEqual((remote.observes, remote.snapshots), ([], []))
 
     def test_no_match_is_unconfirmed_with_suffix(self):
         got, _ = self.run_fast("open chrome", remote=FakeRemote(

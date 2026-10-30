@@ -438,15 +438,16 @@ class UploadEndpointTests(HttpCase):
     def test_upload_is_streamed_to_the_sender_with_a_safe_name(self):
         seen = {}
 
-        def fake_send(target, identity, path, name):
-            seen.update(target=target, name=name, data=Path(path).read_bytes())
-            return {"sent": name, "bytes": len(seen["data"]), "to": "x"}
+        # The cluster is on in CONFIG, so the file goes to the node over the hub link.
+        def fake_push(config, state, device, source, size, name=None, **_):
+            seen.update(device=device, name=name, data=source.read(), size=size)
+            return {"sent": name, "bytes": size}
 
-        with patch("jarvis.transfer.send", fake_send):
+        with patch("jarvis.transfer.push", fake_push):
             status, body = self.request("POST", "/api/send?name=..%2F..%2Fa%20b.png", b"PNGdata")
         self.assertEqual((status, body["sent"]), (200, "a b.png"))
-        self.assertEqual(seen["data"], b"PNGdata")
-        self.assertEqual(seen["target"], CONFIG["devices"]["zenbook"]["target"])
+        self.assertEqual((seen["data"], seen["size"]), (b"PNGdata", 7))
+        self.assertEqual(seen["device"], "zenbook")
 
     def test_upload_rejects_empty_and_unauthenticated(self):
         status, _ = self.request("POST", "/api/send?name=x", b"")

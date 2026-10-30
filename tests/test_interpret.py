@@ -370,6 +370,24 @@ class UsageLimitTests(unittest.TestCase):
         self.assertEqual(chatgpt._LIMIT["until"], want.timestamp())
         self.assertEqual(chatgpt._LIMIT["text"], "until 3:15 PM")
 
+    def test_parses_relative_days(self):
+        now = dt.datetime(2026, 10, 26, 15, 0)
+        chatgpt.note_usage_limit(RuntimeError("usage limit, try again in 3 days 2 hours"), now=now)
+        self.assertEqual(chatgpt._LIMIT["until"], dt.datetime(2026, 10, 29, 17, 0).timestamp())
+        self.assertEqual(chatgpt._LIMIT["text"], "until Thu Oct 29, 5:00 PM")
+
+    def test_parses_relative_minutes(self):
+        now = dt.datetime(2026, 10, 26, 15, 0)
+        chatgpt.note_usage_limit("usageLimitExceeded: try again in 45 minutes.", now=now)
+        self.assertEqual(chatgpt._LIMIT["text"], "until 3:45 PM")
+
+    def test_parses_dated_reset(self):
+        now = dt.datetime(2026, 10, 26, 15, 0)
+        chatgpt.note_usage_limit("usage limit, try again at Nov 3rd, 2026 8:00 PM", now=now)
+        self.assertEqual(chatgpt._LIMIT["until"], dt.datetime(2026, 11, 3, 20, 0).timestamp())
+        chatgpt.note_usage_limit("usage limit, try again at Jan 2nd 9:15 AM", now=now)
+        self.assertEqual(chatgpt._LIMIT["until"], dt.datetime(2027, 1, 2, 9, 15).timestamp())
+
     def test_usage_limit_before_and_after(self):
         now = dt.datetime(2026, 10, 26, 15, 0)
         chatgpt.note_usage_limit(RuntimeError("usage limit, try again at 8:00 PM"), now=now)

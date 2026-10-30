@@ -59,7 +59,8 @@ class RemoteTests(unittest.TestCase):
         def run(args, **kw):
             seen.append(args)
             if args[-2] == "jdoe@192.168.0.194":  # first address is down
-                return subprocess.CompletedProcess(args, 255, "", "No route to host")
+                return subprocess.CompletedProcess(
+                    args, 255, "", "ssh: connect to host 192.168.0.194 port 22: No route to host\n")
             return subprocess.CompletedProcess(args, 0, '{"ok": true, "text": "Opened Spotify."}\n', "")
 
         with patch.object(remote.shutil, "which", return_value="/usr/bin/ssh"), \
@@ -72,6 +73,31 @@ class RemoteTests(unittest.TestCase):
         data = shlex.split(command.split("--b64", 1)[1])[0]
         self.assertEqual(base64.b64decode(data).decode(), evil)
         self.assertIn("StrictHostKeyChecking=yes", seen[-1])
+
+    def test_ssh_drop_mid_command_is_not_resent_on_the_next_address(self):
+        seen = []
+
+        def run(args, **kw):
+            seen.append(args[-2])
+            return subprocess.CompletedProcess(
+                args, 255, "", "Connection to 192.168.0.194 closed by remote host.\n")
+
+        with patch.object(remote.shutil, "which", return_value="/usr/bin/ssh"), \
+                patch.object(remote.subprocess, "run", side_effect=run):
+            ok, text = self.remote("dell").call("zenbook", "close_app", "Spotify")
+        self.assertFalse(ok)
+        self.assertIn("may have run", text)
+        self.assertEqual(seen, ["jdoe@192.168.0.194"])  # never re-sent over Tailscale
+
+    def test_ssh_reply_without_a_result_may_have_run(self):
+        def run(args, **kw):
+            return subprocess.CompletedProcess(args, 1, "", "Traceback ...\nKeyError: 'x'\n")
+
+        with patch.object(remote.shutil, "which", return_value="/usr/bin/ssh"), \
+                patch.object(remote.subprocess, "run", side_effect=run):
+            ok, text = self.remote("dell").call("zenbook", "media", "next")
+        self.assertFalse(ok)
+        self.assertIn("may have run", text)
 
     def test_zenbook_reaches_dell_through_the_tunnel_relay(self):
         token = secrets.token_urlsafe(16)

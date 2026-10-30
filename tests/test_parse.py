@@ -54,6 +54,18 @@ class ParserTests(unittest.TestCase):
         got = parse("open blender", DEVICES, "dell", apps={"dell": ["Blender"]})
         self.assertEqual(got["commands"][0]["args"], {"name": "Blender"})
 
+    def test_link_path_keeps_its_case(self):
+        # Video ids are case-sensitive: v=dqw4w9wgxcq is a different (or no) video.
+        for text, url in (("open youtube.com/watch?v=dQw4w9WgXcQ",
+                           "https://youtube.com/watch?v=dQw4w9WgXcQ"),
+                          ("Jarvis, open HTTPS://YouTube.com/watch?v=dQw4w9WgXcQ on Arch",
+                           "https://youtube.com/watch?v=dQw4w9WgXcQ"),
+                          ("go to github.com/DavidRen/JARVIS.", "https://github.com/DavidRen/JARVIS")):
+            with self.subTest(text=text):
+                got = parse(text, DEVICES, "dell")
+                self.assertIsNotNone(got["commands"], got["reason"])
+                self.assertEqual(got["commands"][0]["args"], {"url": url})
+
     def test_shared_alias_never_resolves(self):
         devices = {**DEVICES, "zenbook": {**DEVICES["zenbook"],
                                           "aliases": DEVICES["zenbook"]["aliases"] + ["g15"]}}

@@ -94,7 +94,9 @@ class LinuxAutostartTests(unittest.TestCase):
             made = daemon.autostart(Path(tmp, "state"), True)
             unit = Path(made["unit"]).read_text()
             self.assertIn("-m jarvis --state", unit)
-            self.assertIn("voice start", unit)
+            self.assertIn("voice listen", unit)  # systemd watches the listener itself
+            self.assertIn("Type=simple", unit)
+            self.assertIn("Restart=on-failure", unit)
             self.assertIn("WantedBy=default.target", unit)
             systemctl.assert_any_call("enable", daemon.UNIT_NAME)
             self.assertTrue(daemon.status(Path(tmp, "state"))["autostart"])
@@ -104,6 +106,21 @@ class LinuxAutostartTests(unittest.TestCase):
     def test_overlay_autostart_refuses_instead_of_writing_a_vbs(self):
         with self.assertRaises(RuntimeError):
             overlay.autostart("state", True)
+
+
+
+@unittest.skipIf(os.name == "nt", "Windows relies on the profile's ACL")
+class PrivateStateTests(unittest.TestCase):
+    def test_state_folder_is_closed_to_other_accounts(self):
+        from jarvis.platforms import private_dir
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / ".jarvis"
+            state.mkdir(mode=0o755)
+            state.chmod(0o755)
+            private_dir(state)
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            private_dir(Path(d) / "fresh")  # created private too
+            self.assertEqual((Path(d) / "fresh").stat().st_mode & 0o077, 0)
 
 
 if __name__ == "__main__":
