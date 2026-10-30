@@ -11,12 +11,18 @@ so the two can never silently drift apart. `update` closes the gap:
 5. restart only the node agent and wait until it reports the new fingerprint
 
 The node's own config and state are never part of the package.
+
+Nodes without SSH pull the code instead (/v1/code). That reply comes from a loopback port
+which, while the tunnel is down, any program on the node could be listening on, so the
+main signs each bundle with its code-signing key (`ssh-keygen -Y sign`, no extra Python
+packages) and a node installs only what verifies against the key its invite pinned.
 """
 
 import base64
 import hashlib
 import io
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -31,6 +37,10 @@ SKIP = {"__pycache__"}
 REMOTE_DIR = "~/projects/JARVIS"
 SERVICE = "jarvis-cluster.service"
 WAIT = 40  # seconds for the restarted node to check in with the new code
+SIGN_NAMESPACE = "jarvis-code"
+SIGNING_KEY = "code-signing.key"  # in the main's state folder; the .pub beside it is pinned
+CODE_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]+={0,2}")
+FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 # Runs on the node: the same fingerprint as code_fingerprint(), for a folder (CRLF-blind).
 REMOTE_FINGERPRINT = r"""
@@ -90,8 +100,59 @@ def is_ssh_node(config, node):
     return ((config.get("devices") or {}).get(node) or {}).get("transport") == "ssh"
 
 
-def code_bundle():
-    """What /v1/code serves: jarvis/ + pyproject.toml as base64 zip, with its fingerprint."""
+def _keygen():
+    binary = shutil.which("ssh-keygen")
+    if not binary:
+        raise ValueError("ssh-keygen (OpenSSH client) is not installed.")
+    return binary
+
+
+def code_key(state):
+    """The main's code-signing public key line ("ssh-ed25519 AAAA..."), made on first use."""
+    key = Path(state) / SIGNING_KEY
+    public = Path(f"{key}.pub")
+    if not key.is_file():
+        key.parent.mkdir(parents=True, exist_ok=True)
+        public.unlink(missing_ok=True)
+        subprocess.run([_keygen(), "-q", "-t", "ed25519", "-N", "", "-C", SIGN_NAMESPACE,
+                        "-f", str(key)], check=True, capture_output=True, timeout=30,
+                       creationflags=FLAGS)
+    line = " ".join(public.read_text(encoding="ascii").split()[:2])
+    if not CODE_KEY.fullmatch(line):
+        raise ValueError(f"{public} is not an ed25519 public key.")
+    return line
+
+
+def sign(data, state):
+    """An armored SSH signature of `data` by the main's code-signing key."""
+    code_key(state)
+    out = subprocess.run([_keygen(), "-Y", "sign", "-q", "-f", str(Path(state) / SIGNING_KEY),
+                          "-n", SIGN_NAMESPACE], input=data, capture_output=True, timeout=30,
+                         creationflags=FLAGS)
+    if out.returncode or b"BEGIN SSH SIGNATURE" not in out.stdout:
+        raise RuntimeError("Couldn't sign the code bundle: "
+                           + out.stderr.decode("utf-8", "replace").strip()[-200:])
+    return out.stdout.decode("ascii")
+
+
+def verify(data, signature, key):
+    """True only if `signature` is the holder of public `key` signing exactly `data`."""
+    if not isinstance(key, str) or not CODE_KEY.fullmatch(key) or not isinstance(signature, str) \
+            or "BEGIN SSH SIGNATURE" not in signature:
+        return False
+    with tempfile.TemporaryDirectory(prefix="jarvis-verify-") as folder:
+        signers, sig = Path(folder) / "signers", Path(folder) / "code.sig"
+        signers.write_text(f'{SIGN_NAMESPACE} namespaces="{SIGN_NAMESPACE}" {key}\n', encoding="ascii")
+        sig.write_text(signature, encoding="ascii")
+        out = subprocess.run([_keygen(), "-Y", "verify", "-f", str(signers), "-I", SIGN_NAMESPACE,
+                              "-n", SIGN_NAMESPACE, "-s", str(sig)], input=data,
+                             capture_output=True, timeout=30, creationflags=FLAGS)
+    return out.returncode == 0
+
+
+def code_bundle(state):
+    """What /v1/code serves: jarvis/ + pyproject.toml as base64 zip, with its fingerprint
+    and the main's signature over the zip."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
         for path in _files(PACKAGE):
@@ -99,7 +160,9 @@ def code_bundle():
         pyproject = PACKAGE.parent / "pyproject.toml"
         if pyproject.is_file():
             bundle.write(pyproject, "pyproject.toml")
-    return {"code": code_fingerprint(), "zip": base64.b64encode(buffer.getvalue()).decode("ascii")}
+    raw = buffer.getvalue()
+    return {"code": code_fingerprint(), "zip": base64.b64encode(raw).decode("ascii"),
+            "signature": sign(raw, state)}
 
 
 def _safe_name(name):
@@ -110,11 +173,18 @@ def _safe_name(name):
     return parts
 
 
-def apply_bundle(bundle, repo=PACKAGE.parent):
-    """Unpack a /v1/code bundle, check its fingerprint, then replace this checkout's files
-    (tmp + os.replace each, so a crash never leaves a half-written .py). Returns the count."""
+def apply_bundle(bundle, key, repo=PACKAGE.parent):
+    """Check a /v1/code bundle's signature against the pinned main `key` and its
+    fingerprint, then replace this checkout's files (tmp + os.replace each, so a crash
+    never leaves a half-written .py). Returns the count."""
     repo = Path(repo).resolve()
-    with zipfile.ZipFile(io.BytesIO(base64.b64decode(bundle["zip"], validate=True))) as archive:
+    if not key:
+        raise ValueError("No code-signing key is pinned for the main PC; re-join with a fresh "
+                         "invite (jarvis cluster invite on the main) to accept its updates.")
+    raw = base64.b64decode(bundle["zip"], validate=True)
+    if not verify(raw, bundle.get("signature"), key):
+        raise ValueError("The code bundle isn't signed by the main PC's pinned key; not installed.")
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         entries = [(i.filename, _safe_name(i.filename)) for i in archive.infolist() if not i.is_dir()]
         with tempfile.TemporaryDirectory(prefix="jarvis-update-") as stage:
             stage = Path(stage)

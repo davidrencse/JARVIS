@@ -104,6 +104,7 @@ class History:
             db.execute("DELETE FROM hops WHERE command IN (SELECT id FROM commands WHERE at<?)",
                        (now - KEEP_DAYS * 86400,))
             db.execute("DELETE FROM commands WHERE at<?", (now - KEEP_DAYS * 86400,))
+            db.execute("DELETE FROM confirmation_audit WHERE at<?", (now - KEEP_DAYS * 86400,))
         return cid
 
     # -- the H-checks ---------------------------------------------------------------------

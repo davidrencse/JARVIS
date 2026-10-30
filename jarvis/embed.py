@@ -55,7 +55,11 @@ def available():
     if _state["missing"]:
         return False
     try:
-        import onnxruntime  # noqa: F401
+        import importlib.util
+        import sys
+        if ("onnxruntime" not in sys.modules  # no import here: it costs ~100 MB
+                and importlib.util.find_spec("onnxruntime") is None):
+            raise ImportError("onnxruntime")
         _files()
         return True
     except Exception:

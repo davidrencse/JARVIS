@@ -4,7 +4,8 @@
 .jarvis/logs/voice.log. `stop` / `status` manage it via a PID file; an exclusive file
 lock guarantees two listeners never share the mic. `autostart on` adds a hidden
 launcher to the Windows Startup folder (same pattern as Lan Mouse), or on Linux a
-systemd user unit that runs `voice start` at login.
+systemd user unit that runs the listener itself and restarts it if it crashes; with
+that unit installed, `start`/`stop` go through systemctl.
 """
 
 import atexit
@@ -27,30 +28,62 @@ def log(message):
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {message}", file=sys.stderr, flush=True)
 
 
-class InstanceLock:
-    """Exclusive lock on .jarvis/voice.lock; released automatically if the process dies."""
+def _try_lock(handle):
+    if os.name == "nt":
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
-    def __init__(self, state_dir):
+
+class InstanceLock:
+    """Exclusive lock on .jarvis/voice.lock; released automatically if the process dies.
+    `wait` covers a restart: the old listener may still be exiting when the new one starts."""
+
+    def __init__(self, state_dir, wait=0.0):
         self.path = Path(state_dir).resolve() / "voice.lock"
-        self.handle = None
+        self.handle, self.wait = None, wait
 
     def __enter__(self):
+        if self.handle and not self.handle.closed:
+            return self  # already held (taken early so a busy lock exits cleanly)
         self.handle = open(self.path, "a+")
-        try:
-            if os.name == "nt":
-                import msvcrt
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            self.handle.close()
-            raise RuntimeError("JARVIS is already listening (see: jarvis voice status).") from None
+        deadline = time.monotonic() + self.wait
+        while True:
+            try:
+                _try_lock(self.handle)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    self.handle.close()
+                    raise RuntimeError(
+                        "JARVIS is already listening (see: jarvis voice status).") from None
+                time.sleep(0.5)
         return self
 
     def __exit__(self, *_):
         self.handle.close()
+
+
+def lock_held(state):
+    """True while a live process holds voice.lock. The OS drops the lock when its holder
+    dies, so a pid file left behind by a stopped listener never passes for a live one."""
+    path = Path(state).resolve() / "voice.lock"
+    if not path.is_file():
+        return False
+    try:
+        handle = open(path, "a+")
+    except OSError:
+        return False
+    try:
+        _try_lock(handle)
+    except OSError:
+        return True
+    finally:
+        handle.close()  # closing releases the probe's own lock
+    return False
 
 
 FOLLOW_UP = 6.0  # seconds after a bare "Jarvis" in which the next utterance is the request
@@ -68,11 +101,32 @@ def answers_jarvis(text):
     return 0 < len(words) <= 6 and all(w in REPLY_WORDS for w in words)
 
 
+def confirmation_waiting(config, state):
+    """A confirmation is pending for this device, or might be: a node's confirmations live
+    on the main, out of sight. Approving one always takes "Jarvis" (the reply window must
+    not turn a "Yes" said to someone in the room into an approval)."""
+    from .topology import is_node
+    if is_node(config):
+        return True
+    try:
+        from .assistant import confirmation_origin
+        from .confirm import ConfirmQueue
+        return bool(ConfirmQueue(state).pending(confirmation_origin(config, state)))
+    except Exception:
+        return True  # can't tell: treat as pending
+
+
+def opens_reply_window(result):
+    """Only a reply that went through invites an answer; a failure ends the exchange."""
+    return not result.get("error") and not any(
+        isinstance(o, dict) and o.get("ok") is False for o in result.get("outcomes") or ())
+
+
 BORDERLINE = 0.10  # live mic scores dropped to 0.11-0.28 on 2026-10-26; the wake word gates the rest
 
 
 def listen_loop(state, config, base, threshold=None):
-    from .assistant import ask, wake_word
+    from .assistant import ask, confirmation_words, wake_word
     from .chatgpt import make_lane
     from concurrent.futures import ThreadPoolExecutor
 
@@ -95,7 +149,13 @@ def listen_loop(state, config, base, threshold=None):
     if not ears.path.is_file():  # fail once, clearly, instead of on every utterance
         log(f"error: {NOT_ENROLLED}")
         raise SystemExit(2)
-    with InstanceLock(state):
+    lock = InstanceLock(state, wait=15)
+    try:
+        lock.__enter__()
+    except RuntimeError as exc:
+        log(f"error: {exc}")
+        raise SystemExit(3) from None  # the unit doesn't restart on 3: someone else listens
+    with lock:
         foreground_priority()
         pid_file = Path(state) / "voice.pid"
         pid_file.write_text(str(os.getpid()))
@@ -124,6 +184,7 @@ def listen_loop(state, config, base, threshold=None):
                     continue
                 # When this utterance began, so a long follow-up still lands in the window.
                 began = time.monotonic() - len(audio) / RATE
+                said_at = time.time() - len(audio) / RATE  # wall clock, before Whisper runs
                 # Voice check (CPU) and transcription (GPU) run side by side to save ~0.3 s.
                 # A stranger's transcript is discarded unread: never logged or answered.
                 check, text = pool.submit(ears.verify, audio, threshold), pool.submit(stt, audio)
@@ -150,16 +211,20 @@ def listen_loop(state, config, base, threshold=None):
                     request = heard.strip()  # the rest of "Jarvis, ... <pause> ..."
                 # Answering JARVIS ("I can check it if you want." "Then check it.") needs
                 # no wake word, but only a full voice match and a short reply count.
-                # Wall clock: the reply's end is read once, after JARVIS stops talking.
-                if request is None and is_owner and answers_jarvis(heard) and \
-                        time.time() - len(audio) / RATE < chatting:
-                    request = heard.strip()
-                armed = chatting = 0.0
+                # Wall clock: the reply's end is read once, after JARVIS stops talking, and
+                # the utterance's start before transcribing, so Whisper's time doesn't count.
+                if request is None and is_owner and answers_jarvis(heard) and said_at < chatting:
+                    if confirmation_words(heard) and confirmation_waiting(config, state):
+                        log("reply window: approving or cancelling a confirmation needs \"Jarvis\"")
+                    else:
+                        request = heard.strip()
+                if request or is_owner:  # a near miss (TV, another voice) closes no window
+                    armed = chatting = 0.0
                 if not request:  # not addressed to JARVIS: never answered
                     if near:  # still unconfirmed as David: discarded unread
                         log(f"ignored another voice (similarity {score}, near miss)")
-                    elif heard:  # David's own voice without the wake word: say so, briefly
-                        log(f"no wake word ({score}): {' '.join(heard.split()[:3])}...")
+                    elif heard:  # David's own voice without the wake word: say so, never what
+                        log(f"no wake word ({score}): {len(heard.split())} words, not kept")
                     continue
                 if not near:
                     ears.learn()  # passed the voice check AND said "Jarvis": adapt to live audio
@@ -191,7 +256,8 @@ def listen_loop(state, config, base, threshold=None):
                     speaker.put(spoken(result["reply"], voice.limit))
                 speaker.drain()  # finish talking before listening again
                 mic.flush()  # and don't treat JARVIS's own reply as something heard
-                chatting = time.time() + REPLY_FOLLOW_UP
+                if opens_reply_window(result):
+                    chatting = time.time() + REPLY_FOLLOW_UP
                 failures = 0
             except KeyboardInterrupt:
                 raise
@@ -257,16 +323,19 @@ def _pid(state):
         pid = int((Path(state) / "voice.pid").read_text().strip())
     except (OSError, ValueError):
         return None
-    return pid if _alive(pid) and _is_listener(pid) else None
+    return pid if _alive(pid) and _is_listener(pid) and lock_held(state) else None
 
 
 def _is_listener(pid):
     """After a reboot a stale voice.pid can name an unrelated process: on Linux, check it
-    really is the listener before reporting it running (or signalling it to stop)."""
+    really is the listener (and not a zombie) before reporting it running or stopping it."""
     try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
         cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
         return True  # no /proc (Windows, macOS): the liveness probe is all there is
+    if stat.rpartition(")")[2].split()[:1] == ["Z"]:
+        return False
     return b"jarvis" in cmdline and b"listen" in cmdline
 
 
@@ -293,7 +362,7 @@ def status(state):
 
 
 NOT_ENROLLED = ("No voiceprint on this machine, so every voice would be rejected. "
-                "Run: jarvis voice enroll  (each laptop needs its own)")
+                "Run: jarvis voice enroll  (about a minute; each laptop needs its own)")
 
 
 def _under_systemd_unit():
@@ -318,11 +387,37 @@ def _detach_from_unit(command):
     return command
 
 
+def _supervised():
+    """The Linux unit runs the listener itself (Type=simple), so systemd restarts it after
+    a crash. Older units ran `voice start` as a oneshot and watched nothing."""
+    if os.name == "nt" or not shutil.which("systemctl"):
+        return False
+    try:
+        return "voice listen" in _startup_file().read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _wait_listening(state):
+    for _ in range(60):  # model loading takes a few seconds
+        time.sleep(0.5)
+        if _pid(state):
+            return {"started": True, **status(state)}
+    return {"started": False, "note": "Listener did not come up; check the log.",
+            **status(state)}
+
+
 def start(state):
     if _pid(state):
         return {"started": False, **status(state)}
     if not (Path(state).resolve() / "voice" / "voiceprint.json").is_file():
         return {"started": False, "note": NOT_ENROLLED, **status(state)}
+    if _supervised():
+        _systemctl("reset-failed", UNIT_NAME)
+        if not _systemctl("start", UNIT_NAME):
+            return {"started": False, "note": f"systemctl --user start {UNIT_NAME} failed; "
+                    f"see: journalctl --user -u {UNIT_NAME}", **status(state)}
+        return _wait_listening(state)
     logs = Path(state).resolve() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -335,18 +430,16 @@ def start(state):
         subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
                          creationflags=flags, start_new_session=os.name != "nt", env=env,
                          close_fds=True)
-    for _ in range(60):  # model loading takes a few seconds
-        time.sleep(0.5)
-        if _pid(state):
-            return {"started": True, **status(state)}
-    return {"started": False, "note": "Listener did not come up; check the log.",
-            **status(state)}
+    return _wait_listening(state)
 
 
 def stop(state):
     pid = _pid(state)
     if not pid:
         return {"stopped": False, "note": "Not running."}
+    if _supervised() and _systemctl("is-active", "--quiet", UNIT_NAME):
+        _systemctl("stop", UNIT_NAME)  # a plain kill would leave the unit to restart it
+        return {"stopped": True, "pid": pid}
     if os.name == "nt":
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
     else:
@@ -371,8 +464,8 @@ def _systemctl(*args):
 
 
 def _systemd_autostart(state, enable):
-    """`voice start` detaches the listener, so the unit is a oneshot that stays active;
-    `voice stop` still works through the PID file."""
+    """The unit runs `voice listen` in the foreground so systemd sees it die and restarts
+    it. Exit 2 (no voiceprint) and 3 (another listener holds the mic) aren't retried."""
     path = _startup_file()
     if not enable:
         _systemctl("disable", UNIT_NAME)
@@ -384,14 +477,19 @@ def _systemd_autostart(state, enable):
     path.write_text(
         "# JARVIS: start the voice listener at login. `jarvis voice autostart off` removes it.\n"
         "[Unit]\nDescription=JARVIS voice listener\n"
-        "After=pipewire.service pipewire-pulse.service\n\n"
-        f"[Service]\nType=oneshot\nRemainAfterExit=yes\n"
+        "After=pipewire.service pipewire-pulse.service\n"
+        "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
+        "[Service]\nType=simple\nRestart=on-failure\nRestartSec=5\n"
+        "RestartPreventExitStatus=2 3\n"
         f"WorkingDirectory={Path(__file__).resolve().parent.parent}\n"
         # systemd's PATH lacks ~/.local/bin, where the claude CLI usually lives.
         f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"\n'
-        f'ExecStart="{sys.executable}" -m jarvis --state "{state}" voice start\n'
-        f'ExecStop="{sys.executable}" -m jarvis --state "{state}" voice stop\n\n'
+        'Environment="PYTHONIOENCODING=utf-8" "PYTHONUNBUFFERED=1"\n'
+        f'ExecStart="{sys.executable}" -m jarvis --state "{state}" voice listen\n'
+        f"StandardOutput=append:{state / 'logs' / 'voice.log'}\n"
+        f"StandardError=append:{state / 'logs' / 'voice.log'}\n\n"
         "[Install]\nWantedBy=default.target\n", encoding="utf-8")
+    (state / "logs").mkdir(parents=True, exist_ok=True)
     enabled = _systemctl("daemon-reload") and _systemctl("enable", UNIT_NAME)
     return {"autostart": True, "unit": str(path), "enabled": enabled}
 

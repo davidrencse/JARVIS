@@ -35,7 +35,7 @@ VERBS = {
     "head to": "go", "take me to": "go",
     "play": "play", "play me": "play", "resume": "play", "put on": "play",
     "pause": "pause", "stop": "pause",
-    "skip": "next", "next": "next", "previous": "previous", "go back": "previous",
+    "skip": "next", "next": "next", "previous": "previous", "go back": "back",
     "close": "close", "quit": "close", "exit": "close",
     "switch to": "focus", "focus": "focus", "focus on": "focus",
 }
@@ -70,6 +70,8 @@ SITES = {
     "instagram reels": "https://www.instagram.com/reels", "reels": "https://www.instagram.com/reels",
 }
 DOMAIN = re.compile(r"(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(/\S*)?\Z")
+# A link's path and query keep their case ("watch?v=dQw4w9WgXcQ"); only the rest is lowered.
+URL_PATH = re.compile(r"\b((?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,})(/\S*)", re.I)
 
 ORIGIN_WORDS = {"here", "this", "this one", "this pc", "this computer", "this laptop",
                 "this machine"}
@@ -115,6 +117,15 @@ SCROLL = (
 NEXT_VIDEO = re.compile(r"(?:short|video|reel|tiktok)s?\Z")
 
 
+def _lower(text):
+    """text.lower(), except the path of a link: video ids and the like are case-sensitive."""
+    parts, end = [], 0
+    for match in URL_PATH.finditer(text):
+        parts += [text[end:match.start()].lower(), match.group(1).lower(), match.group(2)]
+        end = match.end()
+    return "".join(parts) + text[end:].lower()
+
+
 def _spelled(text):
     """Typed or misheard scroll words ("scorllling") read as the real word."""
     def fix(match):
@@ -157,7 +168,7 @@ def parse(text, devices, origin, main=None, apps=None):
 def _parse(text, devices, origin, main, apps):
     if not isinstance(text, str) or not text.strip() or len(text) > 500:
         raise Unsure("empty or too long")
-    text = LEAD.sub("", text.replace("’", "'").replace("‘", "'")).lower()
+    text = _lower(LEAD.sub("", text.replace("’", "'").replace("‘", "'")))
     text = GREETING.sub("", text.strip())
     text = re.sub(r"[?!.]+$", "", text.strip())
     # Filler leaves its comma behind ("open chrome, please." -> "open chrome, "): strip it.
@@ -368,6 +379,13 @@ def _site(obj):
 
 def _command(clause, catalog):
     verb, obj = clause["verb"], clause["object"]
+    if verb == "back":
+        # "go back" alone could be a track, a browser page or an undo: only a named
+        # track or video ("go back a song") is certain.
+        what = re.sub(r"^(?:to\s+)?(?:the\s+)?(?:previous|last)?\s*", "", obj)
+        if re.sub(r"^(?:a|one)\s+", "", what) in ("", "it"):
+            raise Unsure("go back to what?")
+        verb = "previous"
     if verb == "scroll":
         return {"intent": "scroll", "args": dict(clause["scroll"])}
     if verb in ("next", "previous") and NEXT_VIDEO.match(

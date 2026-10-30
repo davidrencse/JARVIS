@@ -7,11 +7,14 @@ Runs in the console server, on the same mic path the always-on listener uses (Po
   level   "Hey Jarvis, can you hear me?": loudness and Silero scores fit the speech
           cutoffs to this mic and room (.jarvis/voice/mic.json)
   enroll  ENROLL_PHRASES, read off the screen; clips land in enroll.new/ and replace the
-          old ones only when every phrase is in, so cancelling keeps the old voiceprint
+          old ones only when every phrase is in
   test    one more phrase scored against the new voiceprint
-  done    the listener restarts with the new print and mic settings
+  done    the listener restarts with the new print and mic settings, and starts at
+          login from now on (the last screen's switch turns that off)
 
 The listener is paused for the whole run so it doesn't answer the enrollment phrases.
+A run that doesn't reach "done" (cancelled or failed at any step, even the test phrase)
+puts back the mic settings, voiceprint and clips it started with.
 """
 
 import shutil
@@ -27,6 +30,7 @@ TEST = "Last one. Say: Jarvis, what time is it?"
 DONE = "All set. Just say Jarvis whenever you need me."
 LEVEL_PHRASE, TEST_PHRASE = "Hey Jarvis, can you hear me?", "Jarvis, what time is it?"
 QUIET_SECONDS, ATTEMPTS = 2.0, 3
+KEPT = ("mic.json", "voiceprint.json", "enroll")  # what a run that doesn't finish puts back
 SILENT = 1e-5  # RMS of a mic that is open but delivers nothing (a DSP mic read raw)
 QUIET_VOICE = 0.006  # speech RMS below this transcribes poorly: ask for more input gain
 
@@ -45,6 +49,7 @@ class VoiceSetup:
         self._lock = threading.Lock()
         self._cancel = threading.Event()
         self._thread, self._mic = None, None
+        self.on_change = None  # called with each new view (the terminal prints from it)
         self.view = self._idle()
 
     def _idle(self):
@@ -100,6 +105,9 @@ class VoiceSetup:
     def _set(self, **changes):
         with self._lock:
             self.view.update(changes)
+            view = dict(self.view)
+        if self.on_change:
+            self.on_change(view)
 
     def _daemon_mod(self):
         if self._daemon is None:
@@ -129,6 +137,7 @@ class VoiceSetup:
         daemon = self._daemon_mod()
         was_listening = daemon._pid(self.state) is not None
         finished, mic = False, None
+        kept = self._keep()
         try:
             if was_listening:
                 self._set(message="Pausing the always-on listener")
@@ -146,12 +155,12 @@ class VoiceSetup:
             clips = self._enroll(mic, tuning)
             result = self._finish(mic, tuning, clips)
             finished = True
-            self._set(step="done", running=False, result=result, message=DONE, phrase="")
+            self._set(step="done", result=result, message=DONE, phrase="")
         except Cancelled:
-            self._set(step="cancelled", running=False, message="Setup cancelled. Nothing "
+            self._set(step="cancelled", message="Setup cancelled. Nothing "
                       "was changed.", phrase="")
         except Exception as exc:
-            self._set(step="error", running=False, error=str(exc), phrase="")
+            self._set(step="error", error=str(exc), phrase="")
         finally:
             self._mic = None
             if mic is not None:
@@ -160,6 +169,16 @@ class VoiceSetup:
                 except Exception:
                     pass
             shutil.rmtree(self.state / "voice" / "enroll.new", ignore_errors=True)
+            try:  # before the listener restarts, so it never loads a half-made setup
+                self._put_back(kept, restore=not finished)
+            except Exception as exc:
+                self._set(warning=f"Couldn't put the old voice setup back: {exc}")
+            if finished:
+                try:  # a listener that dies with a reboot isn't "set up": start it at login too
+                    if not daemon._startup_file().is_file():
+                        daemon.autostart(self.state, True)
+                except Exception as exc:
+                    self._set(warning=f"Couldn't set the listener to start at login: {exc}")
             if was_listening or finished:
                 try:
                     started = daemon.start(self.state)
@@ -170,6 +189,33 @@ class VoiceSetup:
                                     started.get("started") or started.get("listening"))
                 except Exception as exc:
                     self._set(warning=f"The listener didn't restart: {exc}")
+            self._set(running=False)  # only now: the page and terminal read the final state
+
+    def _keep(self):
+        """Copy what this run may overwrite into voice/setup.old/; returns that folder."""
+        voice, kept = self.state / "voice", self.state / "voice" / "setup.old"
+        shutil.rmtree(kept, ignore_errors=True)
+        kept.mkdir(parents=True)
+        for name in KEPT:
+            src = voice / name
+            if src.is_dir():
+                shutil.copytree(src, kept / name)
+            elif src.is_file():
+                shutil.copy2(src, kept / name)
+        return kept
+
+    def _put_back(self, kept, restore):
+        voice = self.state / "voice"
+        if restore:
+            for name in KEPT:
+                now, old = voice / name, kept / name
+                if now.is_dir():
+                    shutil.rmtree(now)
+                elif now.exists():
+                    now.unlink()
+                if old.exists():
+                    shutil.move(str(old), str(now))
+        shutil.rmtree(kept, ignore_errors=True)
 
     def _open(self, tuning):
         if self._open_mic is not None:
@@ -312,3 +358,54 @@ class _Reader:
 
     def __init__(self, read):
         self.read = read
+
+
+def run_terminal(state, config, device=None, out=None, poll=0.1, setup=None):
+    """`jarvis voice enroll`: the same guided setup in a terminal, so it needs no console
+    and no browser. JARVIS speaks each cue; the line to read is printed large, with a live
+    mic meter. Ctrl+C cancels and leaves the old voiceprint as it was."""
+    import sys
+    out = out or sys.stderr
+    setup = setup or VoiceSetup(state, config)
+    lock, shown = threading.Lock(), {"step": None, "phrase": None, "warning": None}
+
+    def show(view):  # runs on setup's thread at every change, so no line is ever skipped
+        with lock:
+            lines = []
+            if view["phrase"] and (view["phrase"], view["index"]) != shown["phrase"]:
+                count = f"[{view['index']}/{view['total']}]  " if view["step"] == "enroll" else ""
+                lines.append(f"  {count}Say:  \"{view['phrase']}\"")
+                shown["phrase"] = (view["phrase"], view["index"])
+            elif view["message"] and view["step"] != shown["step"] and not view["phrase"]:
+                lines.append(f"  {view['message']}")
+            shown["step"] = view["step"]
+            if view["warning"] and view["warning"] != shown["warning"]:
+                lines.append(f"  ! {view['warning']}")
+            shown["warning"] = view["warning"]
+            if lines:
+                out.write("\r" + " " * 40 + "\r\n" + "\n".join(lines) + "\n")
+                out.flush()
+    setup.on_change = show
+    setup.start(device)
+    try:
+        while True:
+            view = setup.status()
+            if not view["running"]:
+                break
+            bars = int(min(1.0, (view["level"] * 14) ** 0.6) * 24)
+            with lock:
+                out.write("\r  mic " + "█" * bars + "·" * (24 - bars))
+                out.flush()
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        setup.cancel()
+        setup._thread.join(30)
+        view = setup.status()
+    out.write("\n")
+    if view["step"] == "error":
+        raise RuntimeError(view["error"])
+    result = view.get("result") or {}
+    return {"step": view["step"], "listening": view["listening"], "autostart": view["autostart"],
+            **{k: result[k] for k in ("threshold", "test_score", "test_passed") if k in result},
+            **({"mic": view["mic"]} if view["step"] == "done" else {}),
+            **({"warning": view["warning"]} if view["warning"] else {})}

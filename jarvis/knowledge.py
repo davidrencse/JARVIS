@@ -1181,8 +1181,10 @@ class KnowledgeBase:
             for sid in mutated:
                 self.event("checker", "flag", f"raw/{sid}", "@you raw source changed since ingest")
             flags = len(new_conflicts) + len(stale) + len(mutated) + len(broken)
-            self.event("checker", "audit", "--nightly --source-links",
-                       f"scanned {len(claims)} claims · {flags} flags",
+            # An empty base scans 0 claims every night; say why so it doesn't read as a fault.
+            summary = (f"scanned {len(claims)} claims · {flags} flags" if pages else
+                       "nothing to check yet: no sources ingested")
+            self.event("checker", "audit", "--nightly --source-links", summary,
                        scanned=len(claims), conflicts=len(new_conflicts), stale=len(stale),
                        orphans=len(orphans), mutated=len(mutated), broken=len(broken))
             if notify and (new_conflicts or mutated):

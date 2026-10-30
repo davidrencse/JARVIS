@@ -134,15 +134,23 @@ def parse_reply(raw):
 
 
 def normalize(data):
-    """Give act commands ids c1, c2... and default depends_on; drop anything else."""
+    """Give act commands ids c1, c2... and default depends_on; drop anything else.
+    The model may name its own steps ("open_browser") and depend on those names; they are
+    renamed with the step, so the plan still validates instead of going to Grok."""
+    raws = data.get("commands") or []
+    if not all(isinstance(raw, dict) for raw in raws):
+        return None
+    ids = {}
+    for n, raw in enumerate(raws, 1):
+        own = raw.get("id")
+        if isinstance(own, str) and own not in ids:
+            ids[own] = f"c{n}"
     commands = []
-    for n, raw in enumerate(data.get("commands") or [], 1):
-        if not isinstance(raw, dict):
-            return None
+    for n, raw in enumerate(raws, 1):
         deps = raw.get("depends_on") or []
         commands.append({"id": f"c{n}", "intent": raw.get("intent"), "device": raw.get("device"),
                          "args": raw.get("args") if isinstance(raw.get("args"), dict) else {},
-                         "depends_on": [d for d in deps if isinstance(d, str)]})
+                         "depends_on": [ids.get(d, d) for d in deps if isinstance(d, str)]})
     return commands
 
 

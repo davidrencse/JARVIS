@@ -10,6 +10,7 @@ X11 (wmctrl) or macOS (System Events through osascript), chosen by platforms.det
 through PowerShell, which takes most of a second per call and is too slow to poll.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -23,8 +24,12 @@ from urllib.parse import urlsplit
 from . import platforms
 
 KINDS = ("window", "title", "focused", "gone", "playback", "volume")
+# playerctl's player choice on Linux: Spotify when it is running, else whatever plays.
+# Without it playerctl drives the most recently active player (a browser video, say).
+PLAYERCTL_PLAYERS = "spotify,%any"
 MAX_SETTLE = 15.0
 POLL = 0.25
+UNCHANGED_GRACE = 1.5
 # Sites whose window titles don't contain their domain name.
 # JARVIS's own console runs as a Chromium --app window (class "chrome-127.0.0.1__-Default"),
 # which must not count as Chrome: "close chrome" would close the console instead.
@@ -285,7 +290,13 @@ $manager = [System.WindowsRuntimeSystemExtensions]::AsTask($op).GetAwaiter().Get
 $session = $manager.GetCurrentSession()
 if ($null -eq $session) { 'null'; exit }
 $status = $session.GetPlaybackInfo().PlaybackStatus.ToString()
-@{status=$status} | ConvertTo-Json -Compress
+$track = ''
+try {
+  $null = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionMediaProperties,Windows.Media.Control,ContentType=WindowsRuntime]
+  $props = [System.WindowsRuntimeSystemExtensions]::AsTask($session.TryGetMediaPropertiesAsync()).GetAwaiter().GetResult()
+  $track = "$($props.Artist)|$($props.Title)"
+} catch {}
+@{status=$status; track=$track} | ConvertTo-Json -Compress
 '''
     out = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                          capture_output=True, text=True, timeout=8,
@@ -312,10 +323,15 @@ def playback():
         return {"status": "Playing" if float(rate) > 0 else "Paused"}
     if not shutil.which("playerctl"):
         raise LookupError("observing playback needs playerctl")
-    out = subprocess.run(["playerctl", "status"], capture_output=True, text=True, timeout=5)
+    out = _run("playerctl", "-p", PLAYERCTL_PLAYERS, "status")
     if out.returncode:
         return None
-    return {"status": out.stdout.strip()}
+    state = {"status": out.stdout.strip()}
+    track = _run("playerctl", "-p", PLAYERCTL_PLAYERS, "metadata", "--format",
+                 "{{mpris:trackid}}|{{xesam:artist}}|{{xesam:title}}")
+    if not track.returncode and track.stdout.strip(" |\n"):
+        state["track"] = track.stdout.strip()
+    return state
 
 
 def pactl_volume():
@@ -520,28 +536,85 @@ def matches(predicate, listed):
     return bool(hits), hits[0]["app"].split()[0] if hits and hits[0]["app"] else None
 
 
-def check(predicate, settle, lister=None, clock=time.monotonic, sleep=time.sleep):
-    """Poll until the predicate holds or `settle` seconds pass. Never raises for a
-    missing match; raises only for a bad predicate or when windows can't be listed."""
-    validate(predicate)
+def wants_snapshot(predicate):
+    """Whether a before/after comparison can tell this effect from a state that already
+    held: windows, focus, page titles, and track changes. Play/pause is read by the
+    media executor itself ("Already paused."), volume and "gone" are fine as they are."""
+    kind = (predicate or {}).get("kind")
+    return kind in ("window", "focused", "title") or (
+        kind == "playback" and predicate.get("command") in ("next", "previous"))
+
+
+def fingerprint(predicate, listed):
+    """An opaque digest of the state the predicate looks at, so "did it change?" can be
+    asked without window titles or track names leaving the machine. None: nothing to compare."""
+    kind = predicate["kind"]
+    if kind == "playback":
+        if not listed or not listed.get("track"):
+            return None  # no track identity: a skip can't be told apart from no skip
+        state = [listed.get("status", ""), listed["track"]]
+    elif kind in ("window", "focused"):
+        query = _flat(predicate["app"])
+        state = sorted([w["app"], w["title"], bool(w["focused"])]
+                       for w in listed if _is_app(w, query))
+    elif kind == "title":
+        state = sorted([w["app"], w["title"], bool(w["focused"])]
+                       for w in listed if is_browser(w["app"]))
+    else:
+        return None
+    return hashlib.sha256(json.dumps(state).encode()).hexdigest()[:16]
+
+
+def _lister(predicate):
     kind = predicate.get("kind") if isinstance(predicate, dict) else None
-    lister = lister or (playback if kind == "playback" else
-                        volume_state if kind == "volume" else windows)
+    return playback if kind == "playback" else volume_state if kind == "volume" else windows
+
+
+def snapshot(predicate, lister=None):
+    """{"before": digest or None} for wants_snapshot predicates, taken before acting."""
+    validate(predicate)
+    if not wants_snapshot(predicate):
+        return {"before": None}
+    return {"before": fingerprint(predicate, (lister or _lister(predicate))())}
+
+
+def check(predicate, settle, lister=None, clock=time.monotonic, sleep=time.sleep, before=None):
+    """Poll until the predicate holds or `settle` seconds pass. Never raises for a
+    missing match; raises only for a bad predicate or when windows can't be listed.
+    With `before` (a snapshot digest) the state must also differ from it: a window that
+    was already open, focused and unchanged doesn't prove "open it" did anything.
+    "changed" (with `before` only) is None when there was nothing to compare."""
+    validate(predicate)
+    lister = lister or _lister(predicate)
     settle = max(0.0, min(float(settle), MAX_SETTLE))
     start = clock()
     while True:
-        match, app = matches(predicate, lister())
+        listed = lister()
+        match, app = matches(predicate, listed)
+        changed = None
+        if before is not None:
+            now = fingerprint(predicate, listed)
+            changed = None if now is None else now != before
         elapsed = clock() - start
-        if match or elapsed >= settle:
-            return {"match": match, "after_ms": round(elapsed * 1000), "app": app}
+        # An unchanged match gets a short grace for a late change, not the whole settle.
+        if (match and (changed is not False or elapsed >= UNCHANGED_GRACE)) or elapsed >= settle:
+            seen = {"match": match, "after_ms": round(elapsed * 1000), "app": app}
+            return {**seen, "changed": changed} if before is not None else seen
         sleep(min(POLL, settle - elapsed))
 
 
 def run(arg):
-    """The `observe` desktop action: arg is JSON {"predicate", "settle"}. (ok, json text)."""
+    """The `observe` desktop action: arg is JSON {"predicate", "settle", "before"}, or
+    {"snapshot": predicate} for the before-state digest. (ok, json text)."""
     try:
         body = json.loads(arg)
-        result = check(body.get("predicate"), body.get("settle", 5))
+        if "snapshot" in body:
+            return True, json.dumps(snapshot(body["snapshot"]))
+        before = body.get("before")
+        if before is not None and not (isinstance(before, str) and
+                                       re.fullmatch(r"[0-9a-f]{16}", before)):
+            raise ValueError("bad snapshot digest")
+        result = check(body.get("predicate"), body.get("settle", 5), before=before)
     except (ValueError, TypeError, AttributeError, LookupError, OSError,
             subprocess.SubprocessError) as exc:
         return False, f"Can't observe: {exc}"

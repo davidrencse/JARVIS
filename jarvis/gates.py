@@ -16,13 +16,15 @@ import re
 from . import registry
 
 AGENT_ORIGINS = frozenset({"agent", "system"})
-DUPLICATE_WINDOW = 2.0   # seconds: a double-triggered utterance is merged, not resent
+DUPLICATE_WINDOW = 2.0   # seconds after a run finishes: a double trigger is merged, not resent
+RUNNING_CAP = 300.0      # seconds: an unreleased run (a lost thread) stops blocking repeats
 
 
 class InFlight:
     """Commands being executed now (U7, and the in-flight half of H3)."""
 
     def __init__(self):
+        # key -> (time, request, running): running since `time`, or finished at `time`.
         self._lock, self._items = threading.Lock(), {}
 
     @staticmethod
@@ -31,16 +33,21 @@ class InFlight:
                 tuple(sorted((k, str(v)) for k, v in command["args"].items())))
 
     def claim(self, command, request=None):
-        """True if this caller now owns the command; False if an identical one is running
-        or finished within DUPLICATE_WINDOW. Commands of the same `request` are never
-        merged ("next and next" means twice); only another request's duplicate is."""
+        """True if this caller now owns the command; False if an identical one is still
+        running (however long it takes: "open spotify on arch" can take 45 s over the
+        cluster) or finished within DUPLICATE_WINDOW. Commands of the same `request` are
+        never merged ("next and next" means twice); only another request's duplicate is.
+        A run never released stops blocking after RUNNING_CAP, so nothing sticks forever."""
         key, now = self.key(command), time.monotonic()
         with self._lock:
-            started, owner = self._items.get(key, (None, None))
-            if (started is not None and now - started < DUPLICATE_WINDOW
-                    and (request is None or owner is None or owner != request)):
+            for old in [k for k, (at, _, run) in self._items.items()  # forget expired entries
+                        if now - at >= (RUNNING_CAP if run else DUPLICATE_WINDOW)]:
+                del self._items[old]
+            since, owner, running = self._items.get(key, (None, None, False))
+            busy = since is not None and now - since < (RUNNING_CAP if running else DUPLICATE_WINDOW)
+            if busy and (request is None or owner is None or owner != request):
                 return False
-            self._items[key] = (now, request)
+            self._items[key] = (now, request, True)
             return True
 
     def release(self, command, ok=True, request=None):
@@ -48,7 +55,7 @@ class InFlight:
         failure clears it, so retrying right away runs instead of "already doing that"."""
         with self._lock:
             if ok:
-                self._items[self.key(command)] = (time.monotonic(), request)
+                self._items[self.key(command)] = (time.monotonic(), request, False)
             else:
                 self._items.pop(self.key(command), None)
 

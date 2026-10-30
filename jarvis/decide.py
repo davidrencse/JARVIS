@@ -123,6 +123,9 @@ def record(state, job, text, decision, label=None, source=None):
                     (decision or {}).get("winner"),
                     json.dumps({"probs": (decision or {}).get("probs"), "sims": (decision or {}).get("sims")}),
                     (decision or {}).get("confidence"), label, source))
+        # Calibration needs recent behaviour, not all of it: drop rows past the history's age.
+        from .history import KEEP_DAYS
+        db.execute("DELETE FROM decisions WHERE at<?", (time.time() - KEEP_DAYS * 86400,))
     return did
 
 
