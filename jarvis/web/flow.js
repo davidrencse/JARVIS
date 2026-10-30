@@ -146,7 +146,8 @@
 
   // ---------- replay: recent fast-path requests from the history DB (/api/history/commands) ----------
   const HOP = { parse: "Parser", gates: "Gates", run: "Run", observe: "Observe" };
-  const OUTCOME = { observed: "done", acknowledged: "done", merged: "done", unconfirmed: "fail",
+  const OUTCOME = { observed: "done", acknowledged: "done", merged: "done", unchanged: "done",
+                    unconfirmed: "fail",
                     uncertain: "fail", pre_effect_failure: "fail", partial_effect: "fail",
                     not_sent: "fail" };
 

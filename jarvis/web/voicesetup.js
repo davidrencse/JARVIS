@@ -53,13 +53,8 @@
     body.innerHTML = `
       ${orb(0)}
       <h2 id="vs-title">${again ? "Retrain JARVIS on your voice" : "Teach JARVIS your voice"}</h2>
-      <p class="vs-lede">JARVIS talks you through it: a moment of quiet, a quick mic check, then seven short lines. About a minute.</p>
-      ${deviceSelect()}
-      <ul class="vs-points">
-        <li>${icon("check")}Sit where you usually do and talk normally.</li>
-        <li>${icon("check")}Only your voice will be answered; other people and the TV are ignored.</li>
-        <li>${icon("check")}Audio stays on this computer.${view?.listening ? " The listener pauses until setup ends." : ""}</li>
-      </ul>`;
+      <p class="vs-lede">About a minute. JARVIS tells you what to say; just talk normally from where you usually sit.</p>
+      <details class="vs-more"${device ? " open" : ""}><summary>Different mic?</summary>${deviceSelect()}</details>`;
     foot.innerHTML = `
       <button type="button" class="st-btn" data-act="later">${again ? "Close" : "Not now"}</button>
       <button type="button" class="st-btn st-btn-strong" data-act="start">${icon("mic")}${again ? "Start again" : "Start"}</button>`;
