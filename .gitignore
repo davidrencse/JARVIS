@@ -9,3 +9,5 @@ __pycache__/
 .venv/
 jarvis.egg-info/
 *.mp3
+.playwright-mcp/
+jarvis.config.json.pre-*
