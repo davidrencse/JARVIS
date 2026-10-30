@@ -15,15 +15,17 @@ import sys
 import time
 from pathlib import Path
 
+from .platforms import NO_WINDOW
 from .cluster import save_json
 from .locking import exclusive_lock
-from .topology import identity
+from .topology import DEFAULT_PORT, identity
 from .transfer import _check_target, _ssh_args, ssh_device
 
 NAME = "cluster-tunnel"
 # While on a fallback target (e.g. Tailscale), how often to look for an earlier one (the
 # LAN) again. Doubles after each switch back that does not hold, up to LAN_RETRY_MAX.
 LAN_RETRY, LAN_RETRY_MAX = 60, 30 * 60
+HEARTBEAT = 5  # seconds between liveness refreshes of the status note (status() allows 15)
 
 
 def reachable(target, timeout=2):
@@ -108,7 +110,7 @@ def command(config, state, target):
     binary = shutil.which("ssh")
     if not binary:
         raise ValueError("OpenSSH client is not installed.")
-    port = int(config.get("cluster", {}).get("listen_port", 7778))
+    port = int(config.get("cluster", {}).get("listen_port", DEFAULT_PORT))
     if not 1 <= port <= 65535:
         raise ValueError("Invalid cluster listen port.")
     return [*_ssh_args(binary, machine.get("identity_file")), *pinned_host(machine, state),
@@ -141,15 +143,23 @@ def run(config, state):
         command(config, state, target)
     marker = state / f"{NAME}.stop"
     note = {"pid": os.getpid(), "ssh_alive": False}
+    written = {}  # last content saved (sans `updated`) and when; wait() calls publish ~4x/s
 
     def publish(**values):
-        note.update(values, updated=time.time())
+        # Write only when the content changed or the heartbeat is due: status() treats a
+        # note older than 15 s as dead, so refreshing `updated` every HEARTBEAT s keeps it live.
+        now = time.time()
+        body = {k: v for k, v in {**note, **values}.items() if k != "updated"}
+        if body == written.get("body") and now - written.get("at", 0) < HEARTBEAT:
+            return
+        note.update(values, updated=now)
         # Windows refuses to replace a file another process is reading (WinError 5), and
         # `cluster tunnel status` or the console reads this one. A status note must never
         # kill the tunnel: retry briefly, then skip; the next publish (<= 1 s) refreshes it.
         for _ in range(5):
             try:
                 save_json(state / f"{NAME}.json", note)
+                written.update(body=body, at=now)
                 return
             except PermissionError:
                 time.sleep(0.05)
@@ -177,7 +187,7 @@ def run(config, state):
                         with (logs / f"{NAME}.log").open("a", encoding="utf-8") as log:
                             proc = subprocess.Popen(command(config, state, target), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=log,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                creationflags=NO_WINDOW)
                             while proc.poll() is None and not marker.exists():
                                 # SSH -N has no application handshake. This reports a
                                 # living SSH session, not node health; cluster status owns that.

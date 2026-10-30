@@ -186,16 +186,12 @@ class Watcher:
         """(notes, newest mtime) over the vault's Markdown: changes when any note does."""
         if not self.vault:
             return None
+        from .vault import scan  # the one shared walk, not a private one every 3 s
         count, newest = 0, 0.0
-        for folder, dirs, names in os.walk(self.vault):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for name in names:
-                if name.endswith(".md"):
-                    count += 1
-                    try:
-                        newest = max(newest, os.stat(os.path.join(folder, name)).st_mtime)
-                    except OSError:  # saved or deleted while we were walking
-                        continue
+        for rel, _, mtime, _ in scan(self.vault):
+            if rel.endswith(".md") and not any(part.startswith(".") for part in rel.split("/")):
+                count += 1
+                newest = max(newest, mtime or 0.0)
         return count, newest
 
     def _poll_vault(self):

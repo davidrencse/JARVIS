@@ -19,6 +19,7 @@ the date it was last confirmed:
     - Review runs daily at 02:00. ^c3f2a1 — source: [[source-042]] · confirmed: 2026-10-18
 """
 
+import copy
 import difflib
 import hashlib
 import json
@@ -36,6 +37,9 @@ from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+from .fsio import atomic_write
+from .stemming import stem
 from .locking import exclusive_lock
 
 STALE_DAYS = 30
@@ -98,27 +102,16 @@ def words(text):
     return [w.strip("'.-") for w in re.findall(r"[a-z0-9$%][a-z0-9'+#.%-]*", (text or "").lower())]
 
 
-def stem(word):
-    """Light suffix stripping, enough that runs/running/run and routine/routines meet."""
-    if len(word) <= 3 or not word.isalpha():
-        return word
-    for suffix in ("ies", "ing", "edly", "ed", "ly"):
-        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
-            word = word[:-len(suffix)] + ("y" if suffix == "ies" else "")
-            if len(word) > 3 and word[-1] == word[-2] and word[-1] not in "lsz":
-                word = word[:-1]
-            break
-    else:
-        if word.endswith("es") and word[:-2].endswith(("sh", "ch", "x", "ss", "z")):
-            word = word[:-2]
-        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
-            word = word[:-1]
-    return word[:-1] if word.endswith("e") and len(word) > 4 else word
-
-
 def content(text):
     return [stem(w) for w in words(text)
             if len(w) > 1 and w not in STOP and w not in NEGATION and not w[0].isdigit()]
+
+
+@lru_cache(maxsize=65536)
+def _terms(text):
+    """content() memoized for retrieve: recall runs every talk turn over every claim, and
+    claim and title text rarely change between turns. A tuple so no caller can mutate it."""
+    return tuple(content(text))
 
 
 def plain(text):
@@ -527,6 +520,7 @@ class KnowledgeBase:
         self._local = threading.RLock()
         self._depth = 0
         self._sha = {}  # raw file -> (mtime, size, sha256): snapshot() runs on every refresh
+        self._hashes = (None, {})  # (raw/ listing stamp, {sha256: meta file}) for _by_hash
 
     def today(self):
         return self._today or date.today()
@@ -570,9 +564,7 @@ class KnowledgeBase:
 
     @staticmethod
     def _atomic(path, text):
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_write(path, text)  # its own temporary name: two syncs at once never collide
 
     def event(self, bot, action, target="", message="", **data):
         record = {"at": datetime.now().isoformat(timespec="seconds"), "bot": bot,
@@ -594,11 +586,16 @@ class KnowledgeBase:
         folder = self.root / "bots"
         folder.mkdir(exist_ok=True)
         path = folder / f"{name}.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {}
-        if update:
+
+        def load():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                return {}
+        if not update:
+            return load()
+        with self.lock():  # read, change and write as one: a concurrent sync's update survives
+            data = load()
             update(data)
             self._atomic(path, json.dumps(data, indent=2, ensure_ascii=False))
         return data
@@ -700,10 +697,9 @@ class KnowledgeBase:
                                    *(() if own_text else ((meta["extract"], extract.encode("utf-8")),))):
                     self._write_raw(self.raw / name, blob)
                     written.append(self.raw / name)
-                tmp = self.raw / f"{sid}.meta.json.tmp"  # the meta lands last: no meta, no source
-                tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-                os.chmod(tmp, 0o444)
-                os.replace(tmp, self.raw / f"{sid}.meta.json")
+                # The meta lands last: no meta, no source.
+                atomic_write(self.raw / f"{sid}.meta.json", json.dumps(meta, indent=2), mode=0o444)
+                self._remember_hash(meta)
             except BaseException:
                 for path in written:
                     os.chmod(path, 0o644)
@@ -744,14 +740,48 @@ class KnowledgeBase:
             seen[rel] = digest_hex
             if not result["duplicate"]:
                 added.append(rel)
-        self.bot("reader", lambda m: m.update(vault=seen, vault_root=str(vault.root)))
+        # Merged into what is on disk now, not a copy read at the start: another sync that
+        # ran meanwhile keeps the notes it recorded.
+        self.bot("reader", lambda m: m.update(vault={**m.get("vault", {}), **seen},
+                                              vault_root=str(vault.root)))
         self.event("reader", "sync", f"vault/{vault.root.name}",
                    f"{len(added)} notes read · {unchanged} unchanged · raw/ untouched",
                    added=len(added), unchanged=unchanged, failed=failed[:20])
         return {"added": added, "unchanged": unchanged, "failed": failed}
 
     def _by_hash(self, digest_hex):
-        return next((m for m in self.sources() if m.get("sha256") == digest_hex), None)
+        """The source with these bytes, or None. Reading every meta file per ingest cost
+        ~57k JSON reads on a first vault sync; the index is rebuilt only when raw/'s listing
+        changes (a source added or removed, by us or another process)."""
+        stamp, index = self._hashes
+        try:
+            now = self.raw.stat().st_mtime_ns
+        except OSError:
+            now = None
+        if now is None or now != stamp:
+            index = {}
+            for meta in self.sources():
+                if meta.get("sha256") and meta.get("id"):
+                    index[meta["sha256"]] = meta["id"]
+            self._hashes = (now, index)
+        sid = index.get(digest_hex)
+        if sid is None:
+            return None
+        try:
+            meta = self.source(sid)
+        except (LookupError, OSError, ValueError):
+            self._hashes = (None, {})  # removed since: rebuild next time
+            return None
+        return meta if meta.get("sha256") == digest_hex else None
+
+    def _remember_hash(self, meta):
+        """Our own ingest: add it without rereading every meta (we hold the lock)."""
+        _, index = self._hashes
+        index[meta["sha256"]] = meta["id"]
+        try:
+            self._hashes = (self.raw.stat().st_mtime_ns, index)
+        except OSError:
+            self._hashes = (None, {})
 
     def _duplicate(self, meta):
         self.event("reader", "duplicate", f"raw/{meta['file']}", "already in raw/ — nothing written")
@@ -795,20 +825,33 @@ class KnowledgeBase:
         return data.decode("utf-8", "replace")
 
     # ---- wiki --------------------------------------------------------------------------
-    def pages(self):
+    def pages(self, shared=False):
+        """Every wiki page, parsed. Parsing is cached per file by (mtime_ns, size), so an
+        unchanged page is never re-parsed; only changed, new and gone files cost anything.
+        The default hands back private copies (writers mutate pages); read-only callers such
+        as recall pass shared=True and get the cached objects, which they must not modify."""
+        cache = self.__dict__.setdefault("_page_cache", {})
         pages = {}
         for path in sorted(self.wiki.glob("*.md")):
             if path.stem == "index":
                 continue
             try:
-                pages[path.stem] = parse_page(path.stem, path.read_text(encoding="utf-8"))
+                stat = path.stat()
+                key = (stat.st_mtime_ns, stat.st_size)
+                hit = cache.get(path.stem)
+                if not hit or hit[0] != key:
+                    hit = cache[path.stem] = (key, parse_page(path.stem, path.read_text(encoding="utf-8")))
+                pages[path.stem] = hit[1]
             except (OSError, ValueError) as exc:  # UnicodeDecodeError is a ValueError
+                cache.pop(path.stem, None)
                 self._skipped = getattr(self, "_skipped", set())
                 if path.stem not in self._skipped:
                     self._skipped.add(path.stem)
                     self.event("librarian", "error", f"wiki/{path.name}", f"unreadable, skipped: {exc}")
                 continue
-        return pages
+        for gone in set(cache) - set(pages):
+            del cache[gone]
+        return pages if shared else copy.deepcopy(pages)
 
     def page(self, slug):
         path = self.wiki / f"{slug}.md"
@@ -1205,7 +1248,7 @@ class KnowledgeBase:
     def retrieve(self, question, limit=6, pages=None):
         """BM25 over every claim (page title included), best first."""
         pages = pages if pages is not None else self.pages()
-        docs = [(slug, c, content(c["text"]) + content(p["title"]))
+        docs = [(slug, c, _terms(c["text"]) + _terms(p["title"]))
                 for slug, p in pages.items() if p["type"] == "page" for c in p["claims"]
                 if c.get("flag") != "superseded"]
         if not docs:
@@ -1277,7 +1320,7 @@ class KnowledgeBase:
             out = subprocess.run([binary, "-p", "--model", self.settings.get("llm_model", "haiku")],
                                  input=prompt, capture_output=True, text=True, timeout=120,
                                  encoding="utf-8", env=subscription_env(),
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+                                 creationflags=NO_WINDOW).stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
             return None
         cited = set(re.findall(r"\[(c[0-9a-f]{6})\]", out))
@@ -1416,7 +1459,7 @@ class KnowledgeBase:
 
     def recall(self, text, limit=4):
         lines = []
-        for hit in self.retrieve(text, limit=limit):
+        for hit in self.retrieve(text, limit=limit, pages=self.pages(shared=True)):
             mark = " DISPUTED" if hit.get("flag") == "conflict" else (
                 " UNCONFIRMED" if hit.get("flag") == "unconfirmed" else "")
             lines.append(f"[wiki {hit['page']}] {hit['text']} ({', '.join(hit['sources'])}, "

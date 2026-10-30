@@ -10,7 +10,9 @@ so the two can never silently drift apart. `update` closes the gap:
 4. swap it in, keeping the previous code as `jarvis.prev` (`--rollback` swaps it back)
 5. restart only the node agent and wait until it reports the new fingerprint
 
-The node's own config and state are never part of the package.
+The node's own config and state are never part of the package. What gets packed is the
+tested release (release.py), not the live working tree: a file saved mid-edit never reaches
+a node, and a node that doesn't check in with new code is rolled back.
 
 Nodes without SSH pull the code instead (/v1/code). That reply comes from a loopback port
 which, while the tunnel is down, any program on the node could be listening on, so the
@@ -32,6 +34,8 @@ import time
 import zipfile
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 PACKAGE = Path(__file__).resolve().parent
 SKIP = {"__pycache__"}
 REMOTE_DIR = "~/projects/JARVIS"
@@ -40,7 +44,7 @@ WAIT = 40  # seconds for the restarted node to check in with the new code
 SIGN_NAMESPACE = "jarvis-code"
 SIGNING_KEY = "code-signing.key"  # in the main's state folder; the .pub beside it is pinned
 CODE_KEY = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]+={0,2}")
-FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+FLAGS = NO_WINDOW
 
 # Runs on the node: the same fingerprint as code_fingerprint(), for a folder (CRLF-blind).
 REMOTE_FINGERPRINT = r"""
@@ -84,13 +88,14 @@ def code_fingerprint(root=PACKAGE):
     return value
 
 
-def package():
-    """The tar stream a node unpacks: jarvis/ plus pyproject.toml."""
+def package(root=PACKAGE):
+    """The tar stream a node unpacks: jarvis/ plus pyproject.toml, from `root` (the tested
+    release, release.source(); the live package by default)."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
-        for path in _files(PACKAGE):
-            tar.add(path, arcname="jarvis/" + path.relative_to(PACKAGE).as_posix(), recursive=False)
-        pyproject = PACKAGE.parent / "pyproject.toml"
+        for path in _files(root):
+            tar.add(path, arcname="jarvis/" + path.relative_to(root).as_posix(), recursive=False)
+        pyproject = root.parent / "pyproject.toml"
         if pyproject.is_file():
             tar.add(pyproject, arcname="pyproject.toml")
     return buffer.getvalue()
@@ -151,17 +156,19 @@ def verify(data, signature, key):
 
 
 def code_bundle(state):
-    """What /v1/code serves: jarvis/ + pyproject.toml as base64 zip, with its fingerprint
-    and the main's signature over the zip."""
+    """What /v1/code serves: the tested release's jarvis/ + pyproject.toml (release.py) as
+    base64 zip, with its fingerprint and the main's signature over the zip."""
+    from .release import source
+    root = source(state)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
-        for path in _files(PACKAGE):
-            bundle.write(path, "jarvis/" + path.relative_to(PACKAGE).as_posix())
-        pyproject = PACKAGE.parent / "pyproject.toml"
+        for path in _files(root):
+            bundle.write(path, "jarvis/" + path.relative_to(root).as_posix())
+        pyproject = root.parent / "pyproject.toml"
         if pyproject.is_file():
             bundle.write(pyproject, "pyproject.toml")
     raw = buffer.getvalue()
-    return {"code": code_fingerprint(), "zip": base64.b64encode(raw).decode("ascii"),
+    return {"code": code_fingerprint(root), "zip": base64.b64encode(raw).decode("ascii"),
             "signature": sign(raw, state)}
 
 
@@ -195,6 +202,10 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent):
             got = code_fingerprint(stage / "jarvis")
             if got != bundle.get("code"):
                 raise ValueError(f"Downloaded code fingerprint {got} != {bundle.get('code')}; not installed.")
+            problem = _starts(stage)
+            if problem:
+                raise ValueError(f"The main's code doesn't start ({problem}); kept this node's code.")
+            _keep_previous(repo)
             for name, parts in entries:
                 target = repo.joinpath(*parts).resolve()
                 if repo not in target.parents:
@@ -209,6 +220,45 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent):
                 if path.resolve() not in keep:
                     path.unlink(missing_ok=True)
     return len(entries)
+
+
+# What a node must import to run its agent and pull the next update. The main serves its
+# files as they are, so a bundle taken mid-edit (2026-10-30: deploy.py used NO_WINDOW a minute
+# before its import landed) once killed the Dell's agent, which then couldn't pull the fix.
+NODE_MODULES = ("__main__", "cluster_cli", "cluster", "deploy", "node", "remote")
+
+
+def _starts(stage, timeout=60):
+    """Why the staged package can't be imported, or None. Runs in a child Python with the
+    staged folder first on the path, so it imports the new code, not this process's."""
+    present = [m for m in NODE_MODULES if (Path(stage) / "jarvis" / f"{m}.py").is_file()]
+    if not present or not (Path(stage) / "jarvis" / "__init__.py").is_file():
+        return None  # not a full package (tests' small trees); the fingerprint check stands
+    import sys
+    code = "import " + ", ".join(f"jarvis.{m}" for m in present)
+    try:
+        done = subprocess.run([sys.executable, "-c", code], cwd=stage, capture_output=True,
+                              text=True, timeout=timeout, creationflags=NO_WINDOW,
+                              env={**os.environ, "PYTHONPATH": str(stage), "PYTHONDONTWRITEBYTECODE": "1"})
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"couldn't test it: {exc}"
+    if done.returncode:
+        last = (done.stderr.strip().splitlines() or ["exit " + str(done.returncode)])[-1]
+        return last[-300:]
+    return None
+
+
+def _keep_previous(repo):
+    """Copy the running jarvis/ to jarvis.prev before an update replaces it, so a bad update
+    can be undone by hand (swap the folders back) even when the agent won't start."""
+    current, previous = Path(repo) / "jarvis", Path(repo) / "jarvis.prev"
+    if not current.is_dir():
+        return
+    try:
+        shutil.rmtree(previous, ignore_errors=True)
+        shutil.copytree(current, previous, ignore=shutil.ignore_patterns("__pycache__"))
+    except OSError:
+        pass  # a backup that can't be made never blocks the update itself
 
 
 def _ssh(config, state, node):
@@ -236,12 +286,38 @@ def _remote(config, state, node, command, stdin=b"", timeout=120):
     last = ""
     for target in targets:
         out = subprocess.run([*argv, target, command], input=stdin, capture_output=True,
-                             timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                             timeout=timeout, creationflags=NO_WINDOW)
         if out.returncode == 255:  # ssh itself failed: next address
             last = out.stderr.decode("utf-8", "replace").strip()[-200:]
             continue
         return out.returncode, out.stdout.decode("utf-8", "replace"), out.stderr.decode("utf-8", "replace")
     raise ConnectionError(last or f"No address for {node} answered.")
+
+
+# How each node OS restarts its agent (autostart.install("jarvis-cluster", ...)). A failed
+# restart is reported but not fatal: the files are already swapped, and a node still on the
+# old code sees the main's fingerprint differ on its next poll and restarts itself.
+RESTART = {"Linux": f"systemctl --user restart {SERVICE}",
+           "Darwin": 'launchctl kickstart -k "gui/$(id -u)/com.jarvis.jarvis-cluster"'}
+
+
+def _node_os(config, state, node):
+    """"Linux" or "Darwin" when the node's SSH shell is POSIX with one of those kernels,
+    else None (Windows' cmd/PowerShell, Git Bash, or anything unrecognised)."""
+    code, out, _ = _remote(config, state, node, "uname -s", timeout=30)
+    kernel = out.strip().split()[0] if not code and out.strip() else ""
+    return kernel if kernel in RESTART else None
+
+
+def _restart(kernel):
+    return (f"{{ {RESTART[kernel]}; }} || echo 'agent restart failed; it restarts itself "
+            "on its next poll' >&2")
+
+
+def _bash(script):
+    """A command line that runs script under bash whatever the node's login shell is (fish
+    can't parse `{ ...; }`); base64 keeps the script clear of every shell's quoting."""
+    return f"bash -c 'eval \"$(echo {base64.b64encode(script.encode()).decode()} | base64 -d)\"'"
 
 
 def _node_code(state, node):
@@ -265,14 +341,23 @@ def update(config, state, node, rollback=False):
                 "note": f"{node} has no SSH link: it pulls the main's code itself on its next poll "
                         "(within ~30 s while its node agent runs) and restarts."}
     _, _, folder = _ssh(config, state, node)
+    kernel = _node_os(config, state, node)
+    if kernel is None:
+        # The scripts below need a POSIX shell, tar and a known service manager.
+        if rollback:
+            raise ValueError(f"{node} isn't a Linux or macOS node, so it can't be rolled back remotely.")
+        return {"node": node, "updated": False, "pull": True,
+                "note": f"{node} isn't a Linux or macOS node: it pulls the main's code itself on "
+                        "its next poll (within ~30 s while its node agent runs) and restarts."}
     started = time.monotonic()
     _, before = _node_code(state, node)
-    want = None if rollback else code_fingerprint()
+    from .release import served_code, source
+    want = None if rollback else served_code(state)
     py = f"$( [ -x {folder}/.venv/bin/python ] && echo {folder}/.venv/bin/python || echo python3 )"
     if rollback:
         script = (f"set -e; cd {folder}; [ -d jarvis.prev ] || {{ echo 'no previous code to roll back to' >&2; exit 3; }}; "
                   f"rm -rf jarvis.bad; mv jarvis jarvis.bad; mv jarvis.prev jarvis; mv jarvis.bad jarvis.prev; "
-                  f"systemctl --user restart {SERVICE}; {py} - jarvis <<'PY'\n{REMOTE_FINGERPRINT}\nPY")
+                  f"{_restart(kernel)}; {py} - jarvis <<'PY'\n{REMOTE_FINGERPRINT}\nPY")
         code, out, err = _remote(config, state, node, "bash -s", stdin=script.encode() + b"\n")
         if code:
             raise RuntimeError(err.strip()[-300:] or f"Rollback failed ({code}).")
@@ -284,8 +369,8 @@ def update(config, state, node, rollback=False):
                   f"[ \"$got\" = {shlex.quote(want)} ] || {{ echo \"staged code fingerprint $got != {want}\" >&2; rm -rf {stage}; exit 4; }}; "
                   f"rm -rf jarvis.prev; [ -d jarvis ] && mv jarvis jarvis.prev; mv {stage}/jarvis jarvis; "
                   f"[ -f {stage}/pyproject.toml ] && cp {stage}/pyproject.toml pyproject.toml; rm -rf {stage}; "
-                  f"systemctl --user restart {SERVICE}; echo ok")
-        code, out, err = _remote(config, state, node, script, stdin=package())
+                  f"{_restart(kernel)}; echo ok")
+        code, out, err = _remote(config, state, node, _bash(script), stdin=package(source(state)))
         if code or "ok" not in out:
             raise RuntimeError(err.strip()[-300:] or f"Update failed ({code}); the node kept its code.")
     deadline = time.monotonic() + WAIT
@@ -295,6 +380,20 @@ def update(config, state, node, rollback=False):
             return {"node": node, "updated": not rollback, "rolled_back": rollback,
                     "before": before, "after": now, "seconds": round(time.monotonic() - started, 1)}
         time.sleep(1)
+    if not rollback:
+        # The new code never checked in: put the previous code back (jarvis.prev) instead of
+        # leaving the node dead until someone notices.
+        try:
+            back = update(config, state, node, rollback=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            back = {"error": str(exc)}
+        restored = back.get("after") or back.get("expected")
+        return {"node": node, "updated": False, "rolled_back": "error" not in back,
+                "before": before, "after": restored, "rejected": want,
+                "note": f"{node} didn't check in with {want} within {WAIT} s; " +
+                        (f"rolled back to {restored}." if "error" not in back
+                         else f"rollback failed too: {back['error']}"),
+                "seconds": round(time.monotonic() - started, 1)}
     return {"node": node, "updated": not rollback, "rolled_back": rollback, "before": before,
             "after": _node_code(state, node)[1], "expected": want,
             "note": f"Code is in place but {node} hasn't checked in with it yet; check its jarvis-cluster.service.",

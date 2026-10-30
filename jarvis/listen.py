@@ -163,7 +163,7 @@ START_CUTOFF, HOLD_CUTOFF = 0.4, 0.18
 
 
 class _SpeechGate:
-    """Is this block speech? Scores the newest block with ~1 s of context, so fans,
+    """Is this block speech? Scores the newest block with the context before it, so fans,
     keyboards and room hum don't count the way they do for a loudness threshold.
     Hysteresis: two blocks in a row above `start` engage it, then anything above `hold`
     stays speech until a block falls below; a lone click never reaches the lower bar."""
@@ -171,11 +171,30 @@ class _SpeechGate:
     def __init__(self, model, context=32, start=START_CUTOFF, hold=HOLD_CUTOFF):
         self.model, self.start, self.hold, self.recent = model, start, min(hold, start), []
         self.context, self.run, self.engaged, self.last = context, 0, False, 0.0
+        # Silero carries its LSTM state (h, c) and the previous block's last 64 samples
+        # between blocks; scoring one block with them gives exactly what scoring the whole
+        # stream would. Re-scoring a 32-block window per block did 32x the work, nonstop.
+        self.session = getattr(model, "session", None)
+        self.h = self.c = None
+
+    def _stream(self, block):
+        np = _np()
+        if self.h is None:
+            self.h = np.zeros((1, 1, 128), dtype="float32")
+            self.c = np.zeros((1, 1, 128), dtype="float32")
+            self.tail = np.zeros(64, dtype="float32")
+        x = np.concatenate([self.tail, np.asarray(block, dtype="float32")])[None]
+        out, self.h, self.c = self.session.run(None, {"input": x, "h": self.h, "c": self.c})
+        self.tail = x[0, -64:]
+        return float(out.reshape(-1)[-1])
 
     def __call__(self, block):
         np = _np()
-        self.recent = (self.recent + [block])[-self.context:]
-        self.last = p = float(self.model(np.concatenate(self.recent)).reshape(-1)[-1])
+        if self.session is not None and len(block) == VAD_CHUNK:
+            self.last = p = self._stream(block)
+        else:  # a stand-in model (tests) or an odd-sized block: score a window, as before
+            self.recent = (self.recent + [block])[-self.context:]
+            self.last = p = float(self.model(np.concatenate(self.recent)).reshape(-1)[-1])
         self.run = self.run + 1 if p > self.start else 0
         if self.run >= 2:
             self.engaged = True
@@ -499,6 +518,7 @@ class Transcriber:
         self.model_name = cfg.get("stt_model", "large-v3-turbo")
         self.language = cfg.get("language", "en")
         self._model, self.device = None, None
+        self._stats = {}
 
     def __call__(self, audio):
         if self._model is None:
@@ -530,4 +550,32 @@ class Transcriber:
     def _run(self, audio):
         segments, _ = self._model.transcribe(audio, language=self.language, vad_filter=True,
                                              beam_size=1, hotwords="Jarvis")
+        segments = list(segments)
+        tokens = sum(len(s.tokens) for s in segments)
+        # How sure Whisper was, for unsure(): token-weighted log probability, worst silence score.
+        # Kept per clip (stats(audio)): on CUDA a cancelled stranger's clip can finish later.
+        self.last = {"logprob": (sum(s.avg_logprob * len(s.tokens) for s in segments) / tokens
+                                 if tokens else None),
+                     "no_speech": max((s.no_speech_prob for s in segments), default=None)}
+        self._stats[id(audio)] = self.last
+        while len(self._stats) > 8:
+            self._stats.pop(next(iter(self._stats)))
         return " ".join(s.text.strip() for s in segments).strip()
+
+    def stats(self, audio):
+        """The confidence of this clip's transcript (see unsure()), or None."""
+        return self._stats.pop(id(audio), None)
+
+
+# Whisper's own fallback threshold is avg_logprob < -1.0; below it the words are mostly guessed
+# ("for the day." answered with "It's Tuesday.", 2026-10-27). Mostly-silence clips that still
+# produced text are guesses too.
+UNSURE_LOGPROB, UNSURE_NO_SPEECH = -1.0, 0.6
+
+
+def unsure(stats):
+    """True when a transcript's confidence (Transcriber.last) says it was probably misheard."""
+    if not isinstance(stats, dict) or stats.get("logprob") is None:
+        return False
+    logprob, silence = stats["logprob"], stats.get("no_speech") or 0.0
+    return logprob < UNSURE_LOGPROB or (silence > UNSURE_NO_SPEECH and logprob < -0.6)

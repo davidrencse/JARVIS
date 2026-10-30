@@ -16,6 +16,8 @@ import threading
 import time
 from datetime import datetime
 
+from .platforms import NO_WINDOW
+
 # Read-only lookups only. No shell: it invites slow tool round trips for trivia.
 LEAN_FLAGS = ["--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
               "--setting-sources", "project", "--tools", "WebSearch,WebFetch,Read,Glob,Grep"]
@@ -91,7 +93,7 @@ class FastLane:
         self.proc = subprocess.Popen(
             args, cwd=self.base, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=subscription_env())
+            creationflags=NO_WINDOW, env=subscription_env())
         self.lines, self.turns = queue.Queue(), 0
         self._reader = threading.Thread(target=self._pump, args=(self.proc, self.lines),
                                         daemon=True)

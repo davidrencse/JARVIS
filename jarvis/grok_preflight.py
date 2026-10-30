@@ -41,11 +41,17 @@ class PreflightError(ValueError):
     """A handoff could not be prepared safely; no prompt was sent to Grok."""
 
 
-def infer_with_chatgpt(prompt, config, base):
-    """Use a separate tool-free lane; the action lane may be busy handling this call."""
+def chatgpt_lane(config, base):
+    """A separate tool-free lane; the action lane may be busy handling this call.
+    max_turns=1 starts a new thread for every ask, so the review never sees the draft's
+    reasoning, while both passes share one Codex process (a cold start is ~4 s)."""
     from .chatgpt import ChatGPTLane
-    lane = ChatGPTLane(config, base, max_turns=1, timeout=20,
+    return ChatGPTLane(config, base, max_turns=1, timeout=20,
                        instructions=INSTRUCTIONS, overrides=['web_search="disabled"'])
+
+
+def infer_with_chatgpt(prompt, config, base):
+    lane = chatgpt_lane(config, base)
     try:
         return lane.ask(prompt)
     finally:
@@ -54,13 +60,29 @@ def infer_with_chatgpt(prompt, config, base):
 
 def assess(request, config, base, infer=None):
     """Return {decision, task, reply, checks}; fail closed on bad inference output."""
+    if infer is not None:
+        return _assess(request, infer)
+    lane = None
+
+    def infer(prompt):
+        nonlocal lane
+        lane = lane or chatgpt_lane(config, base)
+        return lane.ask(prompt)
+    try:
+        return _assess(request, infer)
+    finally:
+        if lane is not None:
+            lane.close()
+
+
+def _assess(request, infer):
     if not isinstance(request, str) or not request.strip():
         raise PreflightError("The Grok request is empty.")
     request = request.strip()
     if len(request) > MAX_REQUEST:
         raise PreflightError("The Grok request is too long to check.")
     def read_json(prompt):
-        raw = infer(prompt) if infer else infer_with_chatgpt(prompt, config, base)
+        raw = infer(prompt)
         if not isinstance(raw, str) or len(raw) > 16000:
             raise ValueError("invalid inference response")
         answer = raw.strip()

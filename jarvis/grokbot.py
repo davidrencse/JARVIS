@@ -53,6 +53,8 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 HOME = Path.home()
 WINDOWS = os.name == "nt"
 DATA = HOME / ".grokbot"
@@ -415,8 +417,10 @@ class Grokbot:
             from .topology import is_node
             payload = {"text": prompt}
             if is_node(self.full_config):
+                wait = min(timeout, REQUEST_TIMEOUT)
                 return Client(self.full_config, self.state).request("/v1/control", {
-                    "node": route["device"], "kind": "grokbot", "payload": payload})
+                    "node": route["device"], "kind": "grokbot", "payload": payload,
+                    "timeout": wait}, timeout=wait + 5)
             return dispatch(self.full_config, self.state, route["device"], "grokbot", payload,
                             timeout=min(timeout, REQUEST_TIMEOUT))
         if route["local"]:
@@ -528,7 +532,7 @@ class Grokbot:
         try:
             # Bytes, not text: Windows text mode would turn \n into \r\n for bash.
             done = subprocess.run(argv, input=script, capture_output=True, timeout=timeout,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                  creationflags=NO_WINDOW)
         except subprocess.TimeoutExpired:
             raise TimeoutError(f"Grokbot on {route['device']} didn't answer before the request deadline; stopped.")
         out = done.stdout.decode("utf-8", "replace")
@@ -576,7 +580,7 @@ class Grokbot:
         if ssh.get("identity_file"):
             base += ["-i", str(Path(ssh["identity_file"]).expanduser()), "-o", "IdentitiesOnly=yes"]
         note = f".config/jarvis/grokbot-{here}.json"
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        flags = NO_WINDOW
         print(f"Relay for {here}'s Grokbot on 127.0.0.1:{relay_port}; forwarding to "
               f"{to} 127.0.0.1:{remote_port}. Ctrl+C stops.", flush=True)
         targets = [ssh["target"], *ssh.get("fallback_targets", [])]
@@ -629,7 +633,7 @@ class Grokbot:
                                    "-ExecutionPolicy", "Bypass", "-File", str(script),
                                    "-PromptFile", str(text)],
                                   capture_output=True, text=True, timeout=timeout,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                  creationflags=NO_WINDOW)
         return done.stdout
 
     # -- JARVIS's own windows ----------------------------------------------------------

@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 
 ACK = "On it."
+UNCLEAR = "Sorry, I didn't catch that."  # a transcript Whisper was unsure of (listen.unsure)
 STARTUP_NAME = "JARVIS Voice.vbs"
 UNIT_NAME = "jarvis-voice.service"
 
@@ -122,17 +123,36 @@ def opens_reply_window(result):
         isinstance(o, dict) and o.get("ok") is False for o in result.get("outcomes") or ())
 
 
-BORDERLINE = 0.10  # live mic scores dropped to 0.11-0.28 on 2026-10-26; the wake word gates the rest
+# Live mic scores dropped to 0.11-0.28 on 2026-10-26, so near misses started at 0.10. Every one
+# is transcribed on the CPU before the wake word can reject it: 603 of 2,259 rejected clips by
+# 2026-10-30 (median 0.205), and none became a request. The voice print's own cutoff is
+# 0.30-0.36, so 0.25 keeps the band just under it and skips Whisper for ~3/4 of the strangers.
+BORDERLINE = 0.25
+# David far from the mic has scored 0.11-0.28, so a clip between this floor and BORDERLINE
+# is not dropped outright: only its opening seconds are transcribed (cheap next to the whole
+# clip), and it counts as a near miss when they start with "Jarvis". Below the floor, noise.
+STRANGER_FLOOR = 0.08
+HEAD_SECONDS = 2.5
 
 
-def listen_loop(state, config, base, threshold=None):
+def warm_quietly(lane):
+    """Warm the brain. Codex not up yet (at login) or down is no failed turn: logging it
+    is enough. Uncaught, it killed the listener at startup until systemd gave up, and a
+    short noise (a None clip warms the brain) said "Sorry, that one failed"."""
+    try:
+        lane.warm()
+    except Exception as exc:
+        log(f"brain warm-up failed: {type(exc).__name__}: {exc}")
+
+
+def listen_loop(state, config, base, threshold=None, config_path=None):
     from .assistant import ask, confirmation_words, wake_word
     from .chatgpt import make_lane
     from concurrent.futures import ThreadPoolExecutor
 
     from .events import Turn, emit, feed_sender
     from .instant import answer as instant_answer
-    from .listen import RATE, LiveMic, Transcriber, VoicePrint, _np, mic_settings, record_utterance
+    from .listen import RATE, LiveMic, Transcriber, VoicePrint, _np, mic_settings, record_utterance, unsure
     from .memory import Memory
     from .speech import SpeechQueue, Voice, spoken
     from .store import Store, lanes_from
@@ -164,9 +184,12 @@ def listen_loop(state, config, base, threshold=None):
         # `voice stop` sends SIGTERM, whose default action skips atexit and leaves the pid file.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         # Warm up so the first real request isn't slow: load Whisper, cache the ack line.
-        stt(_np().zeros(16000, dtype="float32"))
-        voice.synth(ACK)
-        lane.warm()
+        for name, warm in (("Whisper", lambda: stt(_np().zeros(16000, dtype="float32"))),
+                           ("speech", lambda: voice.synth(ACK)), ("brain", lambda: warm_quietly(lane))):
+            try:  # a failed warm-up costs the first request some speed, never the listener
+                warm()
+            except Exception as exc:
+                log(f"{name} warm-up failed: {type(exc).__name__}: {exc}")
         if not node:
             from .pipeline import warm
             warm()  # the installed-app list, for the direct-action fast path
@@ -179,8 +202,8 @@ def listen_loop(state, config, base, threshold=None):
                 mic = mic or LiveMic(tuning=mic_settings(state))  # device + cutoffs from setup
                 audio = record_utterance(mic=mic)
                 failures = 0  # the mic works again; only consecutive failures back off
-                if audio is None:  # 30 s of silence: keep the brain warm
-                    lane.warm()
+                if audio is None:  # silence or a short noise: keep the brain warm
+                    warm_quietly(lane)
                     continue
                 # When this utterance began, so a long follow-up still lands in the window.
                 began = time.monotonic() - len(audio) / RATE
@@ -195,14 +218,28 @@ def listen_loop(state, config, base, threshold=None):
                 is_owner, score = check.result()
                 # A near miss (David further from the mic, quieter, music behind him) is
                 # accepted only when it also starts with "Jarvis"; strangers score far lower.
-                near = not is_owner and score >= config.get("voice", {}).get("near_miss", BORDERLINE)
+                settings = config.get("voice", {})
+                near = not is_owner and score >= settings.get("near_miss", BORDERLINE)
+                heard = None
                 if not is_owner and not near:
-                    if text is not None:
-                        text.cancel()
-                    log(f"ignored another voice (similarity {score})")
-                    emit(state, "voice.ignored", score=score)
-                    continue
-                heard = text.result() if text is not None else stt(audio)
+                    head = None
+                    if score >= settings.get("stranger_floor", STRANGER_FLOOR):
+                        try:  # its words stay unread unless they open with the wake word
+                            head = text.result() if text is not None else \
+                                stt(audio[:int(HEAD_SECONDS * RATE)])
+                        except Exception:
+                            head = None
+                    if head is None or wake_word(head) is None:
+                        if text is not None:
+                            text.cancel()
+                        log(f"ignored another voice (similarity {score})")
+                        emit(state, "voice.ignored", score=score)
+                        continue
+                    near = True
+                    if text is not None or len(audio) <= HEAD_SECONDS * RATE:
+                        heard = head  # already the whole clip
+                if heard is None:
+                    heard = text.result() if text is not None else stt(audio)
                 request = wake_word(heard)
                 if request == "":  # a bare "Jarvis" and a pause: the request comes next
                     armed, armed_by_owner = began + len(audio) / RATE + FOLLOW_UP, is_owner
@@ -231,6 +268,15 @@ def listen_loop(state, config, base, threshold=None):
                     elif heard:  # David's own voice without the wake word: say so, never what
                         log(f"no wake word ({score}): {len(heard.split())} words, not kept")
                     continue
+                if unsure(stt.stats(audio) if hasattr(stt, "stats") else None):
+                    # Probably misheard: ask again rather than answer a guess, and keep the
+                    # follow-up window open so the repeat needs no "Jarvis".
+                    log(f"unclear ({score}): asked to repeat")
+                    emit(state, "voice.unclear", score=score)
+                    armed, armed_by_owner = time.monotonic() + FOLLOW_UP + 3, is_owner
+                    voice.say(UNCLEAR, wait=True)
+                    mic.flush()
+                    continue
                 if not near:
                     ears.learn()  # passed the voice check AND said "Jarvis": adapt to live audio
                 log(f"you ({score}): {request}")
@@ -247,6 +293,12 @@ def listen_loop(state, config, base, threshold=None):
                         budget[0] -= len(sentence)
                         speaker.put(sentence)
 
+                if config_path:  # console saves (vault.write...) since the last request
+                    try:
+                        from .settings import refresh
+                        refresh(config, config_path)
+                    except Exception as exc:
+                        log(f"settings refresh failed: {exc}")
                 started = time.time()
                 try:
                     result = ask(request, store, memory, config, base, lane=lane,
@@ -277,6 +329,7 @@ def listen_loop(state, config, base, threshold=None):
                     mic = None
                 if failures == 1:  # a dead mic must not apologise out loud every second
                     try:
+                        speaker.clear(timeout=10)  # never over the failed turn's half-spoken reply
                         voice.say("Sorry, that one failed. The details are in the log.")
                     except Exception:
                         pass
@@ -479,21 +532,17 @@ def _systemd_autostart(state, enable):
         return {"autostart": False}
     path.parent.mkdir(parents=True, exist_ok=True)
     state = Path(state).resolve()
-    path.write_text(
-        "# JARVIS: start the voice listener at login. `jarvis voice autostart off` removes it.\n"
-        "[Unit]\nDescription=JARVIS voice listener\n"
-        "After=pipewire.service pipewire-pulse.service\n"
-        "StartLimitIntervalSec=300\nStartLimitBurst=5\n\n"
-        "[Service]\nType=simple\nRestart=on-failure\nRestartSec=5\n"
-        "RestartPreventExitStatus=2 3\n"
-        f"WorkingDirectory={Path(__file__).resolve().parent.parent}\n"
-        # systemd's PATH lacks ~/.local/bin, where the claude CLI usually lives.
-        f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"\n'
-        'Environment="PYTHONIOENCODING=utf-8" "PYTHONUNBUFFERED=1"\n'
-        f'ExecStart="{sys.executable}" -m jarvis --state "{state}" voice listen\n'
-        f"StandardOutput=append:{state / 'logs' / 'voice.log'}\n"
-        f"StandardError=append:{state / 'logs' / 'voice.log'}\n\n"
-        "[Install]\nWantedBy=default.target\n", encoding="utf-8")
+    from .autostart import systemd_unit
+    log = state / "logs" / "voice.log"
+    path.write_text(systemd_unit(
+        "JARVIS voice listener", [sys.executable, "-m", "jarvis", "--state", str(state), "voice", "listen"],
+        comment="JARVIS: start the voice listener at login. `jarvis voice autostart off` removes it.",
+        after="pipewire.service pipewire-pulse.service",
+        service=["RestartPreventExitStatus=2 3",
+                 # systemd's PATH lacks ~/.local/bin, where the claude CLI usually lives.
+                 f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"',
+                 'Environment="PYTHONIOENCODING=utf-8" "PYTHONUNBUFFERED=1"',
+                 f"StandardOutput=append:{log}", f"StandardError=append:{log}"]), encoding="utf-8")
     (state / "logs").mkdir(parents=True, exist_ok=True)
     enabled = _systemctl("daemon-reload") and _systemctl("enable", UNIT_NAME)
     return {"autostart": True, "unit": str(path), "enabled": enabled}

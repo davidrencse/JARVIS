@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .claude_auth import renew_claude_session
+from .fsio import atomic_write
 
 try:
     HOME = Path.home()
@@ -176,17 +177,8 @@ def owner_only(path):
 
 def write_private(path, text):
     """Write a secrets file atomically, created 0600 so the key is never world-readable."""
-    path = Path(path)
-    partial = path.with_suffix(".part")
-    try:
-        partial.unlink()
-    except FileNotFoundError:
-        pass
-    fd = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as out:
-        out.write(text)
-    owner_only(partial)  # in case the umask or filesystem ignored the mode above
-    partial.replace(path)
+    # owner_only: in case the umask or filesystem ignored the mode.
+    atomic_write(path, text, mode=0o600, prepare=owner_only)
 
 
 def _credential_path(provider):

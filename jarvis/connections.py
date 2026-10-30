@@ -23,8 +23,8 @@ def _safely(fn, fallback=None):
 
 def _nodes(config, state, main):
     from .cluster_store import Broker
-    from .deploy import code_fingerprint
-    broker, code = Broker(state), code_fingerprint()
+    from .release import served_code
+    broker, code = Broker(state), served_code(state)
     out = []
     for node in broker.nodes():
         device = (config.get("devices") or {}).get(node["id"], {})
