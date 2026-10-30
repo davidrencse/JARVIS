@@ -133,7 +133,7 @@ class LinuxControlTests(unittest.TestCase):
             self.assertTrue(actions.volume("up")[0])
             self.assertFalse(actions.volume("eleven")[0])
             self.assertFalse(actions.media("rm -rf")[0])
-        self.assertIn(("playerctl", "pause"), calls)
+        self.assertIn(("playerctl", "-p", "spotify,%any", "pause"), calls)
         self.assertIn(("wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "30%"), calls)
         self.assertIn(("wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "10%+"), calls)
 

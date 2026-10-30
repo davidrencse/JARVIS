@@ -137,9 +137,35 @@ class InFlightTests(unittest.TestCase):
         base = time.monotonic()
         with mock.patch.object(gates.time, "monotonic", return_value=base):
             self.assertTrue(f.claim(c))
+            f.release(c)
         with mock.patch.object(gates.time, "monotonic",
                                return_value=base + gates.DUPLICATE_WINDOW + 0.1):
             self.assertTrue(f.claim(c))
+
+    def test_slow_run_blocks_repeat_until_it_finishes(self):
+        # "open spotify on arch" takes 3-45 s; a double trigger 2.5 s in must not resend.
+        f = gates.InFlight()
+        c = cmd()
+        base = time.monotonic()
+        with mock.patch.object(gates.time, "monotonic", return_value=base):
+            self.assertTrue(f.claim(c, "r1"))
+        with mock.patch.object(gates.time, "monotonic", return_value=base + 45):
+            self.assertFalse(f.claim(c, "r2"))
+            f.release(c, True, "r1")
+            self.assertFalse(f.claim(c, "r2"))  # still inside the after-finish window
+        with mock.patch.object(gates.time, "monotonic",
+                               return_value=base + 45 + gates.DUPLICATE_WINDOW + 0.1):
+            self.assertTrue(f.claim(c, "r2"))
+
+    def test_unreleased_run_stops_blocking_after_cap(self):
+        f = gates.InFlight()
+        c = cmd()
+        base = time.monotonic()
+        with mock.patch.object(gates.time, "monotonic", return_value=base):
+            self.assertTrue(f.claim(c, "r1"))
+        with mock.patch.object(gates.time, "monotonic",
+                               return_value=base + gates.RUNNING_CAP + 0.1):
+            self.assertTrue(f.claim(c, "r2"))
 
 
 if __name__ == "__main__":

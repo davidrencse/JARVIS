@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from jarvis import cluster_setup, cluster_tunnel
+from jarvis import cluster_setup, cluster_tunnel, deploy
 from jarvis.cluster import Client
 from jarvis.cluster_store import Broker
 
@@ -81,6 +81,9 @@ class SetupTests(unittest.TestCase):
             self.assertNotIn("token", json.dumps(saved))
             self.assertNotIn("PRIVATE KEY", json.dumps(saved))
             self.assertTrue((state / "cluster-node.key").is_file())
+            # The main's code-signing key is pinned: only code it signs gets installed here.
+            pinned = json.loads((state / "cluster-node.json").read_text(encoding="utf-8"))
+            self.assertEqual(pinned["code_key"], deploy.code_key(self.tmp / "main-state"))
             link = cluster_tunnel.peer(saved, state)
             self.assertEqual(link["target"], "jdoe@192.168.1.5")
             self.assertEqual(link["fallback_targets"], ["jdoe@100.64.0.9"])
@@ -116,11 +119,12 @@ class SetupTests(unittest.TestCase):
     def test_validate_rejects_tampered_invites(self):
         good = {"v": 1, "node_id": "dell", "main_device": "zenbook", "token": "t" * 40,
                 "host_key": HOST_KEY, "key": "-----BEGIN OPENSSH PRIVATE KEY-----\n", "port": 7780,
-                "user": "jdoe", "addresses": ["192.168.1.5"]}
+                "user": "jdoe", "addresses": ["192.168.1.5"], "code_key": "ssh-ed25519 AAAAC3Nz"}
         cluster_setup._validate(good)
         for change in ({"addresses": ["1.2.3.4 -oProxyCommand=x"]}, {"user": "-oProxy"},
                        {"port": 0}, {"host_key": "ssh-ed25519 AAA\nevil"}, {"main_device": "dell"},
-                       {"addresses": []}, {"main": {"hostname": "a b"}}):
+                       {"addresses": []}, {"main": {"hostname": "a b"}},
+                       {"code_key": None}, {"code_key": "ssh-rsa AAAA"}, {"code_key": "ssh-ed25519 A\nx"}):
             with self.assertRaises(ValueError, msg=change):
                 cluster_setup._validate({**good, **change})
 

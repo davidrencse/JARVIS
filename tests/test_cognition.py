@@ -191,6 +191,13 @@ class AssistantTests(Temp):
         self.assertIsNone(wake_word("I was talking to Jarvis"))  # no comma: about it
         self.assertEqual(wake_word("What's the weather today Jarvis?"),
                          "What's the weather today")  # Whisper dropped the comma
+        for about in ("Did you ask Jarvis?", "Who is Jarvis?", "So Jarvis said it would rain",
+                      "And Jarvis is useless", "Jarvis can't hear me"):
+            self.assertIsNone(wake_word(about), about)  # talking about it, not to it
+        self.assertEqual(wake_word("Jarvis is it raining"), "is it raining")  # a question to it
+        self.assertEqual(wake_word("Jarvis can you open Spotify"), "can you open Spotify")
+        self.assertEqual(wake_word("So Jarvis open Spotify"), "open Spotify")
+        self.assertEqual(wake_word("Who is that, Jarvis?"), "Who is that")
 
 
 class SpeechTests(Temp):

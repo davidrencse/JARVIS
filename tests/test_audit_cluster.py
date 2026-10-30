@@ -110,12 +110,17 @@ def make_tree(root, files):
         path.write_bytes(data)
 
 
-def bundle_of(entries, code):
+def bundle_of(entries, code, signer=None):
+    """A /v1/code bundle; `signer` is a state folder whose code-signing key signs it."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as z:
         for name, data in entries.items():
             z.writestr(name, data)
-    return {"code": code, "zip": base64.b64encode(buffer.getvalue()).decode()}
+    raw = buffer.getvalue()
+    bundle = {"code": code, "zip": base64.b64encode(raw).decode()}
+    if signer:
+        bundle["signature"] = deploy.sign(raw, signer)
+    return bundle
 
 
 class PullUpdateTests(unittest.TestCase):
@@ -128,9 +133,11 @@ class PullUpdateTests(unittest.TestCase):
         stage = Path(self.tmp.name) / "stage"
         make_tree(stage, self.new)
         self.want = deploy.code_fingerprint(stage / "jarvis")
+        self.signer = Path(self.tmp.name) / "main-state"
+        self.key = deploy.code_key(self.signer)
 
     def test_installs_verified_files_and_drops_stale_ones(self):
-        deploy.apply_bundle(bundle_of(self.new, self.want), self.repo)
+        deploy.apply_bundle(bundle_of(self.new, self.want, self.signer), self.key, self.repo)
         self.assertEqual((self.repo / "jarvis/a.py").read_bytes(), b"new\n")
         self.assertEqual((self.repo / "jarvis/sub/b.py").read_bytes(), b"b\n")
         self.assertEqual((self.repo / "pyproject.toml").read_bytes(), b"new\n")
@@ -142,20 +149,38 @@ class PullUpdateTests(unittest.TestCase):
         for name in ("jarvis/../../evil.py", "../evil.py", str(outside), "jarvis\\..\\evil.py",
                      "C:/evil.py", "other/x.py"):
             with self.assertRaises(ValueError, msg=name):
-                deploy.apply_bundle(bundle_of({name: b"x"}, "0" * 16), self.repo)
+                deploy.apply_bundle(bundle_of({name: b"x"}, "0" * 16, self.signer), self.key, self.repo)
         self.assertFalse(outside.exists())
         self.assertEqual((self.repo / "jarvis/a.py").read_bytes(), b"old\n")
 
     def test_wrong_fingerprint_installs_nothing(self):
         with self.assertRaisesRegex(ValueError, "fingerprint"):
-            deploy.apply_bundle(bundle_of(self.new, "f" * 16), self.repo)
+            deploy.apply_bundle(bundle_of(self.new, "f" * 16, self.signer), self.key, self.repo)
+        self.assertEqual((self.repo / "jarvis/a.py").read_bytes(), b"old\n")
+        self.assertTrue((self.repo / "jarvis/stale.py").exists())
+
+    def test_unsigned_or_foreign_or_tampered_bundles_install_nothing(self):
+        """Whatever answers the node's loopback port can't hand it code: only bundles
+        signed by the pinned main key install."""
+        other = Path(self.tmp.name) / "squatter"
+        good = bundle_of(self.new, self.want, self.signer)
+        tampered = {**bundle_of({**self.new, "jarvis/a.py": b"evil\n"}, self.want),
+                    "signature": good["signature"]}
+        cases = {"unsigned": (bundle_of(self.new, self.want), self.key),
+                 "other key": (bundle_of(self.new, self.want, other), self.key),
+                 "tampered zip": (tampered, self.key),
+                 "nothing pinned": (good, None)}
+        for name, (bundle, key) in cases.items():
+            with self.assertRaises(ValueError, msg=name):
+                deploy.apply_bundle(bundle, key, self.repo)
         self.assertEqual((self.repo / "jarvis/a.py").read_bytes(), b"old\n")
         self.assertTrue((self.repo / "jarvis/stale.py").exists())
 
     def test_node_pulls_once_then_restarts_instead_of_looping(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
-            save_json(state / "cluster-node.json", {"node_id": "node", "main_device": "main", "token": "t" * 24})
+            save_json(state / "cluster-node.json", {"node_id": "node", "main_device": "main",
+                                                    "token": "t" * 24, "code_key": "ssh-ed25519 AAAA"})
             worker = NodeWorker(configuration("node"), state, executor=Mock())
             bundle = {"code": "abc", "zip": ""}
             worker.client.request = Mock(side_effect=[{"job": None, "code": "abc"}, bundle,
@@ -163,13 +188,15 @@ class PullUpdateTests(unittest.TestCase):
             with patch("jarvis.deploy.apply_bundle", return_value=3) as apply:
                 self.assertFalse(worker.once())
                 self.assertTrue(worker.restarting)
-                apply.assert_called_once_with(bundle)
+                apply.assert_called_once_with(bundle, "ssh-ed25519 AAAA")
                 worker.restarting = False
                 worker.once()  # same target again within 10 minutes: no second download
                 apply.assert_called_once()
 
     def test_hub_serves_bundle_and_skips_non_ssh_nodes(self):
-        self.assertEqual(deploy.code_bundle()["code"], deploy.code_fingerprint())
+        bundle = deploy.code_bundle(self.signer)
+        self.assertEqual(bundle["code"], deploy.code_fingerprint())
+        self.assertTrue(deploy.verify(base64.b64decode(bundle["zip"]), bundle["signature"], self.key))
         config = configuration()
         config["devices"]["dell"] = {"transport": "cluster"}
         self.assertFalse(deploy.is_ssh_node(config, "dell"))

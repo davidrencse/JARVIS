@@ -43,6 +43,25 @@ class ApprovalTests(unittest.TestCase):
                     {**approval("browser_click"), "serverName": "node_repl"}):
             self.assertFalse(approve_browser(bad)[0], bad)
 
+    def test_browser_never_opens_this_pc_or_home_network(self):
+        def ab(tool, **args):
+            return {**approval(tool, **args), "serverName": "agent_browser"}
+        for url in ("http://127.0.0.1:7777/#settings", "http://localhost:7780/", "http://[::1]:7777",
+                    "http://0.0.0.0:7777", "http://2130706433:7777/", "http://127.1:7777",
+                    "http://[::ffff:127.0.0.1]:7777", "http://192.168.1.1/", "http://10.0.0.5",
+                    "http://169.254.169.254/latest", "http://archmain.local:7777",
+                    "https://router.lan/", "http://foo.localhost/", "http://user@127.0.0.1:7777/"):
+            self.assertFalse(approve_browser(approval("browser_navigate", url=url))[0], url)
+            self.assertFalse(approve_browser(ab("agent_browser_open", url=url))[0], url)
+        with patch("jarvis.actions.socket.getaddrinfo",
+                        return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]):  # public name -> loopback
+            self.assertFalse(approve_browser(approval("browser_navigate", url="http://evil.example"))[0])
+        with patch("jarvis.actions.socket.getaddrinfo",
+                        return_value=[(2, 1, 6, "", ("93.184.215.14", 0))]):
+            self.assertTrue(approve_browser(approval("browser_navigate", url="https://example.com"))[0])
+            self.assertFalse(approve_browser(ab("agent_browser_open", url="https://example.com",
+                                                 targetUrl="http://127.0.0.1:7777"))[0])
+
     def test_browser_server_blocks_risky_tools_and_uses_own_profile(self):
         with tempfile.TemporaryDirectory() as d:
             spec = browser_mcp(d).get("playwright")
@@ -50,6 +69,7 @@ class ApprovalTests(unittest.TestCase):
                 self.skipTest("npx not installed")
             self.assertIn("browser_file_upload", spec["disabled_tools"])
             self.assertIn(str(Path(d).resolve() / "browser-profile"), spec["args"])
+            self.assertIn("http://127.0.0.1:7777", spec["args"][spec["args"].index("--blocked-origins") + 1])
 
     def test_agent_browser_policy(self):
         def ab(tool, **args):

@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 from jarvis.cluster import Client, Hub, NodeWorker, ProxyLane, save_json, validate_action
 from jarvis.cluster_proxy import proxy_handler
-from jarvis.cluster_store import Broker
+from jarvis.cluster_store import CAPABILITIES, NODE_DEFAULT, Broker
 from jarvis.topology import ORIGIN, endpoint, identity, is_node, request_from
 from jarvis.ui import Console, ConsoleServer
 
@@ -146,7 +146,7 @@ class ClusterHTTPTests(unittest.TestCase):
         self.node = copy.deepcopy(self.main)
         self.node["cluster"]["local_device"] = "node"
         self.state = self.root / "node"
-        token = self.hub.broker.enroll("node")
+        token = self.hub.broker.enroll("node", CAPABILITIES)
         save_json(self.state / "cluster-node.json", {"node_id": "node", "main_device": "main", "token": token})
         self.client = Client(self.node, self.state)
 
@@ -189,6 +189,36 @@ class ClusterHTTPTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "revoked"):
             self.client.request("/v1/status")
 
+    def test_invite_is_single_use_and_short_lived(self):
+        from jarvis.cluster import redeem_invite
+        invite = self.hub.broker.enroll("node", CAPABILITIES, invite_ttl=3600)
+        key = self.state / "node.key"
+        save_json(self.state / "cluster-node.json", {
+            "node_id": "node", "main_device": "main", "token": invite, "redeem": True,
+            "link": {"identity_file": str(key)}})
+        joined, agent = Client(self.node, self.state), Client(self.node, self.state)
+        # Never touch this PC's real authorized_keys or run ssh-keygen in a test.
+        with patch("jarvis.cluster_setup.keypair", return_value=("PRIVATE\n", "ssh-ed25519 AAAA x")), \
+                patch("jarvis.cluster_setup.authorize") as authorize:
+            self.assertEqual(redeem_invite(self.node, self.state, joined), {"token": True, "ssh_key": True})
+            self.assertIsNone(redeem_invite(self.node, self.state, joined))  # nothing left to redeem
+        authorize.assert_called_once()
+        self.assertEqual(key.read_text(), "PRIVATE\n")
+        note = json.loads((self.state / "cluster-node.json").read_text())
+        self.assertNotIn("redeem", note)
+        self.assertNotEqual(note["token"], invite)
+        joined.request("/v1/status")
+        agent.request("/v1/status")  # started on the invite: picks up the saved token once
+        self.assertEqual(agent.token, note["token"])
+        leaked = Client(self.node, self.state)
+        leaked.token, leaked.invite = invite, False
+        with self.assertRaisesRegex(RuntimeError, "revoked"):
+            leaked.request("/v1/status")  # the invite code is dead once used
+        with self.assertRaises(PermissionError):
+            self.hub.broker.redeem("node")  # and can't be redeemed twice
+        unused = self.hub.broker.enroll("late", CAPABILITIES, invite_ttl=-1)
+        self.assertIsNone(self.hub.broker.authenticate(unused))  # nobody joined in time
+
     def test_capabilities_restrict_proxy_control_and_poll_work(self):
         token = self.hub.broker.enroll("node", {"ask"})
         self.client.token = token
@@ -196,6 +226,82 @@ class ClusterHTTPTests(unittest.TestCase):
             self.client.request("/v1/control", {"node": "main", "kind": "inventory", "payload": {}})
         self.assertEqual(self.client.request("/v1/poll", {})["job"], None)
         self.assertEqual(self.client.ask("hello", timeout=3)["reply"], "main answered")
+
+    def test_files_node_may_hand_the_main_a_transfer_and_nothing_else(self):
+        self.client.token = self.hub.broker.enroll("node", {"files"})
+        with patch("jarvis.cluster.execute_local", return_value={"entries": []}) as execute:
+            self.assertEqual(self.client.request("/v1/control", {
+                "node": "main", "kind": "transfer", "payload": {"action": "inbox"}}), {"entries": []})
+        execute.assert_called_once()
+        for body in ({"node": "main", "kind": "desktop", "payload": {"action": "volume", "arg": "5"}},
+                     {"node": "other", "kind": "transfer", "payload": {"action": "inbox"}}):
+            with self.subTest(body=body), self.assertRaisesRegex(RuntimeError, "cannot use"):
+                self.client.request("/v1/control", body)
+
+    def test_large_transfer_chunk_reaches_the_node_and_is_compacted(self):
+        executed = []
+        worker = NodeWorker(self.node, self.state,
+            executor=lambda kind, payload: executed.append(len(payload["data"])) or {"received": 1})
+        worker.once()
+        payload = {"action": "put", "upload": "c" * 32, "offset": 0, "name": "f", "last": False,
+                   "data": "A" * 1_000_000}  # over the 64 KB control limit, under the bulk one
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(self.hub.dispatch, "node", "transfer", payload, 5)
+            deadline = time.monotonic() + 5
+            while not future.done() and time.monotonic() < deadline:
+                worker.once()
+                time.sleep(0.03)
+            self.assertEqual(future.result(timeout=1), {"received": 1})
+        self.assertEqual(executed, [1_000_000])
+        with self.hub.broker.db() as db:
+            self.assertEqual(db.execute("SELECT payload FROM jobs WHERE kind='transfer'").fetchone()[0], "{}")
+
+    def _api(self, path, body=None):
+        try:
+            with self.client.open(path, None if body is None else json.dumps(body).encode(), 5,
+                                  {"X-JARVIS": "1", "Content-Type": "application/json"}) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return exc.code
+
+    def test_new_nodes_get_only_node_work_by_default(self):
+        self.hub.broker.enroll("other")
+        caps = {n["id"]: set(n["capabilities"]) for n in self.hub.broker.nodes()}
+        self.assertEqual(caps["other"], set(NODE_DEFAULT))
+        self.assertFalse(caps["other"] & {"ask", "console"})
+
+    def test_node_console_reaches_only_listed_main_api(self):
+        self.assertEqual(self._api("/api/overview"), 200)
+        self.assertEqual(self._api("/api/jobs/x/../../settings"), 403)
+        for path in ("/api/settings", "/api/fs?device=main&path=~/.ssh", "/api/screen",
+                     "/api/memory", "/api/export?case=x"):
+            self.assertEqual(self._api(path), 403, path)
+        with patch.object(Console, "grokbot_command") as command, \
+                patch.object(Console, "submit") as submit:
+            for path, body in (("/api/grokbot", {"text": "id", "mode": "terminal"}),
+                               ("/api/settings", {"changes": {}}),
+                               ("/api/fs/copy", {}), ("/api/plans/x/run", {})):
+                self.assertEqual(self._api(path, body), 403, path)
+            command.assert_not_called()
+            submit.return_value = {"id": "j"}
+            self.assertEqual(self._api("/api/ask", {"text": "hi"}), 200)
+            self.hub.broker.set_capabilities("node", {"console"})
+            self.assertEqual(self._api("/api/ask", {"text": "hi"}), 403)
+        submit.assert_called_once()
+
+    def test_node_cannot_start_a_write_run(self):
+        with self.assertRaisesRegex(RuntimeError, "only on the main"):
+            self.client.ask("change the code", write=True, timeout=3)
+        self.assertEqual(self.calls, [])
+
+    def test_set_capabilities_keeps_the_credential(self):
+        self.assertEqual(self.hub.broker.set_capabilities("node", {"desktop"}), ["desktop"])
+        self.assertEqual(self.client.request("/v1/poll", {})["job"], None)
+        with self.assertRaises(RuntimeError):
+            self.client.ask("hello", timeout=3)
+        with self.assertRaises(LookupError):
+            self.hub.broker.set_capabilities("ghost", {"desktop"})
 
     def test_raw_shell_operations_are_rejected(self):
         for kind, payload in (("shell", {"command": "anything"}),
@@ -234,6 +340,24 @@ class ClusterHTTPTests(unittest.TestCase):
         worker.once()
         self.assertFalse(worker.outbox.exists())
         executor.assert_called_once()
+
+
+    def test_executor_crash_reports_may_have_run_but_expiry_does_not(self):
+        sent = []
+        worker = NodeWorker(self.node, self.state, executor=Mock(side_effect=RuntimeError("boom")))
+        worker._send_result = sent.append
+        job = {"id": uuid.uuid4().hex, "kind": "desktop", "deadline": time.time() + 5,
+               "payload": {"action": "close_app", "arg": "Spotify"}}
+        worker.client.request = Mock(return_value={"job": job})
+        worker.once()
+        self.assertTrue(sent[-1]["failed"])
+        self.assertIn("may have run", sent[-1]["result"]["error"])
+        worker.executor = Mock()
+        job = {**job, "id": uuid.uuid4().hex, "deadline": time.time() - 1}
+        worker.client.request = Mock(return_value={"job": job})
+        worker.once()
+        worker.executor.assert_not_called()
+        self.assertNotIn("may have run", sent[-1]["result"]["error"])
 
 
 class TunnelTests(unittest.TestCase):
