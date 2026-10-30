@@ -163,9 +163,14 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                           type(lane).__name__.lower()}
                 step("brain", "route", lane_label(lane, text), "answered")
             except (RuntimeError, LookupError, TypeError, ValueError, OSError) as exc:
-                # fall back to a normal one-shot run below
+                # fall back to a normal one-shot run below, unless tools already ran:
+                # then part of the request happened, and the reply must say so
                 detail = {"lane_error": str(exc)}
                 step("brain", "route", lane_label(lane, text), str(exc), "fail")
+                ran = list(getattr(lane, "tool_log", None) or ())
+                if ran:
+                    reply = _partial_reply(ran)
+                    detail.update(state="partial", tools=[[str(t[0]), bool(t[1])] for t in ran])
         if reply is None:
             spec = {"objective": text, "context": CONVERSATIONAL, "evidence": recall,
                     "provider": routing.get("simple_provider", "claude"),
@@ -343,6 +348,20 @@ def _direct_reply(provider, text, recall, config, base, timeout, detail):
             lane.close()
 
 
+def _partial_reply(tool_log):
+    """The brain failed after some tools ran: say what did and didn't happen, instead of
+    claiming nothing was done (a retry would run the done ones again)."""
+    done = [str(t[0]) for t in tool_log if t[1]]
+    failed = [str(t[0]) for t in tool_log if not t[1]]
+    parts = []
+    if done:
+        parts.append(f"{', '.join(dict.fromkeys(done))} ran")
+    if failed:
+        parts.append(f"{', '.join(dict.fromkeys(failed))} failed")
+    return (f"I only got partway: {' and '.join(parts)}, then the brain stopped before "
+            "finishing. Check the result before asking again, so nothing runs twice.")
+
+
 LOGGED_OUT = ("not logged in", "please run /login", "invalid api key", "authentication")
 
 
@@ -499,6 +518,8 @@ def confirm_pending(config, state, identifier, action, step=None, hash=None):
     if action != "approve":
         raise ValueError("Choose approve or reject.")
     command = queue.approve(identifier, origin, hash=hash)
+    if command["intent"] == "browser_action":  # browser_gate is waiting on this approval
+        return {"reply": "Okay, go ahead.", "commands": [command], "outcomes": []}
     if command["intent"] != "agent_task":
         return run_confirmed(command, config, state, origin=origin, step=step)
     from . import gates
@@ -524,19 +545,30 @@ def confirm_pending(config, state, identifier, action, step=None, hash=None):
         outcome = {"id": command["id"], "ok": True, "state": "agent_claimed", "text": reply}
     except (RuntimeError, ValueError, LookupError, OSError, TimeoutError) as exc:
         reply = f"Confirmed task failed: {exc}"
-        outcome = {"id": command["id"], "ok": False, "state": "uncertain", "text": reply}
+        # Checks, routing and a down tunnel fail before Grok gets the task: certainly
+        # nothing happened. A timeout or an error mid-request may have reached it.
+        reached = not isinstance(exc, (ValueError, LookupError, ConnectionError))
+        outcome = {"id": command["id"], "ok": False,
+                   "state": "uncertain" if reached else "pre_effect_failure", "text": reply}
     history.record(uuid.uuid4().hex, command, outcome, "Confirmed agent task", origin,
                    total_ms=round((time.monotonic() - began) * 1000))
     return {"reply": reply, "commands": [command], "outcomes": [outcome]}
 
 
+NUMBERS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+           "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"}
+
+
+def confirmation_words(text):
+    """"Yes", "cancel C3", "go ahead two"...: the words that answer a pending confirmation."""
+    words = (wake_word(text) or text).strip().lower().replace("\u2019", "'").rstrip(".!?")
+    return re.fullmatch(r"(yes|confirm|do it|go ahead|no|cancel|don't)(?:\s+(c?\d+|" +
+                        "|".join(NUMBERS) + r"))?", words)
+
+
 def _confirmation_turn(text, memory, config, base, channel, on_start, on_sentence, on_step):
     # The voice listener is the wake-word gate; this only handles its accepted turns.
-    words = (wake_word(text) or text).strip().lower().replace("\u2019", "'").rstrip(".!?")
-    numbers = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
-               "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"}
-    match = re.fullmatch(r"(yes|confirm|do it|go ahead|no|cancel|don't)(?:\s+(c?\d+|" +
-                         "|".join(numbers) + r"))?", words)
+    match, numbers = confirmation_words(text), NUMBERS
     if not match or memory is None:
         return None
     from .confirm import ConfirmQueue
@@ -595,6 +627,23 @@ def _with_tools(lane, step, call):
 WAKE_WORDS = ("jarvis", "jervis", "jarvas", "javis", "jarvus", "jarviss", "jarves")
 # Filler Whisper keeps before the name: "Hello, Jarvis, ...", "Okay so Jarvis ...".
 WAKE_LEAD = r"(?:(?:hey|hi|hello|yo|ok|okay|oh|so|um|uh|and|alright)[\s,.!?]+)*"
+# The name as the subject of a sentence ("Jarvis said...", "Jarvis is useless"), when no
+# comma follows it. An auxiliary followed by a subject is a question to it instead:
+# "Jarvis is it raining", "Jarvis can you open Spotify" (Whisper dropped the comma).
+WAKE_SUBJECT = re.compile(
+    r"(?:said|says|told|tells|thinks|thought|knows|knew|keeps|kept|seems|seemed|sucks|"
+    r"wants|wanted|gets|got|had|needs|likes|hates|broke|messed|"
+    r"(?:is|was|are|were|does|did|will|would|can|could|should|has|have|might|must|"
+    r"isn['’]t|wasn['’]t|doesn['’]t|didn['’]t|won['’]t|can['’]t|couldn['’]t|"
+    r"wouldn['’]t|shouldn['’]t|hasn['’]t|never|always|just|really|still|also)"
+    r"(?!\s+(?:it|there|this|that|the|my|your|you|he|she|they|we|i|a|an|any|anything|"
+    r"anyone|someone|something|everything)\b))\b", re.I)
+# The word before a comma-less closing name that makes the name its object or complement:
+# "Who is Jarvis?", "Did you ask Jarvis?", "Have you heard of Jarvis?".
+WAKE_OBJECT = re.compile(
+    r"\b(?:is|was|are|were|be|been|ask|asked|about|to|with|from|for|of|by|at|called|named|"
+    r"call|tell|told|like|love|hate|use|using|trust|the|a|an|my|your|and|or|than|as|meet|"
+    r"met|mean|meant|hear|heard|see|saw|know|knew|try|tried|said)\W*$", re.I)
 
 
 def wake_word(text, words=WAKE_WORDS):
@@ -604,10 +653,14 @@ def wake_word(text, words=WAKE_WORDS):
     question ("what time is it, Jarvis?" - Whisper often drops that comma); "I was talking
     to Jarvis" is neither and doesn't count."""
     names = "|".join(words)
-    match = re.match(r"^\W*" + WAKE_LEAD + r"(?:" + names + r")\b(?!['’]s\b)[\s,.!?:-]*(.*)",
+    match = re.match(r"^\W*" + WAKE_LEAD + r"(?:" + names + r")\b(?!['’]s\b)([\s,.!?:-]*)(.*)",
                      text, re.I | re.S)
     if match:
-        return match.group(1).strip()
+        if not match.group(1).strip() and WAKE_SUBJECT.match(match.group(2)):
+            return None  # "So Jarvis said it would rain": about it, not to it
+        return match.group(2).strip()
     match = re.match(r"^\W*(.*?\w.*?)(?:\s*,\s*(?:" + names + r")\W*|\s+(?:" + names +
                      r")\s*\?\W*)$", text, re.I | re.S)
+    if match and "," not in text[match.end(1):] and WAKE_OBJECT.search(match.group(1)):
+        return None  # "Who is Jarvis?", "Did you ask Jarvis?": a question about it
     return match.group(1).strip() if match else None

@@ -31,11 +31,13 @@ import zlib
 from pathlib import Path
 
 from .cluster import Client, save_json
-from .cluster_store import CAPABILITIES, Broker
+from .cluster_store import NODE_DEFAULT, Broker
+from .deploy import CODE_KEY, code_key
 from .topology import DEVICE_ID, enabled, identity
 
 PREFIX = "jarvis-invite-1:"
 DEFAULT_PORT = 7780
+INVITE_TTL = 24 * 3600  # an invite nobody joins with stops working after a day
 MARK = "jarvis-node:"  # SSH key comment that marks the key JARVIS made for one node
 HOST_KEY = re.compile(r"(?:ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+")
 ADDRESS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
@@ -303,7 +305,7 @@ def invite(config, path, state, node, extra=(), capabilities=None, output=None):
     if not found:
         raise ValueError("No address found for this PC; pass --address IP_OR_NAME.")
     key = host_key()
-    caps = sorted(capabilities or CAPABILITIES)
+    caps = sorted(capabilities or NODE_DEFAULT)
     devices = dict(config.get("devices") or {})
     if node not in devices:
         devices[node] = {"label": node}
@@ -315,14 +317,16 @@ def invite(config, path, state, node, extra=(), capabilities=None, output=None):
     except PermissionError:
         raise ValueError(f"Can't write {_authorized_keys()}. On Windows, admin accounts' SSH keys "
                          "live there: run this invite in an administrator terminal.") from None
-    token = Broker(state).enroll(node, caps)  # rotates any earlier credential for this node
+    # Rotates any earlier credential for this node. The node trades this one for its own
+    # on joining (cluster.redeem_invite), so the code is single-use as well as short-lived.
+    token = Broker(state).enroll(node, caps, invite_ttl=INVITE_TTL)
     me = devices.get(main) or {}
     code = encode({"v": 1, "node_id": node, "main_device": main, "user": getpass.getuser(),
                    "addresses": found, "host_key": key, "port": port, "token": token,
-                   "key": private, "capabilities": caps,
+                   "key": private, "capabilities": caps, "code_key": code_key(state),
                    "main": {k: me[k] for k in ("hostname", "label", "aliases") if k in me}})
     report = {"invited": node, "capabilities": caps, "addresses": found,
-              "authorized_keys": keys_file}
+              "authorized_keys": keys_file, "expires": "in 24 hours, or once used"}
     if output:
         target = Path(output).expanduser()
         if target.exists():
@@ -377,6 +381,8 @@ def _validate(note):
         raise ValueError("The invite has no SSH key.")
     if not isinstance(note.get("port"), int) or not 1 <= note["port"] <= 65535:
         raise ValueError("The invite has an invalid hub port.")
+    if not isinstance(note.get("code_key"), str) or not CODE_KEY.fullmatch(note["code_key"]):
+        raise ValueError("The invite has no code-signing key; make a new one on the updated main.")
     from .transfer import _check_target
     targets = [f"{note.get('user')}@{a}" for a in note.get("addresses") or []]
     if not targets:
@@ -440,7 +446,8 @@ def join(config, path, state, note, autostart=True, start=True, wait=25):
     key_file = state / "cluster-node.key"
     _private_file(key_file, note["key"])
     save_json(state / "cluster-node.json", {
-        "node_id": node, "main_device": main, "token": note["token"],
+        "node_id": node, "main_device": main, "token": note["token"], "redeem": True,
+        "code_key": note["code_key"],  # only code signed by this key is installed
         "link": {"targets": targets, "host_key": note["host_key"], "hostname": main_host,
                  "identity_file": str(key_file)}})
     devices = dict(config.get("devices") or {})
@@ -466,6 +473,7 @@ def join(config, path, state, note, autostart=True, start=True, wait=25):
                                "node": role_autostart(path, state, True)}
     if start:
         report["tunnel"] = cluster_tunnel.start(path, state).get("running", False)
+        report["redeemed"] = _redeem(proposed, state, wait)
         if not _agent_running(state):
             time.sleep(1)  # a just-enabled systemd unit may be taking the lock
             if not _agent_running(state):
@@ -474,6 +482,24 @@ def join(config, path, state, note, autostart=True, start=True, wait=25):
     report["next"] = ("jarvis cluster doctor" if report.get("connected", True) is False
                       else "Done. Check any time with: jarvis cluster doctor")
     return report
+
+
+def _redeem(config, state, seconds):
+    """Trade the invite's credentials for this node's own as soon as the main answers.
+    If it can't be reached yet, the node agent does it on its next start."""
+    from .cluster import HubRefused, redeem_invite
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return redeem_invite(config, state) or {"token": False, "note": "nothing to redeem"}
+        except HubRefused as exc:
+            return {"token": False, "error": str(exc),
+                    "fix": "Ask the main for a new invite: jarvis cluster invite NODE"}
+        except (OSError, ValueError, RuntimeError) as exc:
+            if time.monotonic() >= deadline:
+                return {"token": False, "pending": str(exc),
+                        "note": "The node agent will finish this when it reaches the main."}
+            time.sleep(1)
 
 
 def _await_hub(config, state, seconds):

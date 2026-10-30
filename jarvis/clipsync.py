@@ -1,10 +1,16 @@
 """Unified clipboard: copy on one laptop, paste on the other. Text and images, both ways.
 
-It rides the SSH link JARVIS already trusts (same key, BatchMode, strict host-key
-checking as `jarvis send`), so there is no new port, pairing code or crypto. The Dell
-runs `jarvis clipboard start`; that opens one SSH session to the Zenbook and sends this
-very file as the remote half, which watches the Wayland clipboard with wl-paste. Both
-halves speak one JSON line per clipboard change.
+With the cluster on, each laptop runs its own half (`jarvis clipboard start`, or
+`autostart on`, once on each): it watches the local clipboard and hands every new copy
+to the other laptop as a `transfer` job over the hub link (transfer.push), which the
+receiver's node agent or hub pastes in with apply(). No SSH, so it works whichever way
+the tunnel points and on Windows. apply() notes what it pasted in the state folder, so
+the receiver's own watcher doesn't bounce the copy straight back.
+
+Without the cluster it rides the SSH link JARVIS already trusts (same key, BatchMode,
+strict host-key checking as `jarvis send`): one side runs `jarvis clipboard start`,
+which opens one SSH session to the peer and sends this very file as the remote half
+(Linux/Wayland peers only). Both halves speak one JSON line per clipboard change.
 
 This module is deliberately stdlib-only with no package imports at the top level,
 because the remote half runs it as a bare script.
@@ -393,6 +399,75 @@ def serve():
     Sync(board, sys.stdin.buffer, sys.stdout.buffer).run()
 
 
+# ---- over the cluster link ---------------------------------------------------------------
+APPLIED = "clipboard-applied.json"
+
+
+def apply(state, kind, data):
+    """Paste a copy that came from the other laptop (the transfer job's last chunk)."""
+    if kind not in ("text", "png") or not data or len(data) > MAX_BYTES:
+        raise ValueError("Not a clipboard copy.")
+    if state:  # first, so this machine's watcher sees it as ours, not a new copy
+        path = os.path.join(os.path.abspath(state), APPLIED)
+        with open(path, "w", encoding="utf-8") as out:
+            json.dump({"digest": digest(kind, data), "at": time.time()}, out)
+    local_clipboard().write(kind, data)
+
+
+def _applied(state):
+    try:
+        with open(os.path.join(state, APPLIED), encoding="utf-8") as f:
+            return json.load(f).get("digest")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def run_cluster(config, state, device_name=None, board=None, log=None):
+    """Watch this clipboard and push each new copy to the other laptop(s) over the hub."""
+    import io
+    from .transfer import peer, peers, push
+    targets = [peer(config, device_name)] if device_name else peers(config)
+    board = board or local_clipboard()
+    log = log or _log_line(os.path.join(state, "logs", "clipboard.log"))
+    last = [None]
+    try:
+        current = board.read()
+        if current:  # don't push whatever happened to be copied before starting
+            last[0] = digest(*current)
+    except Exception:
+        pass
+
+    def changed():
+        try:
+            item = board.read()
+        except Exception as exc:  # a busy or odd clipboard must not stop the watcher
+            log(f"read failed: {exc}")
+            return
+        if not item or not item[1] or len(item[1]) > MAX_BYTES:
+            return
+        kind, data = item
+        key = digest(kind, data)
+        if key == last[0]:
+            return
+        last[0] = key
+        if key == _applied(state):  # the other laptop's copy, just pasted in here
+            return
+        for target in targets:
+            try:
+                push(config, state, target, io.BytesIO(data), len(data), dest="clipboard", kind=kind)
+                log(f"sent {kind} ({len(data)} bytes) to {target}")
+            except Exception as exc:  # offline peer, hub restarting: skip this copy
+                log(f"not sent to {target}: {exc}")
+
+    log(f"linked with {', '.join(targets)} over the cluster")
+    while True:
+        try:
+            board.watch(changed)  # Wayland: returns if wl-paste dies; Windows: runs on
+        except Exception as exc:
+            log(f"watch failed: {exc}")
+        time.sleep(2)
+
+
 # ---- the local half: connect, reconnect, daemon ------------------------------------------
 def _log_line(path):
     def log(message):
@@ -466,10 +541,15 @@ def connect(device, board, log, target=None, state=None):
 
 def run(config, state, device_name=None):
     """Keep the link up: reconnect with backoff (sleep, Wi-Fi changes, the peer rebooting)."""
+    from .topology import enabled
     from .transfer import ssh_device
     state = os.path.abspath(state)
     os.makedirs(os.path.join(state, "logs"), exist_ok=True)
     log = _log_line(os.path.join(state, "logs", "clipboard.log"))
+    if enabled(config):
+        with open(os.path.join(state, "clipboard.pid"), "w") as pid:
+            pid.write(str(os.getpid()))
+        return run_cluster(config, state, device_name, log=log)
     device, board, wait = ssh_device(config, device_name), local_clipboard(), 2
     targets, turn = _targets(device), 0
     with open(os.path.join(state, "clipboard.pid"), "w") as pid:

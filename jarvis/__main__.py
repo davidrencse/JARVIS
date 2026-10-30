@@ -56,13 +56,14 @@ def main():
         cmd.add_argument("id")
         if name == "run":
             cmd.add_argument("--timeout", type=int, default=900)
-    cb = sub.add_parser("clipboard", help="Unified clipboard with the other laptop over SSH")
+    cb = sub.add_parser("clipboard", help="Unified clipboard with the other laptop (cluster link, else SSH)")
     cb.add_argument("action", choices=("start", "stop", "status", "run", "autostart", "serve"))
     cb.add_argument("value", nargs="?", help="autostart: on|off")
-    cb.add_argument("--device", help="configured SSH device (default: the first)")
-    lm = sub.add_parser("lanmouse", help="Lan Mouse pairing: fingerprints and config")
-    lm.add_argument("action", choices=("fingerprint", "config"))
-    lm.add_argument("--device", default="local", help="fingerprint: configured device to query")
+    cb.add_argument("--device", help="the other laptop (default: every peer)")
+    lm = sub.add_parser("lanmouse", help="Lan Mouse: start/stop, pairing, fingerprints, config")
+    lm.add_argument("action", choices=("start", "stop", "status", "pair", "fingerprint", "config"))
+    lm.add_argument("--device", default="local",
+                    help="start/stop/status/fingerprint: which computer (default: this one); pair: the peer")
     lm.add_argument("--peer-name", help="config: the other laptop's hostname")
     lm.add_argument("--peer-ip", action="append", default=[], help="config: repeatable")
     lm.add_argument("--peer-fingerprint", help="config: the other laptop's fingerprint")
@@ -88,7 +89,7 @@ def main():
         cmd = sub.add_parser(name, help=helptext)
         if name != "inbox":
             cmd.add_argument("path" if name == "send" else "name")
-        cmd.add_argument("--device", default=None, help="configured SSH device (default: the first)")
+        cmd.add_argument("--device", default=None, help="the other laptop (default: the only peer)")
     voice = sub.add_parser("speak")
     voice.add_argument("text")
     voice.add_argument("--output", required=True)
@@ -175,6 +176,8 @@ def main():
                     help="flood the capture queue while captured (implies --capture)")
     st.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args()
+    from .platforms import private_dir
+    private_dir(args.state)  # tokens, keys and memory live here: this account only
     try:
         config_path = Path(args.config).resolve()
         base = config_path.parent
@@ -268,14 +271,40 @@ def main():
             else:
                 emit(clipsync.status(args.state))
         elif args.command == "lanmouse":
-            if args.action == "fingerprint":
+            from . import sharedinput
+            from .remote import Remote
+            from .topology import enabled
+            remote = Remote(config, args.state)
+            here = args.device == "local" or remote.resolve(args.device) is None \
+                or remote.resolve(args.device) == remote.here()
+            if args.action == "pair":
+                if here or not args.position:
+                    raise ValueError("Usage: jarvis lanmouse pair --device PEER --position left|right|top|bottom "
+                                     "(the side of this screen the peer sits on)")
+                emit(sharedinput.pair(config, args.state, remote.resolve(args.device), args.position, remote))
+            elif args.action in ("start", "stop", "status"):
+                ok, text = sharedinput.control(args.action) if here else \
+                    remote.call(args.device, "lan_mouse", args.action)
+                if not ok:
+                    raise RuntimeError(text)
+                emit(json.loads(text))
+            elif args.action == "fingerprint":
                 devices = config.get("devices", {})
-                device = devices.get(args.device, {"transport": "local"})
-                if args.device != "local" and args.device not in devices:
+                if not here and remote.resolve(args.device) not in devices:
                     raise ValueError("Unknown configured device.")
-                emit({"device": args.device, "fingerprint": local_fingerprint()
-                      if device["transport"] == "local" else
-                      remote_fingerprint(device.get("target"), device.get("identity_file"))})
+                device = {"transport": "local"} if here else devices[remote.resolve(args.device)]
+                if device["transport"] == "local":
+                    value = local_fingerprint()
+                elif enabled(config):  # over the cluster: the peer reads its own certificate
+                    ok, text = remote.call(args.device, "input_info", "")
+                    if not ok:
+                        raise RuntimeError(text)
+                    value = (json.loads(text).get("lan_mouse") or {}).get("fingerprint")
+                    if not value:
+                        raise ValueError(f"Lan Mouse has no certificate on {args.device} yet; start it there once.")
+                else:
+                    value = remote_fingerprint(device.get("target"), device.get("identity_file"))
+                emit({"device": args.device, "fingerprint": value})
             else:
                 text = lan_mouse_config(args.peer_name or "", args.peer_ip, args.position,
                                         args.peer_fingerprint or "",
@@ -336,13 +365,12 @@ def main():
             return task_command(args, config)
         elif args.command in ("send", "fetch", "inbox"):
             from . import transfer
-            device = transfer.ssh_device(config, args.device)
             if args.command == "send":
-                emit(transfer.send(device.get("target"), device.get("identity_file"), args.path))
+                emit(transfer.send_file(config, args.state, args.path, args.device))
             elif args.command == "fetch":
-                emit(transfer.fetch(device.get("target"), device.get("identity_file"), args.name))
+                emit(transfer.fetch_file(config, args.state, args.name, args.device))
             else:
-                emit(transfer.inbox(device.get("target"), device.get("identity_file")))
+                emit(transfer.list_inbox(config, args.state, args.device))
         elif args.command == "speak":
             emit(speak(args.text, args.output))
         else:
@@ -748,26 +776,10 @@ def cognition(args, config, base):
             from .agent import Agent
             emit(Agent(args.state, config).status())
         elif args.action == "enroll":
-            from .listen import ENROLL_PHRASES, RATE, VoicePrint, record_utterance, save_wav
-            clips, ears = [], VoicePrint(args.state, config)
-            print("Read each line the way you'd normally talk to JARVIS, from where you "
-                  "usually sit.", file=sys.stderr)
-            for i, phrase in enumerate(ENROLL_PHRASES, 1):
-                for _ in range(3):
-                    print(f"[{i}/{len(ENROLL_PHRASES)}]  \"{phrase}\"", file=sys.stderr)
-                    audio = record_utterance(max_seconds=12, min_voiced=0.5)
-                    if audio is not None:
-                        break
-                    print("   didn't catch enough speech, say it again a bit louder",
-                          file=sys.stderr)
-                else:
-                    raise RuntimeError("Couldn't hear speech. Check the input device and mic "
-                                       "volume (" + ("Settings > Sound > Input" if os.name == "nt"
-                                                     else "wpctl status; pavucontrol") + ").")
-                print(f"   got it ({len(audio) / RATE:.1f}s)", file=sys.stderr)
-                save_wav(ears.dir / "enroll" / f"{i:02d}.wav", audio)
-                clips.append(audio)
-            emit(ears.enroll(clips))
+            # The guided setup (onboard.py): mic check, room tuning, enrollment, a test
+            # phrase, then the listener restarts and starts at login. `text` picks a mic.
+            from .onboard import run_terminal
+            emit(run_terminal(args.state, config, device=args.text or None))
         elif args.action == "recalibrate":
             from .listen import VoicePrint
             emit(VoicePrint(args.state, config).recalibrate())

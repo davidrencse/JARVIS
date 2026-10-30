@@ -6,12 +6,12 @@ import json
 import re
 import time
 
-from .history import History
+from .history import KEEP_DAYS, History
 
 
 def summary(command):
     intent, args = command["intent"], command["args"]
-    if intent == "agent_task":
+    if intent in ("agent_task", "browser_action"):
         what = args["text"]
     elif intent == "close_app":
         what = "close " + args["name"]
@@ -52,6 +52,9 @@ class ConfirmQueue:
                                 "VALUES(?,?,?,?,?,?, 'pending')",
                                 (summary(command), raw, digest, origin, now,
                                  now + (60 if channel == "voice" else 600))).lastrowid
+            # Handled ones are kept as long as the history (their audit rows go with it).
+            db.execute("DELETE FROM confirmations WHERE status!='pending' AND created<?",
+                       (now - KEEP_DAYS * 86400,))
             item = self._item(db.execute("SELECT * FROM confirmations WHERE number=?", (number,)).fetchone())
         from .events import emit
         emit(self.path.parent, "turn.confirm", item=item)
@@ -101,6 +104,13 @@ class ConfirmQueue:
             db.execute("UPDATE confirmations SET status='approved' WHERE number=?", (row["number"],))
             self.history.record_confirmation(db, "C" + str(row["number"]), origin, "approve", digest)
             return json.loads(row["command"])
+
+    def status(self, number):
+        """pending, approved, rejected or expired; browser_gate polls this while it waits."""
+        self.expire()
+        with self.history.connect() as db:
+            row = db.execute("SELECT status FROM confirmations WHERE number=?", (number,)).fetchone()
+        return row["status"] if row else None
 
     def reject(self, id, origin=None):
         with self.history.connect() as db:

@@ -13,7 +13,15 @@ from pathlib import Path
 from .topology import DEVICE_ID
 
 CAPABILITIES = {"desktop", "inventory", "grokbot", "files", "ask", "console"}
+# What a new node gets unless more is asked for: work the main sends it. "ask" and
+# "console" let a node drive the main itself, so they are opt-in per node.
+NODE_DEFAULT = frozenset({"desktop", "inventory", "grokbot", "files"})
 TERMINAL = {"done", "failed", "expired", "uncertain"}
+# Job kinds that carry file chunks (transfer.CHUNK raw bytes, base64 in JSON). They may be
+# larger than control messages, and their bodies are dropped once the requester has the
+# result, so a sent file doesn't linger in cluster.sqlite3 for a week.
+BULK = frozenset({"transfer"})
+MAX_PAYLOAD, MAX_BULK_PAYLOAD = 65536, 3_000_000
 # A node checks in once per held poll (cluster.POLL_WAIT, 25 s) and not at all while it
 # runs an action (up to 45 s), so "online" must outlast both, or a busy node looks gone.
 ONLINE = 75
@@ -36,6 +44,10 @@ class Broker:
                     created REAL NOT NULL, deadline REAL NOT NULL, result TEXT);
                 CREATE INDEX IF NOT EXISTS cluster_pending ON jobs(node,state,created);
             """)
+            try:  # older databases: an invite's credential works only until this time
+                db.execute("ALTER TABLE nodes ADD COLUMN invite_expires REAL")
+            except sqlite3.OperationalError:
+                pass
 
     @contextmanager
     def db(self):
@@ -57,7 +69,9 @@ class Broker:
             pass
         return path.read_text(encoding="ascii").strip()
 
-    def enroll(self, node, capabilities=CAPABILITIES):
+    def enroll(self, node, capabilities=NODE_DEFAULT, invite_ttl=None):
+        """A fresh credential for `node`. With `invite_ttl` (seconds) it is an invite's:
+        good only until the node redeems it for its own token, and only for that long."""
         if not DEVICE_ID.fullmatch(node):
             raise ValueError("Invalid node ID.")
         caps = set(capabilities)
@@ -65,13 +79,26 @@ class Broker:
             raise ValueError("Unknown or empty node capabilities.")
         token = secrets.token_urlsafe(32)
         with self.db() as db:
-            db.execute("INSERT INTO nodes(id,token_hash,capabilities) VALUES(?,?,?) "
+            db.execute("INSERT INTO nodes(id,token_hash,capabilities,invite_expires) VALUES(?,?,?,?) "
                        "ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash, "
-                       "capabilities=excluded.capabilities, seen=NULL, info='{}'",
-                       (node, hashlib.sha256(token.encode()).hexdigest(), json.dumps(sorted(caps))))
+                       "capabilities=excluded.capabilities, seen=NULL, info='{}', "
+                       "invite_expires=excluded.invite_expires",
+                       (node, hashlib.sha256(token.encode()).hexdigest(), json.dumps(sorted(caps)),
+                        time.time() + invite_ttl if invite_ttl else None))
             # Rotating credentials never redelivers an action already dispatched.
             db.execute("UPDATE jobs SET state='uncertain' WHERE node=? AND state='running'", (node,))
         return token
+
+    def set_capabilities(self, node, capabilities):
+        """Change what an enrolled node may do without rotating its credential."""
+        caps = set(capabilities)
+        if not caps or not caps <= CAPABILITIES:
+            raise ValueError("Unknown or empty node capabilities.")
+        with self.db() as db:
+            if not db.execute("UPDATE nodes SET capabilities=? WHERE id=?",
+                              (json.dumps(sorted(caps)), node)).rowcount:
+                raise LookupError(f"Node {node} is not enrolled.")
+        return sorted(caps)
 
     def revoke(self, node):
         with self.db() as db:
@@ -84,8 +111,22 @@ class Broker:
             return None
         hashed = hashlib.sha256(token.encode()).hexdigest()
         with self.db() as db:
-            row = db.execute("SELECT id,capabilities FROM nodes WHERE token_hash=?", (hashed,)).fetchone()
-        return (row["id"], set(json.loads(row["capabilities"]))) if row else None
+            row = db.execute("SELECT id,capabilities,invite_expires FROM nodes WHERE token_hash=?",
+                             (hashed,)).fetchone()
+        if not row or (row["invite_expires"] is not None and row["invite_expires"] < time.time()):
+            return None  # unknown, revoked, or an invite nobody redeemed in time
+        return row["id"], set(json.loads(row["capabilities"]))
+
+    def redeem(self, node):
+        """Swap an invite's credential for the node's own, once. The invite code stops
+        working at that moment, so a copy of it left in chat or a file is worthless."""
+        token = secrets.token_urlsafe(32)
+        with self.db() as db:
+            if not db.execute("UPDATE nodes SET token_hash=?, invite_expires=NULL "
+                              "WHERE id=? AND invite_expires IS NOT NULL AND invite_expires>=?",
+                              (hashlib.sha256(token.encode()).hexdigest(), node, time.time())).rowcount:
+                raise PermissionError("This invite was already used or has expired.")
+        return token
 
     def heartbeat(self, node, info):
         # Never accept agent-provided paths, shell commands, or credentials as config.
@@ -124,7 +165,7 @@ class Broker:
         if not isinstance(job_id, str) or not re.fullmatch(r"[a-f0-9]{32}", job_id):
             raise ValueError("request_id must be a 32-character UUID hex string.")
         encoded = json.dumps(payload, sort_keys=True)
-        if len(encoded.encode()) > 65536:
+        if len(encoded.encode()) > (MAX_BULK_PAYLOAD if kind in BULK else MAX_PAYLOAD):
             raise ValueError("Cluster request is too large.")
         now = time.time()
         with self.db() as db:
@@ -137,6 +178,11 @@ class Broker:
                 return job_id
             db.execute("DELETE FROM jobs WHERE state IN ('done','failed','expired','uncertain') "
                        "AND created<?", (now - 7 * 86400,))
+            # Bulk jobs nobody collected (expired, uncertain, requester gone): drop the bytes.
+            db.execute(f"UPDATE jobs SET payload='{{}}', result=NULL WHERE kind IN "
+                       f"({','.join('?' * len(BULK))}) AND state IN "
+                       "('done','failed','expired','uncertain') AND created<? AND payload!='{}'",
+                       (*sorted(BULK), now - 3600))
             count = db.execute("SELECT COUNT(*) FROM jobs WHERE node=? AND state IN ('pending','running')",
                                (node,)).fetchone()[0]
             if count >= 128:
@@ -179,6 +225,13 @@ class Broker:
             if row["state"] != "running":
                 raise ValueError("Job is no longer running; it will not be executed again.")
             db.execute("UPDATE jobs SET state=?,result=? WHERE id=?", (target_state, encoded, job_id))
+
+    def compact(self, job_id):
+        """Drop a finished bulk job's chunk data once its result has been read."""
+        with self.db() as db:
+            db.execute("UPDATE jobs SET payload='{}', result=CASE WHEN result IS NULL THEN NULL "
+                       "ELSE '{}' END WHERE id=? AND state IN ('done','failed','expired','uncertain')",
+                       (job_id,))
 
     def get(self, job_id, requester=None):
         with self.db() as db:

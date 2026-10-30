@@ -25,10 +25,12 @@ reads sites (X, Reddit, YouTube...) but doesn't operate apps or a browser.
 
 import configparser
 import difflib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -586,6 +588,12 @@ def focus_window(name):
     if not hits:
         return False, f"No open window matches {name!r}."
     window = hits[0]
+    ok = raise_window(window)
+    return (True, f"Switched to {window['title'] or window['app'].strip()}.") if ok else (False, f"Couldn't switch to {name}.")
+
+
+def raise_window(window):
+    """Focus one window from open_windows(); True if the desktop accepted it."""
     if os.name == "nt":
         import ctypes
         ok = bool(ctypes.windll.user32.SetForegroundWindow(window["id"]))
@@ -606,7 +614,7 @@ def focus_window(name):
             _run("hyprctl", "dispatch", *command).stdout.strip() == "ok"
             for command in ([f'hl.dsp.focus({{ window = "address:{address}" }})'],
                             ["focuswindow", f"address:{address}"]))
-    return (True, f"Switched to {window['title'] or window['app'].strip()}.") if ok else (False, f"Couldn't switch to {name}.")
+    return ok
 
 
 def close_app(name):
@@ -658,6 +666,8 @@ def media(command):
     if _backend() == "macos":
         if not shutil.which("nowplaying-cli"):
             return False, "Media keys on macOS need nowplaying-cli (brew install nowplaying-cli)."
+        if already := _already(command):
+            return True, already
         # nowplaying-cli has no stop; pausing is the closest.
         verb = {"play_pause": "togglePlayPause", "stop": "pause"}.get(command, command)
         out = _run("nowplaying-cli", verb)
@@ -666,10 +676,38 @@ def media(command):
         return True, MEDIA_SAID[command]
     if not shutil.which("playerctl"):
         return False, "Media control needs playerctl."
-    out = _run("playerctl", command.replace("_", "-"))
+    if already := _already(command):
+        return True, already
+    from .observe import PLAYERCTL_PLAYERS
+    out = _run("playerctl", "-p", PLAYERCTL_PLAYERS, command.replace("_", "-"))
     if out.returncode:
         return False, out.stderr.strip() or "No media player is running."
     return True, MEDIA_SAID[command]
+
+
+def _already(command):
+    """"Already playing." / "Already paused." when play or pause would change nothing;
+    None to go ahead (other commands, or the state can't be read: the player decides)."""
+    if command not in ("play", "pause"):
+        return None
+    from .observe import PLAYERCTL_PLAYERS
+    try:
+        if _backend() == "macos":
+            out = _run("nowplaying-cli", "get", "playbackRate")
+            rate = out.stdout.strip()
+            if out.returncode or not re.fullmatch(r"-?\d+(?:\.\d+)?", rate):
+                return None
+            status = "playing" if float(rate) > 0 else "paused"
+        else:
+            out = _run("playerctl", "-p", PLAYERCTL_PLAYERS, "status")
+            status = "" if out.returncode else out.stdout.strip().lower()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if command == "play" and status == "playing":
+        return "Already playing."
+    if command == "pause" and status in ("paused", "stopped"):
+        return "Already paused."
+    return None
 
 
 def _volume_core_audio(level):
@@ -946,10 +984,44 @@ AGENT_BROWSER_BLOCKED_ARGS = {"extraArgs", "namespace", "session", "restore", "r
                               "caCert", "clearCaCert", "useSystemCa", "path", "screenshotDir"}
 
 
+# The console (7777) and hub (7780) on this PC; the Playwright browser refuses to request them.
+CONSOLE_ORIGINS = [f"http://{host}:{port}" for port in (7777, 7780)
+                   for host in ("127.0.0.1", "localhost", "[::1]", "0.0.0.0")]
+
+
+def _local_address(url):
+    """Why `url` points at this PC or the home network (loopback, private, link-local or
+    .local), else None. Names are resolved too, so a public name for 127.0.0.1 is caught."""
+    from urllib.parse import urlsplit
+    try:
+        host = (urlsplit(str(url).strip()).hostname or "").rstrip(".").lower()
+    except ValueError:
+        return "the address can't be read"
+    if not host:
+        return "the address has no host"
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal", ".lan", ".home.arpa")):
+        return f"{host} is on this PC or the home network"
+    try:
+        addresses = [ipaddress.ip_address(host)]
+    except ValueError:
+        try:  # also catches shorthand like http://2130706433 or http://127.1
+            addresses = [ipaddress.ip_address(info[4][0].split("%")[0])
+                         for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)]
+        except (OSError, UnicodeError, ValueError):
+            return None  # an unresolvable name can't reach anything local either
+    for address in addresses:
+        address = getattr(address, "ipv4_mapped", None) or address
+        if (address.is_loopback or address.is_private or address.is_link_local
+                or address.is_unspecified or address.is_reserved or address.is_multicast):
+            return f"{host} is on this PC or the home network"
+    return None
+
+
 def approve_browser(params):
     """JARVIS's answer when Codex asks to run an MCP tool. Only the JARVIS browsers;
-    never the blocked tools; navigation only to http(s), so no file:// reads of the disk.
-    Returns (approved, reason)."""
+    never the blocked tools; navigation only to public http(s) pages, so no file:// reads of
+    the disk and no JARVIS console or home-network devices (a page could steer the browser
+    there and read them back). Returns (approved, reason)."""
     server = params.get("serverName")
     message = params.get("message", "")
     tool = message.split('"')[1] if message.count('"') >= 2 else ""
@@ -965,9 +1037,14 @@ def approve_browser(params):
             return False, f"argument {bad[0]} is not allowed"
     else:
         return False, "only the JARVIS browser is allowed"
-    url = args.get("url")
-    if url is not None and not re.match(r"https?://", str(url), re.I):
-        return False, "only http(s) pages may be opened"
+    for key, url in args.items():
+        if "url" not in key.lower() or url in (None, ""):
+            continue
+        if not re.match(r"https?://", str(url), re.I):
+            return False, "only http(s) pages may be opened"
+        local = _local_address(url)
+        if local:
+            return False, f"{local}; the browser may only open public pages"
     return True, "browser tool"
 
 
@@ -984,7 +1061,10 @@ def browser_mcp(state_dir, engines=BROWSER_ENGINES):
         profile.mkdir(parents=True, exist_ok=True)
         servers["playwright"] = {
             "command": npx,
-            "args": ["-y", PLAYWRIGHT_MCP, "--browser", "chrome", "--user-data-dir", str(profile)],
+            "args": ["-y", PLAYWRIGHT_MCP, "--browser", "chrome", "--user-data-dir", str(profile),
+                     # Clicked links and page requests to the console; not a full boundary
+                     # (redirects pass), so approve_browser checks every address as well.
+                     "--blocked-origins", ";".join(CONSOLE_ORIGINS)],
             # No uploading local files to sites; no arbitrary page scripts.
             "disabled_tools": sorted(BROWSER_BLOCKED)}
     if "agent-browser" in engines:

@@ -17,10 +17,11 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import __version__
 from .deploy import code_fingerprint
-from .cluster_store import Broker, CAPABILITIES, TERMINAL
+from .cluster_store import BULK, Broker, CAPABILITIES, TERMINAL
 from .topology import endpoint, identity, is_node, request_from
 
 _HUBS = {}
@@ -28,6 +29,16 @@ MAX_PROTOCOL = 65536
 MAX_RESULT = 4_000_000
 POLL_WAIT = 25
 FRESH = 10  # seconds after a check-in that a node counts as alive between polls
+# The console API a node (with "console") may reach on the main; the owner token, held only
+# by the main's own windows, reaches all of it. Left out on purpose: settings, files, screen,
+# memory, uploads, plan runs and Grokbot commands (its /terminal opens a shell here), so a
+# compromised node can't use the main to take over the cluster.
+NODE_API_READ = frozenset({"/api/events", "/api/overview", "/api/confirm", "/api/history",
+                           "/api/history/commands", "/api/cases", "/api/route", "/api/tree",
+                           "/api/specialists", "/api/graph/system", "/api/usage", "/api/credits",
+                           "/api/voice", "/api/agent", "/api/grokbot"})
+NODE_API_READ_UNDER = ("/api/jobs/", "/api/tasks/", "/api/plans/")  # + one id segment
+NODE_API_SUBMIT = frozenset({"/api/ask", "/api/listen", "/api/confirm"})  # also needs "ask"
 
 
 class NodeOffline(ConnectionError):
@@ -69,6 +80,33 @@ def save_json(path, value):
         temporary.unlink(missing_ok=True)
 
 
+def redeem_invite(config, state, client=None):
+    """If this node still runs on its invite's credentials, swap them for its own (once):
+    a new hub token, and a new SSH key when the main can install it. A no-op afterwards.
+    Returns what changed, or None when there was nothing to redeem."""
+    path = Path(state) / "cluster-node.json"
+    try:
+        note = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not note.get("redeem"):
+        return None
+    from .cluster_setup import _private_file, keypair
+    private, public = keypair(note["node_id"])
+    client = client or Client(config, state)
+    answer = client.request("/v1/redeem", {"public_key": public}, timeout=15)
+    if not isinstance(answer.get("token"), str) or len(answer["token"]) < 20:
+        raise ValueError("The main sent no credential.")
+    if answer.get("key_rotated"):  # the tunnel's next connection uses it; this one stays up
+        _private_file(Path((note.get("link") or {}).get("identity_file")
+                           or Path(state) / "cluster-node.key"), private)
+    note.pop("redeem", None)
+    note["token"] = client.token = answer["token"]
+    client.invite = False
+    save_json(path, note)
+    return {"token": True, "ssh_key": bool(answer.get("key_rotated"))}
+
+
 class HubRefused(RuntimeError):
     """The main answered with an HTTP error; `status` says which (400/404 are final)."""
     def __init__(self, message, status):
@@ -83,7 +121,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class Client:
     def __init__(self, config, state, owner=False):
-        self.config, self.state = config, Path(state)
+        self.config, self.state, self.owner = config, Path(state), owner
         # The real pairing lives in the checkout's .jarvis; under tests it would let an ask
         # reach the live main and its ChatGPT brain (see jarvis/__init__.py).
         if os.environ.get("JARVIS_NO_MODELS") == "1" and \
@@ -106,6 +144,7 @@ class Client:
             if note.get("node_id") != self.local or note.get("main_device") != self.main:
                 raise ValueError("Node credentials do not match the configured main/local PC. Pair again.")
             self.token = note.get("token", "")
+            self.invite = bool(note.get("redeem"))  # may be swapped by another process
         if not isinstance(self.token, str) or len(self.token) < 20:
             raise ValueError("Invalid cluster credential; pair this node again.")
         ca = config.get("cluster", {}).get("ca_file")
@@ -122,6 +161,26 @@ class Client:
         return self.opener.open(request, timeout=timeout)
 
     def request(self, path, body=None, timeout=45):
+        try:
+            return self._request(path, body, timeout)
+        except HubRefused as exc:
+            # Another process on this node redeemed the invite and saved a new token
+            # (redeem_invite): pick it up once instead of failing until restarted.
+            if exc.status != 403 or not getattr(self, "invite", False) or not self._reload():
+                raise
+            return self._request(path, body, timeout)
+
+    def _reload(self):
+        try:
+            token = json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8")).get("token")
+        except (OSError, ValueError):
+            return False
+        if not isinstance(token, str) or len(token) < 20 or token == self.token:
+            return False
+        self.token, self.invite = token, False
+        return True
+
+    def _request(self, path, body=None, timeout=45):
         try:
             with self.open(path, None if body is None else json.dumps(body).encode(), timeout,
                            {"Content-Type": "application/json"}) as response:
@@ -164,6 +223,18 @@ class Client:
         return self.wait(started["id"], timeout + 5)
 
 
+def node_api(path, post, caps):
+    """Refuse console API calls a node may not make on the main (see NODE_API_READ)."""
+    if post:
+        allowed = path in NODE_API_SUBMIT and "ask" in caps
+    else:
+        allowed = path in NODE_API_READ or any(
+            path.startswith(prefix) and path[len(prefix):] and "/" not in path[len(prefix):]
+            for prefix in NODE_API_READ_UNDER)
+    if not allowed:
+        raise PermissionError(f"Nodes can't use {path} on the main PC.")
+
+
 def validate_action(kind, payload):
     if not isinstance(payload, dict):
         raise ValueError("Node payload must be an object.")
@@ -179,8 +250,11 @@ def validate_action(kind, payload):
     elif kind == "storage":
         if payload.get("action") not in ("list", "resolve", "exists", "thumbnail") or not isinstance(payload.get("path"), str):
             raise ValueError("Invalid node storage query.")
+    elif kind == "transfer":
+        from .transfer import validate
+        validate(payload)
     elif kind != "inventory":
-        raise ValueError("Nodes execute only desktop, inventory, or Grokbot operations.")
+        raise ValueError("Nodes execute only desktop, inventory, or Grokbot operations, and file transfers.")
 
 
 def execute_local(kind, payload, config, state):
@@ -195,6 +269,9 @@ def execute_local(kind, payload, config, state):
     if kind == "storage":
         from .storage import Storage
         return Storage(config, state)._local(identity(config)[0], payload["path"], payload["action"])
+    if kind == "transfer":
+        from .transfer import run_here
+        return run_here(payload, state)
     from .grokbot import Grokbot
     return Grokbot(config, state).send(payload["text"], device=identity(config)[0])
 
@@ -213,6 +290,22 @@ class Hub:
         self._polling = {}  # node -> sockets of polls held open now (guarded by _condition)
         self.server = self.thread = self.worker = self._lock = None
         self.started = False
+
+    def redeem(self, node, public_key=None):
+        """A newly joined node trades its invite for its own credential: a fresh hub token
+        and, when this PC lets JARVIS write authorized_keys, its own SSH key in place of
+        the invite's. Either way the invite code is dead afterwards."""
+        token = self.broker.redeem(node)
+        rotated = False
+        if public_key:
+            from .cluster_setup import DEFAULT_PORT, authorize
+            port = int((self.config.get("cluster") or {}).get("listen_port") or DEFAULT_PORT)
+            try:
+                authorize(node, str(public_key), port)
+                rotated = True
+            except (OSError, ValueError):  # e.g. Windows admin keys need an elevated shell
+                pass
+        return {"token": token, "key_rotated": rotated}
 
     def authenticate(self, headers, capability=None):
         if headers.get("X-JARVIS-Main") != self.main:
@@ -281,7 +374,7 @@ class Hub:
         if node == self.main:
             return execute_local(kind, payload, self.config, self.state)
         status = next((n for n in self.broker.nodes() if n["id"] == node), None)
-        capability = "files" if kind == "storage" else kind
+        capability = "files" if kind in ("storage", "transfer") else kind
         if not status or capability not in status["capabilities"]:
             raise ValueError(f"Node {node} is not enrolled for {kind} actions.")
         if not self.alive(node, status) and not self._await_poll(node, status):
@@ -298,6 +391,8 @@ class Hub:
             with self._condition:
                 job = self.broker.get(job_id)
                 if job["state"] in TERMINAL:
+                    if kind in BULK:
+                        self.broker.compact(job_id)
                     if job["state"] == "done":
                         return job["result"]
                     raise RuntimeError((job.get("result") or {}).get("error") or
@@ -438,7 +533,9 @@ def make_server(hub, host, port):
         def _request(self, post):
             try:
                 if self.path.startswith("/api/"):
-                    self.node_id, _ = hub.authenticate(self.headers, "console")
+                    self.node_id, caps = hub.authenticate(self.headers, "console")
+                    if "owner" not in caps:
+                        node_api(urlparse(self.path).path, post, caps)
                     with request_from(self.node_id):
                         return Handler.do_POST(self) if post else Handler.do_GET(self)
                 node, caps = hub.authenticate(self.headers)
@@ -447,24 +544,28 @@ def make_server(hub, host, port):
                                             "nodes": hub.broker.nodes()})
                 if self.path == "/v1/code" and not post and "owner" not in caps:
                     from .deploy import code_bundle  # nodes pull the main's code over their own channel
-                    return self._send(200, code_bundle())
+                    return self._send(200, code_bundle(hub.state))
                 if self.path.startswith("/v1/jobs/") and not post:
                     return self._send(200, hub.broker.get(self.path.rsplit("/", 1)[-1],
                                                          None if "owner" in caps else node))
                 if not post:
                     return self._send(404, {"error": "Unknown cluster endpoint."})
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= (MAX_RESULT if self.path == "/v1/result" else MAX_PROTOCOL):
+                # Results, and file chunks on their way to a node (BULK jobs), may be large.
+                bulk = ("/v1/result", "/v1/action", "/v1/control")
+                if not 0 < length <= (MAX_RESULT if self.path in bulk else MAX_PROTOCOL):
                     raise ValueError("Invalid cluster request length.")
                 self.connection.settimeout(15)
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("Cluster body must be an object.")
+                if self.path == "/v1/redeem" and "owner" not in caps:
+                    return self._send(200, hub.redeem(node, data.get("public_key")))
                 if self.path == "/v1/poll" and "owner" not in caps:
                     hub.broker.heartbeat(node, data)
                     kinds = caps & {"desktop", "inventory", "grokbot"}
                     if "files" in caps:
-                        kinds.add("storage")
+                        kinds |= {"storage", "transfer"}
                     deadline = time.monotonic() + POLL_WAIT
                     with hub._condition:
                         hub._polling.setdefault(node, set()).add(self.connection)
@@ -487,7 +588,11 @@ def make_server(hub, host, port):
                         hub._condition.notify_all()
                     return self._send(200, {"accepted": True})
                 if ((self.path == "/v1/action" and "owner" in caps) or
-                        (self.path == "/v1/control" and "console" in caps)):
+                        (self.path == "/v1/control" and "console" in caps) or
+                        # A node with "files" may hand the main a file or a clipboard copy
+                        # (jarvis send / clipboard sync), but nothing else.
+                        (self.path == "/v1/control" and "files" in caps and
+                         data.get("kind") == "transfer" and data.get("node") == hub.main)):
                     return self._send(200, hub.dispatch(data.get("node"), data.get("kind"),
                                         data.get("payload"), timeout=45))
                 if self.path == "/v1/ask" and "ask" in caps:
@@ -499,6 +604,9 @@ def make_server(hub, host, port):
                     timeout = data.get("timeout", 600)
                     if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 1800:
                         raise ValueError("Request timeout must be 1-1800 seconds.")
+                    if data.get("write") and "owner" not in caps:
+                        # A write run changes code that then deploys to every node.
+                        raise PermissionError("Write runs start only on the main PC.")
                     payload = {"text": text.strip(), "tier": tier, "write": bool(data.get("write"))}
                     with hub._condition:
                         job_id = hub.broker.enqueue(hub.main, node, "ask", payload, timeout,
@@ -588,8 +696,12 @@ class NodeWorker:
         if last.get("code") == want and time.time() - last.get("at", 0) < 600:
             return False
         save_json(mark, {"code": want, "at": time.time()})
+        try:  # the main's code-signing key, pinned from the invite (cluster_setup.join)
+            key = json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8")).get("code_key")
+        except (OSError, ValueError):
+            key = None
         bundle = self.client.request("/v1/code", timeout=60)
-        count = apply_bundle(bundle)
+        count = apply_bundle(bundle, key)
         print(f"JARVIS node: installed main's code {bundle.get('code')} ({count} files); restarting.", flush=True)
         return True
 
@@ -639,10 +751,16 @@ class NodeWorker:
                 expired = time.time() >= job["deadline"]
             if expired:
                 raise TimeoutError("Node action expired before execution.")
-            result = self.executor(job["kind"], job["payload"])
-            message = {"id": job["id"], "result": result, "failed": False}
-        except Exception as exc:
+        except Exception as exc:  # nothing ran yet: a plain failure
             message = {"id": job["id"], "result": {"error": str(exc)}, "failed": True}
+        else:
+            try:
+                result = self.executor(job["kind"], job["payload"])
+                message = {"id": job["id"], "result": result, "failed": False}
+            except Exception as exc:
+                # The executor started, so part of the action may already have happened.
+                message = {"id": job["id"], "failed": True, "result": {
+                    "error": f"{exc} (the node crashed mid-action; it may have run, so it wasn't retried)"}}
         save_json(self.outbox, {"main_device": self.client.main, "message": message})
         self._send_result(message)
         self._record(results_sent=1)
@@ -655,6 +773,7 @@ class NodeWorker:
                 delay = 1
                 while not self.stop_event.is_set() and not self.restarting:
                     try:
+                        redeem_invite(self.config, self.state, self.client)
                         worked = self.once()
                         delay = 1
                     except (OSError, ValueError, RuntimeError) as exc:

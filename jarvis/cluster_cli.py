@@ -6,7 +6,8 @@ import sys
 from pathlib import Path
 
 from .cluster import Client, NodeWorker, save_json
-from .cluster_store import CAPABILITIES, Broker
+from .cluster_store import CAPABILITIES, NODE_DEFAULT, Broker
+from .deploy import code_key
 from .topology import DEVICE_ID, enabled, endpoint, identity
 
 
@@ -16,7 +17,7 @@ def parser(sub):
                     "on each node `jarvis cluster join CODE`. `jarvis cluster doctor` on either "
                     "says what is wrong and how to fix it.")
     command.add_argument("action", choices=("init", "invite", "join", "leave", "doctor",
-                                           "configure", "enroll", "revoke", "status",
+                                           "configure", "enroll", "revoke", "caps", "status",
                                            "run", "serve", "node", "request", "autostart", "tunnel", "update", "main", "roles"))
     command.add_argument("value", nargs="?", help="node ID, invite code or file, request ID, or on/off")
     command.add_argument("--id", dest="device_id", help="init: this PC's device ID (default: from its hostname)")
@@ -28,7 +29,9 @@ def parser(sub):
     command.add_argument("--local", dest="local_device", help="this PC's device ID, or auto")
     command.add_argument("--url", help="main HTTPS origin, or loopback HTTP through SSH")
     command.add_argument("--hostname", help="enroll: hostname of a new node")
-    command.add_argument("--capability", action="append", choices=sorted(CAPABILITIES))
+    command.add_argument("--capability", action="append", choices=sorted(CAPABILITIES),
+                         help="enroll/invite/caps: what the node may do (default: "
+                              + ", ".join(sorted(NODE_DEFAULT)) + ")")
     command.add_argument("--output", help="enroll: write the one-time pairing bundle here")
     command.add_argument("--port", type=int, default=7777, help="main: local console port")
     command.add_argument("--rollback", action="store_true", help="update: swap a node back to its previous code")
@@ -125,8 +128,12 @@ def run(args, config, base):
                     "main_device": note["main_device"], "main_url": args.url or note.get("main_url")}}
         endpoint(proposed)
         identity(proposed)
+        from .deploy import CODE_KEY
+        key = note.get("code_key")
+        if not isinstance(key, str) or not CODE_KEY.fullmatch(key):
+            raise ValueError("The pairing bundle has no code-signing key; enroll again on the updated main.")
         save_json(state / "cluster-node.json", {"node_id": note["node_id"],
-                  "main_device": note["main_device"], "token": token})
+                  "main_device": note["main_device"], "token": token, "code_key": key})
         save_json(path, proposed)
         return {"joined": note["node_id"], "main_device": note["main_device"],
                 "main_url": endpoint(proposed), "next": "jarvis cluster node"}
@@ -171,7 +178,7 @@ def run(args, config, base):
     if action == "invite":
         from .cluster_setup import invite
         return invite(config, path, state, args.value, args.address, args.capability, args.output)
-    if action in ("enroll", "revoke"):
+    if action in ("enroll", "revoke", "caps"):
         if local != main:
             raise ValueError("Enroll or revoke nodes on the main PC.")
         node = args.value or ""
@@ -180,6 +187,10 @@ def run(args, config, base):
         if action == "revoke":
             from .cluster_setup import revoke
             return revoke(state, node)
+        if action == "caps":  # keeps the node's credential; it takes effect on its next request
+            if not args.capability:
+                raise ValueError("Usage: jarvis cluster caps NODE --capability CAP [--capability CAP ...]")
+            return {"node": node, "capabilities": Broker(state).set_capabilities(node, args.capability)}
         if not args.output:
             raise ValueError("enroll needs --output PAIRING_FILE; it contains the node's credential.")
         output = Path(args.output).expanduser()
@@ -192,12 +203,13 @@ def run(args, config, base):
             devices[node] = {"hostname": args.hostname, "label": node}
             config = {**config, "devices": devices}
             save_json(path, config)
-        caps = args.capability or sorted(CAPABILITIES)
+        caps = args.capability or sorted(NODE_DEFAULT)
         token = Broker(state).enroll(node, caps)
         safe = {name: {k: device[k] for k in ("hostname", "label", "aliases") if k in device}
                 for name, device in devices.items()}
         save_json(output, {"node_id": node, "main_device": main, "main_url": endpoint(config),
-                           "token": token, "capabilities": caps, "devices": safe})
+                           "token": token, "capabilities": caps, "devices": safe,
+                           "code_key": code_key(state)})
         return {"enrolled": node, "capabilities": caps, "pairing_file": str(output),
                 "next": "Copy this private bundle to the node and run jarvis cluster join FILE."}
     if action == "autostart":
