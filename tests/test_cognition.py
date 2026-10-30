@@ -305,6 +305,27 @@ class SpeechTests(Temp):
             q.drain()
         self.assertEqual(played, ["One.", "Two.", "Three."])
 
+    def test_clear_gives_up_on_a_stalled_synthesis(self):
+        import threading
+        import time
+        from jarvis import speech
+        stuck, started = threading.Event(), threading.Event()
+        voice = Voice(self.base)
+        self.addCleanup(stuck.set)
+
+        def synth(text):
+            started.set()
+            stuck.wait(5)
+            return None, "x"
+        with patch.object(voice, "synth", side_effect=synth):
+            q = speech.SpeechQueue(voice)
+            q.put("This never finishes.")
+            q.put("Nor this.")
+            self.assertTrue(started.wait(2))  # the first line is mid-synthesis
+            started = time.monotonic()
+            self.assertFalse(q.clear(timeout=0.3))  # the listener goes on instead of hanging
+            self.assertLess(time.monotonic() - started, 2)
+
 
 FAKE_CLAUDE = r'''
 import json, os, sys
@@ -436,6 +457,33 @@ class ChatGPTLaneTests(Temp):
         lane.ask("again")  # max_turns=1: a fresh thread on the same warm process
         self.assertEqual(lane.thread, "t2")
 
+    def test_a_thread_is_not_sent_what_it_already_holds(self):
+        from jarvis.chatgpt import ChatGPTLane
+        from jarvis.memory import CONVERSATION
+        script, log = self.base / "fake_app_server.py", self.base / "prompts.jsonl"
+        script.write_text(FAKE_APP_SERVER.replace(
+            'text = m["params"]["input"][0]["text"].splitlines()[-1]',
+            'text = m["params"]["input"][0]["text"]; open(os.environ["PROMPTS"], "a").write('
+            'json.dumps(text) + "\\n")'), encoding="utf-8")
+        lane = ChatGPTLane({}, self.base, timeout=20, command=[sys.executable, str(script)])
+        self.addCleanup(lane.close)
+        origin = "This request originates on dell. The JARVIS main PC is asus."
+        with patch.dict(os.environ, {"PROMPTS": str(log)}):
+            answer = lane.ask("capital of Mongolia?", [origin, "vault: Mongolia trip notes"])
+            lane.ask("and its population?", [
+                origin, "vault: Mongolia trip notes", "vault: census note",
+                CONVERSATION + "\n  Console: earlier\n  David: capital of Mongolia?"
+                "\n  JARVIS: " + answer + "\n  David: from the console"])
+            lane.close()  # a new thread holds nothing: everything goes again
+            lane.ask("again", ["vault: Mongolia trip notes"])
+        second = json.loads(log.read_text().splitlines()[1])
+        self.assertIn(origin, second)  # per request: always sent
+        self.assertIn("census note", second)
+        self.assertNotIn("trip notes", second)  # sent on the first turn
+        self.assertNotIn("capital of Mongolia", second)  # the thread's own exchange
+        self.assertIn("David: from the console", second)  # another channel's turn
+        self.assertIn("trip notes", json.loads(log.read_text().splitlines()[-1]))
+
     def test_conversation_goes_to_brain_without_escalating(self):
         class Brain:
             def ask(self, text, recall, on_sentence=None):
@@ -463,6 +511,13 @@ class InstantTests(Temp):
         for q in ("what time is it in Tokyo?", "what is the day after tomorrow",
                   "tell me a joke", "what date is my exam", "what day is Christmas"):
             self.assertIsNone(answer(q, now), q)
+
+    def test_instant_answer_builds_no_recall(self):
+        store, mem = Store(self.base / "s"), Memory(self.base / "s")
+        with patch("jarvis.assistant.vault_recall", side_effect=AssertionError("recall")), \
+                patch("jarvis.assistant.kb_recall", side_effect=AssertionError("recall")):
+            result = ask("what time is it?", store, mem, {}, self.base, lane=object())
+        self.assertTrue(result["reply"].startswith("It's"))
 
     def test_instant_answer_skips_the_brain(self):
         class Brain:

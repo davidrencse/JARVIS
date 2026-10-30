@@ -157,6 +157,53 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(reply, "Opened Knowledge on the Arch.")
         self.assertEqual(spoken, ["Opened Knowledge on the Arch."])  # the token is never spoken
 
+    def test_talk_excuse_goes_to_the_tools_unspoken(self):
+        # Seen 2026-10-30: the talk lane answered instead of handing off.
+        for excuse in ("I can’t inspect your computers right now, so I don’t know.",
+                       "I don't have access to your Dell.",
+                       "I tried, but the tool service is disabled right now."):
+            chat, act = self.Lane(excuse), self.Lane("Your Dell lists 283 apps.")
+            spoken = []
+            reply = Brain(chat, act, wants=lambda t: False).ask("count the dell's apps",
+                                                                on_sentence=spoken.append)
+            self.assertEqual(reply, "Your Dell lists 283 apps.")
+            self.assertEqual(spoken, ["Your Dell lists 283 apps."])
+
+    def test_answers_about_the_world_are_not_excuses(self):
+        for answer in ("You can't see the aurora from London.", "Most people cannot run a marathon.",
+                       "You don't have access to that feature on the free plan.",
+                       "Say 'Jarvis, yes' or press Confirm (C3).",
+                       "I can't see why that would fail.", "I can't read minds, but here goes.",
+                       "I don't have a way to know how you feel.",
+                       "I cannot list every prime, but here are ten."):
+            chat, act = self.Lane(answer), self.Lane("x")
+            self.assertEqual(Brain(chat, act, wants=lambda t: False).ask("q"), answer)
+            self.assertEqual(act.asked, [])
+
+    def test_usage_limit_turn_reports_no_earlier_tools(self):
+        from unittest.mock import patch
+        from jarvis import chatgpt
+        lane = chatgpt.ChatGPTLane({}, ".", tools=object())
+        lane.tool_log = [("open_app", True, "Opened Spotify.")]  # the previous turn's
+        brain = Brain(self.Lane("x"), lane, wants=lambda t: True)
+        with patch.object(chatgpt, "usage_limit", return_value="try again at 8:00 PM"):
+            with self.assertRaises(RuntimeError):
+                brain.ask("open chrome")
+        self.assertEqual(brain.tool_log, [])
+
+    def test_tool_less_lanes_keep_code_mode_off(self):
+        from jarvis.chatgpt import ChatGPTLane
+        talk = ChatGPTLane({}, ".")
+        act = ChatGPTLane({}, ".", tools=object())
+        self.assertIn("features.code_mode_host=false", talk.overrides)
+        self.assertNotIn("features.code_mode_host=false", act.overrides)
+
+    def test_the_tools_lane_excuse_stands(self):
+        chat, act = self.Lane("x"), self.Lane("I can't open that page: it needs a login.")
+        reply = Brain(chat, act, wants=lambda t: True).ask("open my bank")
+        self.assertEqual(reply, "I can't open that page: it needs a login.")
+        self.assertEqual(chat.asked, [])
+
     def test_plain_talk_stays_talk(self):
         chat, act = self.Lane("Lima."), self.Lane("x")
         self.assertEqual(Brain(chat, act, wants=lambda t: False).ask("capital of Peru?"), "Lima.")

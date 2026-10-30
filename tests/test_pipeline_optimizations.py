@@ -214,7 +214,7 @@ class CheckpointTests(Temp):
     def test_failed_replace_preserves_previous_plan(self):
         previous = self.orch.load(self.record["id"])
         self.record["state"] = "running"
-        with patch("jarvis.orchestrator.os.replace", side_effect=OSError("busy")), \
+        with patch("jarvis.fsio.os.replace", side_effect=OSError("busy")), \
                 self.assertRaises(OSError):
             self.orch._save(self.record)
         self.assertEqual(self.orch.load(self.record["id"]), previous)

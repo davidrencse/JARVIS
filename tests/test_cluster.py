@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 import tempfile
 import threading
 import time
@@ -157,6 +158,53 @@ class ClusterHTTPTests(unittest.TestCase):
         self.assertEqual(len(self.calls), 1)
         self.assertEqual(self.calls[0][1:], ("node", "node"))
         self.assertFalse((self.state / "memory.sqlite3").exists())
+
+    def test_job_result_request_is_held_until_the_result_lands(self):
+        job = self.hub.broker.enqueue("main", "node", "ask", {"text": "slow"})
+        self.hub.broker.claim("main", {"ask"})
+        # Without ?wait the hub answers at once (what an old client expects).
+        began = time.monotonic()
+        self.assertEqual(self.client.request(f"/v1/jobs/{job}")["state"], "running")
+        self.assertLess(time.monotonic() - began, 0.5)
+
+        def finish():
+            time.sleep(0.3)
+            with self.hub._condition:
+                self.hub.broker.finish(job, "main", {"reply": "late"})
+                self.hub._condition.notify_all()
+        threading.Thread(target=finish, daemon=True).start()
+        began = time.monotonic()
+        answer = self.client.request(f"/v1/jobs/{job}?wait=5")
+        self.assertEqual((answer["state"], answer["result"]), ("done", {"reply": "late"}))
+        self.assertTrue(0.2 < time.monotonic() - began < 2)
+
+    def test_wait_makes_one_held_request_not_a_poll_loop(self):
+        job = self.hub.broker.enqueue("main", "node", "ask", {"text": "slow"})
+        self.hub.broker.claim("main", {"ask"})
+        paths = []
+        real = self.client.request
+
+        def spy(path, body=None, timeout=45):
+            paths.append(path)
+            return real(path, body, timeout)
+
+        def finish():
+            time.sleep(0.5)
+            with self.hub._condition:
+                self.hub.broker.finish(job, "main", {"reply": "ok"})
+                self.hub._condition.notify_all()
+        threading.Thread(target=finish, daemon=True).start()
+        with patch.object(self.client, "request", side_effect=spy):
+            self.assertEqual(self.client.wait(job, 10), {"reply": "ok"})
+        self.assertEqual(len(paths), 1)
+
+    def test_wait_backs_off_when_the_hub_ignores_wait(self):
+        states = iter([{"state": "running"}] * 6 + [{"state": "done", "result": 7}])
+        sleeps = []
+        with patch.object(self.client, "request", side_effect=lambda *a, **k: next(states)), \
+                patch("jarvis.cluster.time.sleep", side_effect=sleeps.append):
+            self.assertEqual(self.client.wait("x", 100), 7)
+        self.assertEqual(sleeps, [0.15, 0.3, 0.6, 1.2, 2.0, 2.0])
 
     def test_main_dispatches_work_over_node_initiated_poll(self):
         executed = []
@@ -342,6 +390,70 @@ class ClusterHTTPTests(unittest.TestCase):
         executor.assert_called_once()
 
 
+    def test_job_reported_not_run_during_update_is_never_run(self):
+        sent, executor = [], Mock(return_value={"ok": True})
+        worker = NodeWorker(self.node, self.state, executor=executor)
+        worker._send_result = sent.append
+        job = {"id": uuid.uuid4().hex, "kind": "desktop", "deadline": time.time() + 5,
+               "payload": {"action": "volume", "arg": "5"}}
+        worker.client.request = Mock(return_value={"job": job, "code": "newer-code"})
+        with patch.object(worker, "_pull_update", side_effect=RuntimeError("bundle refused")):
+            self.assertTrue(worker.once())
+        executor.assert_not_called()
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Not run", sent[0]["result"]["error"])
+
+    def test_only_the_unit_itself_counts_as_systemd(self):
+        from jarvis.cluster import _systemd_service
+        unit = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/jarvis-cluster.service\n"
+        shell = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-kitty-1.scope\n"
+        for text, expected in ((unit, True), (shell, False)):
+            with patch("jarvis.cluster.Path.read_text", return_value=text), \
+                    patch.dict(os.environ, {"INVOCATION_ID": "inherited"}):
+                self.assertIs(_systemd_service("jarvis-cluster"), expected)
+
+    def test_lost_redeem_reply_can_be_retried(self):
+        from jarvis.cluster import redeem_invite
+        invite = self.hub.broker.enroll("node", CAPABILITIES, invite_ttl=3600)
+        save_json(self.state / "cluster-node.json", {
+            "node_id": "node", "main_device": "main", "token": invite, "redeem": True,
+            "link": {"identity_file": str(self.state / "node.key")}})
+        joined = Client(self.node, self.state)
+        real = joined.request
+        calls = []
+
+        def lose_first_reply(path, body=None, timeout=45):
+            answer = real(path, body, timeout)
+            calls.append(path)
+            if len(calls) == 1:
+                raise ConnectionError("reply lost")
+            return answer
+        joined.request = lose_first_reply
+        with patch("jarvis.cluster_setup.keypair", return_value=("PRIVATE\n", "ssh-ed25519 AAAA x")), \
+                patch("jarvis.cluster_setup.authorize") as authorize, \
+                patch("jarvis.cluster_setup.authorized", return_value=True) as authorized:
+            with self.assertRaises(ConnectionError):
+                redeem_invite(self.node, self.state, joined)  # the main redeemed; we never heard
+            self.assertEqual(redeem_invite(self.node, self.state, joined), {"token": True, "ssh_key": True})
+        authorize.assert_called_once()  # the retry only checks the first key landed
+        authorized.assert_called_once_with("node", public_key="ssh-ed25519 AAAA x")
+        note = json.loads((self.state / "cluster-node.json").read_text())
+        self.assertNotIn("pending", note)
+        Client(self.node, self.state).request("/v1/status")  # the node is not locked out
+
+    def test_node_token_cannot_re_pair_a_new_ssh_key(self):
+        invite = self.hub.broker.enroll("node", CAPABILITIES, invite_ttl=3600)
+        with patch("jarvis.cluster_setup.authorize") as authorize, \
+                patch("jarvis.cluster_setup.authorized", return_value=False):
+            token = "t" * 40
+            self.assertEqual(self.hub.redeem("node", "ssh-ed25519 AAAA first", token),
+                             {"token": token, "key_rotated": True})
+            self.assertEqual(self.hub.broker.authenticate(token)[0], "node")
+            again = self.hub.redeem("node", "ssh-ed25519 BBBB attacker", token)
+        authorize.assert_called_once()  # only the first pairing's key is written
+        self.assertEqual(again, {"token": token, "key_rotated": False})
+        self.assertNotEqual(invite, token)
+
     def test_executor_crash_reports_may_have_run_but_expiry_does_not(self):
         sent = []
         worker = NodeWorker(self.node, self.state, executor=Mock(side_effect=RuntimeError("boom")))
@@ -375,7 +487,7 @@ class TunnelTests(unittest.TestCase):
             args = command(self.config, self.state, "jdoe@192.0.2.1")
         for value in ("BatchMode=yes", "StrictHostKeyChecking=yes", "HostKeyAlias=known-host",
                       "ExitOnForwardFailure=yes", "ServerAliveInterval=15", "ServerAliveCountMax=2",
-                      "127.0.0.1:7778:127.0.0.1:7778"):
+                      "127.0.0.1:7780:127.0.0.1:7780"):
             self.assertIn(value, args)
         self.assertEqual(args[-1], "jdoe@192.0.2.1")
 
@@ -386,6 +498,49 @@ class TunnelTests(unittest.TestCase):
         self.assertEqual((self.state / "known-host-jarvis-node").read_text(), "jarvis-node ssh-ed25519 AAAA\n")
         with self.assertRaises(ValueError):
             pinned_host({"host_key_alias": "bad\noption"}, self.state)
+
+    def test_status_note_is_written_on_change_or_heartbeat_not_every_tick(self):
+        from jarvis import cluster_tunnel as tunnel
+        proc = Mock()
+        polls = [None] * 200 + [255]
+        proc.poll.side_effect = lambda: polls.pop(0) if polls else 255
+        proc.returncode = 255
+        saves, clock = [], [0]
+
+        def sleep(seconds):
+            clock[0] += seconds
+            if not polls:
+                (self.state / "cluster-tunnel.stop").touch()
+
+        real = tunnel.save_json
+        with patch.object(tunnel.shutil, "which", return_value="ssh"), \
+                patch.object(tunnel.subprocess, "Popen", return_value=proc), \
+                patch.object(tunnel, "save_json", side_effect=lambda *a: saves.append(a[1]["updated"]) or real(*a)), \
+                patch.object(tunnel.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(tunnel.time, "sleep", side_effect=sleep):
+            tunnel.run(self.config, self.state)
+        # ~200 loop passes (several publishes each) used to be one write apiece.
+        self.assertLessEqual(len(saves), 8)
+        self.assertEqual(json.loads((self.state / "cluster-tunnel.json").read_text())["pid"], 0)
+
+    def test_heartbeat_refreshes_an_unchanged_note(self):
+        from jarvis import cluster_tunnel as tunnel
+        proc = Mock()
+        proc.poll.return_value = None
+        stamps = iter(range(1000, 2000, 2))
+        saves = []
+
+        def sleep(seconds):
+            if len(saves) >= 3:
+                (self.state / "cluster-tunnel.stop").touch()
+        with patch.object(tunnel.shutil, "which", return_value="ssh"), \
+                patch.object(tunnel.subprocess, "Popen", return_value=proc), \
+                patch.object(tunnel.time, "time", side_effect=lambda: next(stamps)), \
+                patch.object(tunnel, "save_json", side_effect=lambda *a: saves.append(a[1]["updated"])), \
+                patch.object(tunnel.time, "sleep", side_effect=sleep):
+            tunnel.run(self.config, self.state)
+        self.assertGreaterEqual(len(saves), 3)
+        self.assertTrue(all(b - a >= tunnel.HEARTBEAT for a, b in zip(saves, saves[1:3])))
 
     def test_target_rotation_backoff_and_cooperative_stop(self):
         from jarvis import cluster_tunnel as tunnel

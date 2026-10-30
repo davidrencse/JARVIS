@@ -63,6 +63,16 @@ class PreflightTests(unittest.TestCase):
         self.assertNotIn("tools", lane.call_args.kwargs)
         lane.return_value.close.assert_called_once()
 
+    def test_draft_and_review_share_one_codex_process(self):
+        with patch("jarvis.chatgpt.ChatGPTLane") as lane:
+            lane.return_value.ask.return_value = result()
+            prepared = assess("check my inbox", {}, ".")
+        self.assertEqual(prepared["decision"], "forward")
+        self.assertEqual(lane.call_count, 1)  # one cold start, not one per pass
+        self.assertEqual(lane.return_value.ask.call_count, 2)
+        self.assertEqual(lane.call_args.kwargs["max_turns"], 1)  # each pass: a fresh thread
+        lane.return_value.close.assert_called_once()
+
     def test_local_response_does_not_forward(self):
         prepared = assess("what is two plus two", {}, ".", lambda _: result(
             decision="respond", reply="Four."))

@@ -1,6 +1,7 @@
 """Audit fixes in the cluster: wedged outbox, clock drift, job grace, pull-style code update."""
 
 import base64
+import json
 import copy
 import io
 import tempfile
@@ -153,6 +154,22 @@ class PullUpdateTests(unittest.TestCase):
         self.assertFalse(outside.exists())
         self.assertEqual((self.repo / "jarvis/a.py").read_bytes(), b"old\n")
 
+    def test_code_that_cannot_start_installs_nothing(self):
+        # 2026-10-30: a bundle taken mid-edit raised NameError at import and killed the node.
+        broken = {"jarvis/__init__.py": b"", "jarvis/deploy.py": b"FLAGS = NO_WINDOW\n",
+                  "jarvis/cluster.py": b"from . import deploy\n", "pyproject.toml": b"new\n"}
+        stage = Path(self.tmp.name) / "broken-stage"
+        make_tree(stage, broken)
+        want = deploy.code_fingerprint(stage / "jarvis")
+        with self.assertRaisesRegex(ValueError, "doesn't start.*NO_WINDOW"):
+            deploy.apply_bundle(bundle_of(broken, want, self.signer), self.key, self.repo)
+        self.assertEqual((self.repo / "jarvis/a.py").read_bytes(), b"old\n")
+        self.assertFalse((self.repo / "jarvis/deploy.py").exists())
+
+    def test_update_keeps_the_previous_code(self):
+        deploy.apply_bundle(bundle_of(self.new, self.want, self.signer), self.key, self.repo)
+        self.assertEqual((self.repo / "jarvis.prev/a.py").read_bytes(), b"old\n")
+
     def test_wrong_fingerprint_installs_nothing(self):
         with self.assertRaisesRegex(ValueError, "fingerprint"):
             deploy.apply_bundle(bundle_of(self.new, "f" * 16, self.signer), self.key, self.repo)
@@ -193,6 +210,32 @@ class PullUpdateTests(unittest.TestCase):
                 worker.once()  # same target again within 10 minutes: no second download
                 apply.assert_called_once()
 
+    def test_node_backs_up_confirms_and_never_repulls_rolled_back_code(self):
+        from jarvis import release
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            save_json(state / "cluster-node.json", {"node_id": "node", "main_device": "main",
+                                                    "token": "t" * 24, "code_key": "ssh-ed25519 AAAA"})
+            worker = NodeWorker(configuration("node"), state, executor=Mock())
+            worker.client.request = Mock(side_effect=[{"job": None, "code": "abc"},
+                                                      {"code": "abc", "zip": ""}])
+            with patch("jarvis.deploy.apply_bundle", return_value=3), \
+                    patch("jarvis.release.backup") as backup:
+                worker.once()
+            backup.assert_called_once_with(state)  # before the new files land
+            self.assertEqual(worker.installed, "abc")  # what the watchdog waits for
+            ok = json.loads((state / release.CONFIRMED).read_text())
+            self.assertEqual(ok["code"], worker.code)  # this process reached the main
+            # The watchdog rolled "abc" back: the node stays on its code, without re-pulling.
+            save_json(state / release.BAD, {"code": "abc"})
+            (state / "cluster-update.json").unlink()
+            worker.restarting = False
+            worker.client.request = Mock(return_value={"job": None, "code": "abc"})
+            with patch("jarvis.deploy.apply_bundle") as apply:
+                worker.once()
+            apply.assert_not_called()
+            self.assertFalse(worker.restarting)
+
     def test_hub_serves_bundle_and_skips_non_ssh_nodes(self):
         bundle = deploy.code_bundle(self.signer)
         self.assertEqual(bundle["code"], deploy.code_fingerprint())
@@ -214,6 +257,59 @@ class PullUpdateTests(unittest.TestCase):
             with patch("jarvis.deploy.update") as update:
                 hub._auto_update(settle=0)
             update.assert_not_called()
+
+
+class SshUpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = configuration()
+        self.config["devices"]["node"]["target"] = "jdoe@10.0.0.2"
+
+    def test_non_posix_node_pulls_instead_of_running_a_shell_script(self):
+        remote = Mock(return_value=(1, "", "'uname' is not recognized"))
+        with patch("jarvis.deploy._remote", remote):
+            report = deploy.update(self.config, self.tmp.name, "node")
+            self.assertTrue(report["pull"])
+            self.assertEqual(remote.call_count, 1)  # only the probe ran
+            with self.assertRaises(ValueError):
+                deploy.update(self.config, self.tmp.name, "node", rollback=True)
+
+    def test_update_runs_under_bash_and_survives_a_failed_restart(self):
+        calls = []
+
+        def remote(config, state, node, command, stdin=b"", timeout=120):
+            calls.append(command)
+            return (0, "Darwin\n", "") if command == "uname -s" else (0, "ok\n", "")
+
+        checked_in = ({"seen": time.time()}, deploy.code_fingerprint())
+        with patch("jarvis.deploy._remote", remote), \
+                patch("jarvis.deploy._node_code", return_value=checked_in):
+            report = deploy.update(self.config, self.tmp.name, "node")
+        self.assertTrue(report["updated"])
+        command = calls[1]
+        self.assertTrue(command.startswith("bash -c 'eval"))
+        script = base64.b64decode(command.split("echo ")[1].split(" |")[0]).decode()
+        self.assertIn("launchctl kickstart", script)
+        self.assertNotIn("systemctl", script)
+        self.assertIn("|| echo 'agent restart failed", script)
+
+
+    def test_node_that_never_checks_in_is_rolled_back(self):
+        calls = []
+
+        def remote(config, state, node, command, stdin=b"", timeout=120):
+            calls.append(command + "\n" + stdin.decode(errors="replace") if command == "bash -s" else command)
+            if command == "uname -s":
+                return 0, "Linux\n", ""
+            return (0, "prev123\n", "") if command == "bash -s" else (0, "ok\n", "")
+
+        with patch("jarvis.deploy._remote", remote), patch("jarvis.deploy.WAIT", 0):
+            report = deploy.update(self.config, self.tmp.name, "node")
+        self.assertFalse(report["updated"])
+        self.assertTrue(report["rolled_back"])
+        self.assertEqual(report["after"], "prev123")
+        self.assertTrue(any("mv jarvis.prev jarvis" in c for c in calls))  # the rollback script ran
 
 
 class FingerprintTests(unittest.TestCase):

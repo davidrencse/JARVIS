@@ -56,6 +56,45 @@ class SetupTests(unittest.TestCase):
         self.assertIsNone(Broker(state).authenticate(note["token"]))
         self.assertTrue(Broker(state).authenticate(cluster_setup.decode(again["code"])["token"]))
 
+    def test_concurrent_authorizes_keep_every_line(self):
+        # invite (CLI) and the hub's redeem (a thread) both rewrite the file: none may be lost.
+        import threading
+        key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDLTmUvsc7l7vzfOy/yHk0DpdkDZ62R+t93R+78kEG+R"
+        nodes = [f"n{i}" for i in range(12)]
+        real_write, barrier = cluster_setup._write_keys, threading.Barrier(len(nodes), timeout=1)
+
+        def slow_write(path, lines):  # widen the read-modify-write window
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            real_write(path, lines)
+
+        with mock.patch.object(cluster_setup, "_write_keys", slow_write):
+            threads = [threading.Thread(target=cluster_setup.authorize, args=(n, key, 7780, self.keys))
+                       for n in nodes]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        text = self.keys.read_text(encoding="utf-8")
+        self.assertIn("someone@else", text)
+        for node in nodes:
+            self.assertTrue(cluster_setup.authorized(node, self.keys), node)
+
+    def test_windows_admin_found_by_group_even_unelevated(self):
+        groups = '"BUILTIN\\Administrators","Alias","S-1-5-32-544","Group used for deny only"\n'
+        run = mock.Mock(return_value=mock.Mock(stdout=groups))
+        with mock.patch.object(cluster_setup.subprocess, "run", run):
+            self.assertTrue(cluster_setup._windows_admin())
+        with mock.patch.object(cluster_setup, "_os", return_value="windows"), \
+                mock.patch.object(cluster_setup, "_windows_admin", return_value=True), \
+                mock.patch.dict(cluster_setup.os.environ, {"PROGRAMDATA": str(self.tmp)}):
+            self.assertEqual(cluster_setup._authorized_keys(), self.tmp / "ssh/administrators_authorized_keys")
+        with mock.patch.object(cluster_setup, "_os", return_value="windows"), \
+                mock.patch.object(cluster_setup, "_windows_admin", return_value=False):
+            self.assertEqual(cluster_setup._authorized_keys(), Path.home() / ".ssh/authorized_keys")
+
     @unittest.skipUnless(shutil.which("ssh-keygen"), "needs ssh-keygen")
     def test_revoke_removes_credential_and_key(self):
         report, state = self._invite()

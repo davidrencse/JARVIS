@@ -37,7 +37,7 @@ class Case(unittest.TestCase):
             (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.root / rel).write_text(text, encoding="utf-8")
         self.state = Path(temp.name, "state")
-        self.vault = Vault(self.root, self.state)
+        self.vault = Vault(self.root, self.state, {"write": True})
         self.tasks = Tasks(self.vault)
 
 

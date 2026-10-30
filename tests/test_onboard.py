@@ -205,6 +205,24 @@ class SpeechGateTest(unittest.TestCase):
         g = self.gate([0.9, 0.3, 0.3], start=0.4, hold=0.18)
         self.assertEqual([g(block) for _ in range(3)], [True, False, False])
 
+    def test_streamed_scores_match_scoring_the_whole_clip(self):
+        from jarvis.listen import _SpeechGate, _vad_model
+        model = _vad_model()
+        if model is None:
+            self.skipTest("faster-whisper's Silero VAD not installed")
+        t = np.arange(16000 * 2) / 16000
+        audio = (0.3 * np.sin(2 * np.pi * 220 * t) * (t > 0.7)).astype("float32")
+        audio = audio[:len(audio) // 512 * 512]
+        g = _SpeechGate(model)
+        streamed = []
+        for block in audio.reshape(-1, 512):
+            g(block)
+            streamed.append(g.last)
+        whole = model(audio.copy()).reshape(-1)
+        # faster-whisper zeroes the final block's last 64 samples before scoring it (its
+        # context slice is a view), so the whole-clip score for that one block is off.
+        self.assertLess(float(np.abs(np.array(streamed) - whole)[:-1].max()), 1e-5)
+
     def test_fit_cutoffs_follow_the_voice_but_stay_above_the_room(self):
         from jarvis.listen import START_CUTOFF, fit_cutoffs
         loud = fit_cutoffs([0.01] * 50, [0.97] * 50)

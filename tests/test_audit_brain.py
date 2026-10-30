@@ -46,9 +46,63 @@ class Down:
         raise RuntimeError("ChatGPT usage limit: until 8:00 PM")
 
 
+class Up:
+    def ask(self, *_, **__):
+        return "ChatGPT is back"
+
+
+class StandIn(Temp):
+    """ChatGPT over its usage limit: one warm Claude lane answers, instead of a cold
+    `claude --print` per request, and goes away once ChatGPT answers again."""
+
+    def setUp(self):
+        super().setUp()
+        import jarvis.assistant as assistant
+        self.addCleanup(assistant._STANDIN.update, lane=None)
+        self.store = Store(self.base / "s", lanes=1)
+        self.mem = Memory(self.base / "s")
+
+    def run_ask(self, lane, make):
+        with patch("jarvis.assistant._fastlane", side_effect=make):
+            return ask("what is the capital of Mongolia?", self.store, self.mem,
+                       {"workspace_roots": ["."]}, self.base, lane=lane)
+
+    def test_one_warm_lane_answers_until_chatgpt_is_back(self):
+        fast, made = FakeFast(), []
+        make = lambda *a: made.append(1) or fast
+        for _ in range(2):
+            result = self.run_ask(Down(), make)
+            self.assertEqual((result["reply"], result["brain"]), ("direct answer", "claude"))
+        self.assertEqual((len(made), len(fast.asked), fast.closed), (1, 2, False))
+        self.assertEqual(self.store.list(), [])  # no ledger run, no cold CLI
+        self.assertEqual(self.run_ask(Up(), make)["reply"], "ChatGPT is back")
+        self.assertTrue(fast.closed)
+
+    def test_a_failed_stand_in_falls_back_to_a_ledger_run(self):
+        fast = FakeFast(fail=RuntimeError("claude CLI not found on PATH."))
+        with patch("jarvis.assistant.run_task", return_value={
+                "answer": "ledger answer", "task_id": "t1", "state": "finished"}):
+            result = self.run_ask(Down(), lambda *a: fast)
+        self.assertEqual(result["reply"], "ledger answer")
+        self.assertIn("claude CLI not found", result["lane_error"])
+
+    def test_other_lane_errors_skip_the_stand_in(self):
+        class Broken:
+            def ask(self, *_, **__):
+                raise RuntimeError("ChatGPT lane failed: EOF")
+        with patch("jarvis.assistant.run_task", return_value={
+                "answer": "ledger answer", "task_id": "t1", "state": "finished"}):
+            result = self.run_ask(Broken(), lambda *a: self.fail("stand-in started"))
+        self.assertEqual(result["reply"], "ledger answer")
+
+
 class LaneFullFallback(Temp):
     def setUp(self):
         super().setUp()
+        # These cover the ledger fallback behind the warm Claude stand-in (StandIn below).
+        standin = patch("jarvis.assistant._standin_reply", return_value=None)
+        standin.start()
+        self.addCleanup(standin.stop)
         self.store = Store(self.base / "s", lanes=1)
         self.mem = Memory(self.base / "s")
         busy = self.store.add({"objective": "orchestrator wave"})["id"]
