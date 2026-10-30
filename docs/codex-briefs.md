@@ -1,5 +1,7 @@
 # Codex briefs (2026-10-26)
 
+> Historical task prompts. They assume the Dell was main, the reverse tunnel and the MiniConda interpreter; today the Zenbook is main on a forward tunnel and the interpreter is the project `.venv`. The `jarvis.config.json.pre-*` backups they mention have been removed.
+
 Five self-contained tasks. Paste one brief per Codex session. Background for all of them
 is `docs/jarvis-os-architecture.md`.
 

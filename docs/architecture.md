@@ -105,6 +105,8 @@ pass without changing IDs.
 
 ## Second brain: the Obsidian vault (2026-10-21)
 
+> Currently off: `vault.enabled`, `recall` and `write` are false in config, so none of the table below is active.
+
 The heap records what JARVIS saw and said; the vault (`vault.path`) is what David
 knows and decided. `jarvis/vault.py` adapts obsidian-second-brain's context engine,
 bounded recall and vault tools to this vault's own `CLAUDE.md` schema.

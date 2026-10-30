@@ -95,6 +95,12 @@ Key files in plain words:
   the phrase, scrolling still means David's own browser window. `frame()` never launches
   Chrome: it checks the session's Chrome process first. The box's buttons (`POST
   /api/agent-browser`) are back, reload, stop scrolling and close.
+- `browser_gate.py`: both browser profiles stay signed in, so on top of `approve_browser` a
+  click or key that looks like it commits something (send, post, submit, buy, delete…), Enter
+  after typing outside a search box, a typed field with `submit`, or accepting a page dialog
+  parks a `browser_action` confirmation and waits up to 180 s for David (console Confirm;
+  during a voice request the listener is busy, so use the console). Keyword heuristic over the
+  tool's arguments: it narrows prompt-injection risk, it doesn't remove it.
 - `cluster.py`: the hub (main) and node client; long polling; liveness; code-mismatch refusal.
 - `deploy.py`: code fingerprint, `cluster update` (tar over SSH, keeps the previous copy for `--rollback`).
 
@@ -131,7 +137,11 @@ jarvis cluster join "jarvis-invite-1:..."   # or a file holding the code
 ```
 
 `join` saves the link, starts the tunnel and the node agent, installs both at login
-(`--no-autostart` / `--no-start` to skip), and waits for the hub to answer. Then on either side:
+(`--no-autostart` / `--no-start` to skip), and waits for the hub to answer. An invite is
+single-use and lasts 24 hours: on joining, the node redeems it (`POST /v1/redeem`) for its own
+hub token and SSH key, so the code is dead afterwards. If the main can't write
+`authorized_keys` (Windows admin accounts without an elevated shell) only the token rotates.
+If the main isn't reachable during `join`, the node agent redeems on its next start. Then on either side:
 
 ```
 jarvis cluster doctor             # every check in order; each FAIL carries its fix
@@ -205,7 +215,7 @@ Nothing assumes Windows or Linux. `platforms.detect()` returns
 | Volume | Core Audio | `osascript` | `wpctl`, else `pactl` |
 | Media | media keys | `nowplaying-cli` | `playerctl` |
 | Monitors | Win32 | `system_profiler` (no positions) | `hyprctl`, `swaymsg`, `xrandr` |
-| Overlay console | yes | no (use `jarvis app`) | no (bind a compositor key to `jarvis app`) |
+| Overlay console | yes | no (use `jarvis app`) | no: a compositor key runs `jarvis app` (Hyprland: Super+Shift+J), which focuses an open window |
 
 Plain Wayland compositors other than Hyprland and sway, and GNOME/KDE on Wayland, have no
 window control; JARVIS says so instead of pretending. Everything beyond Windows and
@@ -236,9 +246,11 @@ workers are started through `explorer.exe` (see `cluster_tunnel.start`, `daemon.
    "On it." plays while the brain thinks.
 
 Debugging: `.jarvis/logs/voice.log` shows each utterance's score; "no wake word (score):
-first words..." means your voice was accepted but the transcript didn't start with Jarvis.
+N words, not kept" means your voice was accepted but the transcript didn't start with Jarvis
+(speech not meant for JARVIS is never written down).
 `jarvis voice test` prints live scores; `jarvis voice recalibrate` rebuilds the print from
-the saved clips; `jarvis voice enroll` records new ones (do this on a new mic or machine).
+the saved clips; `jarvis voice enroll` runs the guided voice setup below in the terminal
+(do this on a new mic or machine; `jarvis voice enroll "<mic name>"` picks a mic).
 
 Voice setup (`onboard.py`, Settings > Voice, or opens by itself when a machine has no
 voiceprint): JARVIS speaks each cue while the server records through the listener's own mic
@@ -277,7 +289,8 @@ Claude CLI from inside a Claude session, strip `CLAUDE_*` and `ANTHROPIC_*` env 
   the decider's labels and the console's command history.
 - **David's personal vault** (`vault.path`, per OS): his notes, calendar and tasks. JARVIS
   reads it (`vault.world()` overview goes into every brain call) and writes only when he
-  asks, additively. Protected paths are in `vault.protected`. Its own `CLAUDE.md` is its rulebook.
+  asks, additively. **Currently off** (`vault.enabled`, `recall` and `write` are all
+  `false` in config): nothing is read or written until he turns it on. Protected paths are in `vault.protected`. Its own `CLAUDE.md` is its rulebook.
 - **JARVIS memory vault** (`jarvis-memory/` in this repo): rules, machines, decisions and
   Claude's memory notes. Committed, so it moves with git. Open it in Obsidian as its own vault.
 
@@ -299,7 +312,7 @@ Claude CLI from inside a Claude session, strip `CLAUDE_*` and `ANTHROPIC_*` env 
 |---|---|
 | `cluster.enabled`, `main_device`, `local_device` | the cluster and **which machine is main** |
 | `cluster.main_url`, `listen_host`, `listen_port` | hub address (loopback, through SSH) |
-| `cluster.tunnel` | `reverse` (default) or `forward` |
+| `cluster.tunnel` | `forward` (what `init` sets; this config) or `reverse` (code default when the key is absent) |
 | `cluster.tunnel_device`, `cluster.auto_update` | which node the reverse tunnel serves; push code at hub start |
 | `devices.<id>` | `hostname`, `label`, `aliases`, `transport: ssh`, `target`, `fallback_targets`, `identity_file`, `host_key`, `screen_inches` |
 | `desktop` | clipboard sync, shared input (Lan Mouse), screen stream, extended display |
@@ -333,7 +346,7 @@ Cluster actions: `configure`, `main`, `roles`, `status`, `run` (main), `node`, `
 ## 13 Tests
 
 `python -m unittest discover -s tests` with an interpreter that has the voice extras
-(on the Dell: `~/MiniConda3/python.exe`). About 880 tests, all mocked: none touch the real
+(the project `.venv`: `.venv/bin/python` on Linux, `.venv\Scripts\python.exe` on Windows). About 880 tests, all mocked: none touch the real
 desktop, microphone or accounts. Test configs turn off semantic recall, shadow mode and the
 interpreter. Live checks are `jarvis selftest keyboard` and `jarvis doctor`.
 

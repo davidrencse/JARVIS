@@ -31,7 +31,7 @@ system or which machine is main; read that list.
   are in that list.
 - "here" or "this PC" means the computer David is speaking from.
 - His two laptops today: a Dell G15 and an ASUS Zenbook, side by side (the Zenbook on the
-  left), sharing mouse and keyboard through Lan Mouse.
+  left; which one is main comes from the config list), sharing mouse and keyboard through Lan Mouse.
 
 ## How JARVIS acts
 

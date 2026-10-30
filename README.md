@@ -1,7 +1,7 @@
 # JARVIS
 
-A local assistant and workflow layer for David's Dell Windows laptop and ASUS
-Arch/Hyprland laptop, with a Python CLI, web console, desktop overlay and voice loop.
+A local assistant and workflow layer for David's ASUS Zenbook (Arch/Hyprland, the
+main) and Dell G15 (Windows 11, a node), with a Python CLI, web console, desktop overlay and voice loop.
 
 See the [workflow review and optimization results](docs/pipeline-architecture-review.md)
 and [independent audit](docs/pipeline-independent-audit.md) for the current architecture,
@@ -45,8 +45,9 @@ raw CLI flags, other sessions and screenshot files on disk are refused.
 
 ## Second brain (Obsidian)
 
-JARVIS reads and adds to your Obsidian vault (`vault.path` in `jarvis.config.json`, now
-`C:\Users\jdoe\Documents\Vault`). It follows the vault's own `CLAUDE.md` rules, not a
+**Currently off:** `vault.enabled`, `vault.recall` and `vault.write` are all `false` in
+`jarvis.config.json`, so JARVIS does not read or write the vault today. When switched on,
+it reads and adds to your Obsidian vault (`vault.path` in `jarvis.config.json`, per OS). It follows the vault's own `CLAUDE.md` rules, not a
 layout of its own. Built on the ideas in
 [obsidian-second-brain](https://github.com/eugeniughelbur/obsidian-second-brain) (MIT);
 the code is new, uses only the standard library, and lives in `jarvis/vault.py`.
@@ -154,7 +155,8 @@ changes, from Obsidian or from JARVIS.
 **Other agents.** `jarvis vault mcp` is a stdio MCP server with the same tools. Its
 read-only form is registered for Claude Code in `.mcp.json`; approve `jarvis-vault`
 the first time Claude Code asks. Add `--write` to offer log, capture and append.
-For Codex: `codex mcp add jarvis-vault -- C:\Users\jdoe\MiniConda3\python.exe -m jarvis vault mcp`.
+For Codex: `codex mcp add jarvis-vault -- <project python> -m jarvis vault mcp`
+(`.venv/bin/python` on Linux, `.venv\Scripts\python.exe` on Windows).
 `jarvis vault hook` is an opt-in Claude Code `UserPromptSubmit` hook that adds recall
 to every prompt. It is not registered by default.
 
@@ -250,8 +252,8 @@ bar). Closing the window stops the console server about 15–25 s later; the lis
 keeps running. If the console is already up, it just opens another window onto it.
 
 ```powershell
-C:\Users\jdoe\MiniConda3\python.exe -m jarvis app         # app window (what start.bat runs)
-C:\Users\jdoe\MiniConda3\python.exe -m jarvis ui --open   # plain server + browser tab, http://127.0.0.1:7777
+python -m jarvis app         # app window (what start.bat runs); use the project .venv interpreter
+python -m jarvis ui --open   # plain server + browser tab, http://127.0.0.1:7777
 ```
 
 A local web console over the same `.jarvis/` state: prompt bar with tier choice,
@@ -259,7 +261,7 @@ push-to-talk (hold Space; audio goes only to this laptop's voiceprint check and
 Whisper), the always-on listener toggle, date, provider
 credits, a force-directed knowledge graph (memory heap plus the module graph read
 from real imports), a system-design diagram, memory search, the task ledger, and
-devices. Use the MiniConda interpreter; the PATH `python` lacks the voice packages.
+devices. Use the project `.venv` interpreter (`.venv/bin/python` on Linux, `.venv\Scripts\python.exe` on Windows); a bare system `python` lacks the voice packages.
 
 Credits are labelled by source. **Live**: DeepSeek, OpenRouter and ElevenLabs
 balance endpoints (set `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`; the ElevenLabs
@@ -389,15 +391,16 @@ end
 
 What differs from the Dell:
 
-- **Devices.** The config is written from the Dell's side. On the machine whose
-  hostname matches a device (`archmain`), that device becomes local, and the
-  Dell is left out, since there is no SSH route to Windows. Drop-folder transfers
-  therefore run from the Dell.
+- **Devices.** The Zenbook (`archmain`) is the main (`cluster.main_device`); the Dell
+  is a node that reaches it over a forward SSH tunnel, so there is no SSH route from the
+  main into Windows. `jarvis send` / `fetch` / `inbox`, clipboard sync and Lan Mouse
+  start/pairing therefore go over the cluster link (hub jobs), from either side.
 - **Apps.** `open_app` lists `.desktop` entries (including Flatpak) and launches
   them with `gio launch`; links open in the default browser.
 - **Console window.** `jarvis app` uses `google-chrome-stable`, Chromium, Brave,
-  Edge or Vivaldi in `--app` mode. The hotkey overlay is Windows-only; bind a
-  Hyprland key to `start.sh` instead.
+  Edge or Vivaldi in `--app` mode. The hotkey overlay is Windows-only; on the
+  Zenbook **Super+Shift+J** runs `jarvis app` (hyprland.lua), which brings an open
+  console window forward instead of opening another.
 - **Voice.** Kokoro and Whisper run on CPU (no CUDA on the Zenbook, so the GPU
   model is never downloaded). The mic is read through PipeWire, because without
   `pipewire-alsa` ALSA's default device is the raw DSP mic and reads silence.
@@ -496,16 +499,25 @@ push-to-talk (**Voice**) and the always-on listener still run locally.
 
 See [desktop setup and acceptance checks](docs/unified-desktop.md).
 Clipboard, input sharing, video streaming, and display extension are separate
-connections. **Clipboard:** `jarvis clipboard start` on the Dell syncs text and images
-with the Zenbook over the existing SSH link (`autostart on` to keep it running). Lan Mouse 0.11.0 is installed on the Dell; JARVIS generates each
-side's config so each laptop trusts only the other's certificate fingerprint:
+connections. **Files:** `jarvis send FILE`, `jarvis inbox`, `jarvis fetch NAME` move
+files between the laptops' `~/JARVIS-Drop` folders over the cluster link in 2 MB
+chunks (the receiver names a file only once it is complete). **Clipboard:** run
+`jarvis clipboard start` (or `autostart on`) on *both* laptops; each watches its own
+clipboard and sends new copies (text and images) to the other over the cluster link.
+Lan Mouse 0.11.0 is installed on both; JARVIS generates each side's config so each
+laptop trusts only the other's certificate fingerprint:
 
-```powershell
-python -m jarvis lanmouse fingerprint                  # this laptop
-python -m jarvis lanmouse fingerprint --device zenbook # computed on Arch over SSH
-python -m jarvis lanmouse config --peer-name archmain --peer-ip 172.1.42.215 `
-  --position right --peer-fingerprint <zenbook fp> --output $env:LOCALAPPDATA\lan-mouse\config.toml
+```bash
+jarvis lanmouse start [--device dell]        # start it here, or on the Dell over the cluster
+jarvis lanmouse status|stop [--device dell]
+jarvis lanmouse fingerprint --device dell    # read by the Dell itself, over the cluster
+jarvis lanmouse pair --device dell --position right   # Dell sits right of this screen
 ```
+
+`pair` exchanges fingerprints and addresses over the cluster and has each laptop write
+its own config at its own OS's path (old file kept as `config.toml.bak-<time>`; port,
+release shortcut and `motion_scale` carry over). Each side must have run Lan Mouse once
+so it has a certificate. Neither command changes login autostart.
 
 Only the certificate block is hashed; the private key in `lan-mouse.pem` never
 leaves its laptop. The generated release binding is Left Ctrl + Left Shift +

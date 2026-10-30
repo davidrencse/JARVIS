@@ -1,4 +1,4 @@
-# JARVIS OS: architecture v2 (design, not built)
+# JARVIS OS: architecture v2 (design and built status)
 
 Status: revised 2026-10-26 after a design review (17 findings; see
 [Review traceability](#review-traceability)). Uncommitted work in progress; the suite is
@@ -406,7 +406,7 @@ count as `agent_claimed` until observed or confirmed.
 ### Transports
 
 ```
-                    ┌──────────── main PC (dell) ─────────────┐
+                    ┌──── main PC (config: cluster.main_device) ────┐
                     │ parser · registry · gates · decider      │
                     │ brain · history · vault · hub :7778      │
                     └───────┬─────────────────────────┬───────┘
@@ -705,7 +705,7 @@ Each slice works end to end before the next starts.
 | Volume on Windows | built, live-verified | set and read exactly through Core Audio (IAudioEndpointVolume); "mute" no longer toggles |
 | Idempotent play/pause on Windows | built | reads the media session first; never toggles blind |
 | `spotify_play` | routed to Grok Bot | direct deep link can't start Liked Songs (tested live) |
-| Zenbook as a cluster node | built, live-verified | tunnel `ssh -R 7780` (LAN, Tailscale fallback), node as a systemd user service; "open chrome on arch" observed in 1.8 s via the cluster; SSH fallback in 0.4 s when the node is stopped |
+| Zenbook as a cluster node | built, live-verified (2026-10-26, Dell as main, reverse tunnel; since then the Zenbook became main on a forward tunnel) | tunnel `ssh -R 7780` (LAN, Tailscale fallback), node as a systemd user service; "open chrome on arch" observed in 1.8 s via the cluster; SSH fallback in 0.4 s when the node is stopped |
 
 **Ports.** The cluster hub listens on `127.0.0.1:7780`. Port 7778 is the Grokbot tunnel's
 forward on the Zenbook (to the Dell's relay on 7779); the two must not share a port.
