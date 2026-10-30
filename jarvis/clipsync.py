@@ -650,13 +650,13 @@ def autostart(state, enable):
             path.unlink(missing_ok=True)
             systemctl("daemon-reload")
             return {"autostart": False}
+        from .autostart import systemd_unit
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "# JARVIS: unified clipboard. `jarvis clipboard autostart off` removes it.\n"
-            "[Unit]\nDescription=JARVIS unified clipboard\n"
-            "After=graphical-session.target\n\n"
-            f"[Service]\nExecStart={command} run\nRestart=on-failure\n\n"
-            "[Install]\nWantedBy=graphical-session.target\n", encoding="utf-8")
+        path.write_text(systemd_unit(
+            "JARVIS unified clipboard", [sys.executable, "-m", "jarvis", "--state", state, "clipboard", "run"],
+            comment="JARVIS: unified clipboard. `jarvis clipboard autostart off` removes it.",
+            after="graphical-session.target", wanted="graphical-session.target",
+            service=['Environment="PYTHONIOENCODING=utf-8"']), encoding="utf-8")
         return {"autostart": True, "unit": str(path),
                 "enabled": systemctl("daemon-reload") and systemctl("enable", UNIT_NAME)}
     if not enable:

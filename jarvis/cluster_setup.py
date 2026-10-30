@@ -26,22 +26,25 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
+from .fsio import atomic_write
+from .platforms import NO_WINDOW
 from .cluster import Client, save_json
 from .cluster_store import NODE_DEFAULT, Broker
 from .deploy import CODE_KEY, code_key
-from .topology import DEVICE_ID, enabled, identity
+from .topology import DEFAULT_PORT, DEVICE_ID, enabled, identity
 
 PREFIX = "jarvis-invite-1:"
-DEFAULT_PORT = 7780
 INVITE_TTL = 24 * 3600  # an invite nobody joins with stops working after a day
 MARK = "jarvis-node:"  # SSH key comment that marks the key JARVIS made for one node
 HOST_KEY = re.compile(r"(?:ssh-ed25519|ecdsa-sha2-nistp256|ssh-rsa) [A-Za-z0-9+/=]+")
 ADDRESS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]{0,252}")
-FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+FLAGS = NO_WINDOW
 
 
 def _os():
@@ -181,13 +184,53 @@ def addresses(config, main, extra=()):
     return out[:8]
 
 
+def _windows_admin():
+    """Is this account in Administrators, elevated or not? sshd logs in with the full token,
+    so a UAC-filtered admin still gets administrators_authorized_keys; IsUserAnAdmin()
+    only says whether this terminal is elevated. whoami lists the group either way."""
+    try:
+        out = subprocess.run(["whoami", "/groups", "/fo", "csv", "/nh"], capture_output=True,
+                             text=True, timeout=10, creationflags=FLAGS).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    if "S-1-5-32-544" in out:  # BUILTIN\Administrators
+        return True
+    import ctypes
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
 def _authorized_keys():
-    if _os() == "windows":
-        import ctypes
-        if ctypes.windll.shell32.IsUserAnAdmin():
-            # Windows OpenSSH reads only this file for members of Administrators.
-            return Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "ssh/administrators_authorized_keys"
+    if _os() == "windows" and _windows_admin():
+        # Windows OpenSSH reads only this file for members of Administrators.
+        return Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "ssh/administrators_authorized_keys"
     return Path.home() / ".ssh/authorized_keys"
+
+
+_KEYS_THREADS = threading.Lock()
+
+
+@contextmanager
+def _keys_locked(path):
+    """Hold authorized_keys for one read-modify-write. `cluster invite` (its own process) and
+    the hub's redeem (a server thread) both rewrite it; unlocked, one drops the other's line.
+    Blocking, unlike locking.exclusive_lock: the other writer finishes in milliseconds."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _KEYS_THREADS, open(path.with_name(f".{path.name}.jarvis-lock"), "a+b") as handle:
+        if _os() == "windows":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)  # retries for ~10 s, then OSError
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if _os() == "windows":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def restrictions(port):
@@ -204,20 +247,20 @@ def _key_lines(path):
         return []
 
 
-def authorized(node, path=None):
+def authorized(node, path=None, public_key=None):
+    """This node has a JARVIS key line (holding exactly `public_key`, when given)."""
     path = path or _authorized_keys()
-    return any(line.rstrip().endswith(" " + MARK + node) for line in _key_lines(path))
+    key = " ".join(str(public_key).split()[:2]) if public_key else ""
+    return any(line.rstrip().endswith(" " + MARK + node) and (not key or f" {key} " in line)
+               for line in _key_lines(path))
 
 
 def _write_keys(path, lines):
     path.parent.mkdir(parents=True, exist_ok=True)
     if _os() != "windows":
         path.parent.chmod(0o700)  # sshd's StrictModes ignores keys in a group-writable folder
-    temporary = path.with_name(f".{path.name}.jarvis-tmp")
-    temporary.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
-    if _os() != "windows":
-        temporary.chmod(0o600)
-    os.replace(temporary, path)
+    atomic_write(path, "".join(line + "\n" for line in lines), fsync=True,
+                 mode=None if _os() == "windows" else 0o600)
 
 
 def authorize(node, public_key, port, path=None):
@@ -226,18 +269,20 @@ def authorize(node, public_key, port, path=None):
     parts = public_key.split()
     if len(parts) < 2 or not HOST_KEY.fullmatch(" ".join(parts[:2])):
         raise ValueError("ssh-keygen made an unexpected public key.")
-    lines = [line for line in _key_lines(path) if not line.rstrip().endswith(" " + MARK + node)]
-    lines.append(f"{restrictions(port)} {parts[0]} {parts[1]} {MARK}{node}")
-    _write_keys(path, lines)
+    with _keys_locked(path):
+        lines = [line for line in _key_lines(path) if not line.rstrip().endswith(" " + MARK + node)]
+        lines.append(f"{restrictions(port)} {parts[0]} {parts[1]} {MARK}{node}")
+        _write_keys(path, lines)
     return str(path)
 
 
 def unauthorize(node, path=None):
     path = path or _authorized_keys()
-    lines = _key_lines(path)
-    keep = [line for line in lines if not line.rstrip().endswith(" " + MARK + node)]
-    if len(keep) != len(lines):
-        _write_keys(path, keep)
+    with _keys_locked(path):
+        lines = _key_lines(path)
+        keep = [line for line in lines if not line.rstrip().endswith(" " + MARK + node)]
+        if len(keep) != len(lines):
+            _write_keys(path, keep)
     return len(lines) - len(keep)
 
 
@@ -565,7 +610,8 @@ def doctor(config, path, state):
     _check(checks, "this PC's identity", True, f"{local} ({role}); main is {main}")
     forward = cluster_tunnel.mode(config) == "forward"
     if role == "main":
-        _doctor_main(config, state, main, forward, checks, code_fingerprint())
+        from .release import served_code  # nodes must match the tested release, not the live tree
+        _doctor_main(config, state, main, forward, checks, served_code(state))
     else:
         _doctor_node(config, state, local, main, forward, checks, code_fingerprint())
     return {"ok": all(c["ok"] for c in checks), "role": role, "checks": checks}

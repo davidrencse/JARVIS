@@ -23,6 +23,7 @@ import threading
 import time
 from pathlib import Path
 
+from .platforms import NO_WINDOW
 from .fastlane import SENTENCE_END, close_process, now_line, subscription_env
 
 # David's own Codex loads ~400 tools from plugins and connectors (gmail.delete_emails,
@@ -43,7 +44,10 @@ LEAN_FEATURES_OFF = (
 # runner.py (real coding work) keep Codex's full prompt; only app-server lanes use this.
 BASE_INSTRUCTIONS = Path(__file__).with_name("codex_base.md")
 LEAN_OVERRIDES = (
-    "features.view_image=false", "features.sleep_tool=false", "features.code_mode_host=false",
+    # Not features.code_mode_host=false: since Codex 0.16x the model reaches dynamic tools
+    # (list_apps, terminal...) through code mode's exec, so with the host off every tool call
+    # failed and the brain said "the tool connection is disabled" (2026-10-30).
+    "features.view_image=false", "features.sleep_tool=false",
     "features.guardian_approval=false", "include_permissions_instructions=false",
     "include_environment_context=false", "include_apps_instructions=false",
     "include_apps_usage_instructions=false", "include_plugin_usage_instructions=false",
@@ -169,6 +173,11 @@ def usage_limit(now=None):
 MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError, OSError)
 
 
+# Recall that describes this request, not the world: sent every turn even when repeated, or
+# a request from the Dell after one from the ASUS would read as coming from the ASUS.
+PER_REQUEST = ("This request originates on",)
+
+
 class ChatGPTLane:
     """Same interface as FastLane: warm(), ask(text, recall, on_sentence), close()."""
 
@@ -191,10 +200,14 @@ class ChatGPTLane:
         self.approve, self.context = approve, context
         # models.lean_prompt: false gives the lanes Codex's full coding-agent prompt back.
         lean = config.get("models", {}).get("lean_prompt", True)
-        self.overrides = (*(lean_prompt() if lean else ()), *overrides)
+        # Code mode's exec is how the model reaches dynamic tools (LEAN_OVERRIDES); a lane
+        # without tools (talk, the interpreter) has no use for it or its prompt text.
+        quiet = () if tools or mcp_servers or not lean else ("features.code_mode_host=false",)
+        self.overrides = (*(lean_prompt() if lean else ()), *quiet, *overrides)
         self.tool_log = []  # (tool, success, text) of the current turn
         self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
         self.proc = self.lines = self.thread = None
+        self.seen = set()  # recall and exchanges the current thread already holds (_fresh)
         self._reader = None
         self.mcp_status = {}
         self.turns, self.next_id, self.started = 0, 0, 0.0
@@ -209,7 +222,7 @@ class ChatGPTLane:
             self.command or lean_command(binary, self.mcp_servers, self.overrides), cwd=self.base, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
             errors="replace", bufsize=1, env=subscription_env(),
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            creationflags=NO_WINDOW)
         self.lines, self.thread, self.turns = queue.Queue(), None, 0
         self.mcp_status = {}
         self._reader = threading.Thread(target=self._pump, args=(self.proc, self.lines),
@@ -316,6 +329,7 @@ class ChatGPTLane:
                 params["dynamicTools"] = self.tools.specs()
             result = self._request("thread/start", params)
             self.thread, self.turns, self.started = result["thread"]["id"], 0, time.monotonic()
+            self.seen = set()
             # Tool servers (the browser) start alongside the thread; a turn sent before
             # they're ready has no browser tools, and the model says it can't browse.
             deadline = time.monotonic() + 45
@@ -354,6 +368,7 @@ class ChatGPTLane:
     def ask(self, text, recall=(), on_sentence=None):
         limited = usage_limit()
         if limited:  # don't spend ~2 s asking a plan that already said no
+            self.tool_log = []  # nothing ran this turn: never report the previous turn's tools
             raise RuntimeError(f"ChatGPT usage limit: {limited}")
         with self.lock:
             self.tool_log = []  # a stale log from an earlier turn must not block the retry
@@ -400,9 +415,26 @@ class ChatGPTLane:
             except Exception:  # reporting must never fail the turn
                 pass
 
+    def _fresh(self, recall):
+        """Recall minus what this thread already holds: notes sent on an earlier turn, and
+        recent-conversation lines that are its own exchanges. Re-sending them every turn was
+        a good part of a talk turn's ~9.7k input tokens."""
+        from .memory import CONVERSATION
+        fresh = []
+        for item in recall:
+            item = str(item)
+            if item.startswith(CONVERSATION):
+                lines = [ln for ln in item.split("\n  ")[1:] if ln not in self.seen]
+                if lines:
+                    fresh.append("\n  ".join([CONVERSATION, *lines]))
+            elif item not in self.seen or item.startswith(PER_REQUEST):
+                fresh.append(item)
+        return fresh
+
     def _ask(self, text, recall, on_sentence):
         self._ensure_thread()
-        notes = "\n".join(f"- {r}" for r in recall) or "- (none)"
+        recall = self._fresh(recall)
+        notes = "\n".join(f"- {r}" for r in recall) or "- (none new this conversation)"
         prompt = f"{now_line()}\nMemory recall:\n{notes}\n\nDavid: {text}"
         # Don't wait for the turn/start response before reading: deltas may arrive first.
         self.next_id += 1
@@ -456,6 +488,12 @@ class ChatGPTLane:
                 from .usage import record
                 record("chatgpt", self.model, spent)
                 self.last_usage = spent
+                from .memory import CONVERSATION, exchange_line
+                for item in recall:
+                    # Conversation lines one by one: the thread holds each line it was sent,
+                    # so only newer lines (another channel's latest turn) go next time.
+                    self.seen.update(item.split("\n  ")[1:] if item.startswith(CONVERSATION) else (item,))
+                self.seen.update((exchange_line("David", text), exchange_line("JARVIS", answer)))
                 return answer
 
 
@@ -468,6 +506,13 @@ class Brain:
 
     def __init__(self, chat, act, wants=None):
         self.chat, self.act, self.wants = chat, act, wants
+        self.last = chat  # the lane that answered the latest ask()
+
+    @property
+    def tool_log(self):
+        # assistant reads this after a failed turn to say what already ran; only the action
+        # lane has tools.
+        return getattr(self.last, "tool_log", [])
 
     @property
     def on_tool(self):
@@ -490,11 +535,22 @@ class Brain:
 
     def ask(self, text, recall=(), on_sentence=None):
         if self.pick(text) == "act":
+            self.last = self.act
             return self.act.ask(text, recall, on_sentence=on_sentence)
         # Talk has no tools; it answers HANDOFF when it sees an action the regexes missed.
-        speak = (lambda s: None if is_handoff(s) else on_sentence(s)) if on_sentence else None
-        reply = self.chat.ask(text, recall, on_sentence=speak)
-        if is_handoff(reply):
+        # It also sometimes says it can't check instead (despite TALK_HANDOFF): treat that as
+        # a handoff too, and stop speaking from the first such sentence on.
+        gave_up = []
+
+        def speak(sentence):
+            if gave_up or is_handoff(sentence) or is_refusal(sentence):
+                gave_up.append(sentence)
+            elif on_sentence:
+                on_sentence(sentence)
+        self.last = self.chat
+        reply = self.chat.ask(text, recall, on_sentence=speak if on_sentence else None)
+        if is_handoff(reply) or is_refusal(reply):
+            self.last = self.act
             return self.act.ask(text, recall, on_sentence=on_sentence)
         return reply
 
@@ -509,6 +565,12 @@ class Brain:
 
 
 HANDOFF = "[act]"
+# Overrides the vault and task instructions while vault.write is off.
+VAULT_READ_ONLY = ("Vault writes are OFF right now (Settings: Write to my vault). You can "
+                   "search and read the vault and list tasks, but you cannot log, capture, "
+                   "append, clip or add/change tasks, so never say you saved something there. "
+                   "For 'remember that...', save it with memory_remember and say it went to "
+                   "JARVIS's memory, not the vault.")
 # Only for a talk lane with an action lane behind it (Brain).
 TALK_HANDOFF = (" You have no tools in this conversation, but JARVIS can operate and inspect "
                 "all of David's computers (listed in your brief) and has a long-term memory: "
@@ -525,6 +587,28 @@ MEMORY_HANDOFF = (" You have no tools in this conversation, but JARVIS has a lon
 
 def is_handoff(text):
     return str(text or "").strip().rstrip(".!").strip().lower() == HANDOFF
+
+
+# The talk lane excusing itself instead of handing off: "I can't inspect your computers right
+# now", "I don't have access to your Dell", "the tool service is disabled". Only first-person
+# excuses about his machines count: "You can't see the aurora from London" and "I can't read
+# minds, but..." are answers. Only the tool-less talk lane is checked; the action lane's
+# answer stands.
+_MACHINE = (r"(?:computers?|laptops?|pcs?|dell|zenbook|asus|arch|desktop|screens?|files?|folders?|"
+            r"apps?|applications|programs|devices?|machines?|system|windows|terminal|browser)")
+REFUSAL = re.compile(
+    r"\bI(?:'m|’m|\s+am)?\s+(?:can(?:no|'|’)?t|cannot|unable\s+to|not\s+able\s+to)\s+"
+    r"(?:currently\s+|directly\s+)?"
+    r"(?:inspect|check|access|see|view|look\s+at|control|open|count|list|read|run)\b"
+    rf"[^.!?]{{0,40}}\b{_MACHINE}\b|"
+    r"\bI\s+(?:don(?:'|’)?t|do\s+not)\s+have\s+(?:access|the\s+ability|a\s+way|any\s+way|tools?)\b"
+    rf"[^.!?]{{0,40}}\b{_MACHINE}\b|"
+    r"\b(?:the|my)\s+tools?(?:\s+(?:connection|service|access))?\s+(?:is|are)\s+(?:currently\s+)?disabled\b",
+    re.I)
+
+
+def is_refusal(text):
+    return bool(REFUSAL.search(str(text or "")))
 
 
 VAULT_ONLY = ("You are JARVIS, David's personal assistant. Do what he asks with your "
@@ -594,7 +678,7 @@ class ConfirmGate:
                     "args": {"url": str(args.get("url", "")), **extra}}
         if name == "terminal":
             from .terminal import read_only
-            if read_only(args.get("command")):
+            if read_only(args.get("command"), args.get("cwd")):
                 return None
             extra = {"cwd": str(args["cwd"])} if args.get("cwd") else {}
             return {"intent": "terminal", "device": device,
@@ -649,7 +733,9 @@ def make_lane(config, base, state_dir=None):
     def context():
         # JARVIS.md (who it is, the machines, its rules), then the vault's world brief.
         world = vault.world() if vault else ""
-        return "\n\n".join(p for p in (self_brief(config, base), world) if p)
+        # Checked per thread: vault.write can be switched in the console while running.
+        locked = VAULT_READ_ONLY if vault is not None and not vault.writable else ""
+        return "\n\n".join(p for p in (self_brief(config, base), world, locked) if p)
 
     chat = ChatGPTLane(config, base, context=context,
                        instructions=INSTRUCTIONS + (TALK_HANDOFF if actions else MEMORY_HANDOFF))

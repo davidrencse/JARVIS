@@ -620,7 +620,7 @@ def cognition(args, config, base):
     memory = None if node else Memory(args.state, semantic=semantic_recall(config))
     if args.command == "route":
         from .assistant import decide
-        route = decide(args.text, config, conversational=True)
+        route = decide(args.text, config, conversational=True, state=args.state)
         if route["tier"] == "medium":
             from .router import grok_first
             route["adapter"] = ({"kind": "browser_agent", "name": "grokbot"}
@@ -795,7 +795,7 @@ def cognition(args, config, base):
                     print(f"{'ACCEPT' if ok else 'reject'}  similarity {score}", file=sys.stderr)
         elif args.action == "listen":
             from .daemon import listen_loop
-            listen_loop(args.state, config, base, args.threshold)
+            listen_loop(args.state, config, base, args.threshold, config_path=args.config)
         else:
             from . import daemon
             if args.action == "autostart":

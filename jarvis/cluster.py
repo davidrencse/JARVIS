@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import platform
+import secrets
 import select
 import socket
 import ssl
@@ -17,17 +18,21 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from .platforms import NO_WINDOW
 from . import __version__
 from .deploy import code_fingerprint
+from .release import served_code
+from .fsio import atomic_write
 from .cluster_store import BULK, Broker, CAPABILITIES, TERMINAL
-from .topology import endpoint, identity, is_node, request_from
+from .topology import DEFAULT_PORT, endpoint, identity, is_node, request_from
 
 _HUBS = {}
 MAX_PROTOCOL = 65536
 MAX_RESULT = 4_000_000
 POLL_WAIT = 25
+WAIT_HOLD = 20  # seconds a requester asks the hub to hold a job-result request
 FRESH = 10  # seconds after a check-in that a node counts as alive between polls
 # The console API a node (with "console") may reach on the main; the owner token, held only
 # by the main's own windows, reaches all of it. Left out on purpose: settings, files, screen,
@@ -67,17 +72,19 @@ def _connected(sock):
         return False
 
 
-def save_json(path, value):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}-{uuid.uuid4().hex}.tmp")
+def _systemd_service(name):
+    """True only when this process is the systemd unit `name` itself. INVOCATION_ID alone
+    is inherited by anything a unit starts (a terminal, a shell), and a node started by hand
+    from one would exit for systemd to restart, which then never happens."""
     try:
-        with temporary.open("x", encoding="utf-8") as stream:
-            temporary.chmod(0o600)
-            json.dump(value, stream, indent=2)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+        cgroup = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:  # not Linux, or no /proc
+        return False
+    return any(line.rstrip().endswith(f"/{name}.service") for line in cgroup.splitlines())
+
+
+def save_json(path, value):
+    atomic_write(path, json.dumps(value, indent=2), mode=0o600)
 
 
 def redeem_invite(config, state, client=None):
@@ -92,15 +99,35 @@ def redeem_invite(config, state, client=None):
     if not note.get("redeem"):
         return None
     from .cluster_setup import _private_file, keypair
-    private, public = keypair(note["node_id"])
+    # Save what we propose before asking: if the main's reply is lost, the main already
+    # holds these, and the invite is dead, so the retry must offer the same ones.
+    pending = note.get("pending")
+    if not isinstance(pending, dict) or not all(isinstance(pending.get(k), str) for k in
+                                                ("token", "private", "public")):
+        private, public = keypair(note["node_id"])
+        pending = note["pending"] = {"token": secrets.token_urlsafe(32), "private": private, "public": public}
+        save_json(path, note)
     client = client or Client(config, state)
-    answer = client.request("/v1/redeem", {"public_key": public}, timeout=15)
-    if not isinstance(answer.get("token"), str) or len(answer["token"]) < 20:
+    body = {"public_key": pending["public"], "token": pending["token"]}
+    try:
+        answer = client.request("/v1/redeem", body, timeout=15)
+    except HubRefused as exc:
+        if exc.status != 403:
+            raise
+        # The invite may be spent by our own earlier, unanswered attempt: try our proposal.
+        invite, client.token = client.token, pending["token"]
+        try:
+            answer = client.request("/v1/redeem", body, timeout=15)
+        except HubRefused:
+            client.token = invite
+            raise exc from None
+    if answer.get("token") != pending["token"]:
         raise ValueError("The main sent no credential.")
     if answer.get("key_rotated"):  # the tunnel's next connection uses it; this one stays up
         _private_file(Path((note.get("link") or {}).get("identity_file")
-                           or Path(state) / "cluster-node.key"), private)
+                           or Path(state) / "cluster-node.key"), pending["private"])
     note.pop("redeem", None)
+    note.pop("pending", None)
     note["token"] = client.token = answer["token"]
     client.invite = False
     save_json(path, note)
@@ -206,8 +233,14 @@ class Client:
 
     def wait(self, job_id, timeout):
         deadline = time.monotonic() + timeout
+        fast = 0
         while True:
-            result = self.request("/v1/jobs/" + job_id, timeout=min(15, max(1, deadline - time.monotonic())))
+            # The hub holds this request up to WAIT_HOLD s for the result; an older hub ignores
+            # ?wait and answers at once, which the pause below turns into gentle polling.
+            left = max(1, deadline - time.monotonic())
+            hold = min(WAIT_HOLD, int(left))
+            began = time.monotonic()
+            result = self.request(f"/v1/jobs/{job_id}?wait={hold}", timeout=min(hold + 15, left + 15))
             if result["state"] in TERMINAL:
                 if result["state"] == "done":
                     return result["result"]
@@ -215,7 +248,13 @@ class Client:
                 raise RuntimeError(error or f"Request {job_id} is {result['state']}; do not automatically retry it.")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Request {job_id} has no confirmed result. It may have run; do not automatically retry.")
-            time.sleep(0.15)
+            # Answered at once (old hub, or a hub that cut the hold short): back off, 0.15 s
+            # growing to 2 s, instead of hammering it.
+            if time.monotonic() - began < 0.5:
+                fast = min(fast * 2, 2.0) if fast else 0.15
+                time.sleep(min(fast, max(0, deadline - time.monotonic())))
+            else:
+                fast = 0
 
     def ask(self, text, tier=None, write=False, timeout=600, request_id=None):
         started = self.request("/v1/ask", {"text": text, "tier": tier, "write": write,
@@ -291,19 +330,28 @@ class Hub:
         self.server = self.thread = self.worker = self._lock = None
         self.started = False
 
-    def redeem(self, node, public_key=None):
+    def redeem(self, node, public_key=None, token=None):
         """A newly joined node trades its invite for its own credential: a fresh hub token
         and, when this PC lets JARVIS write authorized_keys, its own SSH key in place of
-        the invite's. Either way the invite code is dead afterwards."""
-        token = self.broker.redeem(node)
+        the invite's. Either way the invite code is dead afterwards. Repeating it with the
+        same proposed token (the node lost our reply) gives the same answer but authorizes
+        nothing: only the first redeem's key is ever written, so a node's own token can't
+        swap in a new SSH key later."""
+        token, first = self.broker.redeem(node, token)
         rotated = False
-        if public_key:
+        if public_key and first:
             from .cluster_setup import DEFAULT_PORT, authorize
             port = int((self.config.get("cluster") or {}).get("listen_port") or DEFAULT_PORT)
             try:
                 authorize(node, str(public_key), port)
                 rotated = True
             except (OSError, ValueError):  # e.g. Windows admin keys need an elevated shell
+                pass
+        elif public_key:  # a retry: report whether the first redeem wrote this very key
+            from .cluster_setup import authorized
+            try:
+                rotated = authorized(node, public_key=str(public_key))
+            except OSError:
                 pass
         return {"token": token, "key_rotated": rotated}
 
@@ -319,18 +367,41 @@ class Hub:
             raise PermissionError("Node credential is missing, revoked, or lacks this capability.")
         return found
 
+    def _keep_up(self, settle=20, every=30):
+        """After start and then every `every` s: cut a tested release once the main's code
+        has changed and settled (release.py), then bring SSH nodes up to it. Nodes only ever
+        get code the test suite passed on, never a file saved mid-edit."""
+        from . import _under_tests
+        from .release import cut, due
+        if self.stop_event.wait(settle):  # let nodes reconnect and report their code
+            return
+        auto = (self.config.get("cluster") or {}).get("auto_release", True)
+        while True:
+            # Never under tests: a release runs the whole suite.
+            if auto and not _under_tests() and due(self.state):
+                report = cut(self.state)
+                print(f"JARVIS: release {report.get('code')}: "
+                      f"{'released' if report.get('released') else report.get('note')}", flush=True)
+            self._auto_update(settle=0)
+            if self.stop_event.wait(every):
+                return
+
     def _auto_update(self, settle=20):
-        """Once after start: bring every online node that runs other code up to this main's
-        code (jarvis cluster update), so nodes follow the main without git or a manual step.
+        """Bring every online node that runs other code up to the release (jarvis cluster
+        update), so nodes follow the main without git or a manual step. Each release is
+        pushed to a node once: one that rolled back stays on its code until the next release.
         Failures are logged; actions to that node stay refused until it matches. Nodes
         without SSH (forward tunnel) pull the code themselves, so they are skipped here."""
         if self.stop_event.wait(settle):  # let nodes reconnect and report their code
             return
         from .deploy import is_ssh_node, update
+        want = served_code(self.state)
+        pushed = self.__dict__.setdefault("_pushed", {})
         for status in self.broker.nodes():
-            if (not status["online"] or status.get("code") == code_fingerprint()
-                    or not is_ssh_node(self.config, status["id"])):
+            if (not status["online"] or status.get("code") == want
+                    or not is_ssh_node(self.config, status["id"]) or pushed.get(status["id"]) == want):
                 continue
+            pushed[status["id"]] = want
             try:
                 report = update(self.config, self.state, status["id"])
                 print(f"JARVIS: updated {status['id']} to {report.get('after')}", flush=True)
@@ -379,10 +450,10 @@ class Hub:
             raise ValueError(f"Node {node} is not enrolled for {kind} actions.")
         if not self.alive(node, status) and not self._await_poll(node, status):
             raise NodeOffline(f"Node {node} is offline. Start jarvis cluster node on that PC.")
-        if not _read_only(kind, payload) and status.get("code") != code_fingerprint():
+        if not _read_only(kind, payload) and status.get("code") != served_code(self.state):
             # Mismatched code can misread a newer job; refuse rather than guess.
             raise ValueError(f"{node} runs different JARVIS code ({status.get('code') or 'unknown'}, "
-                             f"main {code_fingerprint()}). Run: jarvis cluster update {node}")
+                             f"main {served_code(self.state)}). Run: jarvis cluster update {node}")
         with self._condition:
             job_id = self.broker.enqueue(node, self.main, kind, payload, timeout)
             self._condition.notify_all()
@@ -455,7 +526,7 @@ class Hub:
         from .locking import exclusive_lock
         settings = self.config.get("cluster", {})
         host = host or settings.get("listen_host", "127.0.0.1")
-        port = int(settings.get("listen_port", 7778) if port is None else port)
+        port = int(settings.get("listen_port", DEFAULT_PORT) if port is None else port)
         cert, key = settings.get("tls_cert"), settings.get("tls_key")
         if host not in ("127.0.0.1", "localhost", "::1") and not (cert and key):
             raise ValueError("A network-facing main endpoint requires cluster.tls_cert and tls_key; or use SSH forwarding.")
@@ -482,7 +553,7 @@ class Hub:
             self.worker.start()
             self.started = True
             if settings.get("auto_update", True):
-                threading.Thread(target=self._auto_update, name="jarvis-auto-update",
+                threading.Thread(target=self._keep_up, name="jarvis-auto-update",
                                  daemon=True).start()
         except BaseException:
             if self.server:
@@ -540,14 +611,28 @@ def make_server(hub, host, port):
                         return Handler.do_POST(self) if post else Handler.do_GET(self)
                 node, caps = hub.authenticate(self.headers)
                 if self.path == "/v1/status" and not post:
-                    return self._send(200, {"main_device": hub.main, "code": code_fingerprint(),
+                    return self._send(200, {"main_device": hub.main, "code": served_code(hub.state),
                                             "nodes": hub.broker.nodes()})
                 if self.path == "/v1/code" and not post and "owner" not in caps:
                     from .deploy import code_bundle  # nodes pull the main's code over their own channel
                     return self._send(200, code_bundle(hub.state))
                 if self.path.startswith("/v1/jobs/") and not post:
-                    return self._send(200, hub.broker.get(self.path.rsplit("/", 1)[-1],
-                                                         None if "owner" in caps else node))
+                    # ?wait=N holds the request until the job is terminal or N seconds pass
+                    # (<= POLL_WAIT), so a requester needn't poll; no wait answers at once.
+                    url = urlparse(self.path)
+                    try:
+                        hold = min(POLL_WAIT, max(0, float(parse_qs(url.query).get("wait", ["0"])[0])))
+                    except ValueError:
+                        hold = 0
+                    who = None if "owner" in caps else node
+                    until = time.monotonic() + hold
+                    while True:
+                        job = hub.broker.get(url.path.rsplit("/", 1)[-1], who)
+                        remaining = until - time.monotonic()
+                        if job["state"] in TERMINAL or remaining <= 0 or hub.stop_event.is_set():
+                            return self._send(200, job)
+                        with hub._condition:  # woken by results; the slice catches lazy expiry
+                            hub._condition.wait(min(1, remaining))
                 if not post:
                     return self._send(404, {"error": "Unknown cluster endpoint."})
                 length = int(self.headers.get("Content-Length", "0"))
@@ -560,7 +645,7 @@ def make_server(hub, host, port):
                 if not isinstance(data, dict):
                     raise ValueError("Cluster body must be an object.")
                 if self.path == "/v1/redeem" and "owner" not in caps:
-                    return self._send(200, hub.redeem(node, data.get("public_key")))
+                    return self._send(200, hub.redeem(node, data.get("public_key"), data.get("token")))
                 if self.path == "/v1/poll" and "owner" not in caps:
                     hub.broker.heartbeat(node, data)
                     kinds = caps & {"desktop", "inventory", "grokbot"}
@@ -580,7 +665,7 @@ def make_server(hub, host, port):
                         finally:
                             hub._polling[node].discard(self.connection)
                     return self._send(200, {"job": job, "main_device": hub.main,
-                                             "code": code_fingerprint()})
+                                             "code": served_code(hub.state)})
                 if self.path == "/v1/result" and "owner" not in caps:
                     with hub._condition:
                         hub.broker.finish(data.get("id"), node, data.get("result"), bool(data.get("failed")))
@@ -593,8 +678,11 @@ def make_server(hub, host, port):
                         # (jarvis send / clipboard sync), but nothing else.
                         (self.path == "/v1/control" and "files" in caps and
                          data.get("kind") == "transfer" and data.get("node") == hub.main)):
+                    timeout = data.get("timeout", 45)
+                    if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 1800:
+                        raise ValueError("Action timeout must be 1-1800 seconds.")
                     return self._send(200, hub.dispatch(data.get("node"), data.get("kind"),
-                                        data.get("payload"), timeout=45))
+                                        data.get("payload"), timeout=timeout))
                 if self.path == "/v1/ask" and "ask" in caps:
                     text, tier = data.get("text"), data.get("tier")
                     if not isinstance(text, str) or not text.strip() or len(text) > 20000:
@@ -634,7 +722,8 @@ def dispatch(config, state, node, kind, payload, timeout=45):
     if hub:
         return hub.dispatch(node, kind, payload, timeout)
     return Client(config, state, owner=True).request("/v1/action",
-               {"node": node, "kind": kind, "payload": payload}, timeout=timeout + 5)
+               {"node": node, "kind": kind, "payload": payload, "timeout": timeout},
+               timeout=timeout + 5)
 
 
 class ProxyLane:
@@ -660,6 +749,9 @@ class NodeWorker:
         self.outbox = self.state / "cluster-outbox.json"
         self.thread = None
         self.restarting = False  # set once new code is installed; run() then re-execs
+        # The code this process loaded. Files changed since (an unrestarted update) must
+        # not make the node claim code it isn't running.
+        self.code = code_fingerprint()
         # Link health for `cluster doctor`: polls that reached the main or didn't, and
         # results that needed resending from the outbox.
         self.stats = {"started": time.time(), "polls_ok": 0, "polls_failed": 0,
@@ -686,8 +778,12 @@ class NodeWorker:
 
     def _pull_update(self, want):
         """The main runs other code: fetch, verify and install it, then restart. Tried once
-        per target fingerprint per 10 minutes so a bad package can't loop the node."""
+        per target fingerprint per 10 minutes so a bad package can't loop the node, and never
+        again once that code failed to start here and was rolled back (release.guard)."""
         from .deploy import apply_bundle
+        from .release import backup, is_bad
+        if is_bad(self.state, want):
+            return False
         mark = self.state / "cluster-update.json"
         try:
             last = json.loads(mark.read_text(encoding="utf-8"))
@@ -701,7 +797,9 @@ class NodeWorker:
         except (OSError, ValueError):
             key = None
         bundle = self.client.request("/v1/code", timeout=60)
+        backup(self.state)  # what the watchdog restores if the new code won't start
         count = apply_bundle(bundle, key)
+        self.installed = bundle.get("code")
         print(f"JARVIS node: installed main's code {bundle.get('code')} ({count} files); restarting.", flush=True)
         return True
 
@@ -716,15 +814,19 @@ class NodeWorker:
         try:
             response = self.client.request("/v1/poll", {"hostname": platform.node(),
                                 "platform": platform.system(), "version": __version__,
-                                "code": code_fingerprint()},
+                                "code": self.code},
                                 timeout=POLL_WAIT + 10)
         except (OSError, ValueError, RuntimeError) as exc:
             self._record(polls_failed=1, last_error=f"{time.strftime('%H:%M:%S')} {exc}"[:300])
             raise
         self._record(polls_ok=1, last_ok=time.time())
+        if not getattr(self, "_confirmed", False):
+            from .release import confirm
+            confirm(self.state, self.code)  # this code starts and reaches the main: keep it
+            self._confirmed = True
         received = time.monotonic()
         want = response.get("code")
-        if want and want != code_fingerprint():
+        if want and want != self.code:
             job = response.get("job")
             if job:
                 # This poll also claimed a job, built for code we're about to replace. Say
@@ -740,6 +842,10 @@ class NodeWorker:
                     return False
             except (OSError, ValueError, RuntimeError) as exc:
                 print(f"JARVIS node: code update failed: {exc}", flush=True)
+            if job:
+                # Already reported "not run": running it now would contradict that.
+                self._record(results_sent=1)
+                return True
         job = response.get("job")
         if not job:
             return False
@@ -793,15 +899,27 @@ class NodeWorker:
         its ports first."""
         import subprocess
         import sys
+        from .release import guard
+        want = getattr(self, "installed", None)
+        if _systemd_service("jarvis-cluster"):
+            # Under systemd (Restart=on-failure) a clean exit stops the unit and kills the
+            # detached child with its cgroup. Exit non-zero and let systemd start us again;
+            # the watchdog runs as its own unit and rolls back if the new code never checks in.
+            if want:
+                guard(self.state, want, systemd=True)
+            os._exit(75)
         # Under `python -m jarvis`, argv[0] is jarvis/__main__.py; run as a plain script its
         # relative imports fail, so a self-update would leave the node dead. Restart as -m.
         if Path(sys.argv[0]).name == "__main__.py" and Path(sys.argv[0]).parent.name == "jarvis":
             argv = [sys.executable, "-m", "jarvis", *sys.argv[1:]]
         else:
             argv = [sys.executable, *sys.argv]
+        if want:  # starts the new code itself, and the old again if the new never checks in
+            guard(self.state, want, argv=argv)
+            os._exit(0)
         wrapper = "import subprocess,sys,time; time.sleep(2); sys.exit(subprocess.call(sys.argv[1:]))"
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                 | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                 | NO_WINDOW)
         subprocess.Popen([sys.executable, "-c", wrapper, *argv], close_fds=True,
                          **({"creationflags": flags} if os.name == "nt" else {"start_new_session": True}))
         os._exit(0)

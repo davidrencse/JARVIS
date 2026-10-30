@@ -8,7 +8,7 @@ from pathlib import Path
 from .cluster import Client, NodeWorker, save_json
 from .cluster_store import CAPABILITIES, NODE_DEFAULT, Broker
 from .deploy import code_key
-from .topology import DEVICE_ID, enabled, endpoint, identity
+from .topology import DEFAULT_PORT, DEVICE_ID, enabled, endpoint, identity
 
 
 def parser(sub):
@@ -18,7 +18,7 @@ def parser(sub):
                     "says what is wrong and how to fix it.")
     command.add_argument("action", choices=("init", "invite", "join", "leave", "doctor",
                                            "configure", "enroll", "revoke", "caps", "status",
-                                           "run", "serve", "node", "request", "autostart", "tunnel", "update", "main", "roles"))
+                                           "run", "serve", "node", "request", "autostart", "tunnel", "update", "release", "main", "roles"))
     command.add_argument("value", nargs="?", help="node ID, invite code or file, request ID, or on/off")
     command.add_argument("--id", dest="device_id", help="init: this PC's device ID (default: from its hostname)")
     command.add_argument("--address", action="append", default=[],
@@ -78,7 +78,7 @@ def run(args, config, base):
         settings.update(enabled=True,
                         main_device=args.main_device or settings.get("main_device"),
                         local_device=args.local_device or settings.get("local_device", "auto"),
-                        main_url=args.url or settings.get("main_url", "http://127.0.0.1:7778"))
+                        main_url=args.url or settings.get("main_url", f"http://127.0.0.1:{DEFAULT_PORT}"))
         proposed = {**config, "cluster": settings}
         # auto can be used in a shared checkout, but explicit IDs are recommended for nodes.
         local, main = identity(proposed)
@@ -140,6 +140,13 @@ def run(args, config, base):
     if not enabled(config):
         raise ValueError("Configure the main PC first: jarvis cluster configure --main DEVICE --local DEVICE")
     local, main = identity(config)
+    if action == "release":
+        # Nodes get only code the test suite passed on (release.py); this cuts one now
+        # instead of waiting for the hub to notice the tree has settled.
+        if local != main:
+            raise ValueError("Run jarvis cluster release on the main PC.")
+        from .release import cut
+        return cut(state, quiet=0)
     if action == "update":
         from .deploy import update
         nodes = [args.value] if args.value else [n["id"] for n in Broker(state).nodes()]
@@ -222,9 +229,12 @@ def run(args, config, base):
         return Client(config, state, owner=local == main).request("/v1/jobs/" + args.value)
     if action == "status":
         from .deploy import code_fingerprint
+        from .release import current
         result = {"role": "main" if local == main else "node", "local_device": local,
                   "code": code_fingerprint(),
                   "main_device": main, "main_url": endpoint(config)}
+        if local == main:  # what nodes get: the last tested snapshot
+            result["release"] = current(state) or None
         try:
             result.update(Client(config, state, owner=local == main).request("/v1/status", timeout=3))
             result["connected"] = True

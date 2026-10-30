@@ -26,6 +26,8 @@ import threading
 import time
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 PACKAGE = "agent-browser"
 VERSION = "0.39.1"  # pinned with actions.AGENT_BROWSER
 SESSION = "jarvis"
@@ -36,7 +38,7 @@ SCROLL_EVERY = 10.0
 SCROLL_MAX = 30 * 60
 SCROLL_MISSES = 3
 FRAME_QUALITY = 55          # JPEG quality of live-view frames
-FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+FLAGS = NO_WINDOW
 _SCROLLER = {"stop": None}
 _SCROLLER_LOCK = threading.Lock()
 _FRAME_LOCK = threading.Lock()

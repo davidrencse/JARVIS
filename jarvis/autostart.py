@@ -43,6 +43,26 @@ def interpreter(argv):
     return argv
 
 
+def _word(arg):
+    """One ExecStart word: quoted only when it has to be; % is systemd's specifier sign."""
+    arg = str(arg).replace("%", "%%")
+    return json.dumps(arg) if not arg or any(c in arg for c in ' \t"\'\\;$') else arg
+
+
+def systemd_unit(title, argv, comment=None, after="graphical-session.target network-online.target",
+                 wanted="default.target", service=()):
+    """The text of a systemd user unit that runs argv from ROOT, restarting it on failure but
+    giving up after 5 crashes in 5 minutes. service: extra [Service] lines (Environment=...)."""
+    lines = [f"# {comment}"] if comment else []
+    lines += ["[Unit]", f"Description={title}", f"After={after}",
+              "StartLimitIntervalSec=300", "StartLimitBurst=5", "",
+              "[Service]", "Type=simple", f"WorkingDirectory={str(ROOT).replace('%', '%%')}",
+              f"ExecStart={' '.join(_word(arg) for arg in interpreter(argv))}",
+              "Restart=on-failure", "RestartSec=5", *service, "",
+              "[Install]", f"WantedBy={wanted}", ""]
+    return "\n".join(lines)
+
+
 def system():
     if os.name == "nt":
         return "windows"
@@ -92,10 +112,7 @@ def install(name, title, argv, enable=True):
     else:
         if enable:
             target.parent.mkdir(parents=True, exist_ok=True)
-            command = " ".join(json.dumps(arg).replace("%", "%%") for arg in argv)
-            target.write_text(f"[Unit]\nDescription={title}\nAfter=graphical-session.target network-online.target\n"
-                              f"[Service]\nWorkingDirectory={str(ROOT).replace('%', '%%')}\nExecStart={command}\nRestart=on-failure\nRestartSec=5\n"
-                              "[Install]\nWantedBy=default.target\n", encoding="utf-8")
+            target.write_text(systemd_unit(title, argv), encoding="utf-8")
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
         subprocess.run(["systemctl", "--user", "enable" if enable else "disable", "--now", target.name],
                        check=True, timeout=15)

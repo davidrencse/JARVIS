@@ -1,10 +1,12 @@
 """One entry point for text and voice: route the request, do the work, remember it."""
 
 import re
+import threading
 
 from .adapters import call_api
 from .instant import answer as instant_answer
 from .knowledge import recall as kb_recall
+from .memory import CONVERSATION
 from .orchestrator import Orchestrator
 from .router import classify, grok_first, pick_adapter
 from .runner import run_task
@@ -28,9 +30,12 @@ CONVERSATIONAL = ("Reply as JARVIS to the owner, David. Lead with the answer in 
                   "for. Put code or long output after the spoken part.")
 
 
-def decide(text, config, tier=None, conversational=False, write=False):
-    """The tier a request will run on. Shared by ask() and the console's preview."""
-    if tier is None and not write and grok_first(text, config) and not instant_answer(text):
+def decide(text, config, tier=None, conversational=False, write=False, state=None):
+    """The tier a request will run on. Shared by ask() and the console's preview.
+    state: the state folder, so a question the vault answers at once ("what's on my
+    calendar today") stays instant instead of going to Grok for sounding like an account."""
+    if tier is None and not write and grok_first(text, config) and not instant_answer(text) \
+            and not (state is not None and vault_answer(text, config, state)):
         return {"tier": "medium", "reasons": ["Grok Bot orchestrates account and web work"]}
     if (tier is None and conversational and not write
             and not config.get("routing", {}).get("auto_escalate")):
@@ -102,7 +107,11 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
         if fast is not None:
             _shadow(config, memory, text, "act")
             return fast
-    agent = tier is None and not write and _needs_agent(text, config)
+    # The clock or the vault answers it with no model: never hand it to Grok or the
+    # interpreter for sounding like web or account work ("what's on my calendar today").
+    quick = (instant_answer(text) or vault_answer(text, config, memory.path.parent)
+             if tier in (None, "simple") and not write else None)
+    agent = tier is None and not write and not quick and _needs_agent(text, config)
     build = False
     if agent and routing.get("interpreter"):
         # The parser saw an action it couldn't resolve: ask the interpreter before Grok.
@@ -115,11 +124,13 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
             agent = False                                # just a question: the brain
         elif read == "build":
             agent, build = False, True
-    route = ({"tier": "medium", "reasons": ["an action the parser can't run: Grok Bot"]}
+    route = ({"tier": "simple", "reasons": ["instant: the clock or the vault"]}
+             if quick else
+             {"tier": "medium", "reasons": ["an action the parser can't run: Grok Bot"]}
              if agent else {"tier": "complex", "reasons": ["interpreter: software work"]}
              if build else decide(text, config, tier, lane is not None, write))
     if tier is None and not write:
-        _shadow(config, memory, text, "agent" if agent or grok_first(text, config) else
+        _shadow(config, memory, text, "agent" if agent or (not quick and grok_first(text, config)) else
                 "build" if route["tier"] == "complex" else "converse")
     inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
                          meta={"route": route, "channel": channel,
@@ -127,25 +138,33 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
     if on_start:
         on_start({"route": route, "message": inbound["id"]})
     step = _stepper(on_step)
-    # Vault notes first (what David knows and decided), then wiki claims with their
-    # sources and dates, then the heap (what was said).
-    notes = vault_recall(config, memory.path.parent, text)
-    claims = kb_recall(config, memory.path.parent, text)
-    heap = memory.context(text)
-    recall = notes + claims + heap
-    talk = memory.conversation(skip={inbound["id"]}) if hasattr(memory, "conversation") else []
-    if talk:  # earlier turns, so "go check" knows what it refers to
-        recall.insert(0, "Recent conversation, oldest first (any channel):\n  " + "\n  ".join(talk))
-    from .topology import ORIGIN, enabled, identity
-    if enabled(config) and ORIGIN.get():
-        recall.insert(0, f"This request originates on {ORIGIN.get()}. The JARVIS main PC is {identity(config)[1]}. "
-                         "Here/this PC means the requesting node. Use an explicit device ID for another PC.")
-    step("recall", "root", "Recall", f"{len(notes)} vault · {len(claims)} wiki · {len(heap)} heap")
+    built = []
+
+    def recalled():
+        # Built on first use: the clock, the vault's agenda and Grok Bot never read it, and
+        # the vault, wiki, heap and embedding lookups cost more than those answers do.
+        if built:
+            return built[0]
+        # Vault notes first (what David knows and decided), then wiki claims with their
+        # sources and dates, then the heap (what was said).
+        notes = vault_recall(config, memory.path.parent, text)
+        claims = kb_recall(config, memory.path.parent, text)
+        heap = memory.context(text)
+        recall = notes + claims + heap
+        talk = memory.conversation(skip={inbound["id"]}) if hasattr(memory, "conversation") else []
+        if talk:  # earlier turns, so "go check" knows what it refers to
+            recall.insert(0, CONVERSATION + "\n  " + "\n  ".join(talk))
+        from .topology import ORIGIN, enabled, identity
+        if enabled(config) and ORIGIN.get():
+            recall.insert(0, f"This request originates on {ORIGIN.get()}. The JARVIS main PC is {identity(config)[1]}. "
+                             "Here/this PC means the requesting node. Use an explicit device ID for another PC.")
+        step("recall", "root", "Recall", f"{len(notes)} vault · {len(claims)} wiki · {len(heap)} heap")
+        built.append(recall)
+        return recall
     step("route", "root", f"Route · {route['tier']}", "; ".join(route["reasons"]))
     reply, detail = None, {}
 
-    if route["tier"] == "simple" and not write and (
-            quick := instant_answer(text) or vault_answer(text, config, memory.path.parent)):
+    if route["tier"] == "simple" and quick:
         reply = quick  # the clock or the vault: no model
         detail = {"lane": "instant", "streamed": on_sentence is not None}
         step("instant", "route", "Instant", "clock or vault, no model")
@@ -156,12 +175,13 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
         if lane is not None and not write:
             step("brain", "route", lane_label(lane, text), "thinking", "run")
             try:
-                reply = _with_tools(lane, step, lambda: lane.ask(text, recall,
+                reply = _with_tools(lane, step, lambda: lane.ask(text, recalled(),
                                                                 on_sentence=on_sentence))
                 detail = {"lane": type(lane).__name__, "streamed": on_sentence is not None,
                           "brain": "chatgpt" if "ChatGPT" in lane_label(lane, text) else
                           type(lane).__name__.lower()}
                 step("brain", "route", lane_label(lane, text), "answered")
+                _standin_done()
             except (RuntimeError, LookupError, TypeError, ValueError, OSError) as exc:
                 # fall back to a normal one-shot run below, unless tools already ran:
                 # then part of the request happened, and the reply must say so
@@ -171,8 +191,12 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                 if ran:
                     reply = _partial_reply(ran)
                     detail.update(state="partial", tools=[[str(t[0]), bool(t[1])] for t in ran])
+                elif "usage limit" in str(exc).lower() and \
+                        routing.get("simple_provider", "claude") == "claude":
+                    reply = _standin_reply(text, recalled(), config, base, timeout,
+                                           on_sentence, step, detail)
         if reply is None:
-            spec = {"objective": text, "context": CONVERSATIONAL, "evidence": recall,
+            spec = {"objective": text, "context": CONVERSATIONAL, "evidence": recalled(),
                     "provider": routing.get("simple_provider", "claude"),
                     "power": routing.get("simple_power", "low"),
                     "role": "implementer" if write else "assistant",
@@ -181,7 +205,7 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
             step("task", "route", label, spec["mode"], "run")
             result = _run_waiting(store, spec, config, base, timeout)
             if result is None:  # every ledger lane stayed busy: answer in-process instead
-                reply, ok = _direct_reply(spec["provider"], text, recall, config, base,
+                reply, ok = _direct_reply(spec["provider"], text, recalled(), config, base,
                                           timeout, detail)
                 detail.update(state="finished" if ok else "failed", brain=spec["provider"])
                 step("task", "route", label, "ledger busy; answered directly" if ok else
@@ -201,7 +225,7 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
         label = f"{adapter.get('name')} · {adapter['kind'].replace('_', ' ')}"
         step("adapter", "route", label, "", "run")
         if adapter["kind"] == "api":
-            reply = call_api(adapter, text, recall)["answer"]
+            reply = call_api(adapter, text, recalled())["answer"]
             step("adapter", "route", label, "answered")
         elif adapter["kind"] == "browser_agent" and adapter["name"] == "grokbot" and \
                 adapter.get("integration") == "window_automation":
@@ -257,7 +281,7 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                                "see docs/architecture.md (medium tier).")
         else:
             spec = {"objective": text, "context": CONVERSATIONAL + " Use web search/fetch for "
-                    "public pages; you cannot log in to accounts.", "evidence": recall,
+                    "public pages; you cannot log in to accounts.", "evidence": recalled(),
                     "provider": "claude", "power": routing.get("web_power", "mid"),
                     "role": "assistant", "mode": "read-only"}
             result = run_task(store, store.add(spec)["id"], config, base, timeout)
@@ -327,6 +351,35 @@ def _run_waiting(store, spec, config, base, timeout, wait=None):
 def _fastlane(config, base, timeout):
     from .fastlane import FastLane
     return FastLane(config, base, timeout=min(timeout, 90))
+
+
+# While ChatGPT is over its plan's usage limit (hours, sometimes days), every request used to
+# fall back to a fresh `claude --print` run: ~4 s of cold start each. One warm Claude lane
+# stands in instead, and is closed again as soon as ChatGPT answers.
+_STANDIN = {"lane": None, "lock": __import__("threading").Lock()}
+
+
+def _standin_reply(text, recall, config, base, timeout, on_sentence, step, detail):
+    """The warm Claude lane's answer, or None to fall back to a ledger run."""
+    with _STANDIN["lock"]:
+        lane = _STANDIN["lane"] = _STANDIN["lane"] or _fastlane(config, base, timeout)
+    step("standin", "route", "Claude fast lane", "ChatGPT is over its usage limit", "run")
+    try:
+        reply = lane.ask(text, recall, on_sentence=on_sentence)
+    except (RuntimeError, LookupError, TypeError, ValueError, OSError) as exc:
+        detail["lane_error"] = f"{detail.get('lane_error', '')} {exc}".strip()
+        step("standin", "route", "Claude fast lane", str(exc), "fail")
+        return None
+    detail.update(lane="FastLane", brain="claude", streamed=on_sentence is not None)
+    step("standin", "route", "Claude fast lane", "answered")
+    return reply
+
+
+def _standin_done():
+    with _STANDIN["lock"]:
+        lane, _STANDIN["lane"] = _STANDIN["lane"], None
+    if lane is not None:
+        lane.close()
 
 
 def _direct_reply(provider, text, recall, config, base, timeout, detail):
@@ -607,8 +660,20 @@ def _stepper(on_step):
     return step
 
 
+_TOOL_STEPS = threading.local()
+
+
+def _report_tool(key, name, ok, text):
+    handler = getattr(_TOOL_STEPS, "handler", None)
+    if handler:
+        handler(key, name, ok, text)
+
+
 def _with_tools(lane, step, call):
-    """Run call() with the lane's tool calls reported as children of the brain node."""
+    """Run call() with the lane's tool calls reported as children of the brain node.
+    Lanes report tools on the asking thread, so the tree is picked per thread: the console
+    runs requests side by side on one lane, and a callback set on the lane itself sent one
+    request's tools into the other's tree (and the first to finish switched both off)."""
     if not hasattr(lane, "on_tool"):
         return call()
     names = {}
@@ -617,11 +682,12 @@ def _with_tools(lane, step, call):
         node = names.setdefault(key, f"tool:{len(names) + 1}")
         step(node, "brain", name or "tool", text, "run" if ok is None else "done" if ok else "fail")
 
-    lane.on_tool = on_tool
+    lane.on_tool = _report_tool  # the same for every request, so setting it again is harmless
+    previous, _TOOL_STEPS.handler = getattr(_TOOL_STEPS, "handler", None), on_tool
     try:
         return call()
     finally:
-        lane.on_tool = None
+        _TOOL_STEPS.handler = previous
 
 
 WAKE_WORDS = ("jarvis", "jervis", "jarvas", "javis", "jarvus", "jarviss", "jarves")

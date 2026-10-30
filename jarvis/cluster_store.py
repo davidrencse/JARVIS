@@ -18,8 +18,9 @@ CAPABILITIES = {"desktop", "inventory", "grokbot", "files", "ask", "console"}
 NODE_DEFAULT = frozenset({"desktop", "inventory", "grokbot", "files"})
 TERMINAL = {"done", "failed", "expired", "uncertain"}
 # Job kinds that carry file chunks (transfer.CHUNK raw bytes, base64 in JSON). They may be
-# larger than control messages, and their bodies are dropped once the requester has the
-# result, so a sent file doesn't linger in cluster.sqlite3 for a week.
+# larger than control messages. Their payload and result live only in the Broker's memory
+# (the jobs row keeps state and deadline, with '{}' as the body), so a 2 GB transfer isn't
+# rewritten through SQLite several times over. Dropped once the requester has the result.
 BULK = frozenset({"transfer"})
 MAX_PAYLOAD, MAX_BULK_PAYLOAD = 65536, 3_000_000
 # A node checks in once per held poll (cluster.POLL_WAIT, 25 s) and not at all while it
@@ -33,6 +34,7 @@ class Broker:
         self.state = Path(state).resolve()
         self.state.mkdir(parents=True, exist_ok=True)
         self.path = self.state / "cluster.sqlite3"
+        self._bulk = {}  # job id -> {"payload", "encoded", "result"}; memory only, never persisted
         with self.db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS nodes (
@@ -117,16 +119,25 @@ class Broker:
             return None  # unknown, revoked, or an invite nobody redeemed in time
         return row["id"], set(json.loads(row["capabilities"]))
 
-    def redeem(self, node):
-        """Swap an invite's credential for the node's own, once. The invite code stops
-        working at that moment, so a copy of it left in chat or a file is worthless."""
-        token = secrets.token_urlsafe(32)
+    def redeem(self, node, token=None):
+        """Swap an invite's credential for the node's own, once: (token, first). The invite
+        code stops working at that moment, so a copy of it left in chat or a file is worthless.
+        A node may propose its own `token` (saved before asking): if our reply is lost it
+        asks again with that token, and gets the same token instead of a lockout, with
+        first=False so the caller repeats nothing (a node's token must not re-pair it)."""
+        if token is not None and (not isinstance(token, str) or not 32 <= len(token) <= 128):
+            raise ValueError("A proposed node credential must be 32-128 characters.")
+        token = token or secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode()).hexdigest()
         with self.db() as db:
             if not db.execute("UPDATE nodes SET token_hash=?, invite_expires=NULL "
                               "WHERE id=? AND invite_expires IS NOT NULL AND invite_expires>=?",
-                              (hashlib.sha256(token.encode()).hexdigest(), node, time.time())).rowcount:
-                raise PermissionError("This invite was already used or has expired.")
-        return token
+                              (digest, node, time.time())).rowcount:
+                row = db.execute("SELECT token_hash,invite_expires FROM nodes WHERE id=?", (node,)).fetchone()
+                if not (row and row[1] is None and secrets.compare_digest(row[0], digest)):
+                    raise PermissionError("This invite was already used or has expired.")
+                return token, False
+        return token, True
 
     def heartbeat(self, node, info):
         # Never accept agent-provided paths, shell commands, or credentials as config.
@@ -167,28 +178,33 @@ class Broker:
         encoded = json.dumps(payload, sort_keys=True)
         if len(encoded.encode()) > (MAX_BULK_PAYLOAD if kind in BULK else MAX_PAYLOAD):
             raise ValueError("Cluster request is too large.")
+        bulk = kind in BULK
+        stored = "{}" if bulk else encoded
         now = time.time()
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if existing:
-                if (existing["node"], existing["requester"], existing["kind"], existing["payload"]) != (
-                        node, requester, kind, encoded):
+                same = (self._bulk.get(job_id, {}).get("encoded") == encoded) if bulk else existing["payload"] == encoded
+                if not same or (existing["node"], existing["requester"], existing["kind"]) != (node, requester, kind):
                     raise ValueError("request_id already belongs to a different request.")
                 return job_id
             db.execute("DELETE FROM jobs WHERE state IN ('done','failed','expired','uncertain') "
                        "AND created<?", (now - 7 * 86400,))
             # Bulk jobs nobody collected (expired, uncertain, requester gone): drop the bytes.
-            db.execute(f"UPDATE jobs SET payload='{{}}', result=NULL WHERE kind IN "
-                       f"({','.join('?' * len(BULK))}) AND state IN "
-                       "('done','failed','expired','uncertain') AND created<? AND payload!='{}'",
-                       (*sorted(BULK), now - 3600))
+            marks = ",".join("?" * len(BULK))
+            for (old,) in db.execute(f"SELECT id FROM jobs WHERE kind IN ({marks}) AND state IN "
+                                     "('done','failed','expired','uncertain') AND created<?",
+                                     (*sorted(BULK), now - 3600)).fetchall():
+                self._bulk.pop(old, None)
             count = db.execute("SELECT COUNT(*) FROM jobs WHERE node=? AND state IN ('pending','running')",
                                (node,)).fetchone()[0]
             if count >= 128:
                 raise ValueError("This node's queue is full.")
             db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,'pending',?,?,NULL)",
-                       (job_id, node, requester, kind, encoded, now, now + timeout))
+                       (job_id, node, requester, kind, stored, now, now + timeout))
+            if bulk:
+                self._bulk[job_id] = {"payload": payload, "encoded": encoded}
         return job_id
 
     def recover(self):
@@ -199,14 +215,30 @@ class Broker:
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute("UPDATE jobs SET state='expired' WHERE state='pending' AND deadline<?", (time.time(),))
-            rows = db.execute("SELECT * FROM jobs WHERE node=? AND state='pending' ORDER BY created", (node,))
-            row = next((r for r in rows if r["kind"] in kinds), None)
+            kinds = sorted(set(kinds))
+            if not kinds:
+                return None
+            # Only the small columns: payloads are read for the one job handed out, not for
+            # every job waiting in the queue on every poll.
+            rows = db.execute("SELECT id, kind, requester, deadline FROM jobs WHERE node=? AND state='pending' "
+                              f"AND kind IN ({','.join('?' * len(kinds))}) ORDER BY created",
+                              (node, *kinds)).fetchall()
+            row = None
+            for r in rows:
+                if r["kind"] in BULK and r["id"] not in self._bulk:
+                    # The hub restarted since this was queued: its bytes are gone. Expire, never guess.
+                    db.execute("UPDATE jobs SET state='expired' WHERE id=?", (r["id"],))
+                    continue
+                row = r
+                break
             if row is None:
                 return None
             db.execute("UPDATE jobs SET state='running' WHERE id=?", (row["id"],))
             # "remaining" lets the node time the job on its own monotonic clock; the wall-clock
             # deadline is only compared across machines by old nodes.
-            return {"id": row["id"], "kind": row["kind"], "payload": json.loads(row["payload"]),
+            payload = (self._bulk[row["id"]]["payload"] if row["kind"] in BULK else json.loads(
+                db.execute("SELECT payload FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]))
+            return {"id": row["id"], "kind": row["kind"], "payload": payload,
                     "requester": row["requester"], "deadline": row["deadline"],
                     "remaining": row["deadline"] - time.time()}
 
@@ -216,18 +248,25 @@ class Broker:
             raise ValueError("Cluster result is too large.")
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM jobs WHERE id=? AND node=?", (job_id, node)).fetchone()
+            row = db.execute("SELECT kind, state, result FROM jobs WHERE id=? AND node=?",
+                             (job_id, node)).fetchone()
             if not row:
                 raise LookupError("Unknown job for this node.")
             target_state = "failed" if failed else "done"
-            if row["state"] == target_state and row["result"] == encoded:
+            bulk = row["kind"] in BULK
+            if row["state"] == target_state and (
+                    self._bulk.get(job_id, {}).get("result") == encoded if bulk else row["result"] == encoded):
                 return  # result acknowledgement was lost: safe to repeat the result only
             if row["state"] != "running":
                 raise ValueError("Job is no longer running; it will not be executed again.")
-            db.execute("UPDATE jobs SET state=?,result=? WHERE id=?", (target_state, encoded, job_id))
+            if bulk:  # the result stays in memory; the row only records that it arrived
+                self._bulk.setdefault(job_id, {})["result"] = encoded
+            db.execute("UPDATE jobs SET state=?,result=? WHERE id=?",
+                       (target_state, "{}" if bulk else encoded, job_id))
 
     def compact(self, job_id):
         """Drop a finished bulk job's chunk data once its result has been read."""
+        self._bulk.pop(job_id, None)
         with self.db() as db:
             db.execute("UPDATE jobs SET payload='{}', result=CASE WHEN result IS NULL THEN NULL "
                        "ELSE '{}' END WHERE id=? AND state IN ('done','failed','expired','uncertain')",
@@ -239,6 +278,7 @@ class Broker:
             if not row or (requester is not None and requester != row["requester"]):
                 raise LookupError("Unknown request.")
             state = row["state"]
+            held = self._bulk.get(job_id) if row["kind"] in BULK else None
             # A running job gets GRACE past its deadline so a result landing just after the
             # requester gave up is still accepted instead of rejected as "no longer running".
             late = row["deadline"] + (GRACE if state == "running" else 0) < time.time()
@@ -246,4 +286,5 @@ class Broker:
                 state = "expired" if state == "pending" else "uncertain"
                 db.execute("UPDATE jobs SET state=? WHERE id=?", (state, job_id))
         return {"id": row["id"], "node": row["node"], "kind": row["kind"], "state": state,
-                "result": json.loads(row["result"]) if row["result"] is not None else None}
+                "result": json.loads(held["result"] if held and "result" in held else row["result"])
+                if row["result"] is not None else None}

@@ -15,6 +15,8 @@ import threading
 import time
 from pathlib import Path
 
+from .platforms import NO_WINDOW
+
 TIMEOUT = 20
 COOLDOWN = 60
 _lock = threading.Lock()
@@ -74,7 +76,7 @@ def renew_claude_session():
                     command, input=json.dumps(initialize) + "\n", cwd=cwd, env=env,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT,
-                    shell=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    shell=False, creationflags=NO_WINDOW)
             if result.returncode:
                 error = "Claude session renewal did not complete; sign-in may need attention"
         except subprocess.TimeoutExpired:
