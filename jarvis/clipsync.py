@@ -669,3 +669,25 @@ def autostart(state, enable):
         ", 0, False\n", encoding="ascii")
     return {"autostart": True, "launcher": str(path)}
 
+
+
+def control(arg, state=None):
+    """The `clipboard` desktop action, so any computer can switch this one's half on or off:
+    start, stop, status, autostart-on or autostart-off. (ok, json text)."""
+    from pathlib import Path
+    state = state or str(Path(__file__).resolve().parents[1] / ".jarvis")
+    try:
+        if arg == "start":
+            result = start(state)
+        elif arg == "stop":
+            result = stop(state)
+        elif arg == "status":
+            result = status(state)
+        elif arg in ("autostart-on", "autostart-off"):
+            result = autostart(state, arg == "autostart-on")
+        else:
+            raise ValueError("Use start, stop, status, autostart-on or autostart-off.")
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        return False, str(exc)
+    result.pop("log", None)  # a local path; the other computer can't open it
+    return True, json.dumps(result)

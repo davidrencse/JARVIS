@@ -185,19 +185,24 @@ def listen_loop(state, config, base, threshold=None):
                 # When this utterance began, so a long follow-up still lands in the window.
                 began = time.monotonic() - len(audio) / RATE
                 said_at = time.time() - len(audio) / RATE  # wall clock, before Whisper runs
-                # Voice check (CPU) and transcription (GPU) run side by side to save ~0.3 s.
+                # On a GPU the voice check (CPU) and transcription run side by side to save
+                # ~0.3 s. On CPU Whisper takes seconds and can't be stopped once started, so
+                # every TV line or passer-by would hog the cores and make David's next
+                # request queue behind it: there the check (~0.2 s) goes first.
                 # A stranger's transcript is discarded unread: never logged or answered.
-                check, text = pool.submit(ears.verify, audio, threshold), pool.submit(stt, audio)
+                check = pool.submit(ears.verify, audio, threshold)
+                text = pool.submit(stt, audio) if stt.device == "cuda" else None
                 is_owner, score = check.result()
                 # A near miss (David further from the mic, quieter, music behind him) is
                 # accepted only when it also starts with "Jarvis"; strangers score far lower.
                 near = not is_owner and score >= config.get("voice", {}).get("near_miss", BORDERLINE)
                 if not is_owner and not near:
-                    text.cancel()
+                    if text is not None:
+                        text.cancel()
                     log(f"ignored another voice (similarity {score})")
                     emit(state, "voice.ignored", score=score)
                     continue
-                heard = text.result()
+                heard = text.result() if text is not None else stt(audio)
                 request = wake_word(heard)
                 if request == "":  # a bare "Jarvis" and a pause: the request comes next
                     armed, armed_by_owner = began + len(audio) / RATE + FOLLOW_UP, is_owner

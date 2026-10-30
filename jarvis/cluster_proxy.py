@@ -35,11 +35,14 @@ class Runtime:
 
 
 VOICE_SETUP = ("/api/voice/setup", "/api/voice/devices")
+PERIPHERALS = "/api/peripherals"
 
 
-def proxy_handler(client, overlay=None, setup=None):
+def proxy_handler(client, overlay=None, setup=None, local=None):
     """`setup` is this laptop's own VoiceSetup: a voiceprint belongs to the mic it was
-    recorded on, so voice setup is answered here, never forwarded to the main."""
+    recorded on, so voice setup is answered here, never forwarded to the main.
+    `local` is (config, config path, state): Connect & share is answered here too, so a
+    node whose link is down can still show its own checks and take an invite code."""
     from .ui import Handler
 
     class ProxyHandler(Handler):
@@ -52,6 +55,12 @@ def proxy_handler(client, overlay=None, setup=None):
                 try:
                     return self._send(200, setup.status() if self.path == VOICE_SETUP[0]
                                       else {"devices": setup.devices()})
+                except Exception as exc:
+                    return self._send(500, {"error": str(exc)})
+            if local is not None and self.path == PERIPHERALS:
+                from .peripherals import overview
+                try:
+                    return self._send(200, overview(*local))
                 except Exception as exc:
                     return self._send(500, {"error": str(exc)})
             if self.path.startswith("/api/"):
@@ -87,6 +96,18 @@ def proxy_handler(client, overlay=None, setup=None):
                         return self._send(200, setup.autostart(bool(body.get("on"))))
                     raise ValueError("action must be start, cancel or autostart.")
                 except (ValueError, AttributeError, RuntimeError) as exc:
+                    return self._send(400, {"error": str(exc)})
+            if local is not None and self.path == PERIPHERALS:
+                from .peripherals import act
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 8192:
+                        raise ValueError("Invalid request length.")
+                    body = json.loads(self.rfile.read(length))
+                    if not isinstance(body, dict):
+                        raise ValueError("Request body must be a JSON object.")
+                    return self._send(200, act(*local, body))
+                except Exception as exc:
                     return self._send(400, {"error": str(exc)})
             if not self.path.startswith("/api/"):
                 return self._send(404, {"error": "Unknown console endpoint."})
@@ -145,7 +166,8 @@ def local_server(config, base, state, port, overlay=None):
         from .onboard import VoiceSetup
         try:
             return ConsoleServer(("127.0.0.1", port), proxy_handler(
-                client, overlay, VoiceSetup(state, config))), runtime
+                client, overlay, VoiceSetup(state, config),
+                (config, Path(base) / "jarvis.config.json", state))), runtime
         except BaseException:
             runtime.close()
             raise

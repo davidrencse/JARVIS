@@ -15,6 +15,8 @@ def summary(command):
         what = args["text"]
     elif intent == "close_app":
         what = "close " + args["name"]
+    elif intent == "terminal":
+        what = f"run \"{args['command']}\" in the terminal"
     else:
         what = intent.replace("_", " ") + " " + str(next(iter(args.values()), ""))
     return re.sub(r"\s+", " ", f"{what} on the {command['device']}").strip()

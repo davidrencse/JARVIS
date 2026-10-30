@@ -10,8 +10,10 @@ DesktopTools directly. The other laptop is reached the same way Grokbot prompts 
 Only the actions below travel (open_page: a console page, e.g. the knowledge page, as a window;
 close_app, media and volume: close an app's windows, play/pause/skip, speaker volume;
 screen: a downscaled snapshot of the screen, for the Devices view; lan_mouse: start, stop
-or pair Lan Mouse there);
-arguments go as base64 or JSON data, never as code.
+or pair Lan Mouse there; terminal: a shell command, which the brain's ConfirmGate parks for
+David's OK unless terminal.read_only() passes it; clipboard: start, stop or autostart the
+clipboard sync there);
+arguments go as base64 or JSON data, never as code (terminal is the one deliberate shell).
 A laptop can be named by its key, hostname, configured `aliases` ("arch", "asus"...) or
 "the other laptop".
 """
@@ -32,12 +34,12 @@ PRE_SESSION = re.compile(r"ssh: connect to host|Could not resolve hostname|kex_e
                          r"banner exchange|Host key verification failed|Permission denied \(", re.I)
 
 ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media",
-           "volume", "scroll", "browse", "observe", "input_info", "screen", "lan_mouse")
+           "volume", "scroll", "browse", "observe", "input_info", "screen", "lan_mouse", "terminal", "clipboard")
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
        "focus_window": "name", "close_app": "name", "media": "command", "volume": "level",
        "scroll": "spec", "browse": "spec", "observe": "predicate", "input_info": "query",
-       "screen": "spec", "lan_mouse": "command"}
+       "screen": "spec", "lan_mouse": "command", "terminal": "spec", "clipboard": "command"}
 # Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
 SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
@@ -106,8 +108,14 @@ def run_here(action, arg, tools=None):
     if action == "input_info":  # read-only: screens and Lan Mouse, for Settings
         from .sharedinput import run
         return run(arg)
+    if action == "terminal":  # a shell command; risky ones were confirmed before they got here
+        from .terminal import run
+        return run(arg)
     if action == "lan_mouse":  # start / stop / status / pair this computer's Lan Mouse
         from .sharedinput import control
+        return control(arg)
+    if action == "clipboard":  # start / stop / status / autostart this computer's clipboard sync
+        from .clipsync import control
         return control(arg)
     if tools is None:
         from .actions import DesktopTools

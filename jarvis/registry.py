@@ -106,6 +106,9 @@ INTENTS = {i.name: i for i in (
             "every": (lambda v: isinstance(v, str) and bool(EVERY.match(v))
                       and 2 <= float(v) <= 300, False)}, None, None),
     Intent("list_apps", "direct", "allow", {"query": (_name, True)}, None, None),
+    # A shell command (terminal.py): ls/cd/cat-style looking runs, anything else is confirmed.
+    Intent("terminal", "direct", "confirm",
+           {"command": (_text, True), "cwd": (_text, False)}, None, None),
     Intent("spotify_play", "direct", "allow",
            {"target": (lambda v: isinstance(v, str) and bool(SPOTIFY.match(v)), True)},
            "Spotify reports playing", 6, escalate=True),
@@ -130,6 +133,9 @@ def risk(command):
     intent = get(command["intent"])
     if intent.name == "close_app" and command["args"]["name"].strip().lower() in SAFE_TO_CLOSE:
         return "allow"
+    if intent.name == "terminal":
+        from .terminal import read_only
+        return "allow" if read_only(command["args"]["command"]) else "confirm"
     return intent.risk
 
 
