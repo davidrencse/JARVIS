@@ -502,6 +502,61 @@ class VoiceWorkflowTests(Temp):
         # Answering JARVIS's offer counts; chatter, a near miss and a late reply don't.
         self.assertEqual(asked, ["what apps are on my Windows laptop?", "Then check it."])
 
+    def _reply_window(self, queue_, heard, score, reply, waiting=False):
+        from jarvis import daemon
+        asked = []
+
+        def record_utterance(**_):
+            item = queue_.pop(0)
+            if item is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return item
+
+        def ask(text, *a, **k):
+            asked.append(text)
+            return dict(reply)
+
+        ears = MagicMock()
+        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
+            audio, str) else "")
+        stt.device = "cpu"
+        with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
+                patch("jarvis.listen.VoicePrint", return_value=ears), \
+                patch("jarvis.listen.Transcriber", return_value=stt), \
+                patch("jarvis.speech.Voice", return_value=MagicMock(limit=350)), \
+                patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
+                patch("jarvis.chatgpt.make_lane", return_value=Brain()), \
+                patch("jarvis.assistant.ask", ask), \
+                patch.object(daemon, "confirmation_waiting", return_value=waiting), \
+                patch.object(daemon, "foreground_priority"):
+            with self.assertRaises(KeyboardInterrupt):
+                daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        return asked
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_reply_window_never_approves_a_confirmation_without_jarvis(self):
+        heard = {"ask": "Jarvis, close word", "yes": "Yes."}
+        score = {"ask": (True, 0.6), "yes": (True, 0.6)}
+        offer = {"tier": "simple", "reply": "I need your OK to close word. Say 'Jarvis, yes'."}
+        self.assertEqual(self._reply_window(["ask", "yes", KeyboardInterrupt], heard, score,
+                                            offer, waiting=True), ["close word"])
+        # With nothing pending, a bare "Yes." still answers JARVIS.
+        self.assertEqual(self._reply_window(["ask", "yes", KeyboardInterrupt], heard, score,
+                                            offer, waiting=False), ["close word", "Yes."])
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_reply_window_survives_a_near_miss_and_skips_failures(self):
+        heard = {"ask": "Jarvis, check the laptop", "tv": "turn it up", "yes": "Then check it."}
+        score = {"ask": (True, 0.6), "tv": (False, 0.2), "yes": (True, 0.6)}
+        offer = {"tier": "simple", "reply": "I can check it if you want."}
+        self.assertEqual(self._reply_window(["ask", "tv", "yes", KeyboardInterrupt], heard,
+                                            score, offer), ["check the laptop", "Then check it."])
+        failed = {**offer, "outcomes": [{"ok": False, "text": "failed"}]}
+        self.assertEqual(self._reply_window(["ask", "yes", KeyboardInterrupt], heard, score,
+                                            failed), ["check the laptop"])
+
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_bare_wake_word_takes_the_next_utterance_as_the_request(self):
         from jarvis import daemon

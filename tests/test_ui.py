@@ -381,8 +381,15 @@ class DevicesTests(Temp):
             self.assertFalse(d["here"])
         self.assertTrue(out["box_b"]["send"])
 
-    def test_cluster_transport_is_not_sendable(self):
+    def test_cluster_node_is_sendable_from_the_main(self):
+        # Files ride the cluster link (transfer kind), so a node needs no SSH target.
         out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_a"})
+        self.assertTrue(out["box_c"]["send"])
+
+    def test_a_node_sends_only_to_the_main(self):
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_c"})
+        self.assertTrue(out["box_a"]["send"])
+        self.assertFalse(out["box_b"]["send"])
         self.assertFalse(out["box_c"]["send"])
 
 

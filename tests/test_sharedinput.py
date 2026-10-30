@@ -140,11 +140,13 @@ class LocalInfoTests(unittest.TestCase):
     def test_never_raises(self):
         boom = mock.Mock(side_effect=RuntimeError("x"))
         with mock.patch.object(si, "monitors", boom), mock.patch.object(si, "addresses", boom), \
-                mock.patch.object(si, "lan_mouse_status", boom), mock.patch.object(si, "read_config", boom):
+                mock.patch.object(si, "lan_mouse_status", boom), mock.patch.object(si, "read_config", boom), \
+                mock.patch.object(si, "_fingerprint", boom):
             got = si.local_info()
         self.assertEqual(got["monitors"], [])
         self.assertEqual(got["addresses"], [])
-        self.assertEqual(got["lan_mouse"], {"running": False, "build": None, "config": None})
+        self.assertEqual(got["lan_mouse"], {"running": False, "build": None, "config": None,
+                                            "fingerprint": None})
         self.assertIn("hostname", got)
 
     def test_run(self):
