@@ -90,6 +90,8 @@ def run(arg):
     """The `screen` desktop action: arg is "" or JSON {"width", "quality"}. (ok, json text)."""
     try:
         body = json.loads(arg) if arg else {}
+        if not isinstance(body, dict):
+            raise ValueError("the request must be a JSON object")
         width = max(320, min(int(body.get("width", MAX_WIDTH)), 2560))
         quality = max(20, min(int(body.get("quality", QUALITY)), 90))
         return True, json.dumps(capture(width, quality))

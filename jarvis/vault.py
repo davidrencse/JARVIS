@@ -282,6 +282,8 @@ class Vault:
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             for name in names:
                 full = Path(folder) / name
+                if full.is_symlink() and not self._inside(full.relative_to(self.root)):
+                    continue  # a link out of the vault: never index or read through it
                 yield full.relative_to(self.root).as_posix(), full
 
     def markdown(self):
@@ -362,7 +364,10 @@ class Vault:
         if direct and direct.is_file():
             return direct.relative_to(self.root).as_posix()
         names = self.names()
-        return names.get(ref.rsplit("/", 1)[-1].lower()) or names.get(ref.lower())
+        found = names.get(ref.rsplit("/", 1)[-1].lower()) or names.get(ref.lower())
+        if found and not self._inside(found):  # a stale index entry may name an escaping link
+            return None
+        return found
 
     def _inside(self, rel):
         try:

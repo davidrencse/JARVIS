@@ -908,6 +908,18 @@ class Console:
         ok, text = browse(spec, self.state)
         return {"ok": ok, "text": text}
 
+    def connections(self):
+        """Connections view: node links and this computer's peripherals, live."""
+        from .connections import snapshot
+        return snapshot(self.config, self.state)
+
+    def connection_action(self, body):
+        from .connections import act
+        result = act(self.config, self.state, body)
+        self.bus.publish("connections.changed", {k: v for k, v in body.items()
+                                                 if k in ("target", "part", "action")})
+        return result
+
     def shared_input(self):
         """Both computers' screens and Lan Mouse configs, cross-checked (read-only)."""
         from .sharedinput import overview
@@ -1145,6 +1157,9 @@ class Handler(BaseHTTPRequestHandler):
             "/api/agent-browser": c.agent_screen,
             "/api/history/commands": lambda: c.command_history(query.get("limit", 12)),
             "/api/input/shared": c.shared_input,
+            "/api/connections": c.connections,
+            "/api/peripherals": lambda: __import__("jarvis.peripherals", fromlist=["overview"]).overview(
+                c.config, c.base / "jarvis.config.json", c.state),
             "/api/probe": lambda: c.prober.get(refresh=query.get("refresh") == "1"),
             "/api/usage": lambda: c.credits.claude_hourly(int(query.get("hours", 24))),
             "/api/inbox": lambda: c.inbox(query.get("device")),
@@ -1241,6 +1256,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.daemon(body.get("action")))
             if url.path == "/api/voice/setup":
                 return self._send(HTTPStatus.OK, c.voice_setup_action(body))
+            if url.path == "/api/connections":
+                return self._send(HTTPStatus.OK, c.connection_action(body))
             if url.path == "/api/settings":
                 from .settings import write
                 return self._send(HTTPStatus.OK, write(c.config, c.base / "jarvis.config.json",
@@ -1259,6 +1276,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.agent_screen_command(body))
             if url.path == "/api/grokbot":
                 return self._send(HTTPStatus.OK, c.grokbot_command(body))
+            if url.path == "/api/peripherals":
+                from .peripherals import act
+                return self._send(HTTPStatus.OK, act(c.config, c.base / "jarvis.config.json", c.state, body))
             if url.path == "/api/fs/copy":
                 return self._send(HTTPStatus.OK, c.fs_copy(body))
             if url.path == "/api/overlay":

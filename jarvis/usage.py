@@ -26,6 +26,7 @@ PRICES = {
     "haiku": (1.0, 0.1, 5.0),
     "claude": (3.0, 0.3, 15.0),
 }
+GENERIC = frozenset({"claude", "gpt"})  # fallbacks behind the family keys
 _METER = contextvars.ContextVar("jarvis_usage_meter", default=None)
 _CALIBRATION, _CALIBRATED_AT = None, 0.0
 
@@ -33,7 +34,9 @@ _CALIBRATION, _CALIBRATED_AT = None, 0.0
 def price(model, prices=None):
     name = (model or "").lower()
     table = {**PRICES, **(prices or {})}
-    for key in sorted(table, key=len, reverse=True):
+    # Longest key wins, but the generic "claude"/"gpt" only when no family key matches:
+    # "claude" outranked "opus" by length, pricing claude-opus-4-1 as sonnet.
+    for key in sorted(table, key=lambda k: (k in GENERIC, -len(k))):
         if key in name:
             return table[key]
     return table["gpt"]
@@ -144,14 +147,20 @@ def _codex_events(days=14, root=None):
                 if '"token_count"' not in line or '"rate_limits"' not in line:
                     continue
                 try:
-                    payload = json.loads(line).get("payload") or {}
+                    event = json.loads(line)
                 except ValueError:
                     continue
-                info, limits = payload.get("info") or {}, payload.get("rate_limits") or {}
-                if not info.get("total_token_usage") or not limits.get("primary"):
+                # One odd line (a non-object anywhere) is skipped, not fatal to the calibration.
+                payload = event.get("payload") if isinstance(event, dict) else None
+                payload = payload if isinstance(payload, dict) else {}
+                info, limits = payload.get("info"), payload.get("rate_limits")
+                if not isinstance(info, dict) or not isinstance(limits, dict):
                     continue
-                out.append((json.loads(line).get("timestamp", ""), path.name, info["total_token_usage"],
-                            limits.get("primary") or {}, limits.get("secondary") or {}))
+                if not info.get("total_token_usage") or not isinstance(limits.get("primary"), dict):
+                    continue
+                secondary = limits.get("secondary")
+                out.append((event.get("timestamp", ""), path.name, info["total_token_usage"],
+                            limits["primary"], secondary if isinstance(secondary, dict) else {}))
         except OSError:
             continue
     out.sort()

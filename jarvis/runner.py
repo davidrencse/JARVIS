@@ -78,8 +78,10 @@ def final_message(provider, directory):
     directory = Path(directory)
     if provider == "codex":
         last = directory / "last-message.md"
-        if last.is_file():
-            return last.read_text(encoding="utf-8").strip() or None
+        if last.is_file():  # a blank file falls through to the streamed answer
+            text = last.read_text(encoding="utf-8").strip()
+            if text:
+                return text
     result = None
     stdout = directory / "stdout.jsonl"
     if not stdout.is_file():
@@ -98,7 +100,7 @@ def final_message(provider, directory):
             if (event.get("type") == "item.completed" and isinstance(item, dict)
                     and item.get("type") == "agent_message" and isinstance(item.get("text"), str)):
                 result = item["text"]
-    return result.strip() if result else None
+    return (result or "").strip() or None
 
 
 def stop_process(process):

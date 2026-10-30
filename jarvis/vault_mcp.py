@@ -32,6 +32,9 @@ def handle(tools, message):
     params = message.get("params") or {}
     if rid is None:
         return None
+    if not isinstance(params, dict):  # answer it; a crash here would end the MCP session
+        return {"jsonrpc": "2.0", "id": rid,
+                "error": {"code": -32602, "message": "Invalid params: expected an object"}}
     if method == "initialize":
         asked = params.get("protocolVersion")
         result = {"protocolVersion": asked if asked in PROTOCOLS else PROTOCOLS[0],

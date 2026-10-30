@@ -151,6 +151,13 @@ def write(config, path, state, changes):
             clean[key] = _valid(config, key, value)
         else:
             raise ValueError(f"'{key}' can't be changed here.")
+    def current(key):
+        node = config
+        for part in key.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        return node
+    # Saving a value it already has (a slider dropped back) changes nothing to restart for.
+    changed = [k for k in clean if current(k) != clean[k]]
     if clean:
         disk = json.loads(Path(path).read_text(encoding="utf-8"))
         for target in (disk, config):
@@ -167,5 +174,5 @@ def write(config, path, state, changes):
         data["threshold"] = threshold
         save_json(print_path, data)
     return {**read(config, state), "saved": sorted([*clean, *(["voiceprint.threshold"] if threshold else [])]),
-            "restart": [k for k in clean if k.startswith(("cluster.", "voice."))]
+            "restart": [k for k in changed if k.startswith(("cluster.", "voice."))]
                        + (["voiceprint.threshold"] if threshold else [])}
