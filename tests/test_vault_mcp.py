@@ -84,9 +84,6 @@ class TraversalTests(McpCase):
         ok, _ = self.call("vault_read", {"note": str(self.top / "outside.md")})
         self.assertFalse(ok)
 
-    # BUG: jarvis/vault.py:365 resolve() falls back to the unresolved index name, then
-    # vault.py:418 read() follows the symlink and returns a file outside the vault.
-    @unittest.expectedFailure
     def test_symlinked_file_escaping_vault_refused(self):
         try:
             os.symlink(self.top / "outside.md", self.root / "notes" / "link.md")
@@ -319,9 +316,6 @@ class ProtocolTests(McpCase):
                     self.fail(f"handle() raised {type(exc).__name__} for arguments={args!r}")
                 self.assertTrue(r["result"]["isError"])
 
-    # BUG: jarvis/vault_mcp.py:47 (and :33) call params.get() on non-object params, so
-    # handle() raises AttributeError and serve() dies, ending the whole MCP session.
-    @unittest.expectedFailure
     def test_params_wrong_type_does_not_crash(self):
         for params in ("str", 5, ["x"]):
             with self.subTest(params=params):

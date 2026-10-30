@@ -74,10 +74,6 @@ class PriceTests(Case):
         self.assertEqual(price("gpt-5-codex"), usage.PRICES["codex"])  # longest key wins
         self.assertEqual(price("claude-unknown"), usage.PRICES["claude"])
 
-    # BUG: jarvis/usage.py:34-38 picks the longest matching key, and "claude" (6) beats
-    # "opus"/"haiku" (4-5), so full model ids like claude-opus-4-1 are priced as sonnet
-    # (5x under-count for opus, 3x over-count for haiku).
-    @unittest.expectedFailure
     def test_full_claude_model_ids_use_their_family_price(self):
         self.assertEqual(price("claude-opus-4-1"), usage.PRICES["opus"])
         self.assertEqual(price("claude-haiku-4-5"), usage.PRICES["haiku"])
@@ -355,10 +351,6 @@ class CodexLogTests(Case):
         (root / "2026" / "10" / "21" / "s.jsonl").write_bytes(b"\xff\xfe\x00 token_count rate_limits\n")
         self.assertEqual(usage._codex_events(root=root), [])
 
-    # BUG: jarvis/usage.py:140-146 only guards ValueError; a log line that mentions both markers
-    # but parses to a non-object (or has a non-object payload/info/rate_limits) raises
-    # AttributeError out of _codex_events, so one odd line voids the whole calibration.
-    @unittest.expectedFailure
     def test_non_object_payload_is_skipped_not_fatal(self):
         root = self.session("s.jsonl", '["token_count","rate_limits"]',
                             '{"payload":"token_count rate_limits"}',

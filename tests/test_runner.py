@@ -474,9 +474,6 @@ class FinalMessageTests(Base):
         (self.base / "last-message.md").write_text("from file\n")
         self.assertEqual(final_message("codex", self.base), "from file")
 
-    # BUG: jarvis/runner.py:82 returns None for a blank last-message.md instead of falling
-    # back to the streamed agent_message in stdout.jsonl.
-    @unittest.expectedFailure
     def test_blank_last_message_file_falls_back_to_stream(self):
         (self.base / "stdout.jsonl").write_text(json.dumps(
             {"type": "item.completed", "item": {"type": "agent_message", "text": "streamed"}}) + "\n")
@@ -492,9 +489,6 @@ class FinalMessageTests(Base):
     def test_missing_dir(self):
         self.assertIsNone(final_message("claude", self.base / "nope"))
 
-    # BUG: jarvis/runner.py:99 `result.strip() if result else None` returns "" (not None)
-    # for a whitespace-only result.
-    @unittest.expectedFailure
     def test_whitespace_result_is_none(self):
         (self.base / "stdout.jsonl").write_text('{"type":"result","result":"   "}')
         self.assertIsNone(final_message("claude", self.base))

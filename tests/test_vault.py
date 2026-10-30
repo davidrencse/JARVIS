@@ -425,7 +425,12 @@ class WiringTests(VaultCase):
         self.assertFalse(brain.wants("open spotify"))  # no desktop tools without actions
         lane = make_lane({"actions": {"enabled": False}, "vault": {"path": str(self.root / "gone")}},
                          self.root, self.state)
-        self.assertIsInstance(lane, ChatGPTLane)  # missing vault: plain chat, no crash
+        # Missing vault: no crash, and the brain keeps its own long-term memory.
+        self.assertIsInstance(lane, Brain)
+        names = {s["name"] for s in lane.act.tools.specs()}
+        self.assertLessEqual({"memory_remember", "memory_search", "conversation_recent"}, names)
+        self.assertFalse(any(n.startswith("vault_") for n in names))
+        self.assertTrue(lane.wants("what did I tell you about my exam"))
 
     def test_brief_and_recall_reach_the_model(self):
         script = Path(self.state, "fake.py")

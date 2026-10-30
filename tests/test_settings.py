@@ -39,5 +39,27 @@ class MachineStatusTests(unittest.TestCase):
         self.assertFalse((self.state / "cluster.sqlite3").exists())  # never creates a hub database
 
 
+class RestartMarkerTests(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.state, ignore_errors=True)
+        self.path = self.state / "jarvis.config.json"
+
+    def save(self, config, value):
+        import json
+        self.path.write_text(json.dumps(config))
+        with mock.patch("jarvis.settings.read", return_value={}):
+            return settings.write(config, self.path, self.state, {"voice.max_spoken_chars": value})
+
+    def test_a_new_value_asks_for_a_restart(self):
+        out = self.save({"voice": {"max_spoken_chars": 350}}, 400)
+        self.assertEqual(out["restart"], ["voice.max_spoken_chars"])
+
+    def test_saving_the_same_value_does_not(self):
+        out = self.save({"voice": {"max_spoken_chars": 350}}, 350)
+        self.assertEqual(out["saved"], ["voice.max_spoken_chars"])
+        self.assertEqual(out["restart"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

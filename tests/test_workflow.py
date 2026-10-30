@@ -419,6 +419,9 @@ class VoiceWorkflowTests(Temp):
         self.assertNotIn("million", json.dumps(feed))
         self.assertEqual(memory.search("million"), [])
         ears.learn.assert_called_once()  # only the verified + wake-worded clip adapts the print
+        # On CPU the voice check runs first: Whisper never spends seconds on a stranger.
+        self.assertEqual([c.args[0] for c in stt.call_args_list if isinstance(c.args[0], str)],
+                         ["owner", "chatter"])
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_near_miss_needs_the_wake_word_and_never_adapts_the_print(self):

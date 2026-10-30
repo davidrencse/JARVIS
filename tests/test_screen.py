@@ -212,9 +212,6 @@ class RunTests(unittest.TestCase):
                 self.assertTrue(text.startswith("Can't capture the screen:"))
                 cap.assert_not_called()
 
-    # BUG: valid JSON that is not an object ('[]', 'null', '5', '"x"') raises AttributeError
-    # from body.get (jarvis/screen.py:92-93) instead of returning (False, message).
-    @unittest.expectedFailure
     def test_non_object_json_fails_softly(self):
         for arg in ("[1]", "null", "5", '"x"'):
             with self.subTest(arg=arg):
