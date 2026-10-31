@@ -236,6 +236,22 @@ class PullUpdateTests(unittest.TestCase):
             apply.assert_not_called()
             self.assertFalse(worker.restarting)
 
+    def test_a_main_restart_counts_as_one_outage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            save_json(state / "cluster-node.json", {"node_id": "node", "main_device": "main",
+                                                    "token": "t" * 24, "code_key": "ssh-ed25519 AAAA"})
+            worker = NodeWorker(configuration("node"), state, executor=Mock())
+            down, up = ConnectionError("main restarting"), {"job": None, "code": worker.code}
+            worker.client.request = Mock(side_effect=[down, down, down, up, up, down, up])
+            for _ in range(7):
+                try:
+                    worker.once()
+                except OSError:
+                    pass
+            stats = json.loads((state / "cluster-link-stats.json").read_text())
+            self.assertEqual((stats["polls_failed"], stats["outages"]), (4, 2))
+
     def test_hub_serves_bundle_and_skips_non_ssh_nodes(self):
         bundle = deploy.code_bundle(self.signer)
         self.assertEqual(bundle["code"], deploy.code_fingerprint())

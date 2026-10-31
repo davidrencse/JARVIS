@@ -343,7 +343,38 @@ for line in sys.stdin:
 '''
 
 
+ECHO_CLAUDE = r'''
+import json, sys
+for line in sys.stdin:
+    print(json.dumps({"type": "result", "result": json.loads(line)["message"]["content"]}), flush=True)
+'''
+
+
 class FastLaneTests(Temp):
+    def test_sends_only_recall_the_session_lacks(self):
+        from jarvis.fastlane import FastLane
+        from jarvis.memory import CONVERSATION, exchange_line
+        script = self.base / "echo_claude.py"
+        script.write_text(ECHO_CLAUDE, encoding="utf-8")
+        lane = FastLane({}, self.base, max_turns=2, timeout=20, command=[sys.executable, str(script)])
+        self.addCleanup(lane.close)
+        origin = "This request originates on dell."
+        talk = CONVERSATION + "\n  " + exchange_line("David", "earlier")
+        first = lane.ask("hi", [origin, "vault note", talk])
+        self.assertIn("vault note", first)
+        self.assertIn("David: earlier", first)
+        # Turn 2 recall repeats the note and now lists turn 1's own exchange: neither is new.
+        talk += "\n  " + "\n  ".join([exchange_line("David", "hi"), exchange_line("JARVIS", first),
+                                      exchange_line("David", "from the phone")])
+        second = lane.ask("next", [origin, "vault note", talk])
+        self.assertNotIn("vault note", second)
+        self.assertNotIn("David: earlier", second)
+        self.assertNotIn("David: hi", second)
+        self.assertIn("David: from the phone", second)  # another channel's turn is new
+        self.assertIn(origin, second)  # describes this request: always sent
+        third = lane.ask("again", [origin, "vault note"])  # max_turns: a fresh process
+        self.assertIn("vault note", third)
+
     def test_reuses_process_recycles_and_recovers(self):
         from jarvis.fastlane import FastLane
         script = self.base / "fake_claude.py"
