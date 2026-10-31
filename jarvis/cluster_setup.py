@@ -718,8 +718,14 @@ def _doctor_node(config, state, local, main, forward, checks, code):
     if stats:
         polls = stats["polls_ok"] + stats["polls_failed"]
         # A few failures while the main reboots are normal; a steady share means a bad link.
-        _check(checks, "link health", polls < 10 or stats["polls_failed"] / polls < 0.1,
-               f"{stats['polls_ok']}/{polls} polls reached the main, {stats['results_sent']} results "
+        # A main restart fails several polls in a row but is one outage; only repeated
+        # outages count against the link (older stats without the count: the share alone).
+        outages = stats.get("outages")
+        _check(checks, "link health", polls < 10 or stats["polls_failed"] / polls < 0.1
+               or (outages is not None and outages <= max(2, polls // 100)),
+               f"{stats['polls_ok']}/{polls} polls reached the main"
+               f"{f' ({outages} outage' + ('s' if outages != 1 else '') + ')' if outages else ''}, "
+               f"{stats['results_sent']} results "
                f"delivered, {stats['results_resent']} resent; last error: {stats['last_error'] or 'none'}",
                "The link drops often: prefer the LAN address (on the main: jarvis cluster invite "
                "with --address), or check Wi-Fi/Tailscale")

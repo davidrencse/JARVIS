@@ -16,6 +16,7 @@ import threading
 import time
 from datetime import datetime
 
+from .memory import ThreadRecall
 from .platforms import NO_WINDOW
 
 # Read-only lookups only. No shell: it invites slow tool round trips for trivia.
@@ -77,6 +78,7 @@ class FastLane:
         self.base, self.max_turns, self.timeout = str(base), max_turns, timeout
         self.proc, self.lines, self.turns = None, None, 0
         self._reader = None
+        self.held = ThreadRecall()  # what this CLI session already holds; reset on respawn
         self.lock = threading.Lock()
         self.command = command  # tests substitute a fake CLI
         self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
@@ -95,6 +97,7 @@ class FastLane:
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
             creationflags=NO_WINDOW, env=subscription_env())
         self.lines, self.turns = queue.Queue(), 0
+        self.held.reset()
         self._reader = threading.Thread(target=self._pump, args=(self.proc, self.lines),
                                         daemon=True)
         self._reader.start()
@@ -136,7 +139,8 @@ class FastLane:
         if not self.proc or self.proc.poll() is not None or self.turns >= self.max_turns:
             self.close()
             self._spawn()
-        notes = "\n".join(f"- {r}" for r in recall) or "- (none)"
+        recall = self.held.fresh(recall)
+        notes = "\n".join(f"- {r}" for r in recall) or "- (none new this conversation)"
         message = f"{now_line()}\nMemory recall:\n{notes}\n\nDavid: {text}"
         try:
             self.proc.stdin.write(json.dumps({"type": "user", "message": {
@@ -185,4 +189,6 @@ class FastLane:
                     rest = pending.strip() if spoke else event["result"].strip()
                     if rest:
                         on_sentence(rest)
-                return event["result"].strip()
+                answer = event["result"].strip()
+                self.held.sent(recall, text, answer)
+                return answer

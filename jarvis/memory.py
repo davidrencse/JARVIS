@@ -97,13 +97,49 @@ class _Vectors:
 
 
 # The recall item holding conversation() lines; a model lane drops the lines its own thread
-# already holds (chatgpt.ChatGPTLane), so these two must agree on the format.
+# already holds (ThreadRecall), so these two must agree on the format.
 CONVERSATION = "Recent conversation, oldest first (any channel):"
+# Recall that describes this request, not the world: sent every turn even when repeated, or
+# a request from the Dell after one from the ASUS would read as coming from the ASUS.
+PER_REQUEST = ("This request originates on",)
 
 
 def exchange_line(who, text):
     text = " ".join(str(text).split())
     return f"{who}: {text[:300]}{'…' if len(text) > 300 else ''}"
+
+
+class ThreadRecall:
+    """What one live model thread already holds, so a turn sends only new recall. Re-sending
+    notes and recent-conversation lines every turn was a good part of a talk turn's ~9.7k
+    input tokens. reset() whenever the thread or process behind it is replaced."""
+
+    def __init__(self):
+        self.seen = set()
+
+    def reset(self):
+        self.seen = set()
+
+    def fresh(self, recall):
+        """recall minus notes sent on an earlier turn and conversation lines the thread holds."""
+        out = []
+        for item in recall:
+            item = str(item)
+            if item.startswith(CONVERSATION):
+                lines = [ln for ln in item.split("\n  ")[1:] if ln not in self.seen]
+                if lines:
+                    out.append("\n  ".join([CONVERSATION, *lines]))
+            elif item not in self.seen or item.startswith(PER_REQUEST):
+                out.append(item)
+        return out
+
+    def sent(self, recall, text, answer):
+        """Record a finished turn: its recall (conversation lines one by one, so only newer
+        lines, e.g. another channel's latest turn, go next time) and its own exchange."""
+        for item in recall:
+            item = str(item)
+            self.seen.update(item.split("\n  ")[1:] if item.startswith(CONVERSATION) else (item,))
+        self.seen.update((exchange_line("David", text), exchange_line("JARVIS", answer)))
 
 class Memory:
     def __init__(self, directory, semantic=False):

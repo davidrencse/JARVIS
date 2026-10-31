@@ -173,9 +173,7 @@ def usage_limit(now=None):
 MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError, OSError)
 
 
-# Recall that describes this request, not the world: sent every turn even when repeated, or
-# a request from the Dell after one from the ASUS would read as coming from the ASUS.
-PER_REQUEST = ("This request originates on",)
+from .memory import ThreadRecall
 
 
 class ChatGPTLane:
@@ -207,7 +205,7 @@ class ChatGPTLane:
         self.tool_log = []  # (tool, success, text) of the current turn
         self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
         self.proc = self.lines = self.thread = None
-        self.seen = set()  # recall and exchanges the current thread already holds (_fresh)
+        self.held = ThreadRecall()  # recall and exchanges the current thread already holds
         self._reader = None
         self.mcp_status = {}
         self.turns, self.next_id, self.started = 0, 0, 0.0
@@ -329,7 +327,7 @@ class ChatGPTLane:
                 params["dynamicTools"] = self.tools.specs()
             result = self._request("thread/start", params)
             self.thread, self.turns, self.started = result["thread"]["id"], 0, time.monotonic()
-            self.seen = set()
+            self.held.reset()
             # Tool servers (the browser) start alongside the thread; a turn sent before
             # they're ready has no browser tools, and the model says it can't browse.
             deadline = time.monotonic() + 45
@@ -415,25 +413,9 @@ class ChatGPTLane:
             except Exception:  # reporting must never fail the turn
                 pass
 
-    def _fresh(self, recall):
-        """Recall minus what this thread already holds: notes sent on an earlier turn, and
-        recent-conversation lines that are its own exchanges. Re-sending them every turn was
-        a good part of a talk turn's ~9.7k input tokens."""
-        from .memory import CONVERSATION
-        fresh = []
-        for item in recall:
-            item = str(item)
-            if item.startswith(CONVERSATION):
-                lines = [ln for ln in item.split("\n  ")[1:] if ln not in self.seen]
-                if lines:
-                    fresh.append("\n  ".join([CONVERSATION, *lines]))
-            elif item not in self.seen or item.startswith(PER_REQUEST):
-                fresh.append(item)
-        return fresh
-
     def _ask(self, text, recall, on_sentence):
         self._ensure_thread()
-        recall = self._fresh(recall)
+        recall = self.held.fresh(recall)
         notes = "\n".join(f"- {r}" for r in recall) or "- (none new this conversation)"
         prompt = f"{now_line()}\nMemory recall:\n{notes}\n\nDavid: {text}"
         # Don't wait for the turn/start response before reading: deltas may arrive first.
@@ -488,12 +470,7 @@ class ChatGPTLane:
                 from .usage import record
                 record("chatgpt", self.model, spent)
                 self.last_usage = spent
-                from .memory import CONVERSATION, exchange_line
-                for item in recall:
-                    # Conversation lines one by one: the thread holds each line it was sent,
-                    # so only newer lines (another channel's latest turn) go next time.
-                    self.seen.update(item.split("\n  ")[1:] if item.startswith(CONVERSATION) else (item,))
-                self.seen.update((exchange_line("David", text), exchange_line("JARVIS", answer)))
+                self.held.sent(recall, text, answer)
                 return answer
 
 

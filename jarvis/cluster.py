@@ -754,8 +754,11 @@ class NodeWorker:
         self.code = code_fingerprint()
         # Link health for `cluster doctor`: polls that reached the main or didn't, and
         # results that needed resending from the outbox.
-        self.stats = {"started": time.time(), "polls_ok": 0, "polls_failed": 0,
+        # outages: separate runs of failed polls. The main restarting fails a few polls in a
+        # row once; a bad link fails them again and again.
+        self.stats = {"started": time.time(), "polls_ok": 0, "polls_failed": 0, "outages": 0,
                       "results_sent": 0, "results_resent": 0, "last_ok": None, "last_error": None}
+        self._down = False
 
     def _record(self, **change):
         for key, value in change.items():
@@ -817,9 +820,12 @@ class NodeWorker:
                                 "code": self.code},
                                 timeout=POLL_WAIT + 10)
         except (OSError, ValueError, RuntimeError) as exc:
-            self._record(polls_failed=1, last_error=f"{time.strftime('%H:%M:%S')} {exc}"[:300])
+            self._record(polls_failed=1, outages=0 if self._down else 1,
+                         last_error=f"{time.strftime('%H:%M:%S')} {exc}"[:300])
+            self._down = True
             raise
         self._record(polls_ok=1, last_ok=time.time())
+        self._down = False
         if not getattr(self, "_confirmed", False):
             from .release import confirm
             confirm(self.state, self.code)  # this code starts and reaches the main: keep it
