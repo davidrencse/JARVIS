@@ -367,6 +367,21 @@ def _execute(commands, remote, step, request=None, skip=None):
                        "run_ms": _ms(sent)}
             step(f"run:{command['id']}", "parse", label, f"{text} · {outcome['run_ms']} ms",
                  "done" if ok else "fail")
+            if state == "uncertain" and "observe" not in skipped:
+                # The node never said how it went (timed out, lost the job). Look once at
+                # the screen before giving up: never a retry, only a check.
+                watched = time.monotonic()
+                seen = _observe(command, remote, step, label, before)
+                if seen.get("state") == "observed":
+                    outcome.update(state="observed", ok=True, observe_ms=_ms(watched),
+                                   text=(f"Done on the {command['device']}: it never confirmed, "
+                                         "but I checked the screen and it worked."))
+                elif seen.get("state") == "unchanged":
+                    outcome.update(state="unchanged", ok=True, observe_ms=_ms(watched),
+                                   text="It already looked like that on screen.")
+                elif seen.get("state") == "unconfirmed":
+                    outcome["text"] = (f"The {command['device']} never confirmed, and I checked "
+                                       "the screen: it didn't happen. I didn't retry it.")
             if ok and text.startswith(ALREADY):
                 # The executor read the state first and did nothing ("Already paused."):
                 # true, but not a change it caused, so it never counts as observed.

@@ -124,39 +124,90 @@ def validate(predicate):
 
 
 # -- listing windows ----------------------------------------------------------------------
+# Window classes that are the Windows shell itself, never an app: WM_CLOSE on Progman
+# opens the shutdown dialog, so they are never listed (nothing can close or focus them).
+SHELL_CLASSES = frozenset({"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"})
+# Store (UWP) apps draw inside ApplicationFrameHost; the app's own process owns a child
+# window (Calculator: CalculatorApp). Listed as "ApplicationFrameHost CalculatorApp".
+UWP_HOST = "applicationframehost"
+
+
 def _windows_nt():
+    """Visible, uncloaked top-level windows: {"id" (HWND), "app", "title", "focused"}."""
     import ctypes
     from ctypes import wintypes
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    try:
+        dwm = ctypes.windll.dwmapi
+    except OSError:
+        dwm = None
     found, names = [], {}
     proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
+    def pid_of(hwnd):
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value
+
+    def cloaked(hwnd):
+        # Suspended Store apps and other virtual-desktop windows are "visible" but cloaked.
+        if dwm is None:
+            return False
+        value = ctypes.c_int(0)
+        return dwm.DwmGetWindowAttribute(hwnd, 14, ctypes.byref(value), ctypes.sizeof(value)) == 0 \
+            and value.value != 0
+
+    def class_of(hwnd):
+        buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buffer, 256)
+        return buffer.value
+
     def visit(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
+        if user32.IsWindowVisible(hwnd) and not cloaked(hwnd) and class_of(hwnd) not in SHELL_CLASSES:
+            if user32.GetWindowLongW(hwnd, -20) & 0x80:  # WS_EX_TOOLWINDOW: no taskbar entry
+                return True
             size = user32.GetWindowTextLengthW(hwnd)
             if size:
                 title = ctypes.create_unicode_buffer(size + 1)
                 user32.GetWindowTextW(hwnd, title, size + 1)
-                pid = wintypes.DWORD()
-                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                found.append((hwnd, pid.value, title.value))
+                found.append((hwnd, pid_of(hwnd), title.value))
         return True
 
+    def name_of(pid):
+        if pid not in names:
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            name = ""
+            if handle:
+                path, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+                if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
+                    name = os.path.splitext(os.path.basename(path.value))[0]
+                kernel32.CloseHandle(handle)
+            names[pid] = name
+        return names[pid]
+
+    def hosted(hwnd, host):
+        """The process of a Store app drawn in an ApplicationFrameHost window."""
+        inner = []
+
+        def child(sub, _):
+            pid = pid_of(sub)
+            if pid != host:
+                inner.append(pid)
+                return False
+            return True
+        user32.EnumChildWindows(hwnd, proc(child), 0)
+        return name_of(inner[0]) if inner else ""
+
     user32.EnumWindows(proc(visit), 0)
-    for _, pid, _ in found:
-        if pid in names:
-            continue
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
-        name = ""
-        if handle:
-            path, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
-            if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(size)):
-                name = os.path.splitext(os.path.basename(path.value))[0]
-            kernel32.CloseHandle(handle)
-        names[pid] = name
     focused = user32.GetForegroundWindow()
-    return [{"app": names[pid], "title": title, "focused": hwnd == focused}
-            for hwnd, pid, title in found]
+    listed = []
+    for hwnd, pid, title in found:
+        app = name_of(pid)
+        if app.lower() == UWP_HOST:
+            inner = hosted(hwnd, pid)
+            app = f"{app} {inner}" if inner else app
+        listed.append({"id": int(hwnd), "app": app, "title": title, "focused": hwnd == focused})
+    return listed
 
 
 def _windows_hyprland():
@@ -488,9 +539,70 @@ def core_audio(level=None, mute=None):
 
 
 # -- matching ---------------------------------------------------------------------------
+# What an app is called by its process or window class, when that isn't its name: the
+# Store's Calculator is CalculatorApp, Word is WINWORD, Discord on the Zenbook is Vesktop.
+# Keys and values are flattened (lowercase letters and digits only).
+APP_IDS = {
+    "calculator": ("calculatorapp", "calculator", "gnomecalculator", "kcalc", "qalculate",
+                   "qalculategtk", "galculator", "speedcrunch"),
+    "calc": ("calculatorapp", "calculator", "gnomecalculator", "kcalc", "qalculate"),
+    "discord": ("discord", "vesktop", "vencord", "webcord", "discordcanary", "discordptb"),
+    "word": ("winword", "word"), "microsoftword": ("winword",),
+    "excel": ("excel",), "microsoftexcel": ("excel",),
+    "powerpoint": ("powerpnt", "powerpoint"), "outlook": ("outlook", "olk"),
+    "onenote": ("onenote",), "teams": ("teams", "msteams", "msteams"),
+    "settings": ("systemsettings", "systemsettings", "gnomecontrolcenter", "systemsettings5"),
+    "fileexplorer": ("explorer", "dolphin", "nautilus", "thunar", "nemo", "orgkdedolphin"),
+    "files": ("explorer", "dolphin", "nautilus", "thunar", "nemo", "orgkdedolphin"),
+    "photos": ("photos", "microsoftphotos", "photosapp"),
+    "notepad": ("notepad",), "paint": ("mspaint", "paint"),
+    "edge": ("msedge",), "microsoftedge": ("msedge",),
+    "zen": ("zen", "zenbrowser", "appzenbrowserzen"), "zenbrowser": ("zen", "zenbrowser", "appzenbrowserzen"),
+    "chrome": ("chrome", "googlechrome", "comgooglechrome"),
+    "googlechrome": ("chrome", "googlechrome", "comgooglechrome"),
+    "visualstudiocode": ("code", "vscodium", "codeoss"), "vscode": ("code", "vscodium", "codeoss"),
+    # No "terminal": every kitty/Windows Terminal window would match, and closing them all
+    # kills whatever runs in them. "close kitty" names the app; a title picks one window.
+    "commandprompt": ("cmd",), "powershell": ("powershell", "pwsh"),
+    "steam": ("steam", "steamwebhelper"), "taskmanager": ("taskmgr",),
+    "snippingtool": ("snippingtool", "screensketch"), "clock": ("time", "clock"),
+    "virtualbox": ("virtualbox", "virtualboxmanager", "virtualboxvm"),
+}
+
+
+# Reverse-domain pieces that name no app: "close app" must not match app.zen_browser.zen.
+CLASS_NOISE = frozenset({"app", "apps", "org", "com", "dev", "io", "net", "desktop", "kde",
+                         "gnome", "github", "flatpak", "bin", "exe", "x86", "64", "client"})
+
+
+def app_ids(query):
+    """The flattened names an app's window can go by: the query itself plus its known
+    process/class names."""
+    flat = _flat(query)
+    return (flat,) + tuple(n for n in APP_IDS.get(flat, ()) if n != flat)
+
+
+def app_match(window, query, words=()):
+    """0 = not this app; 3 = a process/class name is exactly one of its names; 2 = a name
+    contains what was said ("googlechrome" for chrome), or is one of its words ("code" for
+    visual studio code); 1 = only the title mentions it. Known other names count only
+    exactly: "close code" must never close Codex because "code" is inside it."""
+    names = app_ids(query)
+    app = str(window.get("app") or "")
+    # Each name and each segment of a reverse-domain class: dev.vencord.Vesktop -> vesktop.
+    segments = [x for x in re.split(r"[\s._-]+", app) if _flat(x) not in CLASS_NOISE]
+    parts = list(dict.fromkeys(p for p in (_flat(x) for x in app.split() + segments) if p))
+    if any(part in names for part in parts):
+        return 3
+    said = names[0]
+    if (len(said) >= 4 and said not in CLASS_NOISE and any(said in part for part in parts)) or \
+            any(len(part) >= 3 and part in words for part in parts):
+        return 2
+    return 1 if said and said in _flat(window.get("title") or "") else 0
+
+
 def _is_app(window, query):
-    return any(query in _flat(part) for part in window["app"].split()) or \
-        query in _flat(window["title"])
+    return app_match(window, query) > 0
 
 
 def matches(predicate, listed):

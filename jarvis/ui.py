@@ -234,7 +234,8 @@ class Console:
         """The spoken morning briefing (briefing.py) and the brain's world summary."""
         from .briefing import answer
         tasks = self.tasks()
-        return {"brief": answer("brief me", tasks.vault, tasks), "world": tasks.vault.world()}
+        return {"brief": answer("brief me", tasks.vault, tasks, memory=self.memory),
+                "world": tasks.vault.world()}
 
     def task_counts(self):
         try:
