@@ -47,6 +47,45 @@ PROTOTYPES = {
     },
 }
 
+LABELS = Path(__file__).with_name("decider_labels.jsonl")
+
+
+def _key(text):
+    return re.sub(r"\W+", " ", str(text).lower()).strip()
+
+
+def examples(job, held_out=()):
+    """Labelled (text, option) pairs a job learns from beyond PROTOTYPES: the scorecard's
+    cases (tests/eval/cases.jsonl, absent on a node) first, then decider_labels.jsonl; each
+    text once. held_out: texts left out, so the scorecard can measure on unseen ones."""
+    if job != "mode":
+        return []
+    from .scorecard import CASES, load, mode_for
+    try:
+        rows = [(c["text"], mode_for(c)) for c in load(CASES)[1]]
+    except (OSError, ValueError):
+        rows = []
+    try:
+        lines = LABELS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        row = json.loads(line) if line.strip() else {}
+        if "text" in row:
+            rows.append((row["text"], row.get("label")))
+    seen, out = {_key(t) for t in held_out}, []
+    for text, option in rows:
+        if option in PROTOTYPES[job] and _key(text) not in seen:
+            seen.add(_key(text))
+            out.append((text, option))
+    return out
+
+
+BASE = {job: {o: list(p) for o, p in options.items()} for job, options in PROTOTYPES.items()}
+for _text, _option in examples("mode"):
+    if _text not in PROTOTYPES["mode"][_option]:
+        PROTOTYPES["mode"][_option].append(_text)
+
 _lock = threading.Lock()
 _cache = {}  # job -> {option: matrix of prototype vectors}
 
@@ -73,13 +112,17 @@ def learn(job, option, phrase):
         _cache.pop(job, None)
 
 
+def clean(text):
+    """A leading wake word says nothing about the request and drags it toward "converse"."""
+    return re.sub(r"^\W*jarvis\b\W*", "", str(text), flags=re.I) or str(text)
+
+
 def choose(job, text, temperature=None, options=None):
     """{winner, probs, confidence} over the job's options (or a subset); None if the
     embedding model is unavailable."""
     from .embed import embed
     protos = _vectors(job)
-    # A leading wake word says nothing about the request and drags it toward "converse".
-    query = embed([re.sub(r"^\W*jarvis\b\W*", "", str(text), flags=re.I) or text])
+    query = embed([clean(text)])
     if protos is None or query is None:
         return None
     names = [o for o in (options or protos) if o in protos]

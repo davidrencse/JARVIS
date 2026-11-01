@@ -655,6 +655,23 @@ def _doctor_main(config, state, main, forward, checks, code):
                    f"jarvis cluster update {device}   (forward nodes update themselves within a minute)")
 
 
+def _link_hint(error, forward, main):
+    """What to do about dropped polls. They travel over the SSH tunnel, so Wi-Fi settings and
+    invite addresses only matter if the tunnel itself keeps reconnecting."""
+    error = (error or "").lower()
+    if "closed connection" in error or "refused" in error or "reset" in error:
+        lead = (f"The tunnel was up but nothing answered on {main}: usually JARVIS restarting "
+                f"there (on {main}: systemctl --user status jarvis-cluster). ")
+    else:
+        lead = ""
+    if forward:
+        return (lead + "Polls go through this PC's SSH tunnel: jarvis cluster tunnel status, and "
+                "its log in .jarvis/logs/cluster-tunnel.log. Only if the tunnel keeps reconnecting is "
+                "the network between the PCs the problem (Wi-Fi, Tailscale).")
+    return (lead + f"Polls go through the SSH tunnel {main} opens to this PC: on {main}, "
+            "jarvis cluster tunnel status and its log.")
+
+
 def _doctor_node(config, state, local, main, forward, checks, code):
     from . import cluster_tunnel
     from .transfer import _ssh_args
@@ -727,8 +744,7 @@ def _doctor_node(config, state, local, main, forward, checks, code):
                f"{f' ({outages} outage' + ('s' if outages != 1 else '') + ')' if outages else ''}, "
                f"{stats['results_sent']} results "
                f"delivered, {stats['results_resent']} resent; last error: {stats['last_error'] or 'none'}",
-               "The link drops often: prefer the LAN address (on the main: jarvis cluster invite "
-               "with --address), or check Wi-Fi/Tailscale")
+               _link_hint(stats.get("last_error"), forward, main))
     me = next((n for n in status.get("nodes") or [] if n["id"] == local), {})
     _check(checks, "main sees this node", me.get("online"), "online" if me.get("online") else "offline",
            "Start the node agent: jarvis cluster autostart on")

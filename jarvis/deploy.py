@@ -368,7 +368,11 @@ def update(config, state, node, rollback=False):
                   f"got=$({py} -c {shlex.quote(REMOTE_FINGERPRINT)} {stage}/jarvis); "
                   f"[ \"$got\" = {shlex.quote(want)} ] || {{ echo \"staged code fingerprint $got != {want}\" >&2; rm -rf {stage}; exit 4; }}; "
                   f"rm -rf jarvis.prev; [ -d jarvis ] && mv jarvis jarvis.prev; mv {stage}/jarvis jarvis; "
+                  # New requirements are installed before the restart (see release.install_dependencies).
+                  f"deps=; [ -f {stage}/pyproject.toml ] && ! cmp -s {stage}/pyproject.toml pyproject.toml && deps=1; "
                   f"[ -f {stage}/pyproject.toml ] && cp {stage}/pyproject.toml pyproject.toml; rm -rf {stage}; "
+                  f"[ -n \"$deps\" ] && {{ {py} -m pip install --quiet --disable-pip-version-check -e . "
+                  f"|| echo 'pip install failed' >&2; }}; "
                   f"{_restart(kernel)}; echo ok")
         code, out, err = _remote(config, state, node, _bash(script), stdin=package(source(state)))
         if code or "ok" not in out:

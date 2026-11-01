@@ -52,7 +52,8 @@ class NodeOffline(ConnectionError):
 
 # Queries that change nothing, allowed even when a node's code is out of date, so Settings
 # and status can still say what it is.
-READ_ONLY_DESKTOP = frozenset({"input_info", "list_apps", "screen"})
+# observe only reads windows and playback (the brain's snapshot asks it every request).
+READ_ONLY_DESKTOP = frozenset({"input_info", "list_apps", "screen", "observe"})
 
 
 def _read_only(kind, payload):
@@ -801,10 +802,25 @@ class NodeWorker:
             key = None
         bundle = self.client.request("/v1/code", timeout=60)
         backup(self.state)  # what the watchdog restores if the new code won't start
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        before = pyproject.read_text(encoding="utf-8") if pyproject.is_file() else ""
         count = apply_bundle(bundle, key)
         self.installed = bundle.get("code")
+        from .release import install_dependencies
+        install_dependencies(before, pyproject.read_text(encoding="utf-8") if pyproject.is_file() else "")
         print(f"JARVIS node: installed main's code {bundle.get('code')} ({count} files); restarting.", flush=True)
         return True
+
+    def _rejoined(self):
+        """`jarvis cluster join` wrote a new credential (or main) since this process loaded
+        its own: polling on with the stale one only fails. Our own redeem updates
+        client.token too, so that never counts."""
+        try:
+            note = json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return (isinstance(note.get("token"), str) and note["token"] != self.client.token) or \
+            note.get("main_device", self.client.main) != self.client.main
 
     def once(self):
         # A crash after execution can resend the result; it never reexecutes the action.
@@ -884,6 +900,10 @@ class NodeWorker:
             with exclusive_lock(self.state / "cluster-node.lock"):
                 delay = 1
                 while not self.stop_event.is_set() and not self.restarting:
+                    if self._rejoined():  # before redeem_invite, which would use the stale client
+                        print("JARVIS node: paired again (new credential); restarting to use it.", flush=True)
+                        self.restarting = True
+                        break
                     try:
                         redeem_invite(self.config, self.state, self.client)
                         worked = self.once()

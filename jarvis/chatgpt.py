@@ -25,6 +25,7 @@ from pathlib import Path
 
 from .platforms import NO_WINDOW
 from .fastlane import SENTENCE_END, close_process, now_line, subscription_env
+from .memory import ThreadRecall
 
 # David's own Codex loads ~400 tools from plugins and connectors (gmail.delete_emails,
 # github.update_file, a JS REPL, computer use, ...). Measured 2026-10-21: with them,
@@ -171,9 +172,6 @@ def usage_limit(now=None):
 # What a lane can raise from an odd reply (KeyError...) or a failed spawn (OSError). Never
 # KeyboardInterrupt: that is BaseException and passes through untouched.
 MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError, OSError)
-
-
-from .memory import ThreadRecall
 
 
 class ChatGPTLane:
@@ -553,7 +551,9 @@ TALK_HANDOFF = (" You have no tools in this conversation, but JARVIS can operate
                 "all of David's computers (listed in your brief) and has a long-term memory: "
                 "when he asks you to do something on a computer or website (open, close, play, "
                 "pause, volume, show a page...), to check something on one (what's installed, "
-                "how many apps, what's open, what's in a folder, a terminal command...), to remember something, or what he told you "
+                "how many apps, what's open, what's in a folder, a terminal command...), to remember something "
+                "(including a lasting fact about himself or how he wants you to answer that isn't "
+                "in his profile yet), or what he told you "
                 f"before, reply with exactly {HANDOFF} and nothing else, and it will be done. "
                 "That includes a short answer to your own question about such a request "
                 "(\"shortcuts\", \"the Dell\"). Never say you can't inspect his computers.")
@@ -708,11 +708,17 @@ def make_lane(config, base, state_dir=None):
     from .selfmodel import brief as self_brief
 
     def context():
-        # JARVIS.md (who it is, the machines, its rules), then the vault's world brief.
+        # JARVIS.md (who it is, the machines, its rules), David's profile, then the vault's
+        # world brief. Built per thread, so a fact saved mid-thread shows from the next one.
         world = vault.world() if vault else ""
         # Checked per thread: vault.write can be switched in the console while running.
         locked = VAULT_READ_ONLY if vault is not None and not vault.writable else ""
-        return "\n\n".join(p for p in (self_brief(config, base), world, locked) if p)
+        try:
+            from .memory import Memory as Heap, profile_brief
+            profile = profile_brief(Heap(state))
+        except Exception:  # a broken memory file must never stop the brain from starting
+            profile = ""
+        return "\n\n".join(p for p in (self_brief(config, base), profile, world, locked) if p)
 
     chat = ChatGPTLane(config, base, context=context,
                        instructions=INSTRUCTIONS + (TALK_HANDOFF if actions else MEMORY_HANDOFF))

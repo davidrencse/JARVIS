@@ -194,6 +194,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
             from .pipeline import warm
             warm()  # the installed-app list, for the direct-action fast path
             memory.warm_vectors()  # meaning-based recall index, in the background
+            from .consolidate import start as consolidate_daily
+            consolidate_daily(config, memory, base, log=log)  # memory.consolidate: once a day
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device)
         failures, mic, armed, armed_by_owner, chatting = 0, None, 0.0, False, 0.0

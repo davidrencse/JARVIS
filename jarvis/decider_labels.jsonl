@@ -1,0 +1,184 @@
+{"_meta": {"note": "Labelled examples for the decider's mode job (jarvis/decide.py), on top of PROTOTYPES and the labels in tests/eval/cases.jsonl. src: shadow = a shadow decision from history.sqlite3, relabelled to what should have happened; hard = written to separate build from talk and action from talk."}}
+{"text": "open spotify", "label": "act", "src": "shadow"}
+{"text": "play some lofi on youtube", "label": "agent", "src": "shadow"}
+{"text": "how are you", "label": "converse", "src": "shadow"}
+{"text": "what time is it?", "label": "converse", "src": "shadow"}
+{"text": "what's the capital of the United States?", "label": "converse", "src": "shadow"}
+{"text": "what's today's date?", "label": "converse", "src": "shadow"}
+{"text": "who are you", "label": "converse", "src": "shadow"}
+{"text": "I'm going to sell my car.", "label": "converse", "src": "shadow"}
+{"text": "Haven't you made money from words yet? Have you like, have you like said like Yo, I'll sell you my name and prepare me money and then you scound them Have you done that yet?", "label": "converse", "src": "shadow"}
+{"text": "what time is it", "label": "converse", "src": "shadow"}
+{"text": "what's today's date", "label": "converse", "src": "shadow"}
+{"text": "jarvis open chrome", "label": "act", "src": "shadow"}
+{"text": "jarvis open spotify", "label": "act", "src": "shadow"}
+{"text": "bro, I'm saying the fucking way, like, why are you nervous, like, what the fuck is wrong, Jarvis?", "label": "converse", "src": "shadow"}
+{"text": "hi", "label": "converse", "src": "shadow"}
+{"text": "Hello", "label": "converse", "src": "shadow"}
+{"text": "Open Spotify", "label": "act", "src": "shadow"}
+{"text": "In one short sentence, what is the capital of Australia?", "label": "converse", "src": "shadow"}
+{"text": "opened up Spotify and played some Chinese music", "label": "agent", "src": "shadow"}
+{"text": "Open Chrome", "label": "act", "src": "shadow"}
+{"text": "hello open chrome", "label": "act", "src": "shadow"}
+{"text": "open chrome", "label": "act", "src": "shadow"}
+{"text": "for the day.", "label": "converse", "src": "shadow"}
+{"text": "open chrome go to yt shorts and start scorllling", "label": "act", "src": "shadow"}
+{"text": "open chrome and spotify", "label": "act", "src": "shadow"}
+{"text": "jarvis, in the agent browser go to instagram and keep scrolling", "label": "act", "src": "shadow"}
+{"text": "what apps are on my Windows laptop?", "label": "converse", "src": "shadow"}
+{"text": "jarvis hello what apps are on my windows desktop ?", "label": "converse", "src": "shadow"}
+{"text": "One apps are on my Windows desktop folder", "label": "converse", "src": "shadow"}
+{"text": "how many apps are on my desktop and my Dell computer?", "label": "converse", "src": "shadow"}
+{"text": "shortcut", "label": "converse", "src": "shadow"}
+{"text": "Do you mean the desktop shortcuts on this Zen", "label": "converse", "src": "shadow"}
+{"text": "how many apps are on my Dell?", "label": "converse", "src": "shadow"}
+{"text": "how many apps are on my Dell and on this laptop?", "label": "converse", "src": "shadow"}
+{"text": "what projects am I working on according to my notes?", "label": "converse", "src": "shadow"}
+{"text": "fix the bug where the overlay doesn't hide", "label": "build", "src": "hard"}
+{"text": "write unit tests for the vault recall", "label": "build", "src": "hard"}
+{"text": "add a --json flag to jarvis eval", "label": "build", "src": "hard"}
+{"text": "make the parser understand typos in app names", "label": "build", "src": "hard"}
+{"text": "refactor cluster.py into smaller modules", "label": "build", "src": "hard"}
+{"text": "code a discord bot that posts my calendar every morning", "label": "build", "src": "hard"}
+{"text": "set up a flask backend for the markets tab", "label": "build", "src": "hard"}
+{"text": "build a trading terminal app in python", "label": "build", "src": "hard"}
+{"text": "create a react page that lists my tasks", "label": "build", "src": "hard"}
+{"text": "write a python script to back up my vault every night", "label": "build", "src": "hard"}
+{"text": "debug why the voice listener crashes on startup", "label": "build", "src": "hard"}
+{"text": "implement a markets window in the jarvis console", "label": "build", "src": "hard"}
+{"text": "update the readme with the setup steps", "label": "build", "src": "hard"}
+{"text": "migrate the history database to the new schema", "label": "build", "src": "hard"}
+{"text": "write a bash script that syncs my dotfiles between the laptops", "label": "build", "src": "hard"}
+{"text": "make a leetcode tracker website", "label": "build", "src": "hard"}
+{"text": "fix the css on my ip logger website", "label": "build", "src": "hard"}
+{"text": "add dark mode to the jarvis console", "label": "build", "src": "hard"}
+{"text": "write a function that parses ics calendar files", "label": "build", "src": "hard"}
+{"text": "create a cli to log my workouts", "label": "build", "src": "hard"}
+{"text": "port the overlay to linux", "label": "build", "src": "hard"}
+{"text": "speed up how fast the embedding model loads", "label": "build", "src": "hard"}
+{"text": "add logging to the clipboard sync", "label": "build", "src": "hard"}
+{"text": "code me a snake game in python", "label": "build", "src": "hard"}
+{"text": "write a scraper for software engineering job postings", "label": "build", "src": "hard"}
+{"text": "build a chrome extension that blocks youtube shorts", "label": "build", "src": "hard"}
+{"text": "make a script that resizes my screenshots", "label": "build", "src": "hard"}
+{"text": "add retries to the ssh tunnel code", "label": "build", "src": "hard"}
+{"text": "fix the failing cluster tests", "label": "build", "src": "hard"}
+{"text": "add a new intent for screen brightness", "label": "build", "src": "hard"}
+{"text": "write the backend for my private coding gpt", "label": "build", "src": "hard"}
+{"text": "set up a sqlite database to track my expenses", "label": "build", "src": "hard"}
+{"text": "create a portfolio website for me", "label": "build", "src": "hard"}
+{"text": "implement a binary search tree in c for my os class", "label": "build", "src": "hard"}
+{"text": "fix the typo in the onboarding script", "label": "build", "src": "hard"}
+{"text": "make the jarvis console load faster", "label": "build", "src": "hard"}
+{"text": "write tests for the scorecard", "label": "build", "src": "hard"}
+{"text": "build a small app to track my grad school applications", "label": "build", "src": "hard"}
+{"text": "clean up the dead code in ui.py", "label": "build", "src": "hard"}
+{"text": "change the parser so open google opens chrome", "label": "build", "src": "hard"}
+{"text": "make jarvis able to set timers", "label": "build", "src": "hard"}
+{"text": "write a shell script for my os assignment 2", "label": "build", "src": "hard"}
+{"text": "build the website for project watchtower", "label": "build", "src": "hard"}
+{"text": "refactor the decider so it learns from labels", "label": "build", "src": "hard"}
+{"text": "implement page table walking for the os lab", "label": "build", "src": "hard"}
+{"text": "write a python script that downloads my canvas files", "label": "build", "src": "hard"}
+{"text": "add a button to the console that restarts the voice", "label": "build", "src": "hard"}
+{"text": "fix the bug where spotify opens twice", "label": "build", "src": "hard"}
+{"text": "how does the parser work", "label": "converse", "src": "hard"}
+{"text": "what does cluster.py do", "label": "converse", "src": "hard"}
+{"text": "explain the decider to me", "label": "converse", "src": "hard"}
+{"text": "why did the tests fail earlier", "label": "converse", "src": "hard"}
+{"text": "what's the difference between a process and a thread", "label": "converse", "src": "hard"}
+{"text": "explain virtual memory like I'm five", "label": "converse", "src": "hard"}
+{"text": "what is a race condition", "label": "converse", "src": "hard"}
+{"text": "is python faster than rust", "label": "converse", "src": "hard"}
+{"text": "what do you think of react", "label": "converse", "src": "hard"}
+{"text": "how does spotify pick recommended songs", "label": "converse", "src": "hard"}
+{"text": "what's a good laptop for coding", "label": "converse", "src": "hard"}
+{"text": "how do I open chrome on linux", "label": "converse", "src": "hard"}
+{"text": "can you even open apps", "label": "converse", "src": "hard"}
+{"text": "what can you do", "label": "converse", "src": "hard"}
+{"text": "which apps can you open on my dell", "label": "converse", "src": "hard"}
+{"text": "remind me what the markets tab is", "label": "converse", "src": "hard"}
+{"text": "what's a good song to study to", "label": "converse", "src": "hard"}
+{"text": "what should I eat tonight", "label": "converse", "src": "hard"}
+{"text": "what's 15 percent of 80", "label": "converse", "src": "hard"}
+{"text": "how many kilometers is 5 miles", "label": "converse", "src": "hard"}
+{"text": "good night jarvis", "label": "converse", "src": "hard"}
+{"text": "thanks that worked", "label": "converse", "src": "hard"}
+{"text": "nah never mind", "label": "converse", "src": "hard"}
+{"text": "that's wrong", "label": "converse", "src": "hard"}
+{"text": "you opened the wrong app", "label": "converse", "src": "hard"}
+{"text": "why did you open chrome", "label": "converse", "src": "hard"}
+{"text": "what did you just do", "label": "converse", "src": "hard"}
+{"text": "how do neural networks learn", "label": "converse", "src": "hard"}
+{"text": "who won the knicks game last night", "label": "converse", "src": "hard"}
+{"text": "what's the weather tomorrow", "label": "converse", "src": "hard"}
+{"text": "how long until thanksgiving", "label": "converse", "src": "hard"}
+{"text": "what's the best way to learn chinese", "label": "converse", "src": "hard"}
+{"text": "what's shellcode", "label": "converse", "src": "hard"}
+{"text": "is spotify open on my dell", "label": "converse", "src": "hard"}
+{"text": "what is the jarvis console", "label": "converse", "src": "hard"}
+{"text": "how are you doing today", "label": "converse", "src": "hard"}
+{"text": "what's up", "label": "converse", "src": "hard"}
+{"text": "tell me something interesting", "label": "converse", "src": "hard"}
+{"text": "do you like music", "label": "converse", "src": "hard"}
+{"text": "play my discover weekly", "label": "agent", "src": "hard"}
+{"text": "message my mom happy birthday on whatsapp", "label": "agent", "src": "hard"}
+{"text": "find me a cheap flight to tokyo", "label": "agent", "src": "hard"}
+{"text": "order a pizza from dominos", "label": "agent", "src": "hard"}
+{"text": "search amazon for a usb c hub", "label": "agent", "src": "hard"}
+{"text": "reply to the last email from my professor", "label": "agent", "src": "hard"}
+{"text": "unsubscribe me from these newsletters", "label": "agent", "src": "hard"}
+{"text": "post my drone picture on instagram", "label": "agent", "src": "hard"}
+{"text": "check if my package shipped", "label": "agent", "src": "hard"}
+{"text": "find a youtube video about page tables and play it", "label": "agent", "src": "hard"}
+{"text": "add the os midterm to my google calendar", "label": "agent", "src": "hard"}
+{"text": "text kevin that I'm running late", "label": "agent", "src": "hard"}
+{"text": "like the last post on my instagram feed", "label": "agent", "src": "hard"}
+{"text": "download the lecture slides from brightspace", "label": "agent", "src": "hard"}
+{"text": "sign me up for spring registration", "label": "agent", "src": "hard"}
+{"text": "log into my bank and check my balance", "label": "agent", "src": "hard"}
+{"text": "pay my phone bill", "label": "agent", "src": "hard"}
+{"text": "play the next episode on netflix", "label": "agent", "src": "hard"}
+{"text": "queue some chinese music on spotify", "label": "agent", "src": "hard"}
+{"text": "book office hours with ben", "label": "agent", "src": "hard"}
+{"text": "search twitter for jarvis ai", "label": "agent", "src": "hard"}
+{"text": "fill out the health insurance form", "label": "agent", "src": "hard"}
+{"text": "apply to the squarepoint job on linkedin", "label": "agent", "src": "hard"}
+{"text": "dm sam on discord", "label": "agent", "src": "hard"}
+{"text": "join the csaw meeting on discord", "label": "agent", "src": "hard"}
+{"text": "play a lofi playlist on spotify", "label": "agent", "src": "hard"}
+{"text": "find the cheapest airpods on amazon", "label": "agent", "src": "hard"}
+{"text": "read my latest discord messages", "label": "agent", "src": "hard"}
+{"text": "play the latest mrbeast video on youtube", "label": "agent", "src": "hard"}
+{"text": "open discord on the dell", "label": "act", "src": "hard"}
+{"text": "launch steam on arch", "label": "act", "src": "hard"}
+{"text": "close spotify", "label": "act", "src": "hard"}
+{"text": "pause", "label": "act", "src": "hard"}
+{"text": "play", "label": "act", "src": "hard"}
+{"text": "next song", "label": "act", "src": "hard"}
+{"text": "volume 50", "label": "act", "src": "hard"}
+{"text": "mute on the dell", "label": "act", "src": "hard"}
+{"text": "open youtube on arch", "label": "act", "src": "hard"}
+{"text": "switch to obsidian", "label": "act", "src": "hard"}
+{"text": "open vs code", "label": "act", "src": "hard"}
+{"text": "open the terminal", "label": "act", "src": "hard"}
+{"text": "scroll down", "label": "act", "src": "hard"}
+{"text": "stop scrolling on arch", "label": "act", "src": "hard"}
+{"text": "open slack and discord", "label": "act", "src": "hard"}
+{"text": "open reddit", "label": "act", "src": "hard"}
+{"text": "quit chrome", "label": "act", "src": "hard"}
+{"text": "previous track", "label": "act", "src": "hard"}
+{"text": "turn the volume down on arch", "label": "act", "src": "hard"}
+{"text": "open notepad on the dell", "label": "act", "src": "hard"}
+{"text": "what is a hashmap", "label": "converse", "src": "hard"}
+{"text": "what is tiktok", "label": "converse", "src": "hard"}
+{"text": "what's going on with my health insurance stuff", "label": "converse", "src": "hard"}
+{"text": "how's my cybersecurity training going", "label": "converse", "src": "hard"}
+{"text": "where am I on my leetcode practice", "label": "converse", "src": "hard"}
+{"text": "what did I write about my watchtower project", "label": "converse", "src": "hard"}
+{"text": "who invented the internet", "label": "converse", "src": "hard"}
+{"text": "how many grams are in an ounce", "label": "converse", "src": "hard"}
+{"text": "play hotel california on spotify", "label": "agent", "src": "hard"}
+{"text": "open youtube and play a song by drake", "label": "agent", "src": "hard"}
+{"text": "open spotify and play something chill", "label": "agent", "src": "hard"}
+{"text": "put on some sad music", "label": "agent", "src": "hard"}

@@ -22,6 +22,8 @@ DAY = re.compile(_LEAD + r"(?:what(?:'s|s|\s+is)\s+(?:on\s+)?(?:my\s+)?(?:schedu
                  r"(?:\s+(?:today|tomorrow))?" + _TAIL, re.I)
 DUE = re.compile(_LEAD + r"(?:what(?:'s|s|\s+is)\s+(due|overdue)(?:\s+(?:this\s+week|today|soon))?|"
                  r"what\s+(?:am\s+i|is)\s+(?:behind|late)\s+on|any(?:thing)?\s+overdue|"
+                 r"am\s+i\s+(?:behind|late)\s+on\s+anything|is\s+anything\s+overdue|"
+                 r"what\s+deadlines\s+do\s+i\s+have(?:\s+(?:this\s+week|coming\s+up|soon))?|"
                  r"what\s+are\s+my\s+deadlines|when\s+are\s+my\s+deadlines)" + _TAIL, re.I)
 
 
@@ -58,7 +60,10 @@ def _event(text):
 def _deadline(item, today):
     text = re.sub(r"^(?:\(all[- ]day[^)]*\)|all[- ]day|\d{1,2}:\d{2}(?:\s*[–-]\s*\d{1,2}:\d{2})?)"
                   r"\s*[—-]?\s*", "",
-                  item["text"]).split(" — ")[0].strip()
+                  item["text"]).split(" — ")[0]
+    # "Connect Assignment Ch 7 due (tasks board, CourseSite)" -> "Connect Assignment Ch 7"
+    text = re.sub(r"\s*\([^)]*\)", "", text)
+    text = re.sub(r"\s+due\Z", "", text.strip(), flags=re.I).strip()
     return f"{text} {_when(item['date'], today)}"
 
 
@@ -78,6 +83,64 @@ def _join(items):
     return ", ".join(items[:-1]) + ", and " + items[-1]
 
 
+def _distinct(tasks):
+    """One mention per piece of work, in order. "Operating Systems Assignment 2 was due
+    2026-10-13; see [[operating-systems]]" in an audit note and "Assignment 2" in that
+    course note are the same task: same date, it points at the other's note, and it
+    contains the other's spoken title. The fuller wording is kept."""
+    from .tasks import _key
+
+    def covers(a, b):
+        if a is b or (a["due"] or a["scheduled"]) != (b["due"] or b["scheduled"]):
+            return False
+        link = b["path"].removesuffix(".md")
+        refers = (f"[[{link}" in a["raw"] or f"[[{link.rsplit('/', 1)[-1]}" in a["raw"]
+                  or f" {_key(b['note'])} " in f" {_key(a['raw'])} ")
+        return refers and f" {_key(_say(b['title']))} " in f" {_key(a['raw'])} "
+
+    kept = []
+    for task in tasks:
+        if any(covers(k, task) for k in kept):
+            continue
+        for i, k in enumerate(kept):
+            if covers(task, k):
+                kept[i] = task
+                break
+        else:
+            kept.append(task)
+    return kept
+
+
+def _priority(text):
+    """'Atlas (carried over from Thu): finish the research, then DM Sam' → 'Atlas'."""
+    from .vault import plain
+    text = re.sub(r"\s*\([^)]*\)", "", plain(text))
+    return _say(re.split(r":\s", text, maxsplit=1)[0], 50)
+
+
+def priorities_line(vault, today, back=3, limit=3):
+    """Open priorities from today's daily note or, before today's is written, the ones
+    still unchecked in the latest note of the last few days ("carried over from Friday")."""
+    for ago in range(back + 1):
+        day = today - timedelta(days=ago)
+        path = vault.daily_path(day)
+        if path.is_file():
+            break
+    else:
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    items = [_priority(m) for m in re.findall(r"^\s*\d+\.\s+- \[[ /]\]\s+(\S.*)$", text, re.M)]
+    items = [i for i in items if i]
+    if not items:
+        return ""
+    more = f", plus {len(items) - limit} more" if len(items) > limit else ""
+    lead = "Today's priorities" if day == today else f"Carried over from {_when(day, today) if ago > 1 else 'yesterday'}"
+    return f"{lead}: {_join(items[:limit])}{more}."
+
+
 def day_line(vault, day, today, limit=5):
     events = [_event(i["text"]) for i in vault.calendar_items(today, days=(day - today).days)
               if i["kind"] == "event" and i["date"] == day]
@@ -89,10 +152,10 @@ def day_line(vault, day, today, limit=5):
 
 def tasks_line(tasks, today, limit=2):
     agenda = tasks.agenda(today)
-    parts = []
-    if agenda["overdue"]:
-        names = _join(_say(t["title"]) for t in agenda["overdue"][:limit])
-        parts.append(f"{len(agenda['overdue'])} overdue task{'s' if len(agenda['overdue']) != 1 else ''}: {names}.")
+    parts, overdue = [], _distinct(agenda["overdue"])
+    if overdue:
+        names = _join(_say(t["title"]) for t in overdue[:limit])
+        parts.append(f"{len(overdue)} overdue task{'s' if len(overdue) != 1 else ''}: {names}.")
     due_today = [t for t in agenda["today"] if t["due"] == today.isoformat() or t["scheduled"]]
     if due_today:
         parts.append(f"Due today: {_join(_say(t['title']) for t in due_today[:3])}.")
@@ -119,18 +182,19 @@ def answer(text, vault, tasks, now=None):
     if BRIEF.match(text):
         greeting = "Good morning" if now.hour < 12 else "Good afternoon" if now.hour < 18 else "Good evening"
         parts = [f"{greeting}, David. It's {today:%A}, {today:%B} {_ordinal(today.day)}.",
-                 day_line(vault, today, today), tasks_line(tasks, today), deadlines_line(vault, today)]
+                 day_line(vault, today, today), priorities_line(vault, today),
+                 tasks_line(tasks, today), deadlines_line(vault, today)]
         return " ".join(p for p in parts if p)
     if (match := DAY.match(text)):
         word = next((g for g in match.groups() if g), "today").lower()
         day = today + timedelta(days=1) if word == "tomorrow" else today
         line = day_line(vault, day, today)
         if day == today:
-            line = " ".join(p for p in (line, tasks_line(tasks, today)) if p)
+            line = " ".join(p for p in (line, priorities_line(vault, today), tasks_line(tasks, today)) if p)
         return line
     if (match := DUE.match(text)):
         if (match.group(1) and match.group(1).lower() == "overdue") or re.search(r"behind|late|overdue", text, re.I):
-            overdue = tasks.agenda(today)["overdue"]
+            overdue = _distinct(tasks.agenda(today)["overdue"])
             if not overdue:
                 return "Nothing is overdue."
             def was(t):

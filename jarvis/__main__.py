@@ -104,7 +104,8 @@ def main():
     route = sub.add_parser("route", help="Show which tier a request would use; runs nothing")
     route.add_argument("text")
     mem = sub.add_parser("mem", help="Memory heap")
-    mem.add_argument("action", choices=("add", "search", "get", "link", "stats"))
+    mem.add_argument("action", choices=("add", "search", "get", "link", "stats", "consolidate",
+                                        "knowledge"))
     mem.add_argument("value", nargs="*", help="add: text | search: query | get: ID | "
                      "link: SRC DST [REL]")
     mem.add_argument("--kind", help="add: kind (default note) | search: filter")
@@ -168,6 +169,15 @@ def main():
     cr = sub.add_parser("credits", help="Provider balances; `credits key deepseek` stores a key")
     cr.add_argument("action", nargs="?", default="show", choices=("show", "key"))
     cr.add_argument("provider", nargs="?", help="key: provider id, e.g. deepseek")
+    ev = sub.add_parser("eval", help="Scorecard: parser, registry, decider, vault on real requests")
+    ev.add_argument("--brain", action="store_true",
+                    help="also ask the interpreter about a small sample (uses the subscription)")
+    ev.add_argument("--sample", type=int, default=8, help="--brain: how many cases")
+    ev.add_argument("--seed", type=int, default=0, help="--brain: which sample")
+    ev.add_argument("--cases", help="a cases .jsonl file (default tests/eval/cases.jsonl)")
+    ev.add_argument("--show", type=int, default=5, help="failures listed per part")
+    ev.add_argument("--no-save", action="store_true", help="don't append to .jarvis/eval/runs.jsonl")
+    ev.add_argument("--json", action="store_true", help="machine-readable output")
     st = sub.add_parser("selftest", help="Live checks with PASS/WARN/FAIL flags")
     st.add_argument("suite", choices=("keyboard",))
     st.add_argument("--capture", action="store_true",
@@ -355,6 +365,16 @@ def main():
             else:
                 print(selftest.render(results))
             return 1 if any(r["flag"] == "FAIL" for r in results) else 0
+        elif args.command == "eval":
+            from . import scorecard
+            report = scorecard.run(config, base, args.state, args.cases or scorecard.CASES,
+                                   brain=args.brain, size=args.sample, seed=args.seed,
+                                   save=not args.no_save)
+            if args.json:
+                emit(report)
+            else:
+                print(scorecard.render(report, args.show))
+            return 1 if report["drops"] else 0
         elif args.command in COGNITION:
             return cognition(args, config, base)
         elif args.command == "kb":
@@ -708,6 +728,11 @@ def cognition(args, config, base):
                 raise ValueError("Usage: mem link SRC DST [REL]")
             memory.link(*args.value)
             emit(memory.get(args.value[0]))
+        elif args.action == "consolidate":  # now, whether or not today's run is due
+            from .consolidate import chatgpt_ask, consolidate
+            emit(consolidate(memory, chatgpt_ask(config, base)))
+        elif args.action == "knowledge":  # consolidated facts, preferences, lessons, loops
+            emit(memory.knowledge(limit=args.limit))
         else:
             emit(memory.stats())
     elif args.command == "orchestrate":

@@ -34,8 +34,13 @@ def decide(text, config, tier=None, conversational=False, write=False, state=Non
     """The tier a request will run on. Shared by ask() and the console's preview.
     state: the state folder, so a question the vault answers at once ("what's on my
     calendar today") stays instant instead of going to Grok for sounding like an account."""
-    if tier is None and not write and grok_first(text, config) and not instant_answer(text) \
-            and not (state is not None and vault_answer(text, config, state)):
+    if tier in (None, "simple") and not write:
+        # ask() answers these with no model; "instant" names which, for the console's preview.
+        if instant_answer(text):
+            return {"tier": "simple", "reasons": ["instant: the clock"], "instant": "clock"}
+        if state is not None and vault_answer(text, config, state):
+            return {"tier": "simple", "reasons": ["instant: the vault"], "instant": "vault"}
+    if tier is None and not write and grok_first(text, config):
         return {"tier": "medium", "reasons": ["Grok Bot orchestrates account and web work"]}
     if (tier is None and conversational and not write
             and not config.get("routing", {}).get("auto_escalate")):
@@ -43,6 +48,14 @@ def decide(text, config, tier=None, conversational=False, write=False, state=Non
         # Web/orchestration tiers run only when asked for explicitly with a tier.
         return {"tier": "simple", "reasons": ["conversation (auto_escalate off)"]}
     return classify(text, tier)
+
+
+def _situation_on(config):
+    """brain.situation (default on): send the live machine snapshot (situation.py). Tests
+    get it only when their config asks, so the suite never lists real windows."""
+    from . import _under_tests
+    setting = (config.get("brain") or {}).get("situation")
+    return setting is True or (setting is None and not _under_tests())
 
 
 def lane_label(lane, text):
@@ -98,6 +111,7 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
             result = {**result, "streamed": True}
         return {**result, "via": "main"}
     routing = config.get("routing", {})
+    _note_correction(text, memory)
     confirmed = _confirmation_turn(text, memory, config, base, channel,
                                    on_start, on_sentence, on_step)
     if confirmed is not None:
@@ -149,11 +163,18 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
         # sources and dates, then the heap (what was said).
         notes = vault_recall(config, memory.path.parent, text)
         claims = kb_recall(config, memory.path.parent, text)
-        heap = memory.context(text)
+        # The memory pack (open loops, consolidated facts and lessons that match) before the
+        # raw heap, which then skips the lines the pack already has.
+        pack = _memory_pack(memory, text)
+        held = {line.split("]", 1)[0] for line in pack}
+        heap = pack + [line for line in memory.context(text) if line.split("]", 1)[0] not in held]
         recall = notes + claims + heap
         talk = memory.conversation(skip={inbound["id"]}) if hasattr(memory, "conversation") else []
         if talk:  # earlier turns, so "go check" knows what it refers to
             recall.insert(0, CONVERSATION + "\n  " + "\n  ".join(talk))
+        if _situation_on(config):  # what the computers are doing now ("close that")
+            from .situation import lines
+            recall[:0] = lines(config, memory.path.parent)
         from .topology import ORIGIN, enabled, identity
         if enabled(config) and ORIGIN.get():
             recall.insert(0, f"This request originates on {ORIGIN.get()}. The JARVIS main PC is {identity(config)[1]}. "
@@ -454,6 +475,22 @@ def _shadow(config, memory, text, label, job="mode", decided=True):
     threading.Thread(target=run, name="jarvis-decider-shadow", daemon=True).start()
 
 
+def _note_correction(text, memory):
+    """"No, I meant the Dell": keep a lesson linked to the exchange it corrects."""
+    try:
+        if memory is not None and hasattr(memory, "note_correction"):
+            memory.note_correction(text)
+    except Exception:
+        pass  # a lesson is never worth failing the request it came with
+
+
+def _memory_pack(memory, text):
+    try:
+        return memory.pack(text) if hasattr(memory, "pack") else []
+    except Exception:  # recall must never break a request
+        return []
+
+
 def _needs_agent(text, config):
     """Actions the parser recognized but can't run go to Grok Bot (behind its preflight);
     conversation stays with the brain. Off when Grok isn't set up or routing says so."""
@@ -490,7 +527,11 @@ def _interpret(text, memory, config, base, channel, on_start, on_sentence, on_st
     from .topology import ORIGIN
     from .remote import Remote
     origin = ORIGIN.get() or Remote(config, memory.path.parent).here()
-    read = interpret(text, config, base, origin)
+    try:  # David's past corrections, so "the laptop" resolves the way he taught it
+        lessons = memory.context(text, limit=2, max_chars=600, kinds=("lesson",))
+    except Exception:
+        lessons = []
+    read = interpret(text, config, base, origin, lessons=lessons)
     if read is None:
         return None
     if read["mode"] == "act":
