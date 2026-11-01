@@ -149,6 +149,20 @@ class ReadTests(VaultCase):
         self.assertEqual(self.vault.context("amygdala"), [])  # too short to be a question
         self.assertEqual(recall({}, self.state, "amygdala and fear please"), [])  # no vault set
 
+    def test_recall_gate_drops_keyword_hits_on_requests_not_about_notes(self):
+        question = "what did I write about the amygdala and fear?"
+        sims = {"notes": 0.2, "none": 0.5}  # clearly not about the notes
+        with mock.patch("jarvis.decide.choose", return_value={"sims": sims}):
+            self.assertEqual(self.vault.context(question), [])
+            self.vault.settings = {**self.vault.settings, "recall_gate": False}
+            self.assertTrue(self.vault.context(question))  # gate off: keyword recall as before
+        self.vault.settings = {k: v for k, v in self.vault.settings.items() if k != "recall_gate"}
+        close = {"notes": 0.45, "none": 0.5}  # a close call keeps the notes
+        with mock.patch("jarvis.decide.choose", return_value={"sims": close}):
+            self.assertTrue(self.vault.context(question))
+        with mock.patch("jarvis.decide.choose", return_value=None):  # no model: keep keyword recall
+            self.assertTrue(self.vault.context(question))
+
     def test_world_brief(self):
         brief = self.vault.world(today=TODAY)
         for expected in ("Student at State U, studying OS.", "Current courses: Operating Systems",

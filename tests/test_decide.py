@@ -47,6 +47,8 @@ class DecideBase(unittest.TestCase):
         decide.PROTOTYPES.update(copy.deepcopy(SMALL))
         decide._TEMPS.clear()
         decide._cache.clear()
+        decide._models.clear()  # never keep a classifier trained on SMALL
+        self.addCleanup(decide._models.clear)
         p = mock.patch("jarvis.embed.embed", side_effect=fake_embed)
         self.embed = p.start()
         self.addCleanup(p.stop)
@@ -183,38 +185,41 @@ def synth(winner_is_label=True, n=60, label_override=None):
 
 
 class CalibrateTests(DecideBase):
-    def fill(self, rows, job="mode"):
+    JOB = "tool"  # no classifier: calibrated by temperature over the logged similarities
+
+    def fill(self, rows, job=None):
+        job = job or self.JOB
         for d, label in rows:
             decide.record(self.state, job, "t", d, label=label)
 
     def test_too_few_labels(self):
         self.fill(synth(n=decide.MIN_LABELS - 1))
-        rep = decide.calibrate(self.state, "mode")
+        rep = decide.calibrate(self.state, self.JOB)
         self.assertFalse(rep["ready"])
         self.assertEqual(rep["labels"], decide.MIN_LABELS - 1)
         self.assertIn("needs", rep["note"])
-        self.assertNotIn("mode", decide._TEMPS)
+        self.assertNotIn(self.JOB, decide._TEMPS)
 
     def test_unlabelled_rows_do_not_count(self):
         for d, _ in synth(n=80):
             decide.record(self.state, "mode", "t", d)
-        self.assertEqual(decide.calibrate(self.state, "mode")["labels"], 0)
+        self.assertEqual(decide.calibrate(self.state, self.JOB)["labels"], 0)
 
     def test_perfect_labels_ready(self):
         self.fill(synth(n=60))
-        rep = decide.calibrate(self.state, "mode")
+        rep = decide.calibrate(self.state, self.JOB)
         self.assertTrue(rep["ready"])
         self.assertIsNotNone(rep["threshold"])
         self.assertEqual(rep["accuracy"], 1.0)
         self.assertEqual(rep["labels"], 60)
         grid = [0.01 * k for k in range(1, 31)]
         self.assertTrue(any(abs(rep["temperature"] - g) < 1e-9 for g in grid))
-        self.assertEqual(decide.temperature_for("mode"), rep["temperature"])
+        self.assertEqual(decide.temperature_for(self.JOB), rep["temperature"])
         self.assertGreater(rep["coverage"], 0)
 
     def test_disagreeing_labels_not_ready(self):
         self.fill(synth(winner_is_label=False, n=60))
-        rep = decide.calibrate(self.state, "mode")
+        rep = decide.calibrate(self.state, self.JOB)
         self.assertFalse(rep["ready"])
         self.assertIsNone(rep["threshold"])
         self.assertEqual(rep["accuracy"], 0.0)
@@ -222,18 +227,30 @@ class CalibrateTests(DecideBase):
     def test_labels_outside_sims_are_ignored(self):
         self.fill(synth(n=60))
         self.fill([({"winner": "act", "probs": {}, "sims": {"act": 0.9, "agent": 0.1}}, "ghost")] * 5)
-        rep = decide.calibrate(self.state, "mode")
+        rep = decide.calibrate(self.state, self.JOB)
         self.assertEqual(rep["labels"], 60)
         self.assertTrue(rep["ready"])
 
     def test_only_requested_job(self):
         self.fill(synth(n=60), job="other")
-        self.assertFalse(decide.calibrate(self.state, "mode")["ready"])
+        self.assertFalse(decide.calibrate(self.state, self.JOB)["ready"])
         self.assertTrue(decide.calibrate(self.state, "other")["ready"])
+
+    def test_classifier_job_scores_its_logged_probabilities(self):
+        # mode has a classifier (decide.CUES): its own logged confidence is what's scored.
+        for i in range(60):
+            right = i % 3 != 0  # 40 right at 0.95, 20 wrong at 0.6
+            d = {"winner": "act", "probs": {"act": 0.95 if right else 0.6, "converse": 0.05},
+                 "sims": {"act": 0.5, "converse": 0.5}}
+            decide.record(self.state, "mode", "t", d, label="act" if right else "converse")
+        rep = decide.calibrate(self.state, "mode")
+        self.assertTrue(rep["ready"])
+        self.assertEqual(rep["threshold"], 0.95)  # the 0.6 picks are the wrong ones
+        self.assertEqual(rep["accuracy"], 0.667)
 
     def test_all_labels_unusable_does_not_crash(self):
         self.fill([({"winner": "act", "probs": {}, "sims": {"act": 0.9}}, "ghost")] * 55)
-        rep = decide.calibrate(self.state, "mode")
+        rep = decide.calibrate(self.state, self.JOB)
         self.assertFalse(rep["ready"])
 
 

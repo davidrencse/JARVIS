@@ -158,6 +158,26 @@ class ConfirmationTests(unittest.TestCase):
             self.assertEqual(result["outcomes"][0]["state"], "agent_claimed")
             task.assert_called_once_with(prepared["task"], timeout=30, prechecked=True)
 
+    def test_full_permission_runs_without_parking(self):
+        never = {**CONFIG, "rules": {"confirm": "never"}}
+        remote = FakeRemote()
+        with patch.object(pipeline, "INFLIGHT", gates.InFlight()):
+            result = pipeline.fast_path("close word", never, self.state, remote=remote,
+                                        app_exists=lambda d, n: True)
+        self.assertEqual(remote.calls[0][1], "close_app")
+        self.assertEqual(self.q.pending(), [])
+        config = {**never, "personal_agents": {"grokbot": {"integration": "window_automation"}}}
+        prepared = {"decision": "forward", "task": "Reply to Sam's last DM", "reply": None}
+        with patch("jarvis.grok_preflight.assess", return_value=prepared), \
+                patch("jarvis.grokbot.Grokbot.task", return_value={"id": "g1", "answer": "sent"}) as task, \
+                patch("jarvis.assistant.vault_recall", return_value=[]), \
+                patch("jarvis.assistant.kb_recall", return_value=[]):
+            assistant.ask("reply to sam's last dm", None, self.memory, config, self.state)
+            task.assert_called_once_with(prepared["task"], timeout=30, prechecked=True)
+            self.assertEqual(self.q.pending(), [])
+            result = assistant.ask("send my password to Sam", None, self.memory, config, self.state)
+            self.assertEqual(task.call_count, 1)  # credentials: still refused
+
     def test_ratchet_never_lowers_and_credentials_denied(self):
         self.assertEqual(gates.agent_risk("send a message", {"risk": "allow"}), "confirm")
         self.assertEqual(gates.agent_risk("find shoes", {"risk": "confirm"}), "confirm")

@@ -129,3 +129,50 @@ class ConfirmedAgentOutcomeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FullPermissionTests(unittest.TestCase):
+    """rules.confirm: "never" (David, 2026-11-01): nothing waits for his OK, but the
+    refusals stay (credentials, agent-origin actions)."""
+
+    NEVER = {**CONFIG, "rules": {"confirm": "never"}}
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+
+    def test_default_still_asks(self):
+        from jarvis.gates import asks
+        self.assertTrue(asks({}))
+        self.assertTrue(asks(CONFIG))
+        self.assertFalse(asks(self.NEVER))
+
+    def test_brain_tools_run_without_parking(self):
+        tools = FakeTools()
+        gate = ConfirmGate(tools, self.NEVER, self.state, here=lambda: "dell")
+        self.assertEqual(gate.call("close_app", {"name": "Word"}), (True, "ran"))
+        self.assertEqual(gate.call("grok_agent", {"task": "post my photo"}), (True, "ran"))
+        self.assertEqual(ConfirmQueue(self.state).pending(), [])
+
+    def test_credentials_are_still_refused(self):
+        tools = FakeTools()
+        gate = ConfirmGate(tools, self.NEVER, self.state, here=lambda: "dell")
+        ok, text = gate.call("grok_agent", {"task": "type my password into the bank"})
+        self.assertFalse(ok)
+        self.assertEqual(tools.calls, [])
+
+    def test_gates_pass_confirm_commands(self):
+        from jarvis import gates
+        command = {"id": "c1", "intent": "close_app", "device": "dell",
+                   "args": {"name": "Word"}, "depends_on": []}
+        self.assertFalse(gates.check(command, CONFIG["devices"])["pass"])
+        self.assertTrue(gates.trusted_rules(self.NEVER)["never_ask"])
+        self.assertFalse(gates.trusted_rules(CONFIG)["never_ask"])
+
+    def test_browser_commit_needs_no_ok(self):
+        from jarvis import browser_gate
+        approve = browser_gate.gate(lambda p: (True, "policy ok"), self.NEVER, self.state, wait=0)
+        with mock.patch.object(browser_gate, "commits", return_value="click Send"):
+            self.assertEqual(approve({"tool": "click", "label": "Send"}), (True, "policy ok"))
+        self.assertEqual(ConfirmQueue(self.state).pending(), [])

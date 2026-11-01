@@ -91,6 +91,26 @@ class ConsolidateTest(Base):
         self.assertEqual(summary["closed"], 1)
         self.assertEqual(self.memory.get(loop)["kind"], "closed")
 
+    def test_raw_corrections_are_rewritten_or_dropped(self):
+        m1 = self.said("David", "open spotify on the dell", days=2)
+        self.said("JARVIS", "Opened Spotify on your Dell.", days=2)
+        with mock.patch("jarvis.memory._now", return_value=datetime.now(timezone.utc) - timedelta(days=2)):
+            slip = self.memory.note_correction("no, I meant the zenbook")
+            other = self.memory.note_correction("no, I meant the zenbook again")
+        kept, _ = self.memory.absorb("lesson", "When David says the laptop he means the Dell.", [m1])
+        seen = {}
+
+        def ask(prompt):
+            seen["prompt"] = prompt
+            return json.dumps({"items": [], "closed": [],
+                               "dropped": [slip, kept, "lesson:never-shown"]})
+        summary = cons.consolidate(self.memory, ask)
+        self.assertIn("David corrected JARVIS", seen["prompt"])
+        self.assertEqual(summary["dropped"], 1)  # only a raw correction note can be dropped
+        self.assertEqual(self.memory.get(slip)["kind"], "forgotten")
+        self.assertEqual(self.memory.get(kept)["kind"], "lesson")
+        self.assertEqual(self.memory.get(other)["kind"], "lesson")  # not accounted for: kept
+
     def test_window_runs_once_and_failure_records_nothing(self):
         self.said("David", "hello there")
         with self.assertRaises(RuntimeError):
