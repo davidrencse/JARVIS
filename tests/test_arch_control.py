@@ -204,6 +204,67 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(reply, "I can't open that page: it needs a login.")
         self.assertEqual(chat.asked, [])
 
+    def test_talk_deferrals_go_to_the_tools(self):
+        # Seen 2026-10-29/30: the talk lane offered to check, or asked him to repeat it.
+        for excuse in ("Say “Jarvis, how many apps are on my Dell?” so I can check.",
+                       "I don’t have a list of apps installed on your Dell. I can check it if you want.",
+                       "I can’t inspect the Dell right now because the Windows-check tool is unavailable."):
+            chat, act = self.Lane(excuse), self.Lane("Your Dell lists 283 apps.")
+            reply = Brain(chat, act, wants=lambda t: False).ask("how many apps are on my dell")
+            self.assertEqual(reply, "Your Dell lists 283 apps.", excuse)
+
+    class ToolLane(Lane):
+        """A tools lane whose turns answer in order, each with its own tool log."""
+        def __init__(self, turns):
+            self.turns, self.asked, self.tool_log = list(turns), [], []
+
+        def ask(self, text, recall=(), on_sentence=None):
+            self.asked.append(text)
+            reply, self.tool_log = self.turns.pop(0)
+            if on_sentence:
+                for sentence in reply.split(". "):
+                    on_sentence(sentence)
+            return reply
+
+    def test_tools_lane_excuse_without_a_call_is_retried_unspoken(self):
+        # Seen 2026-10-30: "the tool service is disabled" with no tool called.
+        act = self.ToolLane([("I tried checking your Dell, but the tool service is disabled right now.", []),
+                             ("Your Dell lists 283 apps.", [("list_apps", True, "283 apps")])])
+        spoken = []
+        reply = Brain(self.Lane("x"), act, wants=lambda t: True).ask(
+            "how many apps are on my dell", on_sentence=spoken.append)
+        self.assertEqual(reply, "Your Dell lists 283 apps.")
+        self.assertEqual(spoken, ["Your Dell lists 283 apps."])
+        self.assertEqual(len(act.asked), 2)
+        self.assertIn("did not call any", act.asked[1])
+        self.assertTrue(act.asked[1].endswith("how many apps are on my dell"))
+
+    def test_tools_blamed_for_a_real_failure_names_the_error(self):
+        act = self.ToolLane([("The tool is unavailable right now.", [("list_apps", False, "Node dell is offline")]),
+                             ("Your Dell is offline, so I couldn't count its apps.", [])])
+        reply = Brain(self.Lane("x"), act, wants=lambda t: True).ask("how many apps are on my dell")
+        self.assertEqual(reply, "Your Dell is offline, so I couldn't count its apps.")
+        self.assertIn("list_apps: Node dell is offline", act.asked[1])
+        self.assertEqual(act.tool_log[0], ("list_apps", False, "Node dell is offline"))  # both turns kept
+
+    def test_tools_lane_naming_a_real_limit_stands_and_is_spoken(self):
+        act = self.ToolLane([("I can't open that app on the Dell, it isn't installed.",
+                              [("list_apps", True, "no match")])])
+        spoken = []
+        reply = Brain(self.Lane("x"), act, wants=lambda t: True).ask("open photoshop on the dell",
+                                                                    on_sentence=spoken.append)
+        self.assertEqual(reply, "I can't open that app on the Dell, it isn't installed.")
+        self.assertEqual(spoken, ["I can't open that app on the Dell, it isn't installed."])
+        self.assertEqual(len(act.asked), 1)
+
+    def test_unused_tools_are_pointed_out_once(self):
+        act = self.ToolLane([("Opened Spotify. I can't control playback with the tools available here.",
+                              [("open_app", True, "Opened Spotify.")]),
+                             ("Playing now.", [("media", True, "ok")])])
+        reply = Brain(self.Lane("x"), act, wants=lambda t: True).ask("open spotify and play something")
+        self.assertEqual(reply, "Playing now.")
+        self.assertIn("whole tool list", act.asked[1])
+
     def test_plain_talk_stays_talk(self):
         chat, act = self.Lane("Lima."), self.Lane("x")
         self.assertEqual(Brain(chat, act, wants=lambda t: False).ask("capital of Peru?"), "Lima.")

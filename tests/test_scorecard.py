@@ -69,6 +69,21 @@ class PartTests(unittest.TestCase):
                                                   "args": {"name": "Spotify"}}]))
         self.assertFalse(scorecard.matches(None, [{"intent": "open_app", "device": "zenbook"}]))
 
+    def test_grounding_scores_routes_and_excuses(self):
+        import json, tempfile
+        rows = [{"_meta": {}}, {"route": "how many apps are on my dell", "lane": "act"},
+                {"route": "capital of peru?", "lane": "act"},  # wrong on purpose
+                {"talk": "I can't inspect your computers right now.", "excuse": True},
+                {"tools": "The tool is disabled.", "log": [], "excuse": True},
+                {"tools": "Opened Spotify.", "log": [["open_app", True, "ok"]], "excuse": False}]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "g.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+            part = scorecard.score_grounding(path)
+            self.assertIsNone(scorecard.score_grounding(Path(tmp) / "missing.jsonl"))
+        self.assertEqual((part["correct"], part["n"]), (4, 5))
+        self.assertEqual(part["fails"][0]["text"], "capital of peru?")
+
     def test_parser_counts_a_parsed_question_as_wrong(self):
         cases = [self.ACT, {"text": "open spotify", "type": "converse"}]
         part = scorecard.score_parser(cases, CONFIG, "zenbook")

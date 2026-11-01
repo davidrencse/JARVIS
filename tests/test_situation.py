@@ -56,7 +56,23 @@ class SnapshotTests(unittest.TestCase):
                 patch("jarvis.situation._ask", ask):
             situation.refresh(CLUSTER, self.state)
         text = situation.lines(CLUSTER, self.state, start=lambda fn: None)[0]
-        self.assertNotIn("dell", text)
+        self.assertNotIn("dell: focused", text)  # nothing about it is guessed...
+        self.assertIn("dell: not answering right now", text)  # ...and the brain knows why
+        self.assertIn("zen: open: kitty", text)
+
+    def test_a_node_the_hub_has_offline_is_named(self):
+        with patch("jarvis.situation._machines", return_value=[("zen", True)]), \
+                patch("jarvis.situation._ask", self.reports):
+            situation.refresh(CLUSTER, self.state, offline=lambda c, s: ["dell"])
+        text = situation.lines(CLUSTER, self.state, start=lambda fn: None)[0]
+        self.assertIn("dell: not answering right now", text)
+
+    def test_a_node_back_online_is_not_named_offline(self):
+        with patch("jarvis.situation._machines", return_value=[("zen", True), ("dell", False)]), \
+                patch("jarvis.situation._ask", self.reports):
+            situation.refresh(CLUSTER, self.state, offline=lambda c, s: ["dell"])
+        text = situation.lines(CLUSTER, self.state, start=lambda fn: None)[0]
+        self.assertNotIn("not answering", text)
 
     def test_observe_now_shows_only_the_focused_title(self):
         from jarvis import observe
