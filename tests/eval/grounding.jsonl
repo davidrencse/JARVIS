@@ -59,3 +59,16 @@
 {"tools": "Your Dell is offline right now, so I couldn't count its apps.", "log": [["list_apps", false, "Node dell is offline"]], "excuse": false}
 {"tools": "I can't open that page: it needs a login.", "log": [["browser_navigate", true, "login page"]], "excuse": false}
 {"tools": "Opened Spotify on the Dell.", "log": [["open_app", true, "Opened Spotify."]], "excuse": false}
+{"route": "what's the temperature outside", "lane": "chat"}
+{"route": "what is the charge of an electron", "lane": "chat"}
+{"route": "how far is the drive to Boston", "lane": "chat"}
+{"route": "how is the space station doing", "lane": "chat"}
+{"route": "tell me about the GPU market", "lane": "chat"}
+{"route": "how much space does a tesla have", "lane": "chat"}
+{"route": "is the museum open right now", "lane": "chat"}
+{"route": "is Costco open on Sunday?", "lane": "chat"}
+{"route": "what's the dell's battery", "lane": "act"}
+{"route": "how much battery do i have", "lane": "act"}
+{"tools": "I can't check the Dell right now because the Dell is offline.", "log": [], "excuse": false}
+{"tools": "Developer tools are disabled in this Chrome profile.", "log": [["browser_snapshot", true, "ok"]], "excuse": false}
+{"tools": "The Lan Mouse tool is not connected right now.", "log": [["terminal", true, "ok"]], "excuse": false}
