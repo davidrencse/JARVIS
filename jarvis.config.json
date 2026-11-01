@@ -207,7 +207,8 @@
     "lanes": 2
   },
   "memory": {
-    "semantic": true
+    "semantic": true,
+    "consolidate": true
   },
   "rules": {
     "trusted_local": {
