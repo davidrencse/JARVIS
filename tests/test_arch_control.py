@@ -307,7 +307,7 @@ class HandoffTests(unittest.TestCase):
         from unittest.mock import patch
         brain = Brain(self.Lane("x"), self.Lane("y"), decider=True)
         with patch("jarvis.decide.wants_tools", return_value=True) as asked:
-            self.assertEqual(brain.pick("next short"), "act")
+            self.assertEqual(brain.pick("switch to discord"), "act")
         asked.assert_called_once()
         with patch("jarvis.decide.wants_tools", return_value=False):
             self.assertEqual(brain.pick("tell me about rome"), "chat")
@@ -321,6 +321,59 @@ class HandoffTests(unittest.TestCase):
                 patch("threading.Thread", side_effect=lambda **k: type("T", (), {"start": lambda s: started.append(1)})()):
             self.assertFalse(decide.wants_tools("start up kitty"))
         self.assertEqual(started, [1])  # building in the background instead
+
+    def test_a_failed_warm_up_is_logged_and_retried_later(self):
+        import io
+        from unittest.mock import patch
+        from jarvis import decide
+
+        class Inline:  # runs the build on the calling thread
+            def __init__(self, target, **_):
+                self.target = target
+
+            def start(self):
+                self.target()
+        failed, err = {}, io.StringIO()
+        with patch.object(decide, "_models", {}), patch.object(decide, "_warming", []), \
+                patch.object(decide, "_warm_failed", failed), patch("threading.Thread", Inline), \
+                patch.object(decide, "choose", side_effect=RuntimeError("no model")) as built, \
+                patch("sys.stderr", err):
+            decide.warm("mode")
+            self.assertEqual(decide._warming, [])  # the flag is cleared, not stuck
+            self.assertIn("building the mode model failed", err.getvalue())
+            decide.warm("mode")  # inside the cooldown: no second build
+            self.assertEqual(built.call_count, 1)
+            failed["mode"] -= decide.WARM_RETRY_S + 1  # cooldown over
+            decide.warm("mode")
+            self.assertEqual(built.call_count, 2)
+
+    def test_a_silent_warm_up_failure_counts_as_failed(self):
+        import io
+        from unittest.mock import patch
+        from jarvis import decide
+
+        class Inline:
+            def __init__(self, target, **_):
+                self.target = target
+
+            def start(self):
+                self.target()
+        failed = {}
+        with patch.object(decide, "_models", {}), patch.object(decide, "_warming", []), \
+                patch.object(decide, "_warm_failed", failed), patch("threading.Thread", Inline), \
+                patch.object(decide, "choose", return_value=None), patch("sys.stderr", io.StringIO()):
+            decide.warm("mode")  # no embedding model: choose() returns None
+        self.assertIn("mode", failed)
+
+    def test_one_job_warming_does_not_block_another(self):
+        from unittest.mock import patch
+        from jarvis import decide
+        started = []
+        with patch.object(decide, "_models", {}), patch.object(decide, "_warming", ["notes"]), \
+                patch.object(decide, "_warm_failed", {}), \
+                patch("threading.Thread", side_effect=lambda **k: type("T", (), {"start": lambda s: started.append(1)})()):
+            decide.warm("mode")
+        self.assertEqual(started, [1])
 
     def test_plain_talk_stays_talk(self):
         chat, act = self.Lane("Lima."), self.Lane("x")

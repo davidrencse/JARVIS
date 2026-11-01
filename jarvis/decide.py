@@ -292,7 +292,9 @@ def choose(job, text, temperature=None, options=None):
 # slower answer, never an action: the tools lane still decides what to do.
 ROUTE_THRESHOLD = 0.75
 ROUTE_TO_TOOLS = ("act", "agent")
-_warming = []
+WARM_RETRY_S = 300  # after a failed build, wait this long before trying again
+_warming = []        # jobs whose model is being built right now
+_warm_failed = {}    # job -> monotonic time of its last failed build
 
 
 def ready(job):
@@ -301,17 +303,34 @@ def ready(job):
 
 
 def warm(job):
-    """Build the job's model once in the background (about 2 s): never on a request."""
+    """Build the job's model once in the background (about 2 s): never on a request.
+    A failed build is logged and retried after WARM_RETRY_S, not on every request."""
     with _lock:
-        if _warming or job in _models:
+        if job in _warming or job in _models:
+            return
+        failed = _warm_failed.get(job)
+        if failed is not None and time.monotonic() - failed < WARM_RETRY_S:
             return
         _warming.append(job)
 
     def build():
         try:
             choose(job, "warm up")
-        except Exception:
-            pass
+            # choose() returns None, not an error, when the embedding model is missing.
+            why = None if job in _models else "no embedding model or no cues for the job"
+        except Exception as exc:
+            why = repr(exc)
+        with _lock:
+            if why is None:
+                _warm_failed.pop(job, None)
+            else:
+                _warm_failed[job] = time.monotonic()
+            if job in _warming:
+                _warming.remove(job)
+        if why is not None:
+            import sys
+            print(f"jarvis > decider: building the {job} model failed ({why}); "
+                  f"retrying in {WARM_RETRY_S} s", file=sys.stderr)
     threading.Thread(target=build, name=f"jarvis-decide-{job}", daemon=True).start()
 
 

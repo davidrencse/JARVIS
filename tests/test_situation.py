@@ -129,6 +129,31 @@ class ProfileTests(unittest.TestCase):
         # The same fact can be saved again after being forgotten.
         self.assertTrue(self.tools.call("profile_save", {"fact": "David prefers short spoken answers."})[0])
 
+    def test_an_exact_duplicate_returns_the_existing_fact(self):
+        ok, first = self.tools.call("profile_save", {"fact": "David studies at night."})
+        self.assertTrue(ok)
+        item_id = first.split("(")[1].rstrip(").")
+        ok, again = self.tools.call("profile_save", {"fact": "david  studies at NIGHT."})
+        self.assertTrue(ok)
+        self.assertIn(f"Already in David's profile ({item_id})", again)
+        self.assertEqual(len(self.memory.profile()), 1)
+
+    def test_a_full_profile_refuses_until_a_fact_is_forgotten(self):
+        from jarvis.memory import PROFILE_MAX
+        ids = []
+        for n in range(PROFILE_MAX):
+            ok, text = self.tools.call("profile_save", {"fact": f"David owns plant number {n}."})
+            self.assertTrue(ok, text)
+            ids.append(text.split("(")[1].rstrip(")."))
+        ok, text = self.tools.call("profile_save", {"fact": "David likes tea."})
+        self.assertFalse(ok)
+        self.assertIn(f"full ({PROFILE_MAX} facts)", text)
+        # A duplicate of a fact already there still answers, even when full.
+        self.assertTrue(self.tools.call("profile_save", {"fact": "David owns plant number 0."})[0])
+        self.assertTrue(self.tools.call("profile_forget", {"id": ids[0]})[0])
+        self.assertTrue(self.tools.call("profile_save", {"fact": "David likes tea."})[0])
+        self.assertEqual(len(self.memory.profile(limit=PROFILE_MAX + 5)), PROFILE_MAX)
+
     def test_profile_forget_only_touches_profile_facts(self):
         note = self.memory.add("fact", "the spare key is under the mat")
         self.assertFalse(self.tools.call("profile_forget", {"id": note["id"]})[0])
