@@ -197,6 +197,38 @@ def backup(state, repo=None):
     return target
 
 
+def dependencies(text):
+    """[project] dependencies from a pyproject.toml's text, or None if it can't be read."""
+    try:
+        import tomllib
+        value = tomllib.loads(text or "").get("project", {}).get("dependencies")
+    except Exception:  # Python 3.10 has no tomllib; a broken file has no list
+        return None
+    return value if isinstance(value, list) and all(isinstance(d, str) for d in value) else None
+
+
+def install_dependencies(before, after, log=print, run=subprocess.run):
+    """New code brought new requirements: install them into the Python running this node,
+    before the restart, so the update doesn't die on an import. Returns True when pip ran
+    and succeeded, False when it failed, None when nothing changed."""
+    old, new = dependencies(before), dependencies(after)
+    if new is None or sorted(new) == sorted(old or []):
+        return None
+    log(f"JARVIS node: dependencies changed; installing {', '.join(new)}")
+    try:
+        out = run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *new],
+                  capture_output=True, text=True, timeout=900,
+                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"JARVIS node: pip failed: {exc}")
+        return False
+    if out.returncode:
+        # Restart anyway: if the new code can't import without them, the watchdog rolls back.
+        log(f"JARVIS node: pip failed: {(out.stderr or out.stdout).strip()[-300:]}")
+        return False
+    return True
+
+
 def confirm(state, code):
     """The node agent checked in on `code`: the watchdog stands down."""
     _write(Path(state) / CONFIRMED, {"code": code, "at": time.time()})

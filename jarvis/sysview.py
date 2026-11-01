@@ -22,11 +22,11 @@ STATIONS = [
     {"id": "decide", "title": "Decide", "verb": "routes",
      "plain": "Simple rules, no AI, pick the cheapest way to answer: the clock or your vault "
               "instantly, a quick chat, a web task, or a multi-step plan.",
-     "modules": ["router", "assistant", "instant", "briefing", "parse", "registry", "gates", "pipeline", "confirm", "decide", "interpret", "selfmodel"]},
+     "modules": ["router", "assistant", "instant", "briefing", "parse", "registry", "gates", "pipeline", "confirm", "decide", "interpret", "selfmodel", "scorecard"]},
     {"id": "remember", "title": "Remember", "verb": "recalls",
      "plain": "Before answering it gathers what it already knows: your Obsidian notes, wiki "
               "claims with their sources and dates, and past conversations.",
-     "modules": ["vault", "knowledge", "memory", "vault_mcp", "tasks", "history", "embed", "stemming"]},
+     "modules": ["vault", "knowledge", "memory", "consolidate", "vault_mcp", "tasks", "history", "embed", "stemming", "situation"]},
     {"id": "think", "title": "Think", "verb": "answers",
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",

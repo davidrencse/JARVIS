@@ -133,6 +133,8 @@ class Console:
             from .pipeline import warm
             warm()  # the installed-app list, so the first direct action is fast
             self.memory.warm_vectors()  # meaning-based recall index, in the background
+            from .consolidate import start as consolidate_daily
+            consolidate_daily(self.config, self.memory, self.base)  # memory.consolidate: daily
         return self
 
     def close(self):
@@ -705,7 +707,9 @@ class Console:
         if tier not in (None, "", "simple", "medium", "complex"):
             raise ValueError("tier must be simple, medium or complex.")
         route = decide(text or "", self.config, tier or None, conversational=True, state=self.state)
-        if route["tier"] == "simple":
+        if route.get("instant"):
+            route["handler"] = {"clock": "instant answer", "vault": "vault (no model)"}[route["instant"]]
+        elif route["tier"] == "simple":
             route["handler"] = f"{self.brain()['name']} brain"
         elif route["tier"] == "medium":
             route["adapter"] = pick_adapter(text or "", self.config)

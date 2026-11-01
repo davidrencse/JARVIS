@@ -45,18 +45,40 @@ LOOK = frozenset({
     "sort-object", "format-table", "ft", "format-list", "fl", "get-date", "resolve-path",
     "get-psdrive", "get-computerinfo", "where.exe", "systeminfo"})
 FIND_WRITES = re.compile(r"(?:^|\s)-(?:exec|execdir|ok|okdir|delete|fprint\w*|fls)\b", re.I)
-RECURSIVE = re.compile(r"(?:^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--recursive|-recurse)\b", re.I)
+# --rec: GNU tools take any unambiguous prefix of a long option (--rec = --recursive).
+RECURSIVE = re.compile(r"(?:^|\s)(?:-[a-zA-Z]*[rR][a-zA-Z]*|--rec\w*|-recurse)\b", re.I)
 SHELLISH = re.compile(r"[;&<>`$(){}\n\r]")
 # Paths whose contents would leak a credential if read back to the model.
 SECRET = re.compile(r"\.ssh\b|\.gnupg\b|\.jarvis\b|\.codex\b|\.claude\b|\.aws\b|\.kube\b|"
                     r"\.docker\b|\.netrc\b|\.git-credentials|\.password-store|keyring|"
                     r"\.env\b|id_(?:rsa|ed25519|ecdsa|dsa)|\.pem\b|\.key\b|\.p12\b|\.pfx\b|"
                     r"credential|secret|token|password|shadow\b|Login Data|Cookies\b|"
-                    r"Local State\b", re.I)
+                    r"Local State\b|Local Storage|leveldb|logins\.json|key4\.db|\.kdbx\b|"
+                    # token files with ordinary names (gh, npm, PyPI, rclone, git remotes) and
+                    # shell histories (bash/zsh/fish, PowerShell's ConsoleHost_history.txt)
+                    r"hosts\.yml\b|\.npmrc\b|\.pypirc\b|rclone\.conf\b|\.git[/\\]config\b|"
+                    r"_history\b|\.histfile\b", re.I)
 # /proc holds every process's environment (tokens) and memory; "environ" catches a cd-ed path.
-PROC = re.compile(r"(?:^|[/\\])proc(?:[/\\]|$)|environ\b|\benv\b", re.I)
+# /dev/fd/.. and /dev/stdin lead back into /proc/self.
+PROC = re.compile(r"(?:^|[/\\])proc(?:[/\\]|$)|environ\b|\benv\b|[/\\]dev[/\\](?:fd|std)", re.I)
+# App and browser state where tokens sit under ordinary names (github-copilot/apps.json,
+# VS Code's state.vscdb...): reading inside it, or cd-ing into it, needs David's OK.
+APP_STATE = re.compile(r"\.config\b|\.local[/\\]share\b|AppData\b|Application Support\b|"
+                       r"\.mozilla\b|Library[/\\](?:Keychains|Cookies)\b", re.I)
+# Commands that print what they read, and the only ones a pipe may feed: in PowerShell any
+# other name after | (cat, gc, type, sls...) may read each file object it is handed.
+READERS = frozenset({"cat", "head", "tail", "grep", "sort", "uniq", "cut", "gc", "get-content",
+                     "sls", "select-string", "type", "cd", "chdir", "set-location", "sl"})
+PIPE_OK = frozenset({"grep", "wc", "sort", "uniq", "head", "tail", "cut", "measure-object",
+                     "measure", "select-object", "select", "sort-object", "format-table", "ft",
+                     "format-list", "fl"})
+# Options that read file names from a file or stdin (find -print0 | sort --files0-from=-
+# prints every found file), or reach another computer (Get-Process -ComputerName).
+FILE_LIST = re.compile(r"--fil|--from|--ra|-(?:cn|comp\w*|cim\w*|session\w*)$", re.I)
 GLOB = re.compile(r"[*?\[]")
-CONTENT_READERS = frozenset({"cat", "gc", "get-content", "sls", "select-string"})
+# PowerShell provider paths (HKCU:, cert:, variable:, Registry::...) reach the registry and
+# session state; a UNC path (\\\\host\\x or //host/x) makes Windows send an NTLM hash to host.
+ELSEWHERE = re.compile(r"^[A-Za-z][\w.]+:|::|^[\\/]{2}")
 # grep's other ways to recurse: -d recurse, -drecurse, --directories=recurse (or --dir rec),
 # --dereference-recursive. Any -d/--d... is refused; skip/read aren't worth the parsing.
 GREP_DIRS = re.compile(r"-[^-]*d|--d", re.I)
@@ -68,7 +90,10 @@ FIND_PATTERNS = frozenset({"-name", "-iname", "-path", "-ipath", "-wholename", "
 def read_only(command, cwd=None):
     """True when `command` (run in `cwd`, if given) only looks and may run without David's OK."""
     command = str(command or "").strip()
-    if not command or len(command) > 500 or SECRET.search(command):
+    # Non-ASCII: PowerShell reads curly quotes as quotes (.s‘’sh is .ssh to it, not to us).
+    # ~1: a Windows 8.3 short name (SSH~1 is .ssh) that no name check can see through.
+    if not command or len(command) > 500 or not command.isascii() or \
+            re.search(r"~\d", command) or SECRET.search(command):
         return False
     if cwd is not None and not _safe_folder(str(cwd)):
         return False
@@ -76,9 +101,9 @@ def read_only(command, cwd=None):
         for n, segment in enumerate(chain.split("|")):
             if not _looks(segment.strip()):
                 return False
-            # PowerShell pipes file objects: gci -r | sls key (or | cat, Get-Content's alias)
-            # reads every file the listing found.
-            if n and segment.split()[0].lower() in CONTENT_READERS:
+            # PowerShell pipes file objects: gci -r | sls key (or | cat, | type) reads every
+            # file the listing found, so only plain filters may follow a pipe.
+            if n and segment.split()[0].lower() not in PIPE_OK:
                 return False
     return True
 
@@ -87,13 +112,14 @@ def _safe_folder(folder):
     """A cwd argument: a plain path, no variables, wildcards, secrets or /proc."""
     words = _words(folder)
     return (bool(folder.strip()) and len(folder) <= 300 and words is not None
+            and folder.isascii() and not re.search(r"~\d", folder) and not APP_STATE.search(folder)
             and not SHELLISH.search(folder) and "%" not in folder and not GLOB.search(folder)
             and not SECRET.search(folder) and not _private(folder)
             and not any(SECRET.search(value) or _private(value) for value, _ in words))
 
 
 def _private(path):
-    return bool(PROC.search(str(path)))
+    return bool(PROC.search(str(path)) or ELSEWHERE.search(str(path).strip()))
 
 
 def _words(segment):
@@ -143,6 +169,13 @@ def _looks(segment):
     # Quote splitting ('.s''sh', id_\rsa) hides a name from the raw-text check; recheck each word.
     if any(SECRET.search(value) or _private(value) for value in args):
         return False
+    if any(FILE_LIST.match(value) for value in args):
+        return False
+    if name in READERS and any(APP_STATE.search(value) for value in args):
+        return False
+    # PowerShell doesn't treat \ as an escape: \\host\x reaches it whole, so check raw words too.
+    if any(ELSEWHERE.search(word.strip("'\"")) for word in segment.split()[1:]):
+        return False
     if not _no_wildcards(name, words[1:]):
         return False
     rest = " ".join(args)
@@ -175,6 +208,11 @@ def _no_wildcards(name, words):
     return True
 
 
+HOSTNAME_FLAGS = frozenset({"-s", "-f", "-i", "-I", "-d", "-a", "-A", "-y", "--short", "--fqdn",
+                            "--long", "--ip-address", "--all-ip-addresses", "--domain",
+                            "--alias", "--all-fqdns"})
+
+
 def _no_writes(name, args):
     """Flags that make a looking command write a file, change the system or show env vars."""
     if name == "sort":  # -o FILE writes; --compress-program runs a program
@@ -193,14 +231,24 @@ def _no_writes(name, args):
         return operands <= 1
     if name == "tree":  # -o FILE writes; -R re-runs tree with -o 00Tree.html in each folder
         return not any(re.match(r"-[^-]*[oR]|--o", a) for a in args)
-    if name == "date":  # -s/--set changes the clock
-        return not any(re.match(r"-[^-]*s|--s", a) for a in args)
+    if name == "date":  # -s/--set, or an MMDDhhmm operand, sets the clock; +FORMAT only prints
+        value_next = False
+        for a in args:
+            if re.match(r"-[^-]*s|--s", a):
+                return False
+            if not value_next and not a.startswith(("-", "+")):
+                return False
+            value_next = a in ("-d", "--date", "-r", "--reference")
+        return True
     if name == "hostname":  # a name, -b or -F sets the hostname
-        return all(a.startswith("-") and a not in ("-b", "-F", "--boot", "--file") for a in args)
+        return all(a in HOSTNAME_FLAGS for a in args)
+    if name == "systeminfo":  # /s HOST /u /p logs in to another computer
+        return not args
     if name == "file":  # -C compiles a magic file into the working folder
         return not any(re.match(r"-[^-]*C|--com", a) for a in args)
-    if name == "ps":  # BSD "e" (ps e, ps eww, ps auxe) prints each process's environment
-        return not any(not a.startswith("-") and a.isalpha() and "e" in a.lower() for a in args)
+    if name == "ps":  # e/E (ps e, ps eww, ps -auxe, macOS ps -E) prints environments;
+        # only UNIX-style -e (every process) and its usual companions are plain
+        return not any("e" in a.lower() and not re.fullmatch(r"-e[fFlyLjH]*", a) for a in args)
     return True
 
 
@@ -253,7 +301,8 @@ def run(spec):
     if not _:  # the shell died before printing its folder
         text, where = out.stdout, folder
     where = where.strip() or folder
-    if Path(where).is_dir() and not SECRET.search(where) and not _private(where):
+    if Path(where).is_dir() and not SECRET.search(where) and not _private(where) \
+            and not APP_STATE.search(where):
         _CWD["path"] = where  # a cd persists, like a real terminal (never into a secret folder)
     body = (text.rstrip() + ("\n" + out.stderr.rstrip() if out.stderr.strip() else "")).strip()
     if len(body) > MAX_OUTPUT:

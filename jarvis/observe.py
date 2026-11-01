@@ -602,11 +602,42 @@ def check(predicate, settle, lister=None, clock=time.monotonic, sleep=time.sleep
         sleep(min(POLL, settle - elapsed))
 
 
+FOCUSED_TITLE = 80  # characters of the focused window's title the brain is shown
+
+
+def now():
+    """What this computer is doing, for the brain's per-request snapshot (situation.py):
+    the apps with windows, the focused window's app and (shortened) title, and what's
+    playing. Only the focused title: other titles hold mail subjects and chat names that
+    David chose not to send with every request (2026-10-31)."""
+    apps, focused = [], None
+    try:
+        for w in windows():
+            words = list(dict.fromkeys(str(w.get("app") or "").split()))  # "kitty kitty" -> kitty
+            app = " ".join(words)
+            if app and app not in apps:
+                apps.append(app)
+            if w.get("focused"):
+                title = " ".join(str(w.get("title") or "").split())
+                focused = {"app": app, "title": title[:FOCUSED_TITLE] +
+                           ("…" if len(title) > FOCUSED_TITLE else "")}
+    except (LookupError, OSError, ValueError, subprocess.SubprocessError):
+        apps = None  # can't list windows on this desktop: say nothing rather than "no apps"
+    try:
+        playing = playback()
+    except (LookupError, OSError, ValueError, subprocess.SubprocessError):
+        playing = None
+    return {"apps": apps, "focused": focused, "playing": playing}
+
+
 def run(arg):
-    """The `observe` desktop action: arg is JSON {"predicate", "settle", "before"}, or
-    {"snapshot": predicate} for the before-state digest. (ok, json text)."""
+    """The `observe` desktop action: arg is JSON {"predicate", "settle", "before"},
+    {"snapshot": predicate} for the before-state digest, or {"now": true} for now().
+    (ok, json text)."""
     try:
         body = json.loads(arg)
+        if body.get("now") is True:
+            return True, json.dumps(now())
         if "snapshot" in body:
             return True, json.dumps(snapshot(body["snapshot"]))
         before = body.get("before")

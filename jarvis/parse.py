@@ -20,9 +20,12 @@ LEAD = re.compile(r"^\W*(?:(?:hey|ok|okay)\s+)?(?:jarvis|jervis)\b[\s,.!?:-]*", 
 # "hello, open chrome": a greeting before a command is not chat. Only the command after
 # it is parsed; a greeting alone ("hello there") still has no verb and goes to the brain.
 GREETING = re.compile(r"^(?:(?:hello|hi|hey|yo|ok|okay|alright|good (?:morning|afternoon|evening))"
-                      r"(?:\s+(?:jarvis|jervis|there))?[\s,.!?:-]+)+(?=\w)")
+                      r"(?:\s+(?:jarvis|jervis|jarvas|drivers|travis|there))?[\s,.!?:-]+)+(?=\w)")
+# "...go to youtube and yeah that's it, I just want to": closing chatter, not a clause.
+TRAILER = re.compile(r"\s*,?\s*(?:and\s+)?(?:yeah\s+|ok(?:ay)?\s+)?that'?s\s+(?:it|all)\b.*\Z")
 FILLER = re.compile(r"\b(?:(?:can|could|would|will) you|please|for me|go ahead and|"
-                    r"i want you to|i'?d like you to|just|quickly|real quick|right now)\b")
+                    r"i want you to|i'?d like you to|just|quickly|real quick|right now|"
+                    r"again|agian|agan)\b")
 SPLIT = re.compile(r"\s*,\s*(?:and\s+)?(?:then\s+)?|\s+and\s+then\s+|\s+then\s+|"
                    r"\s+and\s+|\s+also\s+|\s+plus\s+")
 
@@ -94,6 +97,9 @@ VOLUME = (
      lambda m: m.group(1)),
     (re.compile(r"(mute|unmute)(?:\s+(?:the\s+)?(?:volume|sound|audio|it|music))?\Z"),
      lambda m: m.group(1)),
+    (re.compile(r"turn\s+(up|down)\s+(?:the\s+)?(?:volume|sound|music)\Z"), lambda m: m.group(1)),
+    (re.compile(r"(raise|increase|lower|decrease|reduce)\s+(?:the\s+)?(?:volume|sound)\Z"),
+     lambda m: "up" if m.group(1) in ("raise", "increase") else "down"),
 )
 
 # Scrolling, read before the verb table so "start scrolling" isn't "open scrolling".
@@ -136,7 +142,42 @@ def _spelled(text):
             if word != real and difflib.SequenceMatcher(None, word, real).ratio() >= cutoff:
                 return real
         return word
-    return re.sub(r"\bsc[a-z]{3,9}\b", fix, text)
+    text = re.sub(r"\bsc[a-z]{3,9}\b", fix, text)
+
+    def verb(match):
+        # "aopen", "oepn", "opne": one stray or swapped letter in "open".
+        word = match.group(0)
+        if len(word) == 5 and any(word[:i] + word[i + 1:] == "open" for i in range(5)):
+            return "open"
+        if len(word) == 4 and sorted(word) == sorted("open") and _edits(word, "open") == 1:
+            return "open"
+        return word
+    return re.sub(r"\b[a-z]{4,5}\b", verb, text)
+
+
+def _edits(a, b):
+    """Optimal string alignment distance: insertions, deletions, substitutions and
+    swaps of two neighbours ("psotify"), each counting one."""
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        row = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            row[j] = min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                row[j] = min(row[j], prev2[j - 2] + 1)
+        prev2, prev = prev, row
+    return prev[-1]
+
+
+def _typo(word, table, shortest, same_start=False):
+    """The one value `word` is a one-edit typo of, among `table`'s single-word keys at
+    least `shortest` long; None when nothing or more than one value is that close."""
+    if len(word) < shortest or not word.isalpha():
+        return None
+    hits = {value for key, value in table.items()
+            if " " not in key and len(key) >= shortest - 1 and key != word
+            and (not same_start or key[0] == word[0]) and _edits(word, key) == 1}
+    return hits.pop() if len(hits) == 1 and None not in hits else None
 
 
 class Unsure(ValueError):
@@ -170,7 +211,7 @@ def _parse(text, devices, origin, main, apps):
         raise Unsure("empty or too long")
     text = _lower(LEAD.sub("", text.replace("’", "'").replace("‘", "'")))
     text = GREETING.sub("", text.strip())
-    text = re.sub(r"[?!.]+$", "", text.strip())
+    text = TRAILER.sub("", re.sub(r"[?!.]+$", "", text.strip()))
     # Filler leaves its comma behind ("open chrome, please." -> "open chrome, "): strip it.
     text = _spelled(re.sub(r"\s+", " ", FILLER.sub(" ", text)).strip(" ,;"))
     if not text:
@@ -195,13 +236,26 @@ def _parse(text, devices, origin, main, apps):
         if clause["verb"] is None:  # "open spotify ... and chrome on my other pc"
             if verb is None:
                 raise Unsure("no action verb")
-            clause["verb"] = verb
+            clause["verb"], clause["inherited"] = verb, True
         verb = clause["verb"]
         clauses.append(clause)
 
+    for i, clause in enumerate(clauses):
+        if clause.get("inherited") and clause["device"]:
+            for prev in reversed(clauses[:i]):
+                if prev["device"] is not None:
+                    break
+                prev["device"] = clause["device"]
+                if not prev.get("inherited"):
+                    break
     commands = []
     for clause in clauses:
         commands.append({**_command(clause, catalog), "device": clause["device"]})
+    for prev, (clause, command) in zip(commands, list(zip(clauses, commands))[1:]):
+        # "go to youtube on firefox and chrome": YouTube in both, or open Chrome too?
+        if prev["intent"] == "open_url" and prev["args"].get("browser") and clause.get("inherited") \
+                and command["intent"] == "open_app" and command["args"]["name"] in BROWSERS:
+            raise Unsure("which browser gets the site?")
     commands = _merge(commands)
     if agent:
         commands = [_in_agent_browser(c) for c in commands]
@@ -275,8 +329,40 @@ def _device(phrase, aliases):
             if words[i] in DEVICE_NOISE or words[i].isdigit():
                 i += 1
                 continue
+            # "deoll", "arhclinux": one edit from exactly one device's name, same first letter.
+            if found := _typo(words[i], aliases, 5, same_start=True):
+                hits.add(found)
+                i += 1
+                continue
             return None
     return hits.pop() if len(hits) == 1 and None not in hits else None
+
+
+RELATIVE = {"main", "default", "main default", "default main", "primary", "other",
+            "the other one", "other one", "other pc", "other laptop"}
+
+
+def _place(words, aliases, bar, same_start=True):
+    """A place slot no alias spells exactly ("on my arctonics", the speech-to-text for
+    "arch linux"): the device whose names sound closest, when it is clearly closest."""
+    words = [w for w in words if w not in DEVICE_NOISE]
+    if not words:
+        return None
+    said, best = "".join(words), {}
+    if len(said) < 6:
+        bar = max(bar, 0.75)  # "my desk", "my dad": a short word must be nearly a name
+    for alias, device in aliases.items():
+        if device is None or alias in ORIGIN_WORDS or alias in RELATIVE \
+                or (same_start and alias[0] != said[0]):
+            continue  # real names only, starting with the same sound
+        score = difflib.SequenceMatcher(None, said, alias.replace(" ", "")).ratio()
+        best[device] = max(best.get(device, 0), score)
+    ranked = sorted(best.items(), key=lambda kv: -kv[1])
+    if not ranked or ranked[0][1] < bar:
+        return None
+    if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.12:
+        return None
+    return ranked[0][0]
 
 
 def _known(obj, aliases, catalog):
@@ -344,10 +430,19 @@ def _clause(text, aliases, catalog, inherited=None):
         cut = len(rest) - 1 - rest[::-1].index("on")
         tail = " ".join(rest[cut + 1:])
         found = _device(tail, aliases) if tail else None
+        split = tail.split()
+        if not found and split[0] in ("my", "the") and _norm(tail) not in catalog:
+            found = _place(split, aliases, 0.4)  # "on my arctonics": clearly a place
+        if not found and len(split) > 1 and catalog.get(split[0]) in BROWSERS:
+            # "open yt on chrome qarch": a browser, then the place.
+            place = _device(" ".join(split[1:]), aliases) or _place(split[1:], aliases, 0.75, same_start=False)
+            if place:
+                device, words = place, words[:len(words) - len(split) + 1]
+                rest = rest[:len(rest) - len(split) + 1]
         if found:
             device, rest = found, rest[:cut]
             words = words[:len(words) - len(tail.split()) - 1]  # drop "on <device>"
-        elif _norm(tail) not in catalog:  # "on spotify" stays part of the object
+        elif device is None and _norm(tail) not in catalog:  # "on spotify" stays in the object
             raise Unsure(f"unknown place {tail!r}")
     if device is None and len(rest) > 1 and rest[-1] == "here":  # "open spotify here"
         device, rest, words = aliases["here"], rest[:-1], words[:-1]
@@ -365,7 +460,9 @@ def _app(obj, catalog):
         return catalog[close[0]]
     if len(close) > 1 and catalog[close[0]] != catalog[close[1]]:
         raise Unsure(f"{obj!r} could be more than one app")
-    return catalog[close[0]] if close else None
+    if close:
+        return catalog[close[0]]
+    return _typo(name, catalog, 6)  # "psotify": letters swapped
 
 
 def _site(obj):
@@ -400,6 +497,12 @@ def _command(clause, catalog):
     if verb in ("open", "go"):
         if not obj:
             raise Unsure("open what?")
+        # "go to youtube on chrome": a site in a named browser.
+        if (m := re.match(r"(.+?)\s+(?:on|in|with|using)\s+(\S.*)\Z", obj)) \
+                and _app(m.group(2), catalog) in BROWSERS and _site(m.group(1)) \
+                and not _app(m.group(1), catalog):
+            return {"intent": "open_url", "args": {"url": _site(m.group(1)),
+                                                    "browser": _app(m.group(2), catalog)}}
         app, site = _app(obj, catalog), _site(obj)
         if app and site:
             raise Unsure(f"{obj!r} is both an app and a site")
@@ -407,6 +510,10 @@ def _command(clause, catalog):
             return {"intent": "open_url", "args": {"url": site}}
         if app:
             return {"intent": "open_app", "args": {"name": app}}
+        words = obj.split()
+        if len(words) > 1 and len(words[-1]) <= 3 and any(ch.isdigit() for ch in words[-1]):
+            # "sppotifyc 0p": a stray keystroke after the name.
+            return _command({**clause, "object": " ".join(words[:-1])}, catalog)
         raise Unsure(f"don't know {obj!r}")
     if verb == "play":
         if LIKED.match(obj):
