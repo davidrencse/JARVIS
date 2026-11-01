@@ -92,7 +92,11 @@ INSTRUCTIONS = (
     "he names one (Arch, ASUS, Linux, Dell, Windows, the other laptop), pass it. open_page "
     "opens JARVIS's own console pages; media and "
     "volume control what is playing. Never say you can't control a laptop: use the tools "
-    "and report what they returned.")
+    "and report what they returned. Your tools are always connected in this conversation: "
+    "never call them disabled or unavailable. Questions about the computers' live state "
+    "(what's installed, open or playing, files, battery, disk, CPU, network) are answered "
+    "by calling a tool, never guessed and never handed back for David to rephrase; if a "
+    "call fails, say what failed with its error, and if a computer isn't answering, say so.")
 
 
 # Mentions of the browser or a link anywhere also mean "go do it", not "tell me".
@@ -102,6 +106,21 @@ BROWSERISH = re.compile(r"\b(?:in|with|using|use)\s+(?:the\s+|my\s+|a\s+)?(?:bro
 FILEISH = re.compile(r"\b(?:what|which|list|show|any|how\s+many|find|where)\b.{0,40}\b(?:files?|folders?|"
                      r"director(?:y|ies)|desktop|downloads|documents)\b|"
                      r"\b(?:terminal|shell|command\s+line|ls|pwd)\b|^\W*cd\s+\S", re.I)
+# The computers' live state ("what's my battery at", "how much disk space is left on the
+# Dell", "is the dell online", "what's playing on arch"): only a tool can answer it, and the
+# talk lane, which can't call one, used to guess or ask David to rephrase.
+_PC = r"(?:arch|asus|zenbook|linux|dell|windows|laptop|computer|pc|desktop|machine|other\s+one)"
+STATEISH = re.compile(
+    r"\b(?:what|what's|whats|how|is|are|check|show|tell\s+me)\b.{0,40}"
+    r"\b(?:my|the|this|its|on\s+(?:the\s+|my\s+)?\w+)\s+(?:\w+'?s?\s+)?"
+    r"(?:battery|charge|disk|drive|storage|free\s+space|space|cpu|ram|memory\s+usage|uptime|"
+    r"wi-?fi|network|ip(?:\s+address)?|temperature|gpu|processes)\b|"
+    r"\bhow\s+much\s+(?:disk\s+|free\s+|storage\s+)?(?:space|storage|ram)\b|"
+    r"\bhow\s+much\s+battery\s+(?:do\s+i|is|have\s+i|left|does\s+(?:my|the|this))\b|"
+    rf"\bis\s+(?:the\s+|my\s+)?{_PC}\s+(?:on|online|awake|up|connected|running|reachable)\b|"
+    rf"\b(?:what'?s|what\s+is|whats|anything)\s+(?:playing|open|running)\s+on\s+(?:the\s+|my\s+)?{_PC}\b|"
+    r"\bis\s+[\w.+-]+(?:\s+[\w.+-]+)?\s+(?:open|running)(?:\s+(?:on\b.*|right\s+now))?\s*\??\s*$",
+    re.I)
 # Naming Grok means "hand it to Grok Bot": only the action brain has grok_agent.
 GROKISH = re.compile(r"\bgrok(?:\s*bot)?\b", re.I)
 
@@ -118,7 +137,7 @@ def is_action(text):
     return bool(any(ACTION.match(part) for part in CLAUSE.split(text))
                 or (DEVICEISH.search(text) and VERB.search(text))
                 or BROWSERISH.search(text) or GROKISH.search(text) or APPISH.search(text)
-                or FILEISH.search(text))
+                or FILEISH.search(text) or STATEISH.search(text))
 
 
 class DesktopTools:

@@ -17,7 +17,7 @@ STALE = 120     # older than this (machine stopped answering), its line is dropp
 NODE_WAIT = 8   # seconds a node gets to answer (it runs in the background anyway)
 HEADER = "Your computers right now (live, read-only; refreshed every ~30 s):"
 
-_STATE = {"at": 0.0, "machines": {}, "busy": False, "lock": threading.Lock()}
+_STATE = {"at": 0.0, "machines": {}, "silent": [], "busy": False, "lock": threading.Lock()}
 
 
 def _machines(config, state):
@@ -37,6 +37,22 @@ def _machines(config, state):
     return found
 
 
+def _offline(config, state):
+    """Nodes the hub knows but that aren't connected now, so the brain can say the Dell is
+    off instead of guessing what's on it."""
+    from .topology import enabled, identity
+    if not enabled(config):
+        return []
+    local, main = identity(config)
+    if local != main:
+        return []
+    try:
+        from .cluster_store import Broker
+        return [n["id"] for n in Broker(state).nodes() if not n.get("online") and n["id"] != local]
+    except Exception:
+        return []
+
+
 def _ask(config, state, device, here):
     if here:
         from .observe import now
@@ -49,19 +65,23 @@ def _ask(config, state, device, here):
     return json.loads(result.get("text") or "null")
 
 
-def refresh(config, state, ask=None):
-    """Ask every machine now (blocking). Machines that fail keep their last answer."""
+def refresh(config, state, ask=None, offline=None):
+    """Ask every machine now (blocking). Machines that fail keep their last answer and are
+    listed as not answering; nodes the hub has as offline are listed too."""
     ask = ask or _ask
-    seen = {}
+    seen, silent = {}, list((offline or _offline)(config, state))
     for device, here in _machines(config, state):
         try:
             report = ask(config, state, device, here)
         except Exception:  # offline, old code, no window tool: skip this machine
+            if device and not here:
+                silent.append(device)
             continue
         if isinstance(report, dict):
             seen[device or "this PC"] = {"report": report, "at": time.time()}
     with _STATE["lock"]:
         _STATE["machines"].update(seen)
+        _STATE["silent"] = sorted(set(silent) - set(seen))
         _STATE["at"] = time.time()
         _STATE["busy"] = False
 
@@ -90,6 +110,7 @@ def lines(config, state, now=None, start=None):
         if due:
             _STATE["busy"] = True
         machines = dict(_STATE["machines"])
+        silent = list(_STATE["silent"])
     if due:
         def run():
             try:
@@ -100,10 +121,12 @@ def lines(config, state, now=None, start=None):
     described = [_describe(name, m["report"]) for name, m in sorted(machines.items())
                  if now - m["at"] <= STALE]
     described = [d for d in described if d]
+    described += [f"{name}: not answering right now (offline or busy); its live state is unknown, "
+                  "so say so rather than guess" for name in silent]
     return [HEADER + "\n  " + "\n  ".join(described)] if described else []
 
 
 def reset():
     """Forget every snapshot (tests)."""
     with _STATE["lock"]:
-        _STATE.update(at=0.0, machines={}, busy=False)
+        _STATE.update(at=0.0, machines={}, silent=[], busy=False)

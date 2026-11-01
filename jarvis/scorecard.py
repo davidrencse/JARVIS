@@ -30,13 +30,14 @@ from pathlib import Path
 
 HOME = Path(__file__).resolve().parent.parent
 CASES = HOME / "tests" / "eval" / "cases.jsonl"
+GROUNDING = HOME / "tests" / "eval" / "grounding.jsonl"
 TYPES = ("act", "agent", "converse", "build", "instant", "vault", "clarify")
 # What the decider's "mode" job should pick; it has no clarify option.
 DECIDER_MODE = {"act": "act", "agent": "agent", "converse": "converse", "build": "build",
                 "instant": "converse", "vault": "converse"}
 BRAIN_MODE = {**DECIDER_MODE, "clarify": "clarify"}
 RANK = {"allow": 0, "confirm": 1, "ratchet": 1, "deny": 2}
-PARTS = ("parser", "registry", "decider", "vault", "brain")
+PARTS = ("parser", "registry", "decider", "vault", "grounding", "brain")
 SHOW = 5  # failures listed per part
 FOLDS = 5  # cross-validation folds for the decider
 
@@ -230,6 +231,33 @@ def score_vault(cases, answer, recall):
     return _part(rows, false_answers=false_answers, noisy_recall=noisy)
 
 
+def score_grounding(path=GROUNDING):
+    """Phase 4, for free: does a live-state request reach the tools lane (Brain.pick with
+    its default regexes), and is an excuse with no grounds caught (the talk lane's
+    is_refusal, the tools lane's ungrounded) while real answers and real limits pass?"""
+    from .chatgpt import Brain, is_refusal, ungrounded
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    brain, rows = Brain(None, None), []
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("//"):
+            continue
+        case = json.loads(line)
+        if "_meta" in case:
+            continue
+        if "route" in case:
+            text, want, got = case["route"], case["lane"], brain.pick(case["route"])
+        elif "talk" in case:
+            text, want, got = case["talk"], case["excuse"], is_refusal(case["talk"])
+        else:
+            log = [tuple(x) for x in case.get("log") or ()]
+            text, want, got = case["tools"], case["excuse"], ungrounded(case["tools"], log) is not None
+        rows.append((got == want, None if got == want else {"text": text, "want": want, "got": got}))
+    return _part(rows)
+
+
 def sample(cases, size, seed=0):
     """A fixed sample spread over the types, so brain runs compare with each other."""
     rng = random.Random(seed)
@@ -299,6 +327,11 @@ def run(config, base, state, path=CASES, brain=False, size=8, seed=0, save=True)
         notes["vault"] = "no vault configured on this PC"
     else:
         parts["vault"] = score_vault(cases, *tools)
+    grounded = score_grounding()
+    if grounded is None:
+        notes["grounding"] = "no tests/eval/grounding.jsonl"
+    else:
+        parts["grounding"] = grounded
     if brain:
         picked = sample(cases, size, seed)
         parts["brain"] = {**score_brain(picked, config, base, origin), "sample": size, "seed": seed}

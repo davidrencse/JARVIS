@@ -508,10 +508,34 @@ class Brain:
             wants = self.wants(text)
         return "act" if wants else "chat"
 
+    def _act(self, text, recall, on_sentence):
+        """The tools lane, held to its tools: an excuse it has no grounds for ("the tool is
+        disabled" with no call made, seen 2026-10-28/30) is not spoken, and the lane is
+        asked once more in the same thread to use them, or to name the real failure."""
+        self.last = self.act
+        doubted = []
+
+        def speak(sentence):
+            if doubted or is_refusal(sentence) or TOOLS_DOWN.search(sentence):
+                doubted.append(sentence)
+            elif on_sentence:
+                on_sentence(sentence)
+        reply = self.act.ask(text, recall, on_sentence=speak if on_sentence else None)
+        nudge = ungrounded(reply, getattr(self.act, "tool_log", None))
+        if nudge is None:
+            if doubted and on_sentence:  # held back, but it stands: say it after all
+                for sentence in doubted:
+                    on_sentence(sentence)
+            return reply
+        earlier = list(getattr(self.act, "tool_log", None) or ())
+        second = self.act.ask(nudge + str(text), (), on_sentence=on_sentence)
+        if earlier and isinstance(getattr(self.act, "tool_log", None), list):
+            self.act.tool_log[:0] = earlier  # both turns' calls, for a failed-turn report
+        return second
+
     def ask(self, text, recall=(), on_sentence=None):
         if self.pick(text) == "act":
-            self.last = self.act
-            return self.act.ask(text, recall, on_sentence=on_sentence)
+            return self._act(text, recall, on_sentence)
         # Talk has no tools; it answers HANDOFF when it sees an action the regexes missed.
         # It also sometimes says it can't check instead (despite TALK_HANDOFF): treat that as
         # a handoff too, and stop speaking from the first such sentence on.
@@ -525,8 +549,7 @@ class Brain:
         self.last = self.chat
         reply = self.chat.ask(text, recall, on_sentence=speak if on_sentence else None)
         if is_handoff(reply) or is_refusal(reply):
-            self.last = self.act
-            return self.act.ask(text, recall, on_sentence=on_sentence)
+            return self._act(text, recall, on_sentence)
         return reply
 
     def warm(self):
@@ -556,7 +579,8 @@ TALK_HANDOFF = (" You have no tools in this conversation, but JARVIS can operate
                 "in his profile yet), or what he told you "
                 f"before, reply with exactly {HANDOFF} and nothing else, and it will be done. "
                 "That includes a short answer to your own question about such a request "
-                "(\"shortcuts\", \"the Dell\"). Never say you can't inspect his computers.")
+                "(\"shortcuts\", \"the Dell\"). Never say you can't inspect his computers, never "
+                "offer to check or ask him to repeat it with \"Jarvis\" first: hand off instead.")
 MEMORY_HANDOFF = (" You have no tools in this conversation, but JARVIS has a long-term memory: "
                   "when David asks you to remember something, or what he told you before, "
                   f"reply with exactly {HANDOFF} and nothing else.")
@@ -578,14 +602,60 @@ REFUSAL = re.compile(
     r"(?:currently\s+|directly\s+)?"
     r"(?:inspect|check|access|see|view|look\s+at|control|open|count|list|read|run)\b"
     rf"[^.!?]{{0,40}}\b{_MACHINE}\b|"
-    r"\bI\s+(?:don(?:'|’)?t|do\s+not)\s+have\s+(?:access|the\s+ability|a\s+way|any\s+way|tools?)\b"
+    r"\bI\s+(?:don(?:'|’)?t|do\s+not)\s+have\s+(?:[^.!?]{0,30}\b)?(?:access|the\s+ability|a\s+way|any\s+way|tools?|connection)\b"
     rf"[^.!?]{{0,40}}\b{_MACHINE}\b|"
-    r"\b(?:the|my)\s+tools?(?:\s+(?:connection|service|access))?\s+(?:is|are)\s+(?:currently\s+)?disabled\b",
+    r"\btools?(?:\s+(?:connection|service|access))?\s+(?:is|are)\s+(?:currently\s+|right\s+now\s+)?"
+    r"(?:disabled|unavailable|not\s+available|offline|down|not\s+connected)\b|"
+    # "...on this Zenbook, or on your Dell? I can't inspect either right now."
+    r"\bI\s+(?:can(?:no|'|’)?t|cannot)\s+(?:currently\s+)?(?:inspect|check)\s+(?:either|them|both|it|that|those)\b|"
+    # Deferring instead of checking: "Say “Jarvis, how many apps…” so I can check" (seen
+    # 2026-10-30), "I can check it if you want". "Say 'Jarvis, yes' or press Confirm" is an
+    # answer: only a deferral that ends in checking counts.
+    r"\bsay\s+(?:[\"“'‘][^\"”’]{0,100}[\"”’]|[^.!?]{0,80})\s*,?\s*\bso\s+(?:that\s+)?I\s+can\s+"
+    r"(?:check|look|see|find|count|do)\b|"
+    r"\bI\s+can\s+(?:check|look\s+(?:into\s+)?(?:it|that)|find\s+out|count)\b[^.!?]{0,40}\bif\s+you\s+(?:want|like)\b",
     re.I)
+# The tools lane blaming its tools: only these claims make an answer that called tools
+# suspect ("I can't open that, it isn't installed" after list_apps is the truth).
+TOOLS_DOWN = re.compile(
+    r"\btools?(?:\s+(?:connection|service|access))?\s+(?:is|are)\s+(?:currently\s+|right\s+now\s+)?"
+    r"(?:disabled|unavailable|not\s+available|offline|down|not\s+connected)\b|"
+    r"\bwith\s+the\s+tools\s+(?:I\s+have|available)\b|\bI\s+(?:don(?:'|’)?t|do\s+not)\s+have\s+(?:the\s+)?tools?\b",
+    re.I)
+GROUND_RETRY = ("[JARVIS check] Your tools are connected and working in this conversation, and "
+                "you did not call any. Use them now to do or check what David asked, then answer "
+                "him in one or two plain sentences. His request was: ")
+GROUND_FAILED = ("[JARVIS check] Your tools are not disabled. These calls failed: {failures}. "
+                 "Retry once if a different call could work; otherwise tell David in one plain "
+                 "sentence exactly what failed and why, using the error text, never 'disabled'. "
+                 "His request was: ")
+GROUND_MORE = ("[JARVIS check] Your tools are connected. Look through your whole tool list "
+               "(media and volume control playback, terminal runs commands, browser_* and "
+               "agent_browser_* drive websites, device picks the computer) for one that does "
+               "the rest, use it, then answer in one or two plain sentences. If none can, say "
+               "which step isn't supported. His request was: ")
 
 
 def is_refusal(text):
     return bool(REFUSAL.search(str(text or "")))
+
+
+def ungrounded(reply, tool_log):
+    """The nudge to send the tools lane when its reply excuses itself without grounds, or
+    None when the reply stands: it claims it can't inspect/control the computers having
+    called no tool, or blames its tools ("disabled") when calls failed for other reasons."""
+    reply = str(reply or "")
+    if not (is_refusal(reply) or TOOLS_DOWN.search(reply)):
+        return None
+    ran = list(tool_log or ())
+    if not ran:
+        return GROUND_RETRY
+    failed = [f"{name}: {str(error or 'failed')[:160]}" for name, ok, error in ran if not ok]
+    if not TOOLS_DOWN.search(reply):
+        return None  # tools ran and it names a real limit: the answer stands
+    if failed:
+        return GROUND_FAILED.format(failures="; ".join(failed[:4]))
+    return GROUND_MORE
 
 
 VAULT_ONLY = ("You are JARVIS, David's personal assistant. Do what he asks with your "
