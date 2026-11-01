@@ -298,6 +298,21 @@ Claude CLI from inside a Claude session, strip `CLAUDE_*` and `ANTHROPIC_*` env 
   `memory_search`, `conversation_recent` across days), whether or not the vault is on.
   The talk lane hands off (`[act]`) for remember/recall requests, computer checks ("how
   many apps…") and short answers to its own clarifying questions.
+- **Consolidated memory** (`consolidate.py`, kinds `fact`, `preference`, `lesson`, `loop`):
+  when `memory.consolidate` is true, the voice daemon or console checks every 30 min and,
+  once a day after 04:00, sends everything said before local midnight (since the last run)
+  plus the active known items to ChatGPT in one tool-free call. Each returned item must cite
+  ids it was shown; it is linked (`from`) to its source messages. `same_as` or near-identical
+  wording merges into the known item (`meta.seen` +1), `replaces` retires the older item as
+  kind `replaced` (link `replaces`), `closed` retires loops. Retired kinds (`forgotten`,
+  `replaced`, `closed`) stay in the file but search skips them. A failed call records
+  nothing and retries; a file lock keeps two processes from both running it.
+  `jarvis mem consolidate` runs it now; `jarvis mem knowledge` lists the items.
+- **Corrections and the memory pack**: a request like "no, I meant the Dell"
+  (`memory.is_correction`) saves a `lesson` linked to the exchange it corrects, for free.
+  Every brain call's recall starts with the pack (`Memory.pack`): open loops from the last
+  14 days, then matching facts/preferences (3) and lessons (2), ranked by meaning when
+  semantic recall is on. The interpreter's prompt gets the matching lessons too.
 - **History** (`history.py`, `.jarvis/history.sqlite3`): actions taken, for the H-checks,
   the decider's labels and the console's command history.
 - **David's personal vault** (`vault.path`, per OS): his notes, calendar and tasks. JARVIS
