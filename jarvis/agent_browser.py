@@ -52,8 +52,36 @@ def env(state_dir=None, headed=True):
             "AGENT_BROWSER_HEADED": "true" if headed else "false"}
 
 
+# A build from the GitHub source (git clone vercel-labs/agent-browser at the pinned tag,
+# then `cargo build --release --manifest-path cli/Cargo.toml`), used when its version is the
+# pinned one. AGENT_BROWSER_SOURCE points elsewhere; the default is ~/projects/agent-browser.
+SOURCE_ENV = "AGENT_BROWSER_SOURCE"
+_SOURCE_SEEN = {}
+
+
+def source_build():
+    """The source-built CLI's path when it exists and reports VERSION, else None."""
+    root = Path(os.environ.get(SOURCE_ENV) or Path.home() / "projects" / PACKAGE).expanduser()
+    exe = root / "cli" / "target" / "release" / (PACKAGE + (".exe" if os.name == "nt" else ""))
+    if not exe.is_file():
+        return None
+    key = (str(exe), exe.stat().st_mtime)
+    if key not in _SOURCE_SEEN:
+        try:
+            out = subprocess.run([str(exe), "--version"], capture_output=True, text=True,
+                                 timeout=10, creationflags=FLAGS).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        _SOURCE_SEEN[key] = out.strip().split()[-1:] == [VERSION]
+    return str(exe) if _SOURCE_SEEN[key] else None
+
+
 def binary():
-    """The pinned CLI: on PATH, else the copy npx cached for the MCP server, else npx."""
+    """The pinned CLI: the GitHub source build, else on PATH, else the copy npx cached for
+    the MCP server, else npx."""
+    built = source_build()
+    if built:
+        return [built]
     found = shutil.which(PACKAGE)
     if found:
         return [found]
@@ -76,12 +104,70 @@ def binary():
     return [npx, "-y", f"{PACKAGE}@{VERSION}"] if npx else None
 
 
+def _stale_daemons(exe):
+    """PIDs of daemons of the source build started before the binary was last rebuilt:
+    they keep running the old code under the same version, so a fix never shows (seen
+    2026-11-01). Linux /proc only; elsewhere, nothing is reported."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    try:
+        built = Path(exe).stat().st_mtime
+        boot = next(float(line.split()[1]) for line in (proc / "stat").read_text().splitlines()
+                    if line.startswith("btime "))
+        ticks = os.sysconf("SC_CLK_TCK")
+    except (OSError, StopIteration, ValueError, AttributeError):
+        return []
+    stale = []
+    for entry in proc.glob("[0-9]*"):
+        try:
+            if os.readlink(entry / "exe").removesuffix(" (deleted)") != str(exe):
+                continue
+            started = boot + int((entry / "stat").read_text().rsplit(")", 1)[1].split()[19]) / ticks
+        except (OSError, ValueError, IndexError):
+            continue
+        if started < built - 2:  # /proc's boot time is whole seconds: allow for it
+            stale.append(int(entry.name))
+    return stale
+
+
+def _retire_stale(command):
+    """Stop daemons a rebuild left on old code, once per binary build."""
+    exe = command[0] if command and len(command) == 1 else None
+    if not exe or exe != source_build():
+        return
+    key = ("retired", exe, Path(exe).stat().st_mtime)
+    if key in _SOURCE_SEEN:
+        return
+    _SOURCE_SEEN[key] = True
+    import signal
+    stale = _stale_daemons(exe)
+    for pid in stale:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    # The next command must not reach a daemon that is still shutting down.
+    deadline = time.monotonic() + 3
+    while stale and time.monotonic() < deadline:
+        stale = [pid for pid in stale if Path(f"/proc/{pid}").exists()]
+        time.sleep(0.1)
+    for pid in stale:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    if stale:
+        time.sleep(0.2)
+
+
 def run(*args, state_dir=None, timeout=30):
     """(ok, data) for one CLI command in the JARVIS session; data is the JSON `data`
     on success and the error text on failure."""
     command = binary()
     if command is None:
         return False, "agent-browser isn't installed (it needs Node's npx)."
+    _retire_stale(command)
     try:
         out = subprocess.run([*command, *args, "--json"], capture_output=True, text=True,
                              encoding="utf-8", errors="replace", timeout=timeout,

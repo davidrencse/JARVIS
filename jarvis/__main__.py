@@ -526,7 +526,8 @@ def vault_command(args, config):
     if args.action == "brief":
         from .briefing import answer
         from .tasks import tasks_for
-        text = answer("brief me", vault, tasks_for(vault))
+        from .memory import Memory
+        text = answer("brief me", vault, tasks_for(vault), memory=Memory(Path(args.state)))
         print(text)
         if args.speak:
             from .speech import Voice
@@ -730,7 +731,16 @@ def cognition(args, config, base):
             emit(memory.get(args.value[0]))
         elif args.action == "consolidate":  # now, whether or not today's run is due
             from .consolidate import chatgpt_ask, consolidate
-            emit(consolidate(memory, chatgpt_ask(config, base)))
+            from .locking import exclusive_lock
+            try:  # the same lock as the daily run: never two consolidations at once
+                lock = exclusive_lock(Path(memory.path).parent / "consolidate.lock")
+                lock.__enter__()
+            except ValueError:
+                raise ValueError("Consolidation is already running (the daily run); try again shortly.")
+            try:
+                emit(consolidate(memory, chatgpt_ask(config, base)))
+            finally:
+                lock.__exit__(None, None, None)
         elif args.action == "knowledge":  # consolidated facts, preferences, lessons, loops
             emit(memory.knowledge(limit=args.limit))
         else:

@@ -199,6 +199,20 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device)
         failures, mic, armed, armed_by_owner, chatting = 0, None, 0.0, False, 0.0
+        pending = None  # a cut-off command ("open up") waiting for its rest (fragments.py)
+        from .fragments import complete as complete_fragment, judge as judge_fragment
+        from .parse import parse_for
+        from .topology import enabled as cluster_on, identity
+        here = identity(config)[0] if cluster_on(config) else next(iter(config.get("devices") or {"pc": 0}))
+
+        def understood(text):
+            """The strict parser or an instant answer handles it: never a fragment."""
+            if instant_answer(text):
+                return True
+            try:
+                return parse_for(text, config, here)["commands"] is not None
+            except Exception:
+                return False
         while True:
             try:
                 mic = mic or LiveMic(tuning=mic_settings(state))  # device + cutoffs from setup
@@ -250,9 +264,11 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     continue
                 # The follow-up has no wake word of its own, so one of the two clips must
                 # pass the full voice check: two near misses are not enough.
+                follow_up = False
                 if request is None and heard.strip() and began < armed and (
                         is_owner or armed_by_owner):
                     request = heard.strip()  # the rest of "Jarvis, ... <pause> ..."
+                    follow_up = True
                 # Answering JARVIS ("I can check it if you want." "Then check it.") needs
                 # no wake word, but only a full voice match and a short reply count.
                 # Wall clock: the reply's end is read once, after JARVIS stops talking, and
@@ -262,6 +278,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                         log("reply window: approving or cancelling a confirmation needs \"Jarvis\"")
                     else:
                         request = heard.strip()
+                        follow_up = True
                 if request or is_owner:  # a near miss (TV, another voice) closes no window
                     armed = chatting = 0.0
                 if not request:  # not addressed to JARVIS: never answered
@@ -277,6 +294,22 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     emit(state, "voice.unclear", score=score)
                     armed, armed_by_owner = time.monotonic() + FOLLOW_UP + 3, is_owner
                     voice.say(UNCLEAR, wait=True)
+                    mic.flush()
+                    continue
+                if pending and began < pending[1] and (follow_up or len(request.split()) <= 4):
+                    request = complete_fragment(pending[0], request)  # "open up" + "Spotify"
+                pending = None
+                verdict, ask_back = judge_fragment(request, follow_up=follow_up, understood=understood)
+                if verdict == "overheard":  # David talking to someone else: never answered
+                    log(f"overheard ({score}): {len(request.split())} words, not kept")
+                    emit(state, "voice.fragment", verdict=verdict, score=score)
+                    continue
+                if verdict in ("unclear", "incomplete"):
+                    log(f"{verdict} ({score}): {request!r}")
+                    emit(state, "voice.fragment", verdict=verdict, score=score)
+                    armed, armed_by_owner = time.monotonic() + FOLLOW_UP + 3, is_owner
+                    pending = (request, armed) if verdict == "incomplete" else None
+                    voice.say(ask_back or UNCLEAR, wait=True)
                     mic.flush()
                     continue
                 if not near:

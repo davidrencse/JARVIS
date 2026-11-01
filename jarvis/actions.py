@@ -579,15 +579,12 @@ def _backend():
 
 def open_windows():
     """Top-level windows: {"id", "app", "title"}; id is an HWND, a Hyprland address, a sway
-    container id, an X11 window id or (macOS) the app name."""
+    container id, an X11 window id or (macOS) the app name. On Windows, Store apps are
+    named by their own process ("ApplicationFrameHost CalculatorApp") and the shell's
+    desktop and taskbar windows are never listed."""
     if os.name == "nt":
-        out = _run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                   "Get-Process | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object "
-                   "ProcessName,MainWindowTitle,@{n='Handle';e={[int64]$_.MainWindowHandle}} | "
-                   "ConvertTo-Json -Compress")
-        data = json.loads(out.stdout or "[]")
-        return [{"id": int(w["Handle"]), "app": w["ProcessName"], "title": w["MainWindowTitle"] or ""}
-                for w in (data if isinstance(data, list) else [data])]
+        from .observe import _windows_nt
+        return _windows_nt()
     if _backend() != "hyprland":
         from .observe import window_details  # sway, wmctrl, macOS; LookupError if unsupported
         return window_details()
@@ -623,28 +620,78 @@ def _close(window):
     return False
 
 
+def _app_hits(name, windows):
+    """(windows, how) for the app called `name`: the best app tier (exact process/class
+    name or a known other name, then a partial name), else title matches ("title")."""
+    from .observe import app_match
+    full = ALIASES.get(name.strip().lower(), name)
+    words = {_flat(w) for w in re.split(r"[\s._-]+", full) if w}
+    scored = [(app_match(w, full, words), w) for w in windows]
+    for tier in (3, 2):
+        hits = [w for score, w in scored if score == tier]
+        if hits:
+            return hits, "app"
+    return [w for score, w in scored if score == 1], "title"
+
+
+FOCUS_WAIT = 1.0  # seconds a focus request gets to show up as the focused window
+
+
 def focus_window(name):
-    """Raise a uniquely matched window on the current desktop."""
+    """Raise a uniquely matched window on the current desktop, then read back which
+    window is focused: the desktop accepting the request isn't proof (Windows refuses
+    foreground changes it doesn't trust; a window on another Hyprland workspace)."""
     query = _flat(ALIASES.get(name.strip().lower(), name))
     if len(query) < 2:
         return False, "Say which window to switch to."
     windows = open_windows()
-    by_app = [w for w in windows if any(query in _flat(a) for a in w["app"].split())]
-    hits = by_app or [w for w in windows if query in _flat(w["title"])]
+    hits, _ = _app_hits(name, windows)
     if len(hits) > 1:
+        focused = [w for w in hits if w.get("focused")]
+        if len(focused) == 1:  # already in front: nothing to choose
+            return True, f"{focused[0]['title'] or name} is already in front."
         return False, "Several windows match: " + "; ".join(w["title"] for w in hits[:5]) + ". Which one?"
     if not hits:
         return False, f"No open window matches {name!r}."
     window = hits[0]
-    ok = raise_window(window)
-    return (True, f"Switched to {window['title'] or window['app'].strip()}.") if ok else (False, f"Couldn't switch to {name}.")
+    label = window["title"] or window["app"].split()[0]
+    if not raise_window(window):
+        return False, f"Couldn't switch to {name}."
+    seen = _focused_now(window)
+    if seen is False:
+        return False, f"I asked for {label}, but it didn't come to the front."
+    return True, f"Switched to {label}."
+
+
+def _focused_now(window, wait=FOCUS_WAIT, clock=time.monotonic, sleep=time.sleep):
+    """True once `window` is the focused one, False if it never is within `wait`, None
+    when this desktop can't say which window is focused."""
+    deadline = clock() + wait
+    while True:
+        active = _active_window_id()
+        if active is None:
+            return None
+        if str(active) == str(window["id"]):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(0.1)
 
 
 def raise_window(window):
     """Focus one window from open_windows(); True if the desktop accepted it."""
     if os.name == "nt":
         import ctypes
-        ok = bool(ctypes.windll.user32.SetForegroundWindow(window["id"]))
+        user32 = ctypes.windll.user32
+        if user32.IsIconic(window["id"]):
+            user32.ShowWindow(window["id"], 9)  # SW_RESTORE: a minimised window can't take focus
+        ok = bool(user32.SetForegroundWindow(window["id"]))
+        if not ok or int(user32.GetForegroundWindow()) != window["id"]:
+            # Windows only lets the foreground process hand focus away; a tapped Alt (down
+            # then up at once, nothing held) makes this process eligible. Standard, momentary.
+            user32.keybd_event(0x12, 0, 0, 0)
+            user32.keybd_event(0x12, 0, 2, 0)
+            ok = bool(user32.SetForegroundWindow(window["id"]))
     elif _backend() == "macos":
         name = macos_app_name(window["app"])
         ok = bool(name) and _osascript(f'tell application "{name}" to activate').returncode == 0
@@ -657,12 +704,49 @@ def raise_window(window):
             _run("wmctrl", "-i", "-a", address).returncode == 0
     else:
         address = str(window["id"])
-        # Hyprland 0.56+ takes Lua dispatchers (classic focuswindow errors); older ones the classic syntax.
-        ok = bool(re.fullmatch(r"0x[0-9a-f]+", address)) and any(
-            _run("hyprctl", "dispatch", *command).stdout.strip() == "ok"
-            for command in ([f'hl.dsp.focus({{ window = "address:{address}" }})'],
-                            ["focuswindow", f"address:{address}"]))
+        # Hyprland 0.56+ takes Lua dispatchers (classic focuswindow errors); older ones the
+        # classic syntax. On 0.56.2 (2026-11-01) the "address:" string selector answered "ok"
+        # yet left focus where it was for a window on another workspace; a window object
+        # from hl.get_window moves it. Each attempt is read back before the next is tried.
+        if not re.fullmatch(r"0x[0-9a-f]+", address):
+            return False
+        ok = False
+        for command in ([f'hl.dsp.focus({{ window = hl.get_window("address:{address}") }})'],
+                        [f'hl.dsp.focus({{ window = "address:{address}" }})'],
+                        ["focuswindow", f"address:{address}"]):
+            if _run("hyprctl", "dispatch", *command).stdout.strip() == "ok":
+                ok = True
+                if _focused_now(window, wait=0.4) is not False:
+                    return True
+        if ok:
+            _hypr_pointer_focus(address, window)
     return ok
+
+
+def _hypr_pointer_focus(address, window):
+    """Last resort when Hyprland accepted the focus but it didn't land: with follow_mouse
+    on, the window under the pointer on the target workspace takes focus straight back
+    (seen 2026-11-01: Dolphin next to a kitty on workspace 3). Hyprland normally moves
+    the pointer to a focused window itself (cursor:no_warps false) but didn't. So: move the
+    pointer to the target's centre, focus again, read back; if it still fails, the pointer
+    goes back where it was. Only the position changes, never the cursor's look or input."""
+    try:
+        clients = json.loads(_run("hyprctl", "clients", "-j").stdout or "[]")
+        target = next(c for c in clients if c.get("address") == address)
+        x = int(target["at"][0] + target["size"][0] / 2)
+        y = int(target["at"][1] + target["size"][1] / 2)
+        was = _run("hyprctl", "cursorpos").stdout.strip()
+        back = [int(v) for v in re.findall(r"-?\d+", was)][:2]
+    except (StopIteration, KeyError, TypeError, ValueError, IndexError, OSError,
+            subprocess.SubprocessError):
+        return False
+    _run("hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {x}, y = {y} }})")
+    _run("hyprctl", "dispatch", f'hl.dsp.focus({{ window = hl.get_window("address:{address}") }})')
+    if _focused_now(window, wait=0.4):
+        return True
+    if len(back) == 2:  # fail-safe: leave the pointer exactly where David had it
+        _run("hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {back[0]}, y = {back[1]} }})")
+    return False
 
 
 def close_app(name):
@@ -674,19 +758,13 @@ def close_app(name):
     if len(query) < 2:
         return False, "Say which app to close."
     windows = open_windows()
-    # Closest match wins. An app name shorter than the request counts only as one of its
-    # words ("visual studio code" closes app "code"), never as a piece of one: "codex"
-    # must not close VS Code, open or not.
-    words = {_flat(w) for w in re.split(r"[\s._-]+", full) if w}
-    for match in (lambda a: a == query, lambda a: query in a, lambda a: len(a) >= 3 and a in words):
-        hits = [w for w in windows if any(match(_flat(a)) for a in w["app"].split())]
-        if hits:
-            break
-    if not hits:
-        hits = [w for w in windows if query in _flat(w["title"])]
-        if len(hits) > 1:
-            return False, ("Several windows match: " + "; ".join(w["title"] for w in hits[:5])
-                           + ". Which one?")
+    # Closest match wins: an exact process/class name (or a known other name: the Store's
+    # CalculatorApp, WINWORD), then a partial name ("codex" never closes VS Code: "code"
+    # is one of the words of visual studio code, not a piece of codex).
+    hits, how = _app_hits(name, windows)
+    if how == "title" and len(hits) > 1:
+        return False, ("Several windows match: " + "; ".join(w["title"] for w in hits[:5])
+                       + ". Which one?")
     if not hits:
         return False, f"No open window matches {name!r}."
     closed = [w for w in hits if _close(w)]
@@ -1123,11 +1201,13 @@ def browser_mcp(state_dir, engines=BROWSER_ENGINES):
             # No uploading local files to sites; no arbitrary page scripts.
             "disabled_tools": sorted(BROWSER_BLOCKED)}
     if "agent-browser" in engines:
-        from .agent_browser import env as agent_env
+        from .agent_browser import env as agent_env, source_build
+        built = source_build()  # the GitHub source build at the pinned version, if present
         servers["agent_browser"] = {
-            "command": npx,
+            "command": built or npx,
             # The core tool set only: no network interception, cookies, uploads or plugins.
-            "args": ["-y", AGENT_BROWSER, "mcp", "--tools", "core"],
+            "args": (["mcp", "--tools", "core"] if built else
+                     ["-y", AGENT_BROWSER, "mcp", "--tools", "core"]),
             "disabled_tools": sorted(AGENT_BROWSER_BLOCKED),
             # A visible window so David can sign in himself, like the Playwright one. The
             # session is shared with agent_browser.py, so the console shows this browser.

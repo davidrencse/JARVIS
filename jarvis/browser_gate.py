@@ -162,8 +162,8 @@ def gate(policy, config, state, wait=WAIT, queue=None):
         action = commits(params)
         if not action:
             return ok, why
-        from .gates import asks
-        if not asks(config):  # rules.confirm: never
+        from .gates import asks_now
+        if not asks_now(config, state):  # rules.confirm: never (read live)
             return ok, why
         return ask(action, config, state, wait, queue)
     return approve

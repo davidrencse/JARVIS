@@ -479,9 +479,15 @@ class Brain:
     that...", "what do my notes say..."). Talk stays fast; tools load only for work.
     wants(text) -> bool picks the action lane; by default, either kind of request."""
 
-    def __init__(self, chat, act, wants=None):
+    def __init__(self, chat, act, wants=None, decider=None):
         self.chat, self.act, self.wants = chat, act, wants
         self.last = chat  # the lane that answered the latest ask()
+        # routing.decider (default on; off under tests): the local classifier may also
+        # send a request to the tools lane when it is confident it's an action.
+        if decider is None:
+            from . import _under_tests
+            decider = not _under_tests()
+        self.decider = decider
 
     @property
     def tool_log(self):
@@ -504,6 +510,9 @@ class Brain:
             from .memory import is_memory_request
             from .vault import is_vault_request
             wants = is_action(text) or is_vault_request(text) or is_memory_request(text)
+            if not wants and self.decider:  # what the keyword rules missed
+                from .decide import wants_tools
+                wants = wants_tools(text)
         else:
             wants = self.wants(text)
         return "act" if wants else "chat"
@@ -780,9 +789,22 @@ class ConfirmGate:
             return False, f"Not run: {errors[0]}"
         if command["intent"] == "agent_task" and agent_risk(command["args"]["text"]) == "deny":
             return False, "Refused: JARVIS never handles passwords, 2FA codes or card numbers."
-        from .gates import asks
-        if not asks(self.config):  # rules.confirm: never
-            return self.tools.call(name, args)
+        from .gates import asks_now
+        if not asks_now(self.config, self.state):  # rules.confirm: never (read live)
+            from .pipeline import DIRECT
+            if command["intent"] not in DIRECT:  # agent_task: Grok has its own checks
+                return self.tools.call(name, args)
+            # Nothing waits for an OK, but the brain's risky calls get what David's own
+            # commands get: the U-gates, history's loop block (H3; the brain reads web
+            # pages, so a page can drive it in circles) and a record of what ran.
+            from .pipeline import run_confirmed
+            try:
+                result = run_confirmed(command, self.config, self.state, origin=here,
+                                       origin_class="brain")
+            except ValueError as exc:
+                return False, f"Not run: {exc}"
+            outcome = (result.get("outcomes") or [{}])[0]
+            return bool(outcome.get("ok")), str(result.get("reply") or outcome.get("text") or "")
         try:
             item = ConfirmQueue(self.state).park(command, here, "brain")
         except Exception as exc:  # no queue means no run: never fall through to the tool
@@ -858,5 +880,7 @@ def make_lane(config, base, state_dir=None):
                       context=context,
                       # Built-in web search lets the model skip the real browser; off here.
                       overrides=['web_search="disabled"'], **extra)
+    from . import _under_tests
+    decider = config.get("routing", {}).get("decider", True) and not _under_tests()
     return Brain(chat, act, wants=None if actions else
-                 lambda text: is_vault_request(text) or is_memory_request(text))
+                 lambda text: is_vault_request(text) or is_memory_request(text), decider=decider)

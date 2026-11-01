@@ -132,7 +132,8 @@ class History:
     def check(self, command, origin_class="owner", now=None):
         """H1 + H3 for one command: {"block": bool, "warn": str|None, "alert": bool, "checks"}."""
         checks, warn, block, alert = [], None, False, False
-        agent = origin_class in AGENT_ORIGINS
+        # The brain's own tool calls count as a possible loop too: it reads web pages.
+        agent = origin_class in AGENT_ORIGINS or origin_class == "brain"
         failure = self.recent_failure(command, now)
         if failure:
             mins = round(failure["ago"] / 60)

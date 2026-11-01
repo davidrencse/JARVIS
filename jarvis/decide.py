@@ -51,7 +51,7 @@ PROTOTYPES = {
     # words with notes without being about them. Written apart from tests/eval/cases.jsonl
     # so the scorecard measures this job on unseen text.
     "recall": {
-        "notes": ["when is my exam", "what's due this week", "what do I have today",
+        "notes": ["when is my exam", "what deadlines are coming up", "what do I have today",
                   "what's on my schedule tomorrow", "what did I write about the trip",
                   "what are my notes on linear algebra", "where am I with my thesis",
                   "what's the status of my internship applications", "what's my plan for the weekend",
@@ -64,10 +64,10 @@ PROTOTYPES = {
                   "summarize my journal from last week", "what's in my notes about the job offer",
                   "what do I have going on today", "am I falling behind on anything",
                   "what's coming up this week", "what's my agenda"],
-        "none": ["hello", "hi jarvis", "thanks", "good night", "how are you", "you're awesome",
-                 "never mind", "what time is it", "what's today's date", "what day is it",
+        "none": ["hey there", "hi jarvis", "thanks", "good night", "how's it going", "you're awesome",
+                 "never mind", "got the time", "what's the date today", "which day of the week is it",
                  "what's the capital of peru", "who wrote hamlet", "how many grams in a kilo",
-                 "tell me a joke", "what's the weather", "open spotify", "close chrome on the laptop",
+                 "make me laugh", "what's the weather", "launch discord", "close chrome on the laptop",
                  "turn the volume up", "play some music", "how do I install python",
                  "how much is ethereum right now", "explain recursion", "reply with one word",
                  "this is a test", "can you hear me", "say hi to everyone",
@@ -286,6 +286,48 @@ def choose(job, text, temperature=None, options=None):
             "similarity": round(sims[winner], 3), "sims": {o: round(v, 5) for o, v in sims.items()}}
 
 
+# Routing (chatgpt.Brain.pick): the decider can send a request the keyword rules missed to
+# the tools lane. 0.75 sits just above the scorecard's cross-validated 98%-precision cutoff
+# for the mode job (0.734 on 2026-11-01, on text it never trained on). A wrong pick costs a
+# slower answer, never an action: the tools lane still decides what to do.
+ROUTE_THRESHOLD = 0.75
+ROUTE_TO_TOOLS = ("act", "agent")
+_warming = []
+
+
+def ready(job):
+    """True once the job's classifier is built, so asking costs milliseconds."""
+    return job in _models
+
+
+def warm(job):
+    """Build the job's model once in the background (about 2 s): never on a request."""
+    with _lock:
+        if _warming or job in _models:
+            return
+        _warming.append(job)
+
+    def build():
+        try:
+            choose(job, "warm up")
+        except Exception:
+            pass
+    threading.Thread(target=build, name=f"jarvis-decide-{job}", daemon=True).start()
+
+
+def wants_tools(text):
+    """True when the mode classifier is ready and confidently says act or agent. Never
+    blocks: until the model is built it says False and starts building it."""
+    if not ready("mode"):
+        warm("mode")
+        return False
+    try:
+        found = choose("mode", text)
+    except Exception:
+        return False
+    return bool(found) and found["winner"] in ROUTE_TO_TOOLS and found["confidence"] >= ROUTE_THRESHOLD
+
+
 # -- shadow log and calibration (history.sqlite3, table decisions) -----------------------------
 @contextmanager
 def _db(state):
@@ -325,11 +367,32 @@ def label(state, decision_id, value, source="outcome"):
         db.execute("UPDATE decisions SET label=?, source=? WHERE id=?", (value, source, decision_id))
 
 
-def _labelled(state, job):
+def _trained_on(job):
+    """Keys of every text the job's model learns from (built-in examples and examples()),
+    so calibration never scores the model on what it was trained on."""
+    texts = [t for option in PROTOTYPES.get(job, {}).values() for t in option]
+    texts += [t for t, _ in examples(job)]
+    return {_key(clean(t)) for t in texts}
+
+
+def _labelled(state, job, held_out=True):
+    """Labelled shadow decisions, each text once. held_out (default): texts the model was
+    trained on are left out (audit 2026-11-01: 35 relabelled shadow rows sit in
+    decider_labels.jsonl and eval cases come from the same history, so they leaked)."""
     with _db(state) as db:
-        return [dict(r) for r in db.execute(
-            "SELECT probs, winner, confidence, label FROM decisions WHERE job=? AND label IS NOT NULL "
-            "AND probs IS NOT NULL AND probs != 'null'", (job,))]
+        rows = [dict(r) for r in db.execute(
+            "SELECT text, probs, winner, confidence, label FROM decisions WHERE job=? "
+            "AND label IS NOT NULL AND probs IS NOT NULL AND probs != 'null' ORDER BY at",
+            (job,))]
+    skip = _trained_on(job) if held_out else set()
+    seen, out = set(), []
+    for row in rows:
+        key = _key(clean(row.get("text") or ""))
+        if key in skip or key in seen:
+            continue
+        seen.add(key)
+        out.append(row)
+    return out
 
 
 _TEMPS = {}

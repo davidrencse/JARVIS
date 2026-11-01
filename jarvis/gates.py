@@ -9,6 +9,7 @@ The checks that need the outside world take it as arguments (reachable, ready,
 app_exists), so the gates themselves stay pure and testable.
 """
 
+import json
 import os
 import posixpath
 import time
@@ -80,6 +81,27 @@ def asks(config):
     card numbers; agent-origin actions) stay either way: they are not questions (hard_deny).
     Only exactly "never" (whitespace aside) turns asking off; any other value asks."""
     return str(((config or {}).get("rules") or {}).get("confirm", "ask")).strip() != "never"
+
+
+_LIVE = {}  # config path -> (mtime, rules.confirm)
+
+
+def asks_now(config, state=None):
+    """asks(), but from jarvis.config.json as it is on disk now when it sits next to the
+    state folder (the usual layout): the brain and browser gates are built once, so a
+    switch back to "ask" would otherwise wait for a restart. Falls back to `config`."""
+    if state is not None and Path(state).is_dir():
+        path = Path(state).resolve().parent / "jarvis.config.json"
+        try:
+            mtime = path.stat().st_mtime
+            cached = _LIVE.get(str(path))
+            if not cached or cached[0] != mtime:
+                rules = (json.loads(path.read_text(encoding="utf-8")) or {}).get("rules") or {}
+                _LIVE[str(path)] = cached = (mtime, rules.get("confirm", "ask"))
+            return asks({"rules": {"confirm": cached[1]}})
+        except (OSError, ValueError, AttributeError):
+            pass  # no file there, or it's mid-edit: the config the gate was built with
+    return asks(config)
 
 
 # What a brain terminal command may never do, asked or not (hard_deny): enter credentials.

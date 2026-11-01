@@ -172,8 +172,52 @@ def deadlines_line(vault, today, limit=2):
             + _join(_deadline(i, today) for i in items) + ".") if items else ""
 
 
-def answer(text, vault, tasks, now=None):
-    """A spoken answer from the vault, or None when the question isn't one of these."""
+LOOP_DAYS = 14  # open loops older than this are left to the brain's recall, not the briefing
+
+
+# Loops are written about David ("David still hasn't sent..."); the briefing talks to him.
+_VERB = {"hasn't": "haven't", "has not": "have not", "has": "have", "is": "are",
+         "isn't": "aren't", "was": "were", "wasn't": "weren't", "needs": "need",
+         "wants": "want", "plans": "plan", "owes": "owe", "says": "say", "said": "said",
+         "promised": "promised", "asked": "asked", "agreed": "agreed"}
+_YOU = [(re.compile(r"\bDavid's\b"), lambda m: "your"),
+        (re.compile(r"\bDavid (still |also )?(" + "|".join(sorted(map(re.escape, _VERB), key=len, reverse=True))
+                    + r")\b"), lambda m: f"you {m.group(1) or ''}{_VERB[m.group(2)]}"),
+        (re.compile(r"\b(said|promised|agreed|planned|thought) (he|that he)\b"),
+         lambda m: f"{m.group(1)} {'that you' if m.group(2) == 'that he' else 'you'}"),
+        (re.compile(r"\bDavid\b"), lambda m: "you")]
+
+
+def _to_you(text):
+    for pattern, repl in _YOU:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def loops_line(memory, limit=2, days=LOOP_DAYS):
+    """Memory's open loops (consolidate.py: what someone said would happen and hasn't, a
+    question left hanging), newest first: "Still open: ...". "" when there are none, or
+    the memory can't be read: the briefing never fails over it."""
+    if memory is None:
+        return ""
+    try:
+        from datetime import timezone
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        loops = memory.search(kind="loop", since=since, limit=limit + 1)
+    except Exception:
+        return ""
+    said = [_say(_to_you(str(i.get("preview") or i.get("title") or "").rstrip(".…")), 90)
+            for i in loops[:limit]]
+    said = [s for s in said if s]
+    if not said:
+        return ""
+    more = f", plus {len(loops) - limit} more" if len(loops) > limit else ""
+    return f"Still open: {_join(said)}{more}."
+
+
+def answer(text, vault, tasks, now=None, memory=None):
+    """A spoken answer from the vault (and memory's open loops for the briefing), or None
+    when the question isn't one of these."""
     if vault is None:
         return None
     now = now or datetime.now()
@@ -183,7 +227,7 @@ def answer(text, vault, tasks, now=None):
         greeting = "Good morning" if now.hour < 12 else "Good afternoon" if now.hour < 18 else "Good evening"
         parts = [f"{greeting}, David. It's {today:%A}, {today:%B} {_ordinal(today.day)}.",
                  day_line(vault, today, today), priorities_line(vault, today),
-                 tasks_line(tasks, today), deadlines_line(vault, today)]
+                 tasks_line(tasks, today), deadlines_line(vault, today), loops_line(memory)]
         return " ".join(p for p in parts if p)
     if (match := DAY.match(text)):
         word = next((g for g in match.groups() if g), "today").lower()

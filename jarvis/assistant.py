@@ -1,6 +1,7 @@
 """One entry point for text and voice: route the request, do the work, remember it."""
 
 import re
+from pathlib import Path
 import threading
 
 from .adapters import call_api
@@ -20,7 +21,14 @@ def vault_answer(text, config, state):
         from .tasks import tasks_for
         from .vault import vault_for
         vault = vault_for(config, state)
-        return answer(text, vault, tasks_for(vault)) if vault else None
+        if not vault:
+            return None
+        try:
+            from .memory import Memory
+            memory = Memory(Path(state))
+        except Exception:  # no memory: the briefing goes without its open loops
+            memory = None
+        return answer(text, vault, tasks_for(vault), memory=memory)
     except Exception:
         return None
 
