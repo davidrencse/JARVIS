@@ -1,0 +1,61 @@
+{"_meta": {"about": "Phase 4 grounding: does a live-state request reach the tools lane, and is an ungrounded excuse caught? route: the lane Brain.pick should choose. talk/tools: a reply and whether it is an excuse JARVIS must not pass on (talk: hand off; tools: retry). Real replies from the memory heap are marked seen."}}
+{"route": "what apps are on my Windows laptop?", "lane": "act"}
+{"route": "jarvis hello what apps are on my windows desktop ?", "lane": "act"}
+{"route": "how many apps are on my desktop and my Dell computer?", "lane": "act"}
+{"route": "how many apps are on my Dell?", "lane": "act"}
+{"route": "how many apps are on my Dell and on this laptop?", "lane": "act"}
+{"route": "is discord open on the dell", "lane": "act"}
+{"route": "what's playing on arch", "lane": "act"}
+{"route": "how much disk space do i have left", "lane": "act"}
+{"route": "what's my battery at", "lane": "act"}
+{"route": "whats the cpu usage on the dell", "lane": "act"}
+{"route": "is the dell online", "lane": "act"}
+{"route": "is spotify running", "lane": "act"}
+{"route": "how much space is left on the dell", "lane": "act"}
+{"route": "what's my ip address", "lane": "act"}
+{"route": "what's in my downloads folder", "lane": "act"}
+{"route": "open spotify on the dell", "lane": "act"}
+{"route": "is chrome installed on the dell", "lane": "act"}
+{"route": "what's open on the zenbook", "lane": "act"}
+{"route": "go to youtube and play lofi", "lane": "act"}
+{"route": "check the wifi on my laptop", "lane": "act"}
+{"route": "what's the capital of peru", "lane": "chat"}
+{"route": "how is the weather in general in march", "lane": "chat"}
+{"route": "how are you", "lane": "chat"}
+{"route": "tell me about the history of rome", "lane": "chat"}
+{"route": "what is a cpu", "lane": "chat"}
+{"route": "how much battery life does an iphone have", "lane": "chat"}
+{"route": "what's a good laptop battery brand", "lane": "chat"}
+{"route": "is it raining in london usually", "lane": "chat"}
+{"route": "explain recursion", "lane": "chat"}
+{"route": "how many ounces in a pound?", "lane": "chat"}
+{"route": "what's my name", "lane": "chat"}
+{"route": "is the store open today", "lane": "chat"}
+{"route": "who won the world cup in 2018", "lane": "chat"}
+{"route": "what should I eat for dinner", "lane": "chat"}
+{"talk": "I don’t have a list of apps installed on your Dell Windows laptop. I can check it if you want.", "excuse": true, "seen": true}
+{"talk": "I tried checking the installed apps on your Windows Dell, but the tool is currently disabled, so I couldn’t retrieve the list.", "excuse": true, "seen": true}
+{"talk": "Do you mean which apps are installed on your Windows laptop, or which app shortcuts are in its Desktop folder? I can’t inspect the Dell right now because the Windows-check tool is unavailable.", "excuse": true, "seen": true}
+{"talk": "I can’t inspect your computers right now, so I don’t know how many apps are on your desktop or Dell.", "excuse": true, "seen": true}
+{"talk": "Sorry, I meant: do you want me to count the shortcuts on this Zenbook, or on your Dell? I can’t inspect either right now.", "excuse": true, "seen": true}
+{"talk": "Say “Jarvis, how many apps are on my Dell?” so I can check.", "excuse": true, "seen": true}
+{"talk": "I don’t have a Bloomberg Terminal or a connection to your Arch desktop in this chat.", "excuse": true, "seen": true}
+{"talk": "Right, I can’t control your Arch desktop from this chat.", "excuse": true, "seen": true}
+{"talk": "There are 16 ounces in a pound.", "excuse": false}
+{"talk": "Lima.", "excuse": false}
+{"talk": "You can't see the aurora from London.", "excuse": false}
+{"talk": "Say 'Jarvis, yes' or press Confirm (C3).", "excuse": false}
+{"talk": "I can't read minds, but here goes.", "excuse": false}
+{"talk": "I'm not sure what “11 maps” refers to; tell me what you’re looking at and I’ll help.", "excuse": false}
+{"talk": "You’re welcome, David.", "excuse": false}
+{"talk": "Most people cannot run a marathon without training.", "excuse": false}
+{"talk": "I don't have a way to know how you feel.", "excuse": false}
+{"tools": "I tried checking your Dell, but the tool service is disabled right now, so I couldn’t get an app count.", "log": [], "excuse": true}
+{"tools": "I can’t control playback in the desktop app with the tools available here, so I haven’t started any music.", "log": [["open_app", true, "Opened Spotify."]], "excuse": true}
+{"tools": "I can't inspect the Dell right now.", "log": [], "excuse": true}
+{"tools": "The tool is unavailable at the moment.", "log": [["list_apps", false, "Node dell is offline"]], "excuse": true}
+{"tools": "Your Dell lists 283 apps, and this laptop lists 101.", "log": [["list_apps", true, "283"], ["list_apps", true, "101"]], "excuse": false}
+{"tools": "I can't open that app on the Dell, it isn't installed.", "log": [["list_apps", true, "no match"]], "excuse": false}
+{"tools": "Your Dell is offline right now, so I couldn't count its apps.", "log": [["list_apps", false, "Node dell is offline"]], "excuse": false}
+{"tools": "I can't open that page: it needs a login.", "log": [["browser_navigate", true, "login page"]], "excuse": false}
+{"tools": "Opened Spotify on the Dell.", "log": [["open_app", true, "Opened Spotify."]], "excuse": false}
