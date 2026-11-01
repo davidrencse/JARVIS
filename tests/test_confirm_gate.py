@@ -151,10 +151,22 @@ class FullPermissionTests(unittest.TestCase):
         for odd in ("Never", "NEVER", "nver", "no", ""):
             self.assertTrue(asks({"rules": {"confirm": odd}}), odd)
 
+    def ran_through_gates(self):
+        seen = []
+
+        def run_confirmed(command, config, state, origin=None, origin_class="owner", **_):
+            seen.append((command["intent"], origin_class, origin))
+            return {"reply": "Closed 1 Word window.",
+                    "outcomes": [{"id": command["id"], "state": "observed", "ok": True}]}
+        return seen, mock.patch("jarvis.pipeline.run_confirmed", run_confirmed)
+
     def test_brain_tools_run_without_parking(self):
         tools = FakeTools()
         gate = ConfirmGate(tools, self.NEVER, self.state, here=lambda: "dell")
-        self.assertEqual(gate.call("close_app", {"name": "Word"}), (True, "ran"))
+        seen, patched = self.ran_through_gates()
+        with patched:
+            self.assertEqual(gate.call("close_app", {"name": "Word"}), (True, "Closed 1 Word window."))
+        self.assertEqual(seen, [("close_app", "brain", "dell")])  # gates + history, as "brain"
         self.assertEqual(gate.call("grok_agent", {"task": "post my photo"}), (True, "ran"))
         self.assertEqual(ConfirmQueue(self.state).pending(), [])
 
@@ -164,6 +176,27 @@ class FullPermissionTests(unittest.TestCase):
         ok, text = gate.call("grok_agent", {"task": "type my password into the bank"})
         self.assertFalse(ok)
         self.assertEqual(tools.calls, [])
+
+    def test_switching_back_to_ask_needs_no_restart(self):
+        import json
+        from jarvis import gates
+        state = self.state / ".jarvis"
+        state.mkdir()
+        path = self.state / "jarvis.config.json"
+        path.write_text(json.dumps({"rules": {"confirm": "never"}}), encoding="utf-8")
+        self.assertFalse(gates.asks_now(self.NEVER, state))
+        path.write_text(json.dumps({"rules": {"confirm": "ask"}}), encoding="utf-8")
+        import os
+        os.utime(path, (1, 1))  # a new mtime, even within the same second
+        self.assertTrue(gates.asks_now(self.NEVER, state))
+        tools = FakeTools()
+        gate = ConfirmGate(tools, self.NEVER, state, here=lambda: "dell")
+        ok, text = gate.call("close_app", {"name": "Word"})
+        self.assertFalse(ok)  # parked again: the file said ask
+        self.assertEqual(len(ConfirmQueue(state).pending()), 1)
+        path.write_text("{ half-written", encoding="utf-8")
+        os.utime(path, (2, 2))
+        self.assertFalse(gates.asks_now(self.NEVER, state))  # unreadable: the built config
 
     def test_brain_terminal_hits_the_hard_limits(self):
         # Audit 2026-11-01: under never, terminal ran unchecked; these stay refused.
@@ -175,7 +208,10 @@ class FullPermissionTests(unittest.TestCase):
             self.assertFalse(ok, command)
             self.assertTrue(text.startswith("Refused:"), text)
         self.assertEqual(tools.calls, [])
-        self.assertEqual(gate.call("terminal", {"command": "mkdir -p ~/Downloads/x"}), (True, "ran"))
+        seen, patched = self.ran_through_gates()
+        with patched:
+            self.assertTrue(gate.call("terminal", {"command": "mkdir -p ~/Downloads/x"})[0])
+        self.assertEqual(seen, [("terminal", "brain", "dell")])
 
     def test_gates_pass_confirm_commands(self):
         from jarvis import gates

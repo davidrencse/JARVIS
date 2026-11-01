@@ -644,6 +644,45 @@ class VoiceWorkflowTests(Temp):
         self.assertNotIn("downloads", feed)  # two near misses never make a request
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_a_cut_off_command_is_asked_for_and_joined(self):
+        # Phase 6: "Jarvis, open up" (heard 2026-10-24) went to the brain as it was.
+        from jarvis import daemon
+        heard = {"cut": "Jarvis, open up", "rest": "Spotify", "mumble": "Jarvis, Alel."}
+        queue_ = ["cut", "rest", "mumble", KeyboardInterrupt]
+
+        def record_utterance(**_):
+            item = queue_.pop(0)
+            if item is KeyboardInterrupt:
+                raise KeyboardInterrupt
+            return item
+
+        ears = MagicMock()
+        ears.verify.side_effect = lambda audio, threshold=None: (True, 0.7)
+        stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(audio, str) else "")
+        stt.stats.return_value = None
+        stt.device = "cpu"
+        voice = MagicMock(limit=350)
+        brain = Brain()
+        brain.warm = MagicMock()
+        with patch("jarvis.listen.record_utterance", record_utterance), \
+                patch("jarvis.listen.LiveMic"), \
+                patch("jarvis.listen.VoicePrint", return_value=ears), \
+                patch("jarvis.listen.Transcriber", return_value=stt), \
+                patch("jarvis.speech.Voice", return_value=voice), \
+                patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
+                patch("jarvis.chatgpt.make_lane", return_value=brain), \
+                patch("jarvis.daemon.parse_for", create=True), \
+                patch.object(daemon, "foreground_priority"):
+            with self.assertRaises(KeyboardInterrupt):
+                daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        said = [c.args[0] for c in voice.say.call_args_list]
+        self.assertIn("Open what?", said)
+        self.assertIn(daemon.UNCLEAR, said)  # "Alel." is asked again, not answered
+        feed = (self.base / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn("open up Spotify", feed)  # the two halves, as one request
+        self.assertNotIn("Alel", feed)
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_misheard_request_is_asked_again_not_answered(self):
         from jarvis import daemon
         heard = {"mumble": ("Jarvis, for the day.", {"logprob": -1.4, "no_speech": 0.2}),

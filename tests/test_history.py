@@ -147,6 +147,15 @@ class CheckTests(HistoryCase):
                           origin_class="agent")
         self.assertFalse(self.h.check(cmd(), "agent", now=self.NOW)["block"])
 
+    def test_brain_loop_blocks(self):
+        # Audit 2026-11-01: under rules.confirm never, the brain's own tool calls (which a
+        # web page can steer) get the same loop limit as an agent's.
+        self.fill(hist.H3_REPEATS, "brain")
+        got = self.h.check(cmd(), "brain", now=self.NOW)
+        self.assertTrue(got["block"])
+        self.fill(hist.H3_REPEATS - 1, "owner")
+        self.assertFalse(self.h.check(cmd(), "owner", now=self.NOW)["block"])
+
     def test_owner_repeats_never_block(self):
         self.fill(hist.H3_REPEATS * 3, "owner")
         got = self.h.check(cmd(), "owner", now=self.NOW)

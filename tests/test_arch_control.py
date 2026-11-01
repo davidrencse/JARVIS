@@ -303,6 +303,25 @@ class HandoffTests(unittest.TestCase):
             self.assertEqual(Brain(self.Lane("x"), act, wants=lambda t: True).ask("check it"), finding)
             self.assertEqual(len(act.asked), 1)
 
+    def test_the_decider_routes_what_the_keywords_miss(self):
+        from unittest.mock import patch
+        brain = Brain(self.Lane("x"), self.Lane("y"), decider=True)
+        with patch("jarvis.decide.wants_tools", return_value=True) as asked:
+            self.assertEqual(brain.pick("next short"), "act")
+        asked.assert_called_once()
+        with patch("jarvis.decide.wants_tools", return_value=False):
+            self.assertEqual(brain.pick("tell me about rome"), "chat")
+        self.assertEqual(Brain(self.Lane("x"), self.Lane("y")).decider, False)  # off under tests
+
+    def test_the_decider_never_blocks_on_its_model(self):
+        from unittest.mock import patch
+        from jarvis import decide
+        started = []
+        with patch.object(decide, "_models", {}), patch.object(decide, "_warming", []), \
+                patch("threading.Thread", side_effect=lambda **k: type("T", (), {"start": lambda s: started.append(1)})()):
+            self.assertFalse(decide.wants_tools("start up kitty"))
+        self.assertEqual(started, [1])  # building in the background instead
+
     def test_plain_talk_stays_talk(self):
         chat, act = self.Lane("Lima."), self.Lane("x")
         self.assertEqual(Brain(chat, act, wants=lambda t: False).ask("capital of Peru?"), "Lima.")

@@ -201,13 +201,73 @@ class ActionsWindowTests(unittest.TestCase):
                     return done(clients)
                 if a[:2] == ["hyprctl", "dispatch"]:
                     return done("ok" if a[2].startswith("hl.dsp.") == lua_ok else "error: bad syntax")
+                if a[:2] == ["hyprctl", "activewindow"]:
+                    return done(json.dumps({"address": "0xabc"}))
                 return done()
             fake = Fake(handler)
             with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake):
                 self.assertEqual(actions.focus_window("kitty"), (True, "Switched to shell."))
             self.assertEqual(fake.calls[1], ["hyprctl", "dispatch",
-                                             'hl.dsp.focus({ window = "address:0xabc" })'])
-            self.assertEqual(len(fake.calls), 2 if lua_ok else 3)
+                                             'hl.dsp.focus({ window = hl.get_window("address:0xabc") })'])
+            self.assertEqual(len(fake.calls), 4 if lua_ok else 6)  # + raise and focus readbacks
+            if not lua_ok:
+                self.assertEqual(fake.calls[3], ["hyprctl", "dispatch", "focuswindow", "address:0xabc"])
+            self.assertEqual(fake.calls[-1], ["hyprctl", "activewindow", "-j"])  # read back
+
+    def test_hyprland_pointer_fallback_lands_focus(self):
+        # 2026-11-01: follow_mouse handed focus back to the window under the pointer.
+        clients = json.dumps([{"address": "0xabc", "class": "dolphin", "initialClass": "dolphin",
+                               "title": "Files", "at": [100, 50], "size": [400, 300]}])
+        moved = []
+
+        def handler(a):
+            if a[:3] == ["hyprctl", "clients", "-j"]:
+                return done(clients)
+            if a[:2] == ["hyprctl", "cursorpos"]:
+                return done("900, 700")
+            if a[:2] == ["hyprctl", "dispatch"] and a[2].startswith("hl.dsp.cursor.move"):
+                moved.append(a[2])
+                return done("ok")
+            if a[:2] == ["hyprctl", "activewindow"]:
+                return done(json.dumps({"address": "0xabc" if moved else "0xdef"}))
+            return done("ok")
+        fake = Fake(handler)
+        with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake):
+            self.assertEqual(actions.focus_window("dolphin"), (True, "Switched to Files."))
+        self.assertEqual(moved, ["hl.dsp.cursor.move({ x = 300, y = 200 })"])
+
+    def test_hyprland_pointer_goes_back_when_focus_still_fails(self):
+        clients = json.dumps([{"address": "0xabc", "class": "dolphin", "initialClass": "dolphin",
+                               "title": "Files", "at": [100, 50], "size": [400, 300]}])
+        moved = []
+
+        def handler(a):
+            if a[:3] == ["hyprctl", "clients", "-j"]:
+                return done(clients)
+            if a[:2] == ["hyprctl", "cursorpos"]:
+                return done("900, 700")
+            if a[:2] == ["hyprctl", "dispatch"] and a[2].startswith("hl.dsp.cursor.move"):
+                moved.append(a[2])
+            if a[:2] == ["hyprctl", "activewindow"]:
+                return done(json.dumps({"address": "0xdef"}))
+            return done("ok")
+        with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", Fake(handler)), \
+                mock.patch.object(actions, "FOCUS_WAIT", 0):
+            self.assertFalse(actions.focus_window("dolphin")[0])
+        self.assertEqual(moved[-1], "hl.dsp.cursor.move({ x = 900, y = 700 })")  # put back
+
+    def test_hyprland_focus_that_never_lands_is_reported(self):
+        # 2026-10-26: "focus chrome" said uncertain; the dispatcher's "ok" is not proof.
+        clients = json.dumps([{"address": "0xabc", "class": "kitty", "initialClass": "kitty",
+                               "title": "shell"}])
+        fake = Fake(lambda a: done(clients) if a[:3] == ["hyprctl", "clients", "-j"] else
+                    done(json.dumps({"address": "0xdef"})) if a[:2] == ["hyprctl", "activewindow"]
+                    else done("ok"))
+        with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake), \
+                mock.patch.object(actions, "FOCUS_WAIT", 0):
+            ok, text = actions.focus_window("kitty")
+        self.assertFalse(ok)
+        self.assertIn("didn't come to the front", text)
 
     def test_hyprland_console_app_window_is_not_chrome(self):
         clients = json.dumps([{"address": "0xc0", "class": "chrome-127.0.0.1__-Default",

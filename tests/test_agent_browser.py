@@ -160,6 +160,41 @@ class WiringTests(unittest.TestCase):
             self.assertEqual(env, agent_browser.env(state))
         self.assertEqual(env["AGENT_BROWSER_SESSION"], agent_browser.SESSION)
 
+    def fake_build(self, root, version):
+        exe = Path(root) / "cli" / "target" / "release" / "agent-browser"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\necho 'agent-browser %s'\n" % version)
+        exe.chmod(0o755)
+        return exe
+
+    def test_source_build_is_preferred_only_at_the_pinned_version(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as state:
+            exe = self.fake_build(root, agent_browser.VERSION)
+            with mock.patch.dict("os.environ", {agent_browser.SOURCE_ENV: root}), \
+                    mock.patch("shutil.which", return_value="/usr/bin/npx"):
+                self.assertEqual(agent_browser.binary(), [str(exe)])
+                server = actions.browser_mcp(state, ("agent-browser",))["agent_browser"]
+                self.assertEqual((server["command"], server["args"]), (str(exe), ["mcp", "--tools", "core"]))
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as state:
+            self.fake_build(root, "0.0.1")  # another version: the pinned npx copy instead
+            with mock.patch.dict("os.environ", {agent_browser.SOURCE_ENV: root}), \
+                    mock.patch("shutil.which", return_value="/usr/bin/npx"):
+                self.assertIsNone(agent_browser.source_build())
+                server = actions.browser_mcp(state, ("agent-browser",))["agent_browser"]
+                self.assertEqual(server["command"], "/usr/bin/npx")
+                self.assertIn(actions.AGENT_BROWSER, server["args"])
+
+    @unittest.skipUnless(Path("/proc/self/exe").exists(), "needs /proc")
+    def test_a_daemon_older_than_its_binary_is_stale(self):
+        import subprocess, sys, time
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(child.kill)
+        time.sleep(0.2)
+        exe = str(Path(f"/proc/{child.pid}/exe").resolve())
+        with mock.patch.object(Path, "stat", lambda self, **k: type("S", (), {"st_mtime": time.time() + 10})()):
+            self.assertIn(child.pid, agent_browser._stale_daemons(exe))
+        self.assertNotIn(child.pid, agent_browser._stale_daemons(exe))  # not rebuilt since
+
     def test_browse_travels_to_other_machines(self):
         from jarvis import remote
         self.assertIn("browse", remote.ACTIONS)

@@ -211,8 +211,19 @@ class CalibrateTests(DecideBase):
 
     def fill(self, rows, job=None):
         job = job or self.JOB
-        for d, label in rows:
-            decide.record(self.state, job, "t", d, label=label)
+        for n, (d, label) in enumerate(rows):  # distinct texts: each counts once
+            decide.record(self.state, job, f"request number {n}", d, label=label)
+
+    def test_trained_texts_and_repeats_are_not_scored(self):
+        # Audit 2026-11-01: calibrating on training texts (or repeats) overstates precision.
+        trained = next(iter(decide.PROTOTYPES[self.JOB].values()))[0] if self.JOB in decide.PROTOTYPES else None
+        rows = synth(n=decide.MIN_LABELS)
+        for n, (d, label) in enumerate(rows):
+            decide.record(self.state, self.JOB, "same words", d, label=label)
+        self.assertEqual(decide.calibrate(self.state, self.JOB)["labels"], 1)
+        if trained:
+            decide.record(self.state, self.JOB, trained, rows[0][0], label=rows[0][1])
+            self.assertEqual(len(decide._labelled(self.state, self.JOB)), 1)
 
     def test_too_few_labels(self):
         self.fill(synth(n=decide.MIN_LABELS - 1))
@@ -264,7 +275,8 @@ class CalibrateTests(DecideBase):
             right = i % 3 != 0  # 40 right at 0.95, 20 wrong at 0.6
             d = {"winner": "act", "probs": {"act": 0.95 if right else 0.6, "converse": 0.05},
                  "sims": {"act": 0.5, "converse": 0.5}}
-            decide.record(self.state, "mode", "t", d, label="act" if right else "converse")
+            decide.record(self.state, "mode", f"synthetic request {i}", d,
+                          label="act" if right else "converse")
         rep = decide.calibrate(self.state, "mode")
         self.assertTrue(rep["ready"])
         self.assertEqual(rep["threshold"], 0.95)  # the 0.6 picks are the wrong ones

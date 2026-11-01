@@ -139,9 +139,12 @@ class ExecutionTests(Base):
         self.assertFalse(got["outcomes"][0]["ok"])
 
     def test_timeout_text_is_uncertain(self):
-        got, _ = self.run_fast("open chrome", remote=FakeRemote(
-            respond=lambda d, a, r: (False, "Request Timed Out after 8s")))
+        remote = FakeRemote(respond=lambda d, a, r: (False, "Request Timed Out after 8s"),
+                            observe=lambda d, a: (True, json.dumps({"match": False, "after_ms": 5000, "app": None})))
+        got, _ = self.run_fast("open chrome", remote=remote)
         self.assertEqual(got["outcomes"][0]["state"], "uncertain")
+        self.assertIn("checked the screen: it didn't happen", got["outcomes"][0]["text"])
+        self.assertEqual(len(remote.acts), 1)  # looked, never retried
 
     def test_executor_exception_does_not_crash(self):
         def boom(device, action, arg):
@@ -526,8 +529,25 @@ class UncertainRefusalTests(Base):
         text = ("Main PC refused the request: Node action abc is uncertain; "
                 "do not automatically retry.")
         got, _ = self.run_fast("open chrome", remote=FakeRemote(
-            respond=lambda d, a, r: (False, text)))
+            respond=lambda d, a, r: (False, text), observe=lambda d, a: (True, json.dumps({"match": False, "after_ms": 5000, "app": None}))))
         self.assertEqual(got["outcomes"][0]["state"], "uncertain")
+
+    def test_uncertain_but_seen_on_screen_is_done(self):
+        # Phase 5: the 2026-10-26 "focus chrome" came back uncertain; one look settles it.
+        text = "Main PC refused the request: Node action abc is uncertain; do not automatically retry."
+        remote = FakeRemote(respond=lambda d, a, r: (False, text))
+        got, _ = self.run_fast("open chrome", remote=remote)
+        outcome = got["outcomes"][0]
+        self.assertEqual((outcome["state"], outcome["ok"]), ("observed", True))
+        self.assertIn("checked the screen and it worked", outcome["text"])
+        self.assertEqual(len(remote.acts), 1)
+
+    def test_uncertain_stays_uncertain_when_the_screen_cant_be_read(self):
+        remote = FakeRemote(respond=lambda d, a, r: (False, "Request Timed Out after 8s"),
+                            observe=lambda d, a: (False, "Node dell is offline"))
+        got, _ = self.run_fast("open chrome", remote=remote)
+        self.assertEqual(got["outcomes"][0]["state"], "uncertain")
+        self.assertEqual(got["outcomes"][0]["text"], "Request Timed Out after 8s")
 
 
 if __name__ == "__main__":

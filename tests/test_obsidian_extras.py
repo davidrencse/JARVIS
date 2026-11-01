@@ -49,6 +49,26 @@ class BriefingTests(Case):
                          "Coming up: Email the TA Saturday. Next deadline: OS Midterm 1 Tuesday.")
         self.assertEqual(answer("good morning", self.vault, self.tasks, NOW), brief)
 
+    def test_brief_ends_with_memorys_open_loops(self):
+        # Phase 6: "you still haven't sent the Grant Proposal paragraph".
+        memory = Memory(self.state)
+        memory.add("loop", "David still hasn't sent the Grant Proposal paragraph to the team.",
+                   title="Grant Proposal paragraph")
+        memory.add("loop", "Ask the TA about the paging question.", title="Paging question")
+        brief = answer("brief me", self.vault, self.tasks, NOW, memory=memory)
+        self.assertTrue(brief.startswith("Good morning, David."))
+        self.assertIn("Still open: ", brief)
+        self.assertIn("Grant Proposal paragraph", brief)
+        self.assertTrue(brief.endswith("."))
+        # No loops, a broken memory or none at all: the same briefing without the line.
+        plain = answer("brief me", self.vault, self.tasks, NOW)
+        self.assertEqual(answer("brief me", self.vault, self.tasks, NOW, memory=Memory(Path(self.state, "empty"))), plain)
+
+        class Broken:
+            def search(self, **_):
+                raise OSError("disk")
+        self.assertEqual(answer("brief me", self.vault, self.tasks, NOW, memory=Broken()), plain)
+
     def test_day_due_and_overdue_questions(self):
         self.assertEqual(answer("what do I have tomorrow?", self.vault, self.tasks, NOW),
                          "Tomorrow you have Career fair.")
