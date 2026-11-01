@@ -69,6 +69,14 @@ class PartTests(unittest.TestCase):
                                                   "args": {"name": "Spotify"}}]))
         self.assertFalse(scorecard.matches(None, [{"intent": "open_app", "device": "zenbook"}]))
 
+    def test_a_usage_limit_skips_the_brain_instead_of_scoring_zero(self):
+        # 2026-11-01: a plan out of quota showed as brain 0/8, "no reading" on every case.
+        from unittest.mock import patch
+        cases = [{"text": "turn up the volume", "type": "converse"}]
+        with patch("jarvis.chatgpt.usage_limit", return_value="until 10:56 PM"):
+            got = scorecard.score_brain(cases, CONFIG, ".", "zenbook")
+        self.assertEqual(got, {"skipped": "ChatGPT is over its usage limit until 10:56 PM"})
+
     def test_grounding_scores_routes_and_excuses(self):
         import json, tempfile
         rows = [{"_meta": {}}, {"route": "how many apps are on my dell", "lane": "act"},

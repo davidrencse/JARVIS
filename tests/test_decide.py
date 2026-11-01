@@ -385,3 +385,22 @@ class AskWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatementRecallTests(unittest.TestCase):
+    """A plain first-person statement only pulls notes when notes clearly win (2026-11-01)."""
+
+    def gate(self, text, none, notes):
+        from unittest.mock import patch
+        with patch.object(decide, "choose", return_value={"sims": {"none": none, "notes": notes}}):
+            return decide.wants_notes(text)
+
+    def test_statements_need_a_clear_win(self):
+        self.assertFalse(self.gate("I'm going to sell my car.", 0.40, 0.45))   # close: no notes
+        self.assertTrue(self.gate("I'm going to sell my car.", 0.30, 0.45))    # clear: notes
+        self.assertFalse(self.gate("We got nothing.", 0.42, 0.40))
+
+    def test_questions_and_notes_words_keep_the_usual_margin(self):
+        for text in ("what did I write about my car", "my thesis is due friday",
+                     "I need my notes on paging", "I'm behind, what's due?"):
+            self.assertTrue(self.gate(text, 0.45, 0.42), text)  # within RECALL_MARGIN: notes

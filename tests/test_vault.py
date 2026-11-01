@@ -498,3 +498,73 @@ class WiringTests(VaultCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LabelTests(unittest.TestCase):
+    """Link labels David uses ("[[operating-systems|OS]]") name their note in search."""
+
+    def make(self, files):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name, "Vault")
+        for rel, text in files.items():
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return Vault(root, Path(temp.name, "state"))
+
+    COURSE = "---\ntitle: Operating Systems\ntype: course\n---\n\n# Operating Systems\n\nMidterm 1 on Oct 27.\n"
+
+    def daily(self, n, text):
+        return {f"daily/2026/10/2026-10-{n:02d}.md": f"---\ntitle: 2026-10-{n:02d}\ntype: daily\n---\n\n{text}\n"}
+
+    def test_a_label_used_twice_for_one_note_names_it(self):
+        files = {"courses/operating-systems.md": self.COURSE,
+                 "projects/drone.md": "---\ntitle: Drone Blueprint\n---\nbody\n",
+                 "projects/kite.md": "---\ntitle: Kite\n---\nbody\n",
+                 "projects/bike.md": "---\ntitle: Bike\n---\nbody\n"}
+        files.update(self.daily(1, "[[operating-systems|OS]] study, [[drone|Drone]], [[kite|Fly]]"))
+        files.update(self.daily(2, "[[operating-systems|OS]] again, [[drone|Drone]], [[bike|Fly]] "
+                                   "![[kite|Pic]] ![[kite|Pic]] [[kite|Sky]]"))
+        labels = self.vault_labels(files)
+        self.assertEqual(labels, {"os": ("courses/operating-systems.md", "Operating Systems")})
+        # Not: "drone" (already the title), "fly" (two notes), "pic" (embeds), "sky" (once).
+
+    def vault_labels(self, files):
+        return self.make(files).labels()
+
+    def test_the_labelled_note_outranks_daily_notes_that_mention_it(self):
+        files = {"courses/operating-systems.md": self.COURSE}
+        for n in range(1, 6):
+            files.update(self.daily(n, "OS midterm prep today. OS midterm soon. "
+                                       "[[operating-systems|OS]] OS OS midterm"))
+        vault = self.make(files)
+        hits = vault.search("when is my OS midterm")
+        self.assertEqual(hits[0]["path"], "courses/operating-systems.md")
+        lines = vault.context("when is my OS midterm today?")
+        self.assertTrue(lines and lines[0].startswith("[vault:courses/operating-systems.md]"), lines)
+
+    def test_labels_follow_note_changes(self):
+        files = {"courses/operating-systems.md": self.COURSE}
+        files.update(self.daily(1, "[[operating-systems|OS]]"))
+        vault = self.make(files)
+        self.assertEqual(vault.labels(), {})  # once is not enough
+        (vault.root / "daily/2026/10/2026-10-02.md").write_text("[[operating-systems|OS]]\n")
+        vault.refresh(force=True)
+        self.assertIn("os", vault.labels())
+
+    def test_a_link_with_a_folder_resolves_by_its_path(self):
+        files = {"tasks/_index.md": "---\ntitle: Tasks\n---\nx\n",
+                 "jobs/_index.md": "---\ntitle: Job hunt\n---\nx\n"}
+        files.update(self.daily(1, "[[jobs/_index|Jobs]] and [[jobs/_index|Jobs]]"))
+        vault = self.make(files)
+        self.assertEqual(vault.labels()["jobs"][0], "jobs/_index.md")
+        self.assertEqual(len(vault.backlinks("jobs/_index.md")["backlinks"]), 1)
+        self.assertEqual(vault.backlinks("tasks/_index.md")["backlinks"], [])
+
+    def test_according_to_my_notes_is_not_a_search_term(self):
+        files = {"leetcode/29.md": "---\ntitle: Divide\n---\n# apply accordingly\n",
+                 "projects/drone.md": "---\ntitle: Drone\ntype: project\n---\nmy project\n"}
+        vault = self.make(files)
+        paths = [h["path"] for h in vault.search("what projects am I working on according to my notes")]
+        self.assertNotIn("leetcode/29.md", paths)
