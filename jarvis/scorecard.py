@@ -169,22 +169,23 @@ def score_decider(cases, folds=FOLDS):
     vectors = embed([decide.clean(t) for t, _ in fixed] + [decide.clean(c["text"]) for c in scored])
     if vectors is None:
         return None
-    train, test = vectors[:len(fixed)], vectors[len(fixed):]
-    sims_fixed, sims_cases = test @ train.T, test @ test.T
-    fold = [_fold(c["text"], folds) for c in scored]
-    t = decide.temperature_for("mode")
+    import numpy as np
+    train = decide.features("mode", [t for t, _ in fixed], vectors[:len(fixed)])
+    test = decide.features("mode", [c["text"] for c in scored], vectors[len(fixed):])
+    fixed_y = np.array([options.index(o) for _, o in fixed])
+    case_y = np.array([options.index(mode_for(c)) for c in scored])
+    fold = np.array([_fold(c["text"], folds) for c in scored])
+    probs = np.zeros((len(scored), len(options)))
+    for k in range(folds):  # the same classifier decide.choose() runs, trained without fold k
+        seen = fold != k
+        model = decide.fit(np.vstack([train, test[seen]]), np.concatenate([fixed_y, case_y[seen]]),
+                           len(options))
+        if (~seen).any():
+            probs[~seen] = decide.predict(model, test[~seen])
     rows, picks = [], []
     for i, case in enumerate(scored):
-        best = {o: -1.0 for o in options}
-        for k, (_, option) in enumerate(fixed):
-            best[option] = max(best[option], float(sims_fixed[i, k]))
-        for k, other in enumerate(scored):
-            if fold[k] != fold[i]:
-                best[mode_for(other)] = max(best[mode_for(other)], float(sims_cases[i, k]))
-        top = max(best.values())
-        weights = {o: math.exp((v - top) / t) for o, v in best.items()}
-        winner = max(weights, key=weights.get)
-        confidence = weights[winner] / sum(weights.values())
+        winner = options[int(probs[i].argmax())]
+        confidence = float(probs[i].max())
         want = mode_for(case)
         picks.append((confidence, winner == want))
         rows.append((winner == want, None if winner == want else

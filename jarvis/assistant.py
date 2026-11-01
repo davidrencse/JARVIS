@@ -256,7 +256,7 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
             bot = Grokbot(config, memory.path.parent)
             stage = "grok-check"
             try:
-                from .gates import agent_risk
+                from .gates import agent_risk, asks as gates_ask
                 if agent_risk(text) == "deny":
                     raise ValueError("I can't handle passwords, passcodes, 2FA codes or card numbers.")
                 prepared = assess(text, config, base)
@@ -265,7 +265,11 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                 risk = agent_risk(text, prepared)
                 if risk == "deny":
                     raise ValueError("That task is refused by the risk checks.")
-                if prepared["decision"] in ("forward", "confirm") and risk == "confirm":
+                if prepared["decision"] in ("forward", "confirm") and not gates_ask(config):
+                    prepared = {**prepared, "decision": "forward",
+                                "task": prepared.get("task") or text}
+                if prepared["decision"] in ("forward", "confirm") and risk == "confirm" \
+                        and gates_ask(config):
                     from .confirm import ConfirmQueue, prompt
                     from .remote import Remote
                     from .topology import ORIGIN

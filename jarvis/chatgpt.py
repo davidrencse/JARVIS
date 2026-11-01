@@ -679,6 +679,9 @@ class ConfirmGate:
             return False, f"Not run: {errors[0]}"
         if command["intent"] == "agent_task" and agent_risk(command["args"]["text"]) == "deny":
             return False, "Refused: JARVIS never handles passwords, 2FA codes or card numbers."
+        from .gates import asks
+        if not asks(self.config):  # rules.confirm: never
+            return self.tools.call(name, args)
         try:
             item = ConfirmQueue(self.state).park(command, here, "brain")
         except Exception as exc:  # no queue means no run: never fall through to the tool

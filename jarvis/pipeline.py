@@ -156,6 +156,7 @@ def run_commands(text, commands, config, state, step=None, origin=None, origin_c
 def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step, history,
               state=None, channel="cli", confirmed=False, request=None, rule=None):
     gate_started = time.monotonic()
+    confirmed = confirmed or bool((rule or {}).get("never_ask"))  # rules.confirm: never
     skip = {c["id"]: gates.skips(c, origin, origin_class, rule) for c in commands}
     for command in commands:  # a step something waits on keeps its on-screen check:
         for dep in command.get("depends_on", []):  # it says the app is ready for the next

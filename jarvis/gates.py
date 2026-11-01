@@ -71,10 +71,18 @@ TRUSTED_LOCAL = {"enabled": True,
 SKIPPABLE = frozenset({"app_exists", "history", "observe", "dedupe"})
 
 
+def asks(config):
+    """rules.confirm in jarvis.config.json: "ask" (default) parks risky actions for David's
+    OK; "never" runs them at once (his choice, 2026-11-01). Refusals (passwords, 2FA codes,
+    card numbers; agent-origin actions) stay either way: they are not questions."""
+    return str(((config or {}).get("rules") or {}).get("confirm", "ask")).lower() != "never"
+
+
 def trusted_rules(config):
     """The trusted_local rule, defaults filled in from TRUSTED_LOCAL."""
     rule = {**TRUSTED_LOCAL, **((config or {}).get("rules") or {}).get("trusted_local", {})}
     rule["skip"] = [s for s in rule.get("skip") or () if s in SKIPPABLE]
+    rule["never_ask"] = not asks(config)
     return rule
 
 

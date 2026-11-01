@@ -510,6 +510,10 @@ class Vault:
             used += len(line)
             if len(lines) >= limit:
                 break
+        if lines and self.settings.get("recall_gate", True) is not False:
+            from .decide import wants_notes
+            if not wants_notes(text):
+                return []  # shares words with notes but isn't about them (small talk etc.)
         return lines
 
     def world(self, max_chars=3000, today=None):
