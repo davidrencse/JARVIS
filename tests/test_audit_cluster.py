@@ -166,6 +166,14 @@ class PullUpdateTests(unittest.TestCase):
         self.assertEqual((self.repo / "jarvis/a.py").read_bytes(), b"old\n")
         self.assertFalse((self.repo / "jarvis/deploy.py").exists())
 
+    def test_dependencies_install_before_the_start_check(self):
+        order = []
+        with patch("jarvis.release.install_dependencies", side_effect=lambda *a, **k: order.append(("pip", a))), \
+                patch("jarvis.deploy._starts", side_effect=lambda *a, **k: order.append("starts")):
+            deploy.apply_bundle(bundle_of(self.new, self.want, self.signer), self.key, self.repo)
+        self.assertEqual([o if o == "starts" else o[0] for o in order], ["pip", "starts"])
+        self.assertEqual(order[0][1], ("old\n", "new\n"))  # old repo pyproject vs the signed bundle's
+
     def test_update_keeps_the_previous_code(self):
         deploy.apply_bundle(bundle_of(self.new, self.want, self.signer), self.key, self.repo)
         self.assertEqual((self.repo / "jarvis.prev/a.py").read_bytes(), b"old\n")

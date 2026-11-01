@@ -147,3 +147,32 @@ class RunTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeciderFoldTests(unittest.TestCase):
+    def test_wake_word_variants_share_a_fold(self):
+        for n in (3, 5):
+            self.assertEqual(scorecard._fold("Jarvis, open spotify", n), scorecard._fold("open spotify", n))
+
+    def test_builtin_example_equal_to_a_test_case_is_not_trained_on(self):
+        import numpy as np
+        seen = []
+        real = decide.fit
+
+        def spy(x, y, n, *a, **k):
+            seen.append(len(x))
+            return real(x, y, n, *a, **k)
+
+        def vec(texts):
+            return np.array([[float(len(t) % 7), float(len(t) % 5), 1.0] for t in texts])
+
+        cases = [{"text": "hello", "type": "chat"}, {"text": "jarvis open spotify", "type": "act"}]
+        with mock.patch("jarvis.embed.embed", side_effect=vec), \
+                mock.patch.object(decide, "examples", return_value=[]), \
+                mock.patch.object(decide, "fit", side_effect=spy), \
+                mock.patch.object(scorecard, "mode_for", side_effect=lambda c: "converse" if c["text"] == "hello" else "act"), \
+                mock.patch.object(decide, "features", side_effect=lambda j, t, v: v):
+            scorecard.score_decider(cases, folds=len(cases) * 3)
+        builtin = sum(len(v) for v in decide.BASE["mode"].values())
+        self.assertIn(builtin - 1 + 1, seen)  # "hello" held: 1 built-in dropped, the other case kept
+        self.assertNotIn(builtin + 1, seen)

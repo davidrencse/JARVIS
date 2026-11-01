@@ -130,6 +130,28 @@ class LearnTests(DecideBase):
         self.assertLess(before["sims"]["agent"], after["sims"]["agent"])
 
 
+class RobustnessTests(DecideBase):
+    def test_a_bad_label_line_is_skipped_not_fatal(self):
+        labels = self.state / "labels.jsonl"
+        labels.write_text('{"text": "zebra", "label": "act"}\nnot json{\n[1]\n', encoding="utf-8")
+        decide.PROTOTYPES["mode"].setdefault("act", [])
+        with mock.patch.object(decide, "LABELS", labels), \
+                mock.patch("jarvis.scorecard.load", side_effect=OSError), \
+                mock.patch("builtins.print"):
+            self.assertEqual(decide.examples("mode"), [("zebra", "act")])
+
+    def test_a_model_fitted_before_learn_is_not_stored(self):
+        real = decide.fit
+
+        def fit_then_learn(*args, **kwargs):
+            decide.learn("mode", "agent", "zebra xylophone")  # lands mid-fit
+            return real(*args, **kwargs)
+
+        with mock.patch.object(decide, "fit", side_effect=fit_then_learn):
+            decide._model("mode")
+        self.assertNotIn("mode", decide._models)
+
+
 class LogTests(DecideBase):
     def test_record_and_label(self):
         d = decide.choose("mode", "open spotify now")

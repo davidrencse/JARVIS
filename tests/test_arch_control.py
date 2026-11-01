@@ -265,6 +265,44 @@ class HandoffTests(unittest.TestCase):
         self.assertEqual(reply, "Playing now.")
         self.assertIn("whole tool list", act.asked[1])
 
+    def test_first_turn_tools_survive_a_failed_retry(self):
+        # Audit 2026-11-01: the re-ask cleared the log, so a usage limit on it hid open_app
+        # and the fallback could open the app twice.
+        class Failing(self.ToolLane):
+            def ask(inner, text, recall=(), on_sentence=None):
+                if inner.asked:
+                    inner.tool_log = []
+                    raise RuntimeError("ChatGPT usage limit: later")
+                return super().ask(text, recall, on_sentence)
+        act = Failing([("Opened Spotify. My tools are unavailable right now.",
+                        [("open_app", True, "Opened Spotify.")])])
+        brain = Brain(self.Lane("x"), act, wants=lambda t: True)
+        with self.assertRaises(RuntimeError):
+            brain.ask("open spotify and set volume 50")
+        self.assertEqual(brain.tool_log, [("open_app", True, "Opened Spotify.")])
+
+    def test_what_was_already_said_is_not_repeated(self):
+        act = self.ToolLane([("I opened Spotify. I can't set the volume with the tools available here.",
+                              [("open_app", True, "ok")]),
+                             ("Volume is 50.", [("volume", True, "ok")])])
+        spoken = []
+        Brain(self.Lane("x"), act, wants=lambda t: True).ask("spotify at 50", on_sentence=spoken.append)
+        self.assertEqual(spoken, ["I opened Spotify", "Volume is 50."])
+        self.assertIn('already heard you say: "I opened Spotify"', act.asked[1])
+
+    def test_an_offline_machine_is_an_answer(self):
+        act = self.ToolLane([("I can't check the Dell right now because the Dell is offline.", [])])
+        reply = Brain(self.Lane("x"), act, wants=lambda t: True).ask("what's open on the dell")
+        self.assertEqual(reply, "I can't check the Dell right now because the Dell is offline.")
+        self.assertEqual(len(act.asked), 1)
+
+    def test_a_disabled_feature_found_by_a_tool_is_an_answer(self):
+        for finding in ("Developer tools are disabled in this Chrome profile.",
+                        "The Lan Mouse tool is not connected right now."):
+            act = self.ToolLane([(finding, [("browser_snapshot", True, "ok")])])
+            self.assertEqual(Brain(self.Lane("x"), act, wants=lambda t: True).ask("check it"), finding)
+            self.assertEqual(len(act.asked), 1)
+
     def test_plain_talk_stays_talk(self):
         chat, act = self.Lane("Lima."), self.Lane("x")
         self.assertEqual(Brain(chat, act, wants=lambda t: False).ask("capital of Peru?"), "Lima.")

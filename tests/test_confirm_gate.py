@@ -147,6 +147,9 @@ class FullPermissionTests(unittest.TestCase):
         self.assertTrue(asks({}))
         self.assertTrue(asks(CONFIG))
         self.assertFalse(asks(self.NEVER))
+        self.assertFalse(asks({"rules": {"confirm": " never "}}))
+        for odd in ("Never", "NEVER", "nver", "no", ""):
+            self.assertTrue(asks({"rules": {"confirm": odd}}), odd)
 
     def test_brain_tools_run_without_parking(self):
         tools = FakeTools()
@@ -161,6 +164,18 @@ class FullPermissionTests(unittest.TestCase):
         ok, text = gate.call("grok_agent", {"task": "type my password into the bank"})
         self.assertFalse(ok)
         self.assertEqual(tools.calls, [])
+
+    def test_brain_terminal_hits_the_hard_limits(self):
+        # Audit 2026-11-01: under never, terminal ran unchecked; these stay refused.
+        tools = FakeTools()
+        gate = ConfirmGate(tools, self.NEVER, self.state, here=lambda: "dell")
+        for command in ("echo x >> ~/.jarvis/history.sqlite3", "sed -i s/never/ask/ jarvis.config.json",
+                        "sudo -S pacman -Syu", "rm -rf ~"):
+            ok, text = gate.call("terminal", {"command": command})
+            self.assertFalse(ok, command)
+            self.assertTrue(text.startswith("Refused:"), text)
+        self.assertEqual(tools.calls, [])
+        self.assertEqual(gate.call("terminal", {"command": "mkdir -p ~/Downloads/x"}), (True, "ran"))
 
     def test_gates_pass_confirm_commands(self):
         from jarvis import gates

@@ -67,6 +67,24 @@ class SnapshotTests(unittest.TestCase):
         text = situation.lines(CLUSTER, self.state, start=lambda fn: None)[0]
         self.assertIn("dell: not answering right now", text)
 
+    def test_not_answering_expires_and_never_doubles_a_live_line(self):
+        with patch("jarvis.situation._machines", return_value=[("zen", True), ("dell", False)]), \
+                patch("jarvis.situation._ask", self.reports):
+            situation.refresh(CLUSTER, self.state, offline=lambda c, s: [])
+
+        def ask(config, state, device, here):
+            if device == "dell":
+                raise LookupError("offline")
+            return self.reports(config, state, device, here)
+        with patch("jarvis.situation._machines", return_value=[("zen", True), ("dell", False)]), \
+                patch("jarvis.situation._ask", ask):
+            situation.refresh(CLUSTER, self.state, offline=lambda c, s: [])
+        text = situation.lines(CLUSTER, self.state, start=lambda fn: None)[0]
+        self.assertNotIn("dell: focused", text)  # the old live line went with the failure
+        self.assertIn("dell: not answering", text)
+        later = situation._STATE["at"] + situation.STALE + 1
+        self.assertEqual(situation.lines(CLUSTER, self.state, now=later, start=lambda fn: None), [])
+
     def test_a_node_back_online_is_not_named_offline(self):
         with patch("jarvis.situation._machines", return_value=[("zen", True), ("dell", False)]), \
                 patch("jarvis.situation._ask", self.reports):

@@ -12,6 +12,68 @@ from jarvis.confirm import ConfirmQueue
 CONFIG = {"devices": {"dell": {}, "zenbook": {}}, "cluster": {"enabled": False}}
 
 
+class AuditBypassTests(unittest.TestCase):
+    """Bypasses found in the 2026-11-01 audit."""
+
+    def test_powershell_parameter_prefixes_are_remote(self):
+        for command in ("Get-Process -C dell", "Get-Process -Co dell", "gps -cn dell",
+                        "Get-Process -ComputerName dell", "Get-Process -c:dell",
+                        "Get-CimInstance -Cim x", "Get-Content -Comp x"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+        self.assertTrue(terminal.read_only("Get-Process"))
+        self.assertTrue(terminal.read_only("wc -c notes.txt"))
+        self.assertTrue(terminal.read_only("head -c 10 notes.txt"))
+
+    def test_file_and_date_file_options(self):
+        for command in ("file -f list.txt", "file -bf list.txt", "file --files-from=x",
+                        "date -f ~/x", "date --file=x", "date --file x"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+        self.assertTrue(terminal.read_only("file notes.txt"))
+        self.assertTrue(terminal.read_only("date +%F"))
+
+    def test_path_spelling_does_not_hide_app_state(self):
+        for command in ("cat ~/.local/./share/x", "cat ~/.local//share/x",
+                        "cat ~/Documents/../.local/share/x", "ls ~/.ssh/./",
+                        "cat ~/.config/./x", "cat ~/.local/share/../share/x"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+        for cwd in ("/home/jdoe/.local/./share", "/home/jdoe/.local//share",
+                    "/home/jdoe/Documents/../.local/share"):
+            with self.subTest(cwd=cwd):
+                self.assertFalse(terminal.read_only("cat x", cwd))
+        self.assertTrue(terminal.read_only("cat ~/Documents/./notes.txt"))
+
+    def test_split_cd_chain(self):
+        for command in ("cd .local && cd share && cat gnome-shell/x",
+                        "cd ~/.local && cd share && ls", "cd .config && cat x",
+                        "cd ~ && cd .ssh && ls", "cd .. && cd .local && cd share && cat x"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command, "/home/jdoe/Documents"))
+        self.assertTrue(terminal.read_only("cd Documents && cd Notes && cat a.txt", "/home/jdoe"))
+
+    def test_more_secret_and_app_state(self):
+        for command in ("cat ~/.viminfo", "cat ~/.gitconfig", "cat ~/.var/app/x/y",
+                        "cat ~/.thunderbird/p/prefs.js", "cd ~/.var/app"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+
+    def test_endless_devices(self):
+        for command in ("cat /dev/zero", "cat /dev/urandom", "head -c 5 /dev/random",
+                        "cat /dev//zero", "cat /dev/./urandom"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+
+    def test_everyday_looking_still_runs(self):
+        for command in ("ls ~/Downloads", "git status", "df -h", "ls -la", "cd Downloads && ls",
+                        "du -sh ~/Documents", "cat ~/Documents/notes.txt | wc -l"):
+            with self.subTest(command=command):
+                # git isn't in the allowlist: it needs OK exactly as before
+                self.assertEqual(terminal.read_only(command, "/home/jdoe"),
+                                 not command.startswith("git"))
+
+
 class ReadOnlyTests(unittest.TestCase):
     def test_looking_commands_run(self):
         for command in ("ls", "ls -la ~/Desktop", "pwd", "cd Desktop", "cd Desktop && ls",
@@ -162,12 +224,13 @@ class GateTests(unittest.TestCase):
                          (True, "ran"))
         self.assertEqual(ConfirmQueue(self.state).pending(), [])
 
-    def test_secret_cwd_is_parked(self):
-        ok, _ = self.gate.call("terminal", {"command": "ls", "cwd": "~/.ssh", "device": "dell"})
+    def test_secret_cwd_is_refused_not_asked(self):
+        # ~/.ssh is a hard limit (gates.hard_deny): refused, never parked for an OK.
+        ok, text = self.gate.call("terminal", {"command": "ls", "cwd": "~/.ssh", "device": "dell"})
         self.assertFalse(ok)
+        self.assertTrue(text.startswith("Refused:"), text)
         self.assertEqual(self.tools.calls, [])
-        [item] = ConfirmQueue(self.state).pending()
-        self.assertEqual(item["command"]["args"]["cwd"], "~/.ssh")
+        self.assertEqual(ConfirmQueue(self.state).pending(), [])
 
     def test_changing_command_is_parked(self):
         ok, text = self.gate.call("terminal", {"command": "rm old.txt", "device": "dell"})
