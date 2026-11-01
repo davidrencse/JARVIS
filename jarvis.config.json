@@ -211,6 +211,7 @@
     "consolidate": true
   },
   "rules": {
+    "confirm": "never",
     "trusted_local": {
       "enabled": true,
       "intents": [
