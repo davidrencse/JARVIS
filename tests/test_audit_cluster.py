@@ -252,6 +252,31 @@ class PullUpdateTests(unittest.TestCase):
             stats = json.loads((state / "cluster-link-stats.json").read_text())
             self.assertEqual((stats["polls_failed"], stats["outages"]), (4, 2))
 
+    def test_node_agent_restarts_itself_after_a_new_join(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            note = {"node_id": "node", "main_device": "main", "token": "t" * 24,
+                    "code_key": "ssh-ed25519 AAAA"}
+            save_json(state / "cluster-node.json", note)
+            worker = NodeWorker(configuration("node"), state, executor=Mock())
+            self.assertFalse(worker._rejoined())
+            worker.client.token = "o" * 24  # its own redeem swaps the token in memory and on disk
+            save_json(state / "cluster-node.json", {**note, "token": "o" * 24})
+            self.assertFalse(worker._rejoined())
+            save_json(state / "cluster-node.json", {**note, "token": "n" * 24})  # jarvis cluster join
+            worker.client.request = Mock(side_effect=AssertionError("polled with a stale credential"))
+            with patch.object(worker, "respawn") as respawn:
+                worker.run()
+            respawn.assert_called_once()
+
+    def test_link_hint_points_at_the_tunnel_not_the_lan(self):
+        from jarvis.cluster_setup import _link_hint
+        hint = _link_hint("10:29:29 Main PC zenbook is unavailable: Remote end closed connection",
+                          True, "zenbook")
+        self.assertIn("JARVIS restarting", hint)
+        self.assertIn("cluster tunnel status", hint)
+        self.assertNotIn("--address", hint)
+
     def test_hub_serves_bundle_and_skips_non_ssh_nodes(self):
         bundle = deploy.code_bundle(self.signer)
         self.assertEqual(bundle["code"], deploy.code_fingerprint())

@@ -29,6 +29,14 @@ class GrokRoutingTest(unittest.TestCase):
         with patch("jarvis.assistant.vault_answer", return_value=None):
             self.assertEqual(decide(text, GROK, conversational=True, state="state")["tier"], "medium")
 
+    def test_preview_names_the_instant_answer(self):
+        self.assertEqual(decide("what time is it", {}, conversational=True)["instant"], "clock")
+        with patch("jarvis.assistant.vault_answer", return_value="Nothing today."):
+            route = decide("what's on my agenda", {}, conversational=True, state="state")
+        self.assertEqual((route["tier"], route["instant"]), ("simple", "vault"))
+        with patch("jarvis.assistant.vault_answer", return_value=None):
+            self.assertNotIn("instant", decide("tell me a joke", {}, conversational=True, state="state"))
+
     def test_switches(self):
         self.assertFalse(grok_first("read my email", {}))  # Grok Bot not set up
         self.assertFalse(grok_first("read my email",

@@ -247,7 +247,7 @@ class RunCommandsTests(unittest.TestCase):
 
 
 class AskInterpreterTests(unittest.TestCase):
-    TEXT = "open spotify and discord on arch"
+    TEXT = "open spotify and open discord on arch"  # still unclear to the parser: Spotify where?
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

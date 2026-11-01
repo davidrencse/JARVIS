@@ -80,6 +80,29 @@ class CutTests(unittest.TestCase):
         self.assertEqual(release.source(self.state), deploy.PACKAGE)
 
 
+class DependencyTests(unittest.TestCase):
+    OLD = '[project]\nname = "jarvis"\ndependencies = ["Pillow>=12"]\n'
+    NEW = '[project]\nname = "jarvis"\ndependencies = ["Pillow>=12", "psutil>=5.9"]\n'
+
+    def test_changed_dependencies_are_installed_with_this_python(self):
+        calls = []
+        run = lambda argv, **kw: calls.append(argv) or subprocess.CompletedProcess(argv, 0, "", "")
+        self.assertTrue(release.install_dependencies(self.OLD, self.NEW, log=lambda _: None, run=run))
+        self.assertEqual(calls[0][:4], [sys.executable, "-m", "pip", "install"])
+        self.assertEqual(calls[0][-2:], ["Pillow>=12", "psutil>=5.9"])
+
+    def test_unchanged_or_unreadable_dependencies_run_nothing(self):
+        run = lambda *a, **k: self.fail("pip ran")
+        self.assertIsNone(release.install_dependencies(self.OLD, self.OLD, run=run))
+        self.assertIsNone(release.install_dependencies(self.OLD, "not toml [", run=run))
+
+    def test_failed_install_is_reported_not_raised(self):
+        run = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, "", "no network")
+        logged = []
+        self.assertFalse(release.install_dependencies(self.OLD, self.NEW, log=logged.append, run=run))
+        self.assertIn("no network", logged[-1])
+
+
 class GuardTests(unittest.TestCase):
     """The real watchdog script, run as a separate process the way a node runs it."""
 

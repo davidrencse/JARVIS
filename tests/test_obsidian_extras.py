@@ -62,6 +62,45 @@ class BriefingTests(Case):
             self.assertIsNone(answer(other, self.vault, self.tasks, NOW), other)
         self.assertIsNone(answer("brief me", None, None, NOW))
 
+    def test_more_ways_to_ask_whats_due(self):
+        self.assertEqual(answer("am I behind on anything", self.vault, self.tasks, NOW),
+                         "1 overdue: Assignment 2, due October 13th.")
+        self.assertEqual(answer("is anything overdue?", self.vault, self.tasks, NOW),
+                         "1 overdue: Assignment 2, due October 13th.")
+        self.assertIn("OS Midterm 1 Tuesday",
+                      answer("What deadlines do I have this week?", self.vault, self.tasks, NOW))
+        self.assertIsNone(answer("what deadlines do I have to cook dinner", self.vault, self.tasks, NOW))
+
+    def test_deadline_drops_its_source_note(self):
+        (self.root / "calendar.md").write_text(
+            "## Exams and deadlines\n\n- **2026-10-24 (all day)** — Connect Assignment Ch 7 due "
+            "(tasks board, CourseSite announcement)\n", encoding="utf-8")
+        self.assertIn("Next deadline: Connect Assignment Ch 7 Saturday.",
+                      answer("what's due this week", self.vault, self.tasks, NOW))
+
+    def test_one_task_noted_twice_is_said_once(self):
+        (self.root / "AUDIT.md").write_text(
+            "# Audit\n\n- [ ] **Operating Systems Assignment 2** was due 2026-10-13; confirm "
+            "status. See [[os]].\n", encoding="utf-8")
+        self.assertEqual(answer("anything overdue?", self.vault, self.tasks, NOW),
+                         "1 overdue: Operating Systems Assignment 2, due October 13th.")
+        self.assertIn("1 overdue task: Operating Systems Assignment 2.",
+                      answer("brief me", self.vault, self.tasks, NOW))
+
+    def test_open_priorities_carry_over_until_todays_note(self):
+        daily = self.root / "daily/2026/10/2026-10-21.md"
+        daily.parent.mkdir(parents=True, exist_ok=True)
+        daily.write_text("## Priorities\n\n1. - [ ] Atlas (carried over): finish the Snort "
+                         "research — [[atlas]]\n2. - [x] Done already\n3. - [ ] Insurance calls\n",
+                         encoding="utf-8")
+        self.assertIn("Today you have Academic Planning at 11:30 AM and OS at 2 PM. Carried over "
+                      "from yesterday: Atlas and Insurance calls.",
+                      answer("brief me", self.vault, self.tasks, NOW))
+        (self.root / "daily/2026/10/2026-10-22.md").write_text(
+            "## Priorities\n\n1. - [ ] Midterm review\n", encoding="utf-8")
+        self.assertIn("Today's priorities: Midterm review.",
+                      answer("what's on today", self.vault, self.tasks, NOW))
+
     def test_spoken_shapes(self):
         self.assertEqual(_event("14:00–15:50 OS — Room 101 Main Hall"), "OS at 2 PM")
         self.assertEqual(_event("09:30 Gym"), "Gym at 9:30 AM")

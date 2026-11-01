@@ -37,11 +37,34 @@ class ReadOnlyTests(unittest.TestCase):
                         "grep -d recurse key /home/jdoe", "grep -drecurse key /home/jdoe",
                         "grep -nd recurse key /home/jdoe", "grep --directories=recurse key /home/jdoe",
                         "grep --dir recurse key /home/jdoe", "grep --dereference-recursive key /h",
-                        "gci -r /home/jdoe | sls key", "ls -r C:/Users | cat", "dir -Recurse | gc"):
+                        "gci -r /home/jdoe | sls key", "ls -r C:/Users | cat", "dir -Recurse | gc",
+                        "grep --rec key /home/jdoe", "grep --recur key .",
+                        "cat ~/.config/gh/hosts.yml", "cat ~/.bash_history", "cat ~/.npmrc",
+                        "cat ~/.pypirc", "cat ~/.config/rclone/rclone.conf", "cat .git/config",
+                        "cat ~/.local/share/fish/fish_history", "cat ~/.mozilla/f/logins.json",
+                        "gc ~/AppData/Roaming/discord/Local\\ Storage/leveldb/x.ldb",
+                        "dir variable:", "gci cert:", "gc HKCU:\\Software\\x",
+                        "gc Registry::HKCU\\x", "gc \\\\server\\share\\x", "cat //evil/x"):
             with self.subTest(command=command):
                 self.assertFalse(terminal.read_only(command))
         for command in ("find . -name '*.lnk'", "grep 'a.*b' notes.txt", "ps aux", "ps -ef",
-                        "ls | grep notes", "grep -n key notes.txt"):
+                        "ls | grep notes", "grep -n key notes.txt", "gc C:\\Users\\d\\notes.txt"):
+            with self.subTest(command=command):
+                self.assertTrue(terminal.read_only(command))
+
+    def test_audit_bypasses_need_ok(self):
+        # Found by the 2026-10-31 audit; each returned True before.
+        for command in ("find ~ -name 'id_e*' -print0 | sort --files0-from=-",
+                        "wc --files0-from=x", "sort --random-source=x y", "gci -r -fo ~ | type",
+                        "gc ~/SSH~1/ID_ED2~1", "gc ~/.s\u2018\u2019sh/x", "ps -auxe", "ps -E",
+                        "ps -axE", "cat ~/.config/github-copilot/apps.json",
+                        "cd ~/.config/github-copilot && cat apps.json", "systeminfo /s evil /u a /p b",
+                        "hostname --file=/tmp/x", "hostname -F/tmp/x", "date 010100002030",
+                        "cat /dev/fd/../cmdline", "gps -ComputerName evil"):
+            with self.subTest(command=command):
+                self.assertFalse(terminal.read_only(command))
+        for command in ("ps -e", "date +%F", "date -d tomorrow", "systeminfo", "ls ~/.config",
+                        "ls | wc -l", "ps aux | grep x", "gci | measure"):
             with self.subTest(command=command):
                 self.assertTrue(terminal.read_only(command))
 
@@ -56,7 +79,8 @@ class ReadOnlyTests(unittest.TestCase):
                 self.assertTrue(terminal.read_only(command))
 
     def test_cwd_is_checked(self):
-        for folder in ("~/.ssh", "/proc/self", "~/.s*", "$HOME/.ssh", "%USERPROFILE%"):
+        for folder in ("~/.ssh", "/proc/self", "~/.s*", "$HOME/.ssh", "%USERPROFILE%",
+                       "HKCU:\\Software", "\\\\evil\\share"):
             with self.subTest(folder=folder):
                 self.assertFalse(terminal.read_only("ls", folder))
         self.assertTrue(terminal.read_only("ls", "~/Desktop"))
@@ -100,6 +124,11 @@ class RunTests(unittest.TestCase):
     def test_cd_into_a_secret_folder_is_not_remembered(self):
         (self.root / ".ssh").mkdir()
         terminal.run("cd .ssh")
+        self.assertEqual(terminal.cwd(), str(self.root))
+
+    def test_cd_into_app_state_is_not_remembered(self):
+        (self.root / ".config").mkdir()
+        terminal.run("cd .config")
         self.assertEqual(terminal.cwd(), str(self.root))
 
     def test_explicit_cwd(self):
