@@ -22,7 +22,10 @@ LEAD = re.compile(r"^\W*(?:(?:hey|ok|okay)\s+)?(?:jarvis|jervis)\b[\s,.!?:-]*", 
 GREETING = re.compile(r"^(?:(?:hello|hi|hey|yo|ok|okay|alright|good (?:morning|afternoon|evening))"
                       r"(?:\s+(?:jarvis|jervis|jarvas|drivers|travis|there))?[\s,.!?:-]+)+(?=\w)")
 # "...go to youtube and yeah that's it, I just want to": closing chatter, not a clause.
-TRAILER = re.compile(r"\s*,?\s*(?:and\s+)?(?:yeah\s+|ok(?:ay)?\s+)?that'?s\s+(?:it|all)\b.*\Z")
+TRAILER = re.compile(r"\s*,?\s*(?:and\s+)?(?:yeah\s+|ok(?:ay)?\s+)?that'?s\s+(?:it|all)\b(.*)\Z")
+# Chatter after "that's it" is dropped, but a correction or another command is not chatter.
+TRAILER_UNSAFE = re.compile(r"\b(?:don'?t|do not|no|wait|actually|cancel|never ?mind|stop|undo|"
+                            r"open|close|play|pause|go to|launch|start|quit|then)\b")
 FILLER = re.compile(r"\b(?:(?:can|could|would|will) you|please|for me|go ahead and|"
                     r"i want you to|i'?d like you to|just|quickly|real quick|right now|"
                     r"again|agian|agan)\b")
@@ -144,15 +147,21 @@ def _spelled(text):
         return word
     text = re.sub(r"\bsc[a-z]{3,9}\b", fix, text)
 
-    def verb(match):
+    def verb(word):
         # "aopen", "oepn", "opne": one stray or swapped letter in "open".
-        word = match.group(0)
         if len(word) == 5 and any(word[:i] + word[i + 1:] == "open" for i in range(5)):
             return "open"
         if len(word) == 4 and sorted(word) == sorted("open") and _edits(word, "open") == 1:
             return "open"
         return word
-    return re.sub(r"\b[a-z]{4,5}\b", verb, text)
+    # A bare word, never a piece of a URL ("opens.org", "github.com/opens/repo").
+    urlish = re.compile(r"[./?=:]")
+
+    def bare(match):
+        before, after = text[:match.start()].split(" "), text[match.end():].split(" ")
+        near = before[-2:-1] + after[1:2]  # the neighbouring tokens
+        return match.group(0) if any(urlish.search(t) for t in near) else verb(match.group(0))
+    return re.sub(r"(?<![^\s,])[a-z]{4,5}(?![^\s,])", bare, text)
 
 
 def _edits(a, b):
@@ -211,7 +220,10 @@ def _parse(text, devices, origin, main, apps):
         raise Unsure("empty or too long")
     text = _lower(LEAD.sub("", text.replace("’", "'").replace("‘", "'")))
     text = GREETING.sub("", text.strip())
-    text = TRAILER.sub("", re.sub(r"[?!.]+$", "", text.strip()))
+    text = re.sub(r"[?!.]+$", "", text.strip())
+    if (trailer := TRAILER.search(text)) and TRAILER_UNSAFE.search(trailer.group(1)):
+        raise Unsure("a correction or command follows \"that's it\"")
+    text = TRAILER.sub("", text)
     # Filler leaves its comma behind ("open chrome, please." -> "open chrome, "): strip it.
     text = _spelled(re.sub(r"\s+", " ", FILLER.sub(" ", text)).strip(" ,;"))
     if not text:
@@ -314,10 +326,10 @@ def _aliases(devices, origin, main):
     return table
 
 
-def _device(phrase, aliases):
+def _device(phrase, aliases, typos=True):
     """The one device a phrase names ("my dell windows 11 pc" -> dell), else None."""
     words = phrase.split()
-    hits, i = set(), 0
+    hits, i, typed = set(), 0, 0
     while i < len(words):
         for j in range(len(words), i, -1):
             gram = " ".join(words[i:j])
@@ -330,8 +342,11 @@ def _device(phrase, aliases):
                 i += 1
                 continue
             # "deoll", "arhclinux": one edit from exactly one device's name, same first letter.
-            if found := _typo(words[i], aliases, 5, same_start=True):
+            if typos and words[i] not in NOT_DEVICES and (found := _typo(words[i], aliases, 5, same_start=True)):
                 hits.add(found)
+                typed += 1
+                if typed > 1:  # "dellx dellx dellx": junk, not a mishearing
+                    return None
                 i += 1
                 continue
             return None
@@ -342,27 +357,21 @@ RELATIVE = {"main", "default", "main default", "default main", "primary", "other
             "the other one", "other one", "other pc", "other laptop"}
 
 
-def _place(words, aliases, bar, same_start=True):
-    """A place slot no alias spells exactly ("on my arctonics", the speech-to-text for
-    "arch linux"): the device whose names sound closest, when it is clearly closest."""
-    words = [w for w in words if w not in DEVICE_NOISE]
-    if not words:
+PLACE_NOUNS = {"laptop", "computer", "pc", "machine"}
+
+
+def _place(words, aliases, shortest):
+    """A place slot no alias spells exactly ("on my della"): the one device a single
+    last word is a one-edit typo of. Anything else left in the slot is not a device
+    ("my windows phone", "the arch wiki"), so nothing is guessed."""
+    words = [w for w in words if w not in DEVICE_NOISE and w not in PLACE_NOUNS]
+    if len(words) != 1 or words[0] in NOT_DEVICES:
         return None
-    said, best = "".join(words), {}
-    if len(said) < 6:
-        bar = max(bar, 0.75)  # "my desk", "my dad": a short word must be nearly a name
-    for alias, device in aliases.items():
-        if device is None or alias in ORIGIN_WORDS or alias in RELATIVE \
-                or (same_start and alias[0] != said[0]):
-            continue  # real names only, starting with the same sound
-        score = difflib.SequenceMatcher(None, said, alias.replace(" ", "")).ratio()
-        best[device] = max(best.get(device, 0), score)
-    ranked = sorted(best.items(), key=lambda kv: -kv[1])
-    if not ranked or ranked[0][1] < bar:
-        return None
-    if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.12:
-        return None
-    return ranked[0][0]
+    return _typo(words[0], aliases, shortest, same_start=True)
+
+
+# Real words one edit from a device name: never a typo of it.
+NOT_DEVICES = {"linus"}
 
 
 def _known(obj, aliases, catalog):
@@ -431,11 +440,14 @@ def _clause(text, aliases, catalog, inherited=None):
         tail = " ".join(rest[cut + 1:])
         found = _device(tail, aliases) if tail else None
         split = tail.split()
+        if not split:
+            raise Unsure("on which place?")
         if not found and split[0] in ("my", "the") and _norm(tail) not in catalog:
-            found = _place(split, aliases, 0.4)  # "on my arctonics": clearly a place
+            found = _place(split[1:], aliases, 5)  # "on my della": clearly a place
         if not found and len(split) > 1 and catalog.get(split[0]) in BROWSERS:
             # "open yt on chrome qarch": a browser, then the place.
-            place = _device(" ".join(split[1:]), aliases) or _place(split[1:], aliases, 0.75, same_start=False)
+            place = _device(" ".join(split[1:]), aliases, typos=False) \
+                or _place(split[1:], aliases, 7)
             if place:
                 device, words = place, words[:len(words) - len(split) + 1]
                 rest = rest[:len(rest) - len(split) + 1]
@@ -451,7 +463,7 @@ def _clause(text, aliases, catalog, inherited=None):
     return {"verb": verb, "object": " ".join(rest), "device": device}
 
 
-def _app(obj, catalog):
+def _app(obj, catalog, typo=True):
     name = OBJECT_TAIL.sub("", OBJECT_LEAD.sub("", obj))
     if name in catalog:
         return catalog[name]
@@ -462,7 +474,8 @@ def _app(obj, catalog):
         raise Unsure(f"{obj!r} could be more than one app")
     if close:
         return catalog[close[0]]
-    return _typo(name, catalog, 6)  # "psotify": letters swapped
+    # "psotify": letters swapped. Fine for opening; never for closing the wrong app.
+    return _typo(name, catalog, 6) if typo else None
 
 
 def _site(obj):
@@ -528,7 +541,7 @@ def _command(clause, catalog):
             raise Unsure(f"{verb} what: {obj!r}")
         return {"intent": "media", "args": {"command": verb}}
     if verb in ("close", "focus"):
-        app = _app(obj, catalog) if obj else None
+        app = _app(obj, catalog, typo=False) if obj else None
         if not app:
             raise Unsure(f"{verb} what: {obj!r}")
         return {"intent": "close_app" if verb == "close" else "focus_window",

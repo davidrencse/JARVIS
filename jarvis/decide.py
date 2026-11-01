@@ -96,6 +96,9 @@ def _key(text):
     return re.sub(r"\W+", " ", str(text).lower()).strip()
 
 
+_bad_labels = []  # logged once
+
+
 def examples(job, held_out=()):
     """Labelled (text, option) pairs a job learns from beyond PROTOTYPES: the scorecard's
     cases (tests/eval/cases.jsonl, absent on a node) first, then decider_labels.jsonl; each
@@ -112,8 +115,14 @@ def examples(job, held_out=()):
     except OSError:
         lines = []
     for line in lines:
-        row = json.loads(line) if line.strip() else {}
-        if "text" in row:
+        try:
+            row = json.loads(line) if line.strip() else {}
+        except ValueError:
+            if not _bad_labels:
+                _bad_labels.append(line[:80])
+                print(f"decide: skipping malformed line in {LABELS.name}: {line[:80]!r}", flush=True)
+            continue
+        if isinstance(row, dict) and "text" in row:
             rows.append((row["text"], row.get("label")))
     seen, out = {_key(t) for t in held_out}, []
     for text, option in rows:
@@ -130,6 +139,7 @@ for _text, _option in examples("mode"):
 
 _lock = threading.Lock()
 _cache = {}  # job -> {option: matrix of prototype vectors}
+_generation = 0  # bumped by learn(): a model fitted on older examples must not be stored
 
 
 def _vectors(job):
@@ -149,8 +159,10 @@ def _vectors(job):
 
 def learn(job, option, phrase):
     """Add a verified example phrase to a job's option (takes effect immediately)."""
+    global _generation
     PROTOTYPES[job][option].append(str(phrase))
     with _lock:
+        _generation += 1
         _cache.pop(job, None)
         _models.pop(job, None)
 
@@ -226,16 +238,21 @@ def _model(job):
     with _lock:
         if job in _models:
             return _models[job]
+        generation = _generation
     protos = _vectors(job)  # the example embeddings choose() already holds
     if protos is None:
         return None
     options = list(PROTOTYPES[job])
-    texts = [t for o in options for t in PROTOTYPES[job][o]]
-    labels = np.array([i for i, o in enumerate(options) for _ in PROTOTYPES[job][o]])
+    snapshot = {o: list(PROTOTYPES[job][o]) for o in options}
+    if sum(len(v) for v in protos.values()) != sum(len(v) for v in snapshot.values()):
+        return None  # learn() landed between the two reads; the next call rebuilds both
+    texts = [t for o in options for t in snapshot[o]]
+    labels = np.array([i for i, o in enumerate(options) for _ in snapshot[o]])
     vectors = np.vstack([protos[o] for o in options])
     model = (*fit(features(job, texts, vectors), labels, len(options)), options)
     with _lock:
-        _models[job] = model
+        if generation == _generation:
+            _models[job] = model
     return model
 
 

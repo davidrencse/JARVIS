@@ -9,9 +9,12 @@ The checks that need the outside world take it as arguments (reachable, ready,
 app_exists), so the gates themselves stay pure and testable.
 """
 
+import os
+import posixpath
 import time
 import threading
 import re
+from pathlib import Path
 
 from . import registry
 
@@ -74,8 +77,108 @@ SKIPPABLE = frozenset({"app_exists", "history", "observe", "dedupe"})
 def asks(config):
     """rules.confirm in jarvis.config.json: "ask" (default) parks risky actions for David's
     OK; "never" runs them at once (his choice, 2026-11-01). Refusals (passwords, 2FA codes,
-    card numbers; agent-origin actions) stay either way: they are not questions."""
-    return str(((config or {}).get("rules") or {}).get("confirm", "ask")).lower() != "never"
+    card numbers; agent-origin actions) stay either way: they are not questions (hard_deny).
+    Only exactly "never" (whitespace aside) turns asking off; any other value asks."""
+    return str(((config or {}).get("rules") or {}).get("confirm", "ask")).strip() != "never"
+
+
+# What a brain terminal command may never do, asked or not (hard_deny): enter credentials.
+CREDENTIAL_CMD = re.compile(
+    r"\bsudo\s+(?:-\w*S\w*|--stdin)\b|--password\b|--passwd\b|--passphrase\b|--with-token\b|"
+    r"\bpasswd\b|\bchpasswd\b|\bsshpass\b|\bgh\s+auth\s+(?:login|token)\b|\bssh-keygen\b|"
+    r"\bssh-add\b|\bsecret-tool\s+store\b|\bgit\s+credential\b|\bpass\s+(?:insert|edit)\b", re.I)
+RM_NAMES = frozenset({"rm", "rmdir", "remove-item", "ri", "rd", "del", "erase", "unlink"})
+SEPARATORS = re.compile(r"&&|\|\||[;|\n]")
+
+
+def _vault_paths(config):
+    path = ((config or {}).get("vault") or {}).get("path")
+    paths = [v for v in path.values()] if isinstance(path, dict) else [path]
+    return [str(p) for p in paths if p]
+
+
+def _abs(path, here):
+    text = os.path.expanduser(os.path.expandvars(str(path).replace("\\", "/")))
+    if not (text.startswith("/") or re.match(r"[A-Za-z]:", text)):
+        text = posixpath.join(str(here).replace("\\", "/"), text)
+    return posixpath.normpath(text).rstrip("/") or "/"
+
+
+def _under(path, root):
+    path, root = path.casefold(), root.casefold()
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _terminal_denial(args, config, base):
+    from . import terminal
+    command = str((args or {}).get("command") or "")
+    cwd_arg = (args or {}).get("cwd")
+    if terminal.read_only(command, cwd_arg):
+        return None
+    if CREDENTIAL_CMD.search(command):
+        return "JARVIS never enters passwords, tokens or keys"
+    repo = Path(base).resolve() if base else Path(__file__).resolve().parent.parent
+    repo_s = str(repo).replace("\\", "/")
+    home = _abs("~", "/")
+    vaults = [_abs(v, "/") for v in _vault_paths(config)]
+    own = [repo_s + "/jarvis.config.json", repo_s + "/.jarvis", repo_s + "/JARVIS.md",
+           home + "/.ssh"] + [h + "/.jarvis" for h in (home,)]
+    here = _abs(cwd_arg, terminal.cwd()) if cwd_arg else _abs(terminal.cwd(), "/")
+    for step in SEPARATORS.split(command):
+        words = terminal._words(step) or [(w, w) for w in step.split()]
+        if not words:
+            continue
+        values = [v for v, _ in words]
+        name = values[0].lower()
+        if name == "sudo" and len(values) > 1:
+            name = values[1].lower()
+        targets = []
+        for value in values[1:]:
+            # option=path forms (--out=~/x), and quoted/spaced pieces
+            for piece in {value, value.split("=", 1)[-1]}:
+                if piece and not (piece.startswith("-") and "=" not in piece):
+                    targets.append(piece)
+        paths = [_abs(t, here) for t in targets] + [here]
+        for path in paths:
+            if any(_under(path, v) for v in vaults):
+                return "the Obsidian vault is read-only"
+            if any(_under(path, o) for o in own) or \
+                    re.search(r"(?:^|/)(?:\.jarvis|jarvis\.config\.json|JARVIS\.md|\.ssh)(?:/|$)",
+                              path, re.I):
+                return "JARVIS's own config, state and keys are off limits"
+        if name in terminal.CD and values[1:]:
+            here = paths[-2] if len(paths) > 1 else here
+        if name in RM_NAMES:
+            recursive = any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--recursive|-recurse|/s", v, re.I)
+                            or v == "--no-preserve-root" for v in values[1:])
+            if recursive or name in ("rmdir", "rd"):
+                guarded = [repo_s, home, "/"] + vaults
+                for t in targets[:]:
+                    path = _abs(re.sub(r"/\*+$", "", t.replace("\\", "/")) or "/", here)
+                    if any(_under(g, path) for g in guarded):
+                        return "that delete would wipe JARVIS, its vault or the home folder"
+    return None
+
+
+def hard_deny(name, args, config, base=None):
+    """Why a brain tool call is refused whatever rules.confirm says, or None. These are
+    not questions to ask David: credentials are never typed, the vault is read-only, JARVIS
+    doesn't edit its own gates or state. Checks: terminal commands that aren't
+    terminal.read_only (credential-entry commands; any path naming the vault, repo
+    jarvis.config.json, .jarvis/, JARVIS.md or ~/.ssh after ~, ./, //, .. and cd are
+    resolved; recursive deletes covering /, home, the repo or the vault); grok_agent
+    tasks that agent_risk() denies; browser type/fill/click calls (browser_gate.blocked)."""
+    args = args if isinstance(args, dict) else {}
+    if name == "terminal":
+        return _terminal_denial(args, config, base)
+    if name == "grok_agent":
+        if agent_risk(str(args.get("task") or "")) == "deny":
+            return "JARVIS never handles passwords, 2FA codes or card numbers"
+        return None
+    if re.match(r"(?:agent_)?browser_", str(name or "")):
+        from . import browser_gate
+        return browser_gate.blocked(name, args)
+    return None
 
 
 def trusted_rules(config):

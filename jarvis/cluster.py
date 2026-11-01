@@ -802,12 +802,8 @@ class NodeWorker:
             key = None
         bundle = self.client.request("/v1/code", timeout=60)
         backup(self.state)  # what the watchdog restores if the new code won't start
-        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
-        before = pyproject.read_text(encoding="utf-8") if pyproject.is_file() else ""
-        count = apply_bundle(bundle, key)
+        count = apply_bundle(bundle, key)  # installs changed requirements before its start check
         self.installed = bundle.get("code")
-        from .release import install_dependencies
-        install_dependencies(before, pyproject.read_text(encoding="utf-8") if pyproject.is_file() else "")
         print(f"JARVIS node: installed main's code {bundle.get('code')} ({count} files); restarting.", flush=True)
         return True
 

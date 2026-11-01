@@ -110,16 +110,22 @@ FILEISH = re.compile(r"\b(?:what|which|list|show|any|how\s+many|find|where)\b.{0
 # Dell", "is the dell online", "what's playing on arch"): only a tool can answer it, and the
 # talk lane, which can't call one, used to guess or ask David to rephrase.
 _PC = r"(?:arch|asus|zenbook|linux|dell|windows|laptop|computer|pc|desktop|machine|other\s+one)"
+_STATE_NOUN = (r"(?:battery|charge|disk|drive|storage|free\s+space|space|cpu|ram|memory\s+usage|uptime|"
+               r"wi-?fi|network|ip(?:\s+address)?|temperature|gpu|processes)")
 STATEISH = re.compile(
-    r"\b(?:what|what's|whats|how|is|are|check|show|tell\s+me)\b.{0,40}"
-    r"\b(?:my|the|this|its|on\s+(?:the\s+|my\s+)?\w+)\s+(?:\w+'?s?\s+)?"
-    r"(?:battery|charge|disk|drive|storage|free\s+space|space|cpu|ram|memory\s+usage|uptime|"
-    r"wi-?fi|network|ip(?:\s+address)?|temperature|gpu|processes)\b|"
-    r"\bhow\s+much\s+(?:disk\s+|free\s+|storage\s+)?(?:space|storage|ram)\b|"
+    # "what's my battery at", "check my laptop's wifi": a state noun of his own...
+    rf"\b(?:what|what's|whats|how|is|are|check|show|tell\s+me)\b.{{0,40}}\bmy\s+(?:{_PC}'?s?\s+)?{_STATE_NOUN}\b|"
+    # ...or tied to a computer: "the cpu usage on the dell", "the dell's battery"
+    rf"\b(?:what|what's|whats|how|is|are|check|show|tell\s+me)\b.{{0,40}}\b{_STATE_NOUN}\b.{{0,30}}"
+    rf"\b(?:on|of|in)\s+(?:the\s+|my\s+|this\s+)?{_PC}\b|"
+    rf"\b(?:the|this|my)\s+{_PC}'?s\s+{_STATE_NOUN}\b|"
+    r"\bhow\s+much\s+(?:disk\s+|free\s+|storage\s+)?(?:space|storage|ram)\s+(?:is\s+)?"
+    r"(?:left|free|used|do\s+i\s+have|have\s+i|is\s+(?:left|free|used)|on\b)|"
     r"\bhow\s+much\s+battery\s+(?:do\s+i|is|have\s+i|left|does\s+(?:my|the|this))\b|"
     rf"\bis\s+(?:the\s+|my\s+)?{_PC}\s+(?:on|online|awake|up|connected|running|reachable)\b|"
     rf"\b(?:what'?s|what\s+is|whats|anything)\s+(?:playing|open|running)\s+on\s+(?:the\s+|my\s+)?{_PC}\b|"
-    r"\bis\s+[\w.+-]+(?:\s+[\w.+-]+)?\s+(?:open|running)(?:\s+(?:on\b.*|right\s+now))?\s*\??\s*$",
+    # "is spotify running", "is discord open on the dell"; "is the museum open" is not
+    rf"\bis\s+[\w.+-]+(?:\s+[\w.+-]+)?\s+(?:running\b|open\s+on\s+(?:the\s+|my\s+)?{_PC}\b)",
     re.I)
 # Naming Grok means "hand it to Grok Bot": only the action brain has grok_agent.
 GROKISH = re.compile(r"\bgrok(?:\s*bot)?\b", re.I)

@@ -150,8 +150,8 @@ def mode_for(case):
 
 
 def _fold(text, folds):
-    from .decide import _key
-    return int(hashlib.sha256(_key(text).encode()).hexdigest(), 16) % folds
+    from .decide import _key, clean
+    return int(hashlib.sha256(_key(clean(text)).encode()).hexdigest(), 16) % folds
 
 
 def score_decider(cases, folds=FOLDS):
@@ -166,6 +166,7 @@ def score_decider(cases, folds=FOLDS):
     scored = [c for c in cases if mode_for(c)]
     options = list(decide.BASE["mode"])
     fixed = [(t, o) for o, ts in decide.BASE["mode"].items() for t in ts]
+    n_builtin = len(fixed)
     fixed += decide.examples("mode", held_out=[c["text"] for c in cases])
     vectors = embed([decide.clean(t) for t, _ in fixed] + [decide.clean(c["text"]) for c in scored])
     if vectors is None:
@@ -177,10 +178,16 @@ def score_decider(cases, folds=FOLDS):
     case_y = np.array([options.index(mode_for(c)) for c in scored])
     fold = np.array([_fold(c["text"], folds) for c in scored])
     probs = np.zeros((len(scored), len(options)))
+    builtin = np.array([decide._key(decide.clean(t)) for t, _ in fixed[:n_builtin]] +
+                       [None] * (len(fixed) - n_builtin), dtype=object)
+    cleaned = [decide._key(decide.clean(c["text"])) for c in scored]
     for k in range(folds):  # the same classifier decide.choose() runs, trained without fold k
         seen = fold != k
-        model = decide.fit(np.vstack([train, test[seen]]), np.concatenate([fixed_y, case_y[seen]]),
-                           len(options))
+        # A built-in example word for word equal to a test case would be scored on its own training.
+        held = {_t for _t, f in zip(cleaned, fold) if f == k}
+        keep = np.array([b is None or b not in held for b in builtin])
+        model = decide.fit(np.vstack([train[keep], test[seen]]),
+                           np.concatenate([fixed_y[keep], case_y[seen]]), len(options))
         if (~seen).any():
             probs[~seen] = decide.predict(model, test[~seen])
     rows, picks = [], []

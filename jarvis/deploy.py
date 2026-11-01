@@ -202,6 +202,14 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent):
             got = code_fingerprint(stage / "jarvis")
             if got != bundle.get("code"):
                 raise ValueError(f"Downloaded code fingerprint {got} != {bundle.get('code')}; not installed.")
+            # Requirements first, from the signed bundle's own pyproject.toml: a release that
+            # adds an import-time dependency can't pass the start check without them.
+            from .release import install_dependencies
+            staged = stage / "pyproject.toml"
+            current = repo / "pyproject.toml"
+            if staged.is_file():
+                install_dependencies(current.read_text(encoding="utf-8") if current.is_file() else "",
+                                     staged.read_text(encoding="utf-8"))
             problem = _starts(stage)
             if problem:
                 raise ValueError(f"The main's code doesn't start ({problem}); kept this node's code.")
@@ -371,8 +379,8 @@ def update(config, state, node, rollback=False):
                   # New requirements are installed before the restart (see release.install_dependencies).
                   f"deps=; [ -f {stage}/pyproject.toml ] && ! cmp -s {stage}/pyproject.toml pyproject.toml && deps=1; "
                   f"[ -f {stage}/pyproject.toml ] && cp {stage}/pyproject.toml pyproject.toml; rm -rf {stage}; "
-                  f"[ -n \"$deps\" ] && {{ {py} -m pip install --quiet --disable-pip-version-check -e . "
-                  f"|| echo 'pip install failed' >&2; }}; "
+                  f"[ -n \"$deps\" ] && {{ timeout 600 {py} -m pip install --quiet --disable-pip-version-check -e . "
+                  f"|| echo 'pip install failed or timed out (600 s); the node may need its requirements installed by hand' >&2; }}; "
                   f"{_restart(kernel)}; echo ok")
         code, out, err = _remote(config, state, node, _bash(script), stdin=package(source(state)))
         if code or "ok" not in out:

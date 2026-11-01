@@ -508,19 +508,22 @@ class Brain:
             wants = self.wants(text)
         return "act" if wants else "chat"
 
-    def _act(self, text, recall, on_sentence):
+    def _act(self, text, recall, on_sentence, said=()):
         """The tools lane, held to its tools: an excuse it has no grounds for ("the tool is
         disabled" with no call made, seen 2026-10-28/30) is not spoken, and the lane is
-        asked once more in the same thread to use them, or to name the real failure."""
+        asked once more in the same thread to use them, or to name the real failure.
+        said: sentences David already heard (from the talk lane), never to be repeated."""
         self.last = self.act
-        doubted = []
+        doubted, spoken = [], list(said)
 
         def speak(sentence):
             if doubted or is_refusal(sentence) or TOOLS_DOWN.search(sentence):
                 doubted.append(sentence)
             elif on_sentence:
+                spoken.append(sentence)
                 on_sentence(sentence)
-        reply = self.act.ask(text, recall, on_sentence=speak if on_sentence else None)
+        ask = (HEARD.format(heard=" ".join(said)) + str(text)) if said else text
+        reply = self.act.ask(ask, recall, on_sentence=speak if on_sentence else None)
         nudge = ungrounded(reply, getattr(self.act, "tool_log", None))
         if nudge is None:
             if doubted and on_sentence:  # held back, but it stands: say it after all
@@ -528,10 +531,16 @@ class Brain:
                     on_sentence(sentence)
             return reply
         earlier = list(getattr(self.act, "tool_log", None) or ())
-        second = self.act.ask(nudge + str(text), (), on_sentence=on_sentence)
-        if earlier and isinstance(getattr(self.act, "tool_log", None), list):
-            self.act.tool_log[:0] = earlier  # both turns' calls, for a failed-turn report
-        return second
+        if spoken:
+            nudge = HEARD.format(heard=" ".join(spoken)) + nudge
+        try:
+            return self.act.ask(nudge + str(text), (), on_sentence=on_sentence)
+        finally:  # both turns' calls, also when the second raises: the failed-turn report needs them
+            log = getattr(self.act, "tool_log", None)
+            if earlier and isinstance(log, list):
+                log[:0] = earlier
+            elif earlier:
+                self.act.tool_log = earlier
 
     def ask(self, text, recall=(), on_sentence=None):
         if self.pick(text) == "act":
@@ -539,17 +548,18 @@ class Brain:
         # Talk has no tools; it answers HANDOFF when it sees an action the regexes missed.
         # It also sometimes says it can't check instead (despite TALK_HANDOFF): treat that as
         # a handoff too, and stop speaking from the first such sentence on.
-        gave_up = []
+        gave_up, heard = [], []
 
         def speak(sentence):
             if gave_up or is_handoff(sentence) or is_refusal(sentence):
                 gave_up.append(sentence)
             elif on_sentence:
+                heard.append(sentence)
                 on_sentence(sentence)
         self.last = self.chat
         reply = self.chat.ask(text, recall, on_sentence=speak if on_sentence else None)
         if is_handoff(reply) or is_refusal(reply):
-            return self._act(text, recall, on_sentence)
+            return self._act(text, recall, on_sentence, said=heard)
         return reply
 
     def warm(self):
@@ -622,6 +632,21 @@ TOOLS_DOWN = re.compile(
     r"(?:disabled|unavailable|not\s+available|offline|down|not\s+connected)\b|"
     r"\bwith\s+the\s+tools\s+(?:I\s+have|available)\b|\bI\s+(?:don(?:'|’)?t|do\s+not)\s+have\s+(?:the\s+)?tools?\b",
     re.I)
+# Only a claim about its own toolset is suspect after calls that all worked: "Developer
+# tools are disabled in this Chrome profile" is a finding, "with the tools available here" isn't.
+OWN_TOOLS = re.compile(
+    r"\bwith\s+the\s+tools\s+(?:I\s+have|available)\b|\bI\s+(?:don(?:'|’)?t|do\s+not)\s+have\s+(?:the\s+)?tools?\b|"
+    r"\b(?:my|the)\s+tools?(?:\s+(?:connection|service|access))?\s+(?:is|are)\s+(?:currently\s+|right\s+now\s+)?"
+    r"(?:disabled|unavailable|not\s+available|offline|down|not\s+connected)\b",
+    re.I)
+# "The Dell is offline, so I can't check it": true when the snapshot says it isn't
+# answering, and no tool call is needed to know it.
+MACHINE_DOWN = re.compile(rf"\b{_MACHINE}\b[^.!?]{{0,30}}\b(?:is|are|seems|looks)\s+(?:currently\s+)?"
+                          r"(?:offline|off|asleep|not\s+answering|not\s+responding|not\s+connected|unreachable)\b|"
+                          rf"\b{_MACHINE}\b[^.!?]{{0,20}}\b(?:isn(?:'|’)?t|aren(?:'|’)?t)\s+(?:answering|responding|connected|online|on)\b",
+                          re.I)
+HEARD = ("[JARVIS check] David already heard you say: \"{heard}\" Don't repeat that; "
+         "continue from it. ")
 GROUND_RETRY = ("[JARVIS check] Your tools are connected and working in this conversation, and "
                 "you did not call any. Use them now to do or check what David asked, then answer "
                 "him in one or two plain sentences. His request was: ")
@@ -649,13 +674,15 @@ def ungrounded(reply, tool_log):
         return None
     ran = list(tool_log or ())
     if not ran:
+        if MACHINE_DOWN.search(reply) and not TOOLS_DOWN.search(reply):
+            return None  # "the Dell is offline": the snapshot told it so
         return GROUND_RETRY
     failed = [f"{name}: {str(error or 'failed')[:160]}" for name, ok, error in ran if not ok]
-    if not TOOLS_DOWN.search(reply):
-        return None  # tools ran and it names a real limit: the answer stands
-    if failed:
+    if failed and TOOLS_DOWN.search(reply):
         return GROUND_FAILED.format(failures="; ".join(failed[:4]))
-    return GROUND_MORE
+    if OWN_TOOLS.search(reply) and not failed:
+        return GROUND_MORE
+    return None  # tools ran and it names a real limit: the answer stands
 
 
 VAULT_ONLY = ("You are JARVIS, David's personal assistant. Do what he asks with your "
@@ -736,6 +763,10 @@ class ConfirmGate:
         return None
 
     def call(self, name, args):
+        from .gates import hard_deny
+        refusal = hard_deny(name, args or {}, self.config)
+        if refusal:  # not a question: refused under rules.confirm "ask" and "never" alike
+            return False, f"Refused: {refusal}. Tell David plainly; do not retry or work around it."
         here = self.here()
         command = self.command(name, args or {}, here)
         if command is None:

@@ -17,7 +17,7 @@ STALE = 120     # older than this (machine stopped answering), its line is dropp
 NODE_WAIT = 8   # seconds a node gets to answer (it runs in the background anyway)
 HEADER = "Your computers right now (live, read-only; refreshed every ~30 s):"
 
-_STATE = {"at": 0.0, "machines": {}, "silent": [], "busy": False, "lock": threading.Lock()}
+_STATE = {"at": 0.0, "machines": {}, "silent": {}, "busy": False, "lock": threading.Lock()}
 
 
 def _machines(config, state):
@@ -81,7 +81,11 @@ def refresh(config, state, ask=None, offline=None):
             seen[device or "this PC"] = {"report": report, "at": time.time()}
     with _STATE["lock"]:
         _STATE["machines"].update(seen)
-        _STATE["silent"] = sorted(set(silent) - set(seen))
+        # name -> when it last failed; a machine that answers again leaves at once, and one
+        # that fails drops its old live line (never shown as both live and not answering).
+        _STATE["silent"] = {name: time.time() for name in set(silent) - set(seen)}
+        for name in _STATE["silent"]:
+            _STATE["machines"].pop(name, None)
         _STATE["at"] = time.time()
         _STATE["busy"] = False
 
@@ -110,7 +114,7 @@ def lines(config, state, now=None, start=None):
         if due:
             _STATE["busy"] = True
         machines = dict(_STATE["machines"])
-        silent = list(_STATE["silent"])
+        silent = sorted(n for n, at in _STATE["silent"].items() if now - at <= STALE)
     if due:
         def run():
             try:
@@ -129,4 +133,4 @@ def lines(config, state, now=None, start=None):
 def reset():
     """Forget every snapshot (tests)."""
     with _STATE["lock"]:
-        _STATE.update(at=0.0, machines={}, silent=[], busy=False)
+        _STATE.update(at=0.0, machines={}, silent={}, busy=False)

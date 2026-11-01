@@ -20,6 +20,7 @@ heuristic over the command text; it narrows what runs unasked, it isn't a sandbo
 
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -57,14 +58,16 @@ SECRET = re.compile(r"\.ssh\b|\.gnupg\b|\.jarvis\b|\.codex\b|\.claude\b|\.aws\b|
                     # token files with ordinary names (gh, npm, PyPI, rclone, git remotes) and
                     # shell histories (bash/zsh/fish, PowerShell's ConsoleHost_history.txt)
                     r"hosts\.yml\b|\.npmrc\b|\.pypirc\b|rclone\.conf\b|\.git[/\\]config\b|"
-                    r"_history\b|\.histfile\b", re.I)
+                    r"_history\b|\.histfile\b|\.viminfo\b|\.gitconfig\b", re.I)
 # /proc holds every process's environment (tokens) and memory; "environ" catches a cd-ed path.
 # /dev/fd/.. and /dev/stdin lead back into /proc/self.
-PROC = re.compile(r"(?:^|[/\\])proc(?:[/\\]|$)|environ\b|\benv\b|[/\\]dev[/\\](?:fd|std)", re.I)
+# /dev/zero and friends are endless reads that cat would print until the timeout.
+PROC = re.compile(r"(?:^|[/\\])proc(?:[/\\]|$)|environ\b|\benv\b|"
+                  r"[/\\]dev[/\\](?:fd|std|zero|u?random|full)", re.I)
 # App and browser state where tokens sit under ordinary names (github-copilot/apps.json,
 # VS Code's state.vscdb...): reading inside it, or cd-ing into it, needs David's OK.
 APP_STATE = re.compile(r"\.config\b|\.local[/\\]share\b|AppData\b|Application Support\b|"
-                       r"\.mozilla\b|Library[/\\](?:Keychains|Cookies)\b", re.I)
+                       r"\.mozilla\b|\.thunderbird\b|\.var[/\\]app\b|Library[/\\](?:Keychains|Cookies)\b", re.I)
 # Commands that print what they read, and the only ones a pipe may feed: in PowerShell any
 # other name after | (cat, gc, type, sls...) may read each file object it is handed.
 READERS = frozenset({"cat", "head", "tail", "grep", "sort", "uniq", "cut", "gc", "get-content",
@@ -75,6 +78,12 @@ PIPE_OK = frozenset({"grep", "wc", "sort", "uniq", "head", "tail", "cut", "measu
 # Options that read file names from a file or stdin (find -print0 | sort --files0-from=-
 # prints every found file), or reach another computer (Get-Process -ComputerName).
 FILE_LIST = re.compile(r"--fil|--from|--ra|-(?:cn|comp\w*|cim\w*|session\w*)$", re.I)
+# PowerShell takes any unambiguous parameter prefix, also as -Name:value: Get-Process -C dell
+# is -ComputerName dell. On a PowerShell command every -c... is treated as remote.
+PS_REMOTE = re.compile(r"-c\w*(?::|$)|-(?:comp\w*|cim\w*|ses\w*)(?::|$)", re.I)
+PS_ALIASES = frozenset({"gci", "gc", "gi", "gps", "gl", "sl", "sls", "ft", "fl", "measure",
+                        "select", "chdir"})
+CD = frozenset({"cd", "chdir", "set-location", "sl"})
 GLOB = re.compile(r"[*?\[]")
 # PowerShell provider paths (HKCU:, cert:, variable:, Registry::...) reach the registry and
 # session state; a UNC path (\\\\host\\x or //host/x) makes Windows send an NTLM hash to host.
@@ -97,15 +106,54 @@ def read_only(command, cwd=None):
         return False
     if cwd is not None and not _safe_folder(str(cwd)):
         return False
+    # Where each && step runs: `cd .local && cd share && cat x` reads ~/.local/share/x.
+    here = _join(globals()["cwd"](), str(cwd)) if cwd else globals()["cwd"]()
     for chain in command.split("&&"):
         for n, segment in enumerate(chain.split("|")):
             if not _looks(segment.strip()):
                 return False
+            if n == 0:
+                here = _walk(segment.strip(), here)
+                if here is None:
+                    return False
             # PowerShell pipes file objects: gci -r | sls key (or | cat, | type) reads every
             # file the listing found, so only plain filters may follow a pipe.
             if n and segment.split()[0].lower() not in PIPE_OK:
                 return False
     return True
+
+
+def _norm(value):
+    """The path as the OS will resolve it: ./ and // and .. folded away (~/.local/./share),
+    so a name check can't be dodged by spelling. Not a filesystem lookup."""
+    text = str(value).replace("\\", "/")
+    return posixpath.normpath(text) if text.strip() else text
+
+
+def _join(here, arg):
+    """`arg` as an absolute, normalised path run from `here` (~ expanded)."""
+    text = os.path.expanduser(str(arg).replace("\\", "/"))
+    if not (text.startswith("/") or re.match(r"[A-Za-z]:", text)):
+        text = posixpath.join(str(here).replace("\\", "/"), text)
+    return posixpath.normpath(text)
+
+
+def _walk(segment, here):
+    """The folder after this step, or None when it names (or cds into) a secret or app-state
+    folder once joined to where earlier cd steps left us."""
+    words = _words(segment)
+    if not words:
+        return None
+    name = words[0][0].lower()
+    paths = [_join(here, value) for value, _ in words[1:] if not value.startswith("-")]
+    for path in paths:
+        if SECRET.search(path) or _private(path) or (name in READERS and APP_STATE.search(path)):
+            return None
+    if name in CD:
+        if any(value == "-" for value, _ in words[1:]):
+            return None
+        return paths[-1] if paths else str(Path.home())
+    return here
 
 
 def _safe_folder(folder):
@@ -115,7 +163,10 @@ def _safe_folder(folder):
             and folder.isascii() and not re.search(r"~\d", folder) and not APP_STATE.search(folder)
             and not SHELLISH.search(folder) and "%" not in folder and not GLOB.search(folder)
             and not SECRET.search(folder) and not _private(folder)
-            and not any(SECRET.search(value) or _private(value) for value, _ in words))
+            and not any(SECRET.search(value) or _private(value) or APP_STATE.search(value)
+                        for value, _ in words)
+            and not any(SECRET.search(v) or _private(v) or APP_STATE.search(v)
+                        for v in (_norm(folder), *(_norm(w) for w, _ in words))))
 
 
 def _private(path):
@@ -167,11 +218,14 @@ def _looks(segment):
         return False
     args = [value for value, _ in words[1:]]
     # Quote splitting ('.s''sh', id_\rsa) hides a name from the raw-text check; recheck each word.
-    if any(SECRET.search(value) or _private(value) for value in args):
+    spelled = [v for value in args for v in (value, _norm(value))]
+    if any(SECRET.search(value) or _private(value) for value in spelled):
         return False
     if any(FILE_LIST.match(value) for value in args):
         return False
-    if name in READERS and any(APP_STATE.search(value) for value in args):
+    if (name in PS_ALIASES or "-" in name) and any(PS_REMOTE.match(value) for value in args):
+        return False
+    if name in READERS and any(APP_STATE.search(value) for value in spelled):
         return False
     # PowerShell doesn't treat \ as an escape: \\host\x reaches it whole, so check raw words too.
     if any(ELSEWHERE.search(word.strip("'\"")) for word in segment.split()[1:]):
@@ -234,7 +288,7 @@ def _no_writes(name, args):
     if name == "date":  # -s/--set, or an MMDDhhmm operand, sets the clock; +FORMAT only prints
         value_next = False
         for a in args:
-            if re.match(r"-[^-]*s|--s", a):
+            if re.match(r"-[^-]*[sf]|--s|--f", a):  # -f/--file prints each line of a file
                 return False
             if not value_next and not a.startswith(("-", "+")):
                 return False
@@ -244,8 +298,8 @@ def _no_writes(name, args):
         return all(a in HOSTNAME_FLAGS for a in args)
     if name == "systeminfo":  # /s HOST /u /p logs in to another computer
         return not args
-    if name == "file":  # -C compiles a magic file into the working folder
-        return not any(re.match(r"-[^-]*C|--com", a) for a in args)
+    if name == "file":  # -C compiles a magic file into the working folder; -f reads names from a file
+        return not any(re.match(r"-[^-]*[Cf]|--com|--fil", a) for a in args)
     if name == "ps":  # e/E (ps e, ps eww, ps -auxe, macOS ps -E) prints environments;
         # only UNIX-style -e (every process) and its usual companions are plain
         return not any("e" in a.lower() and not re.fullmatch(r"-e[fFlyLjH]*", a) for a in args)
