@@ -81,13 +81,27 @@ RECALL_MARGIN = 0.09  # "none" must beat "notes" by this much to drop recall: mi
                       # note costs more than a stray line, so close calls keep the notes
 
 
+# A first-person statement ("I'm going to sell my car.", "We got nothing.") tells JARVIS
+# something; it doesn't ask what his notes say. Unless it names notes, plans or the
+# calendar, notes have to clearly win to be pulled in (shape, not wording: no eval text).
+STATEMENT = re.compile(r"^\W*(?:i|i'm|im|i am|i'll|ill|i will|i've|i was|i just|we|we're|we'll|"
+                       r"we got|we have|my|me)\b", re.I)
+NOTESY = re.compile(r"\?|\b(?:notes?|vault|journal|wrote|write|written|log(?:ged)?|plan(?:s|ned)?|"
+                    r"schedule|calendar|agenda|due|deadline|remind|remember|told|said|decided|"
+                    r"what|when|where|which|how|who|why|status|progress|priorit\w*|tasks?|todo)\b", re.I)
+STATEMENT_MARGIN = 0.05  # notes must beat "none" by this much for a plain statement
+
+
 def wants_notes(text):
     """False only when a request is clearly not about David's own notes (small talk, general
     knowledge, commands); True when it is, or it's close, or the model is unavailable."""
     found = choose("recall", text)
     if found is None:
         return True
-    return found["sims"]["none"] - found["sims"]["notes"] < RECALL_MARGIN
+    gap = found["sims"]["none"] - found["sims"]["notes"]
+    if STATEMENT.match(str(text)) and not NOTESY.search(str(text)):
+        return gap < -STATEMENT_MARGIN
+    return gap < RECALL_MARGIN
 
 LABELS = Path(__file__).with_name("decider_labels.jsonl")
 

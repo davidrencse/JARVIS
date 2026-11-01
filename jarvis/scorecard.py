@@ -284,10 +284,15 @@ def sample(cases, size, seed=0):
 def score_brain(cases, config, base, origin, ask=None):
     """The interpreter's reading of each case: the mode its type implies, and for act the
     labelled commands. No reading at all counts as wrong."""
+    from .chatgpt import usage_limit
     from .interpret import interpret
     rows = []
     for case in cases:
+        if ask is None and usage_limit():  # the plan said no: that's not the brain being wrong
+            return {"skipped": f"ChatGPT is over its usage limit {usage_limit()}".strip()}
         read = interpret(case["text"], config, base, case.get("origin", origin), ask=ask)
+        if read is None and ask is None and usage_limit():
+            return {"skipped": f"ChatGPT is over its usage limit {usage_limit()}".strip()}
         want = case.get("mode") or BRAIN_MODE[case["type"]]
         ok = read is not None and read["mode"] == want and (
             want != "act" or matches(read.get("commands"), case["commands"]))
@@ -341,7 +346,11 @@ def run(config, base, state, path=CASES, brain=False, size=8, seed=0, save=True)
         parts["grounding"] = grounded
     if brain:
         picked = sample(cases, size, seed)
-        parts["brain"] = {**score_brain(picked, config, base, origin), "sample": size, "seed": seed}
+        scored = score_brain(picked, config, base, origin)
+        if "skipped" in scored:
+            notes["brain"] = f"skipped: {scored['skipped']} (not counted as a score)"
+        else:
+            parts["brain"] = {**scored, "sample": size, "seed": seed}
     else:
         notes["brain"] = "not run (jarvis eval --brain uses the subscription)"
     digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]

@@ -67,8 +67,9 @@ into is it its just me more most my no nor not now of off on once only or other 
 over own same she should so some such than that the their them then there these they this
 those through to too under until up very was we were what when where which while who whom
 why will with would you your yours jarvis please tell show give know want need like okay
-ok hey thanks thank yes say said let lets something anything""".split())
+ok hey thanks thank yes say said let lets something anything according accordingly""".split())
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+LABEL_MIN_USES = 2  # a link label David used this often names its note (Vault.labels)
 WIKILINK = re.compile(r"(!?)\[\[([^\[\]|#^]*)(?:[#^][^\[\]|]*)?(?:\|([^\[\]]*))?\]\]")
 HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
 CONFLICT = re.compile(r"^(<{7}|>{7}) ", re.M)
@@ -142,9 +143,13 @@ def _code_free(text):
 
 
 def _target(names, link):
-    """The note a [[link]] points at, the way Obsidian resolves it: basename, then
-    the full name (which also covers titles and aliases)."""
-    return names.get(link.rsplit("/", 1)[-1].lower()) or names.get(link.lower())
+    """The note a [[link]] points at, the way Obsidian resolves it: a link with a folder
+    ("jobs/_index") by its path first, then the basename, then the full name (which also
+    covers titles and aliases)."""
+    key = link.strip().strip("/").lower()
+    if "/" in key and (hit := names.get(key) or names.get(key + ".md")):
+        return hit
+    return names.get(key.rsplit("/", 1)[-1]) or names.get(key)
 
 
 def open_link(link):
@@ -280,6 +285,7 @@ class Vault:
         # Generated files: the vault says hand edits there are overwritten.
         self.protected = {p.lower() for p in self.settings.get("protected", [self.calendar])}
         self._lock, self._refreshed = threading.Lock(), 0.0
+        self._labels = None  # (index key, labels()) cache
         with self.connect() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS notes(
@@ -391,6 +397,8 @@ class Vault:
             for alias in [a for a in note["aliases"].split(" | ") if a] + [note["title"]]:
                 names.setdefault(alias.lower(), note["path"])
         for rel, _ in self.files():
+            if "/" in rel:  # "jobs/_index": a link that names its folder
+                names.setdefault(rel.lower(), rel)
             name = rel.rsplit("/", 1)[-1].lower()
             names[name] = rel  # basenames win: Obsidian links by filename
             if name.endswith(".md"):
@@ -424,11 +432,55 @@ class Vault:
         return full
 
     # -- reading ---------------------------------------------------------------------
+    def labels(self):
+        """Short names David gives notes in his own links: "[[operating-systems|OS]]" makes
+        "os" mean that note. term -> (path, title), only for a label that is one search
+        term, used at least LABEL_MIN_USES times, and always for the same note. Cached
+        until a note changes."""
+        self.refresh()
+        with self.connect() as db:
+            key = tuple(db.execute("SELECT count(*), total(mtime) FROM notes").fetchone())
+            if self._labels and self._labels[0] == key:
+                return self._labels[1]
+            bodies = [r[0] for r in db.execute("SELECT body FROM notes")]
+            titles = {r[0]: r[1] for r in db.execute("SELECT path, title FROM notes")}
+        names, uses = self.names(), {}
+        for body in bodies:
+            for match in WIKILINK.finditer(_code_free(body)):
+                words = terms(match.group(3) or "")
+                if match.group(1) or len(words) != 1:
+                    continue  # embeds, plain links and multi-word labels name nothing new
+                path = _target(names, match.group(2).strip())
+                if path in titles:
+                    uses.setdefault(words[0], []).append(path)
+        found = {}
+        for term, paths in uses.items():
+            title_terms = terms(titles[paths[0]])
+            if (len(paths) >= LABEL_MIN_USES and len(set(paths)) == 1
+                    and term not in title_terms):  # "[[drone|Drone]]" adds nothing
+                found[term] = (paths[0], titles[paths[0]])
+        self._labels = (key, found)
+        return found
+
+    def expand(self, words):
+        """Search terms plus the title words of any note one of them is David's label for
+        ("os" -> "operating", "systems")."""
+        try:
+            labels = self.labels()
+        except Exception:  # recall must never break on the label table
+            return list(words)
+        out = list(words)
+        for word in words:
+            if word in labels:
+                out += [t for t in terms(labels[word][1]) if t not in out]
+        return out
+
     def search(self, query, limit=6, folder=None, kind=None):
         """Ranked notes for a query: BM25 (title 8×, aliases 5×, tags 3×, path 2×),
-        weighted by note type and lightly by how recently it was updated."""
+        weighted by note type and lightly by how recently it was updated. A word David
+        uses as a link label for a note also searches for that note's title."""
         self.refresh()
-        words = terms(query)
+        words = self.expand(terms(query))
         if not words:
             return []
         where, args = "", []
@@ -462,8 +514,23 @@ class Vault:
                             "tags": row["tags"].split(), "status": row["status"],
                             "updated": row["updated"], "score": round(score, 3),
                             "snippet": plain(row["snippet"])})
+        # A word David uses as a note's link label names that note outright, as its title
+        # would: it ranks with the best match ("my OS midterm" -> the OS course, not the
+        # daily notes that link to it).
+        named = {path for word in terms(query) for path, _ in [self._labels_or_none(word)] if path}
+        if named and results:
+            top = max(r["score"] for r in results)
+            for r in results:
+                if r["path"] in named:
+                    r["score"] = round(max(r["score"], top + 0.001), 3)
         results.sort(key=lambda r: r["score"], reverse=True)
         return results[:limit]
+
+    def _labels_or_none(self, word):
+        try:
+            return self.labels().get(word, (None, None))
+        except Exception:
+            return (None, None)
 
     def read(self, ref, max_chars=12000):
         path = self.resolve(ref)
@@ -491,7 +558,7 @@ class Vault:
         is weak. Lines go into the brain's prompt as data, never as instructions."""
         if len((text or "").strip()) < 12:
             return []
-        asked = {stem(w) for w in terms(text)}
+        asked = {stem(w) for w in self.expand(terms(text))}
         lines, used, hits = [], 0, self.search(text, limit=limit * 3)
         top = max((h["score"] for h in hits), default=0)
         for hit in hits:
