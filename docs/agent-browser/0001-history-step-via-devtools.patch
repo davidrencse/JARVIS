@@ -1,0 +1,80 @@
+diff --git a/cli/src/native/actions.rs b/cli/src/native/actions.rs
+index ad08409..edd55df 100644
+--- a/cli/src/native/actions.rs
++++ b/cli/src/native/actions.rs
+@@ -6762,6 +6762,57 @@ async fn handle_ischecked(cmd: &Value, state: &mut DaemonState) -> Result<Value,
+     Ok(json!({ "checked": checked, "origin": url }))
+ }
+ 
++/// Move through the tab's history with the DevTools history API instead of running
++/// `history.back()` in the page: that evaluation dies with the page it navigates away from,
++/// so a back that worked came back as "Inspected target navigated or closed". This also
++/// says plainly when there is no page to go to.
++async fn history_step(
++    mgr: &BrowserManager,
++    session_id: &str,
++    delta: i64,
++) -> Result<(), String> {
++    let history = mgr
++        .client
++        .send_command_no_params("Page.getNavigationHistory", Some(session_id))
++        .await?;
++    let current = history
++        .get("currentIndex")
++        .and_then(|v| v.as_i64())
++        .ok_or("No navigation history for this tab")?;
++    let entries = history
++        .get("entries")
++        .and_then(|v| v.as_array())
++        .ok_or("No navigation history for this tab")?;
++    let target = current + delta;
++    // The blank page a new tab starts on is not somewhere to go back to.
++    let blank = |i: i64| {
++        entries
++            .get(i as usize)
++            .and_then(|e| e.get("url"))
++            .and_then(|u| u.as_str())
++            .map_or(false, |u| u == "about:blank")
++    };
++    if target < 0 || target as usize >= entries.len() || blank(target) {
++        return Err(if delta < 0 {
++            "There is no earlier page to go back to".to_string()
++        } else {
++            "There is no later page to go forward to".to_string()
++        });
++    }
++    let entry_id = entries[target as usize]
++        .get("id")
++        .and_then(|v| v.as_i64())
++        .ok_or("Navigation history entry has no id")?;
++    mgr.client
++        .send_command(
++            "Page.navigateToHistoryEntry",
++            Some(json!({ "entryId": entry_id })),
++            Some(session_id),
++        )
++        .await?;
++    Ok(())
++}
++
+ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
+     if let Some(ref wb) = state.webdriver_backend {
+         if state.browser.is_none() {
+@@ -6774,7 +6825,7 @@ async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
+     }
+     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+     let session_id = mgr.active_session_id()?.to_string();
+-    mgr.evaluate("history.back()", None).await?;
++    history_step(mgr, &session_id, -1).await?;
+     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+     let url = mgr.get_url().await.unwrap_or_default();
+     state.ref_map.invalidate_page(&session_id);
+@@ -6793,7 +6844,7 @@ async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
+     }
+     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+     let session_id = mgr.active_session_id()?.to_string();
+-    mgr.evaluate("history.forward()", None).await?;
++    history_step(mgr, &session_id, 1).await?;
+     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+     let url = mgr.get_url().await.unwrap_or_default();
+     state.ref_map.invalidate_page(&session_id);
