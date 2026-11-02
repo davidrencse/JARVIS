@@ -38,6 +38,14 @@ def _clock(hhmm):
     return f"{hour}{f':{minute:02d}' if minute else ''} {suffix}"
 
 
+def _day(text):
+    """A date from ISO text, or None when it is missing or not a real date."""
+    try:
+        return date.fromisoformat(str(text or "")[:10])
+    except ValueError:
+        return None
+
+
 def _when(day, today):
     if day == today:
         return "today"
@@ -159,9 +167,9 @@ def tasks_line(tasks, today, limit=2):
     due_today = [t for t in agenda["today"] if t["due"] == today.isoformat() or t["scheduled"]]
     if due_today:
         parts.append(f"Due today: {_join(_say(t['title']) for t in due_today[:3])}.")
-    soon = agenda["upcoming"][:limit]
+    soon = [t for t in agenda["upcoming"] if _day(t["due"] or t["scheduled"])][:limit]
     if soon:
-        parts.append("Coming up: " + _join(f"{_say(t['title'], 50)} {_when(date.fromisoformat(t['due'] or t['scheduled']), today)}"
+        parts.append("Coming up: " + _join(f"{_say(t['title'], 50)} {_when(_day(t['due'] or t['scheduled']), today)}"
                                            for t in soon) + ".")
     return " ".join(parts)
 
@@ -242,8 +250,8 @@ def answer(text, vault, tasks, now=None, memory=None):
             if not overdue:
                 return "Nothing is overdue."
             def was(t):
-                due = date.fromisoformat(t["due"])
-                return f"{_say(t['title'])}, due {due:%B} {_ordinal(due.day)}"
+                due = _day(t["due"])
+                return f"{_say(t['title'])}, due {due:%B} {_ordinal(due.day)}" if due else _say(t["title"])
             return f"{len(overdue)} overdue: " + _join(was(t) for t in overdue[:4]) + "."
         parts = [tasks_line(tasks, today), deadlines_line(vault, today, limit=3)]
         return " ".join(p for p in parts if p) or "Nothing is due in the next week."

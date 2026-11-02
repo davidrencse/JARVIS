@@ -34,12 +34,15 @@ import zlib
 
 MAX_BYTES = 32 * 1024 * 1024
 TEXT = "text/plain;charset=utf-8"
+TRANSIENT = "jarvis-clip-transient"  # grokbot writes the digest of its temporary paste here
 # Executed by the remote shell: read this module's source from stdin, run its serve().
 BOOTSTRAP = ("python3 -c 'import sys;r=sys.stdin.buffer;g={\"__name__\":\"jarvis_clip\"};"
              "exec(r.read(int(r.readline())),g);g[\"serve\"]()'")
 
 
 def digest(kind, data):
+    if kind == "text":  # CRLF and LF copies of the same text must hash alike (Windows adds CRs)
+        data = data.replace(b"\r\n", b"\n")
     return hashlib.sha256(kind.encode() + b"\0" + data).hexdigest()
 
 
@@ -168,6 +171,18 @@ class Wayland:
                                 timeout=10)
         return result.stdout if result.returncode == 0 else None
 
+    def _transient(self):
+        """Digest of JARVIS's own temporary copy (Grok prompt paste), while it's fresh."""
+        runtime = self.env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        try:
+            path = os.path.join(runtime, TRANSIENT)
+            if time.time() - os.path.getmtime(path) > 60:
+                return None
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
     def read(self):
         types = (self._paste("--list-types") or b"").decode(errors="replace").split()
         if "x-kde-passwordManagerHint" in types:
@@ -179,6 +194,8 @@ class Wayland:
         for kind in (TEXT, "UTF8_STRING", "text/plain", "TEXT", "STRING"):
             if kind in types:
                 data = self._paste("--no-newline", "--type", kind)
+                if data and digest("text", data) == self._transient():
+                    return None
                 return ("text", data) if data else None
         return None
 
@@ -539,12 +556,53 @@ def connect(device, board, log, target=None, state=None):
         proc.wait()
 
 
+CODE_FILE = "clipboard.code"  # the code fingerprint the running watcher was started with
+
+
+def _record_code(state):
+    try:
+        from .deploy import code_fingerprint
+        with open(os.path.join(state, CODE_FILE), "w") as out:
+            out.write(code_fingerprint())
+    except Exception:  # never stop the watcher over bookkeeping
+        pass
+
+
+def refresh(state, log=print):
+    """Restart a running watcher that is on older code. It is its own long-lived process,
+    so neither a service restart nor a node's code update reached it (audit 2026-11-01:
+    both laptops' watchers had run unchanged for days). The hub and the node call this
+    when they start. True when it was restarted."""
+    if not _pid(state):
+        return False
+    try:
+        from .deploy import code_fingerprint
+        live = code_fingerprint()
+        with open(os.path.join(state, CODE_FILE)) as f:
+            started = f.read().strip()
+    except OSError:
+        started = None
+    except Exception:
+        return False
+    if started == live:
+        return False
+    stop(state)
+    for _ in range(50):
+        if not _pid(state):
+            break
+        time.sleep(0.1)
+    result = start(state)
+    log(f"clipboard watcher restarted on the current code ({live}): {result.get('started')}")
+    return bool(result.get("started"))
+
+
 def run(config, state, device_name=None):
     """Keep the link up: reconnect with backoff (sleep, Wi-Fi changes, the peer rebooting)."""
     from .topology import enabled
     from .transfer import ssh_device
     state = os.path.abspath(state)
     os.makedirs(os.path.join(state, "logs"), exist_ok=True)
+    _record_code(state)
     log = _log_line(os.path.join(state, "logs", "clipboard.log"))
     if enabled(config):
         with open(os.path.join(state, "clipboard.pid"), "w") as pid:

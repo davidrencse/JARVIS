@@ -123,7 +123,7 @@ def main():
     orch.add_argument("--timeout", type=int, default=1800)
     orch.add_argument("--max-steps", type=int, default=20)
     vc = sub.add_parser("voice", help="Spoken I/O")
-    vc.add_argument("action", choices=("setup", "say", "usage", "demo", "use", "enroll",
+    vc.add_argument("action", choices=("setup", "say", "usage", "demo", "use", "enroll", "tune-mic",
                                        "recalibrate", "test", "listen", "start", "stop",
                                        "status", "autostart", "agent-setup", "agent"))
     vc.add_argument("text", nargs="?")
@@ -178,6 +178,7 @@ def main():
     ev.add_argument("--show", type=int, default=5, help="failures listed per part")
     ev.add_argument("--no-save", action="store_true", help="don't append to .jarvis/eval/runs.jsonl")
     ev.add_argument("--json", action="store_true", help="machine-readable output")
+    sub.add_parser("brain-tools", help="The brain's tools as an MCP server on stdio (for a Claude brain)")
     st = sub.add_parser("selftest", help="Live checks with PASS/WARN/FAIL flags")
     st.add_argument("suite", choices=("keyboard",))
     st.add_argument("--capture", action="store_true",
@@ -365,6 +366,9 @@ def main():
             else:
                 print(selftest.render(results))
             return 1 if any(r["flag"] == "FAIL" for r in results) else 0
+        elif args.command == "brain-tools":
+            from .tools_mcp import serve
+            return serve(config, base, args.state)
         elif args.command == "eval":
             from . import scorecard
             report = scorecard.run(config, base, args.state, args.cases or scorecard.CASES,
@@ -815,18 +819,24 @@ def cognition(args, config, base):
             # phrase, then the listener restarts and starts at login. `text` picks a mic.
             from .onboard import run_terminal
             emit(run_terminal(args.state, config, device=args.text or None))
+        elif args.action == "tune-mic":
+            # Only the mic part of setup: room noise, one phrase, cutoffs fitted to this mic
+            # (.jarvis/voice/mic.json), then a check against the voiceprint, which is kept.
+            from .onboard import run_terminal
+            emit(run_terminal(args.state, config, device=args.text or None, mic_only=True))
         elif args.action == "recalibrate":
             from .listen import VoicePrint
             emit(VoicePrint(args.state, config).recalibrate())
         elif args.action == "test":
-            from .listen import VoicePrint, record_utterance
+            from .listen import VoicePrint, mic_settings, record_utterance
             ears = VoicePrint(args.state, config)
+            tuning = mic_settings(args.state)  # the mic and cutoffs the listener really uses
             print("Speak; each phrase prints its score. Have someone else talk too. "
                   "Ctrl+C to stop.", file=sys.stderr)
             while True:
-                audio = record_utterance()
+                audio = record_utterance(tuning=tuning)
                 if audio is not None:
-                    ok, score = ears.verify(audio, args.threshold)
+                    ok, score = ears.verify(audio, args.threshold, learn=False)  # a test never changes the print
                     print(f"{'ACCEPT' if ok else 'reject'}  similarity {score}", file=sys.stderr)
         elif args.action == "listen":
             from .daemon import listen_loop

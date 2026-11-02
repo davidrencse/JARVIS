@@ -80,7 +80,9 @@ def enabled(config):
 def _cutoff(now=None):
     """Local midnight today, as the UTC ISO time memory rows use."""
     now = (now or datetime.now(timezone.utc)).astimezone()
-    return now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    # Rebuilt from the local date, so the offset is the one in force at midnight (a DST
+    # change day has a different offset than the current time).
+    return datetime(now.year, now.month, now.day).astimezone(timezone.utc)
 
 
 def last_run(memory):
@@ -181,15 +183,11 @@ def parse(raw, ids, known):
 
 
 def chatgpt_ask(config, base):
-    """ask(prompt) -> reply text, on a fresh tool-free ChatGPT thread closed afterwards."""
+    """ask(prompt) -> reply text, a fresh tool-free session closed afterwards: ChatGPT, or
+    Claude while ChatGPT's plan is over its limit (inference.ask, role "consolidate")."""
     def ask(text):
-        from .chatgpt import ChatGPTLane
-        lane = ChatGPTLane(config, base, max_turns=1, timeout=TIMEOUT, instructions=INSTRUCTIONS,
-                           overrides=['web_search="disabled"'])
-        try:
-            return lane.ask(text)
-        finally:
-            lane.close()
+        from .inference import ask as infer
+        return infer(config, base, "consolidate", text, instructions=INSTRUCTIONS)
     return ask
 
 

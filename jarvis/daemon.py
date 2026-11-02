@@ -200,7 +200,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
         emit(state, "voice.ready", device=stt.device)
         failures, mic, armed, armed_by_owner, chatting = 0, None, 0.0, False, 0.0
         pending = None  # a cut-off command ("open up") waiting for its rest (fragments.py)
-        from .fragments import complete as complete_fragment, judge as judge_fragment
+        from .fragments import complete as complete_fragment, completes as completes_fragment, \
+            judge as judge_fragment
         from .parse import parse_for
         from .topology import enabled as cluster_on, identity
         here = identity(config)[0] if cluster_on(config) else next(iter(config.get("devices") or {"pc": 0}))
@@ -217,7 +218,6 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
             try:
                 mic = mic or LiveMic(tuning=mic_settings(state))  # device + cutoffs from setup
                 audio = record_utterance(mic=mic)
-                failures = 0  # the mic works again; only consecutive failures back off
                 if audio is None:  # silence or a short noise: keep the brain warm
                     warm_quietly(lane)
                     continue
@@ -232,6 +232,10 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 check = pool.submit(ears.verify, audio, threshold)
                 text = pool.submit(stt, audio) if stt.device == "cuda" else None
                 is_owner, score = check.result()
+                # Only now does the pass count as working: a voice check that keeps raising
+                # (corrupt voiceprint) must back off, not apologise for every noise (audit
+                # 2026-11-01: the counter was reset as soon as the mic delivered audio).
+                failures = 0
                 # A near miss (David further from the mic, quieter, music behind him) is
                 # accepted only when it also starts with "Jarvis"; strangers score far lower.
                 settings = config.get("voice", {})
@@ -296,7 +300,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     voice.say(UNCLEAR, wait=True)
                     mic.flush()
                     continue
-                if pending and began < pending[1] and (follow_up or len(request.split()) <= 4):
+                if pending and began < pending[1] and completes_fragment(pending[0], request, understood):
                     request = complete_fragment(pending[0], request)  # "open up" + "Spotify"
                 pending = None
                 verdict, ask_back = judge_fragment(request, follow_up=follow_up, understood=understood)

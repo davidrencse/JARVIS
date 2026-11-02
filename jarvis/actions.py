@@ -60,6 +60,7 @@ CLAUSE = re.compile(r"[.!?;,:]+|\b(?:and|then|also)\b", re.I)
 DEVICEISH = re.compile(r"\bon\s+(?:the\s+|my\s+)?(?:arch|asus|zenbook|linux|dell|windows|"
                        r"other\s+(?:laptop|computer|pc|one))\b", re.I)
 VERB = re.compile(rf"\b(?:{VERBS})\b", re.I)
+ALL_APPS = frozenset({"*", "all", "any", "everything", "all apps", "apps", "installed"})
 # Questions about what's installed are answered by list_apps, a tool only the action brain has.
 APPISH = re.compile(r"\b(?:what|which|list|any|how\s+many|count)\b.{0,40}\b(?:apps?|applications|programs|software|shortcuts?)\b|"
                     r"\b(?:installed|have)\b.{0,30}\bon\s+(?:the\s+|my\s+)?\w+\s+(?:laptop|pc|computer)\b|"
@@ -242,6 +243,8 @@ class DesktopTools:
                 return self.open_app(str(args.get("name", "")))
             if name == "list_apps":
                 query = str(args.get("query", "")).strip()
+                if query.casefold() in ALL_APPS:  # models write "all" or "*" for every app (eval 2026-11-02)
+                    query = ""
                 if not query:  # "what apps are on my laptop": all of them, by name
                     names = sorted({a["Name"] for a in self.apps()}, key=str.casefold)
                     if not names:

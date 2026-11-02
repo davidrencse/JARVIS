@@ -34,6 +34,21 @@ LAUNCHERS = SHELLS | {"env", "npx", "npm", "pnpm", "pnpx", "yarn", "bunx", "bun"
 EVENTS = {"subprocess.Popen", "os.exec", "os.posix_spawn", "os.spawn", "os.system", "os.startfile"}
 
 
+# Tests must never start a real app or change real playback/volume either: on 2026-11-01 a
+# voice-loop test sent "open up <app>" through the real executor and launched it on every
+# suite run, including the hub's release test runs. The same hook refuses these programs.
+APP_LAUNCHERS = {"gtk-launch", "xdg-open", "kioclient", "kioclient5", "kde-open", "kde-open5",
+                 "gnome-open", "exo-open", "playerctl", "wpctl", "explorer"}
+APP_SUBCOMMANDS = {"gio": {"launch", "open"}, "flatpak": {"run"}}
+
+
+def _launches_app(program, words):
+    if program in APP_LAUNCHERS:
+        return True
+    verbs = APP_SUBCOMMANDS.get(program)
+    return bool(verbs) and any(w in verbs for w in words[1:3])
+
+
 def _stem(word):
     return Path(os.fsdecode(word).strip("\"'")).stem.lower()
 
@@ -63,6 +78,13 @@ def _refuse_models(event, args):
     if blocked:
         raise PermissionError(f"Blocked {', '.join(blocked)}: real model calls "
                               "are off while tests run (JARVIS_NO_MODELS). Substitute a fake.")
+    stems = [_stem(w) for w in words]
+    starts = [i for i, w in enumerate(stems) if w in APP_LAUNCHERS or w in APP_SUBCOMMANDS]
+    if _launches_app(program, stems) or (
+            (program in LAUNCHERS or event == "os.system")
+            and any(_launches_app(stems[i], stems[i:]) for i in starts)):
+        raise PermissionError(f"Blocked {program}: tests never launch real apps or change "
+                              "real playback (JARVIS_NO_MODELS). Mock the executor.")
     # A test that hands a child its own environment still passes the guard on to it, so a
     # `python -m jarvis` child refuses models too.
     env = args[3] if event == "subprocess.Popen" else None

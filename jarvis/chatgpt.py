@@ -552,6 +552,20 @@ class Brain:
                 self.act.tool_log = earlier
 
     def ask(self, text, recall=(), on_sentence=None):
+        try:
+            return self._ask_lanes(text, recall, on_sentence)
+        except Exception as exc:
+            # This turn's own tool calls, read now: Brain.tool_log follows self.last, which a
+            # concurrent request (another console tab) can move before the caller looks
+            # (audit 2026-11-01), so the failed-turn report could lose or borrow tools.
+            if not hasattr(exc, "tool_log"):
+                try:
+                    exc.tool_log = list(getattr(self.last, "tool_log", None) or ())
+                except Exception:
+                    pass
+            raise
+
+    def _ask_lanes(self, text, recall=(), on_sentence=None):
         if self.pick(text) == "act":
             return self._act(text, recall, on_sentence)
         # Talk has no tools; it answers HANDOFF when it sees an action the regexes missed.
@@ -813,19 +827,13 @@ class ConfirmGate:
                        f"{prompt(item)} Do not retry or work around it.")
 
 
-def make_lane(config, base, state_dir=None):
-    """The configured brain: ChatGPT (default) or Claude; with actions unless disabled,
-    long-term memory always, and David's Obsidian vault when `vault.path` is configured."""
-    from .topology import is_node
-    if is_node(config):
-        from .cluster import ProxyLane
-        return ProxyLane(config, state_dir or Path(base) / ".jarvis")
-    if config.get("routing", {}).get("brain", "chatgpt") == "claude":
-        from .fastlane import FastLane
-        return FastLane(config, base)
-    from .memory import is_memory_request
-    from .vault import VAULT_INSTRUCTIONS, Toolbox, VaultTools, is_vault_request, vault_for
-    state = Path(state_dir or Path(base) / ".jarvis")
+def brain_parts(config, base, state):
+    """What every brain is built from, ChatGPT's or Claude's: the per-thread context, the
+    toolbox (memory always; desktop, Grok and the vault when on) behind ConfirmGate, the
+    tool instructions, and ChatGPT's browser servers. inference.py and tools_mcp.py build
+    Claude's tools brain from the same parts, so both brains have the same tools and gates."""
+    from .vault import VAULT_INSTRUCTIONS, Toolbox, VaultTools, vault_for
+    state = Path(state)
     try:
         vault = vault_for(config, state)
     except (ValueError, OSError):
@@ -846,8 +854,6 @@ def make_lane(config, base, state_dir=None):
             profile = ""
         return "\n\n".join(p for p in (self_brief(config, base), profile, world, locked) if p)
 
-    chat = ChatGPTLane(config, base, context=context,
-                       instructions=INSTRUCTIONS + (TALK_HANDOFF if actions else MEMORY_HANDOFF))
     # The memory heap is the brain's own long-term memory: it doesn't depend on the vault.
     from .memory import MEMORY_INSTRUCTIONS, Memory, MemoryTools
     tools, instructions, extra = [MemoryTools(Memory(state))], [MEMORY_INSTRUCTIONS], {}
@@ -874,13 +880,41 @@ def make_lane(config, base, state_dir=None):
         tools += [VaultTools(vault, None, channel="brain", desktop=True),
                   TaskTools(tasks_for(vault), channel="brain")]
         instructions += [VAULT_INSTRUCTIONS, TASK_INSTRUCTIONS]
+    return {"context": context, "actions": actions, "vault": vault, "extra": extra,
+            "instructions": instructions,
+            "toolbox": ConfirmGate(Toolbox(*tools), config, state)}
+
+
+def make_lane(config, base, state_dir=None):
+    """The configured brain: ChatGPT (default) or Claude; with actions unless disabled,
+    long-term memory always, and David's Obsidian vault when `vault.path` is configured.
+    A ChatGPT brain fails over to a Claude brain with the same tools while ChatGPT is over
+    its plan's usage limit (inference.Failover)."""
+    from .topology import is_node
+    if is_node(config):
+        from .cluster import ProxyLane
+        return ProxyLane(config, state_dir or Path(base) / ".jarvis")
+    state = Path(state_dir or Path(base) / ".jarvis")
+    if config.get("routing", {}).get("brain", "chatgpt") == "claude":
+        from .inference import claude_brain
+        return claude_brain(config, base, state)
+    from .memory import is_memory_request
+    from .vault import is_vault_request
+    parts = brain_parts(config, base, state)
+    actions = parts["actions"]
+    chat = ChatGPTLane(config, base, context=parts["context"],
+                       instructions=INSTRUCTIONS + (TALK_HANDOFF if actions else MEMORY_HANDOFF))
     act = ChatGPTLane(config, base, timeout=240, tier_key="chatgpt_actions",
-                      instructions=" ".join(instructions),
-                      tools=ConfirmGate(Toolbox(*tools), config, state),
-                      context=context,
+                      instructions=" ".join(parts["instructions"]),
+                      tools=parts["toolbox"],
+                      context=parts["context"],
                       # Built-in web search lets the model skip the real browser; off here.
-                      overrides=['web_search="disabled"'], **extra)
+                      overrides=['web_search="disabled"'], **parts["extra"])
     from . import _under_tests
     decider = config.get("routing", {}).get("decider", True) and not _under_tests()
-    return Brain(chat, act, wants=None if actions else
-                 lambda text: is_vault_request(text) or is_memory_request(text), decider=decider)
+    brain = Brain(chat, act, wants=None if actions else
+                  lambda text: is_vault_request(text) or is_memory_request(text), decider=decider)
+    if not config.get("inference", {}).get("failover", True):
+        return brain
+    from .inference import Failover, claude_brain
+    return Failover(brain, lambda: claude_brain(config, base, state), name="brain")

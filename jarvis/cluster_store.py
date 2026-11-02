@@ -156,6 +156,22 @@ class Broker:
             return db.execute("SELECT COUNT(*) FROM jobs WHERE node=? AND state='running'",
                               (node,)).fetchone()[0]
 
+    def busy_job(self, node, grace=15):
+        """The job this node is executing right now, if still inside its deadline plus
+        `grace` seconds (a hung job stops counting as busy). None when idle."""
+        with self.db() as db:
+            row = db.execute("SELECT id, kind, payload, deadline FROM jobs WHERE node=? AND "
+                             "state='running' AND deadline>? ORDER BY created DESC LIMIT 1",
+                             (node, time.time() - grace)).fetchone()
+        if not row:
+            return None
+        try:
+            action = json.loads(row["payload"]).get("action")
+        except (ValueError, AttributeError):
+            action = None
+        return {"id": row["id"], "kind": row["kind"], "action": action or row["kind"],
+                "deadline": row["deadline"]}
+
     def nodes(self):
         with self.db() as db:
             rows = db.execute("SELECT id,capabilities,seen,info FROM nodes ORDER BY id").fetchall()
@@ -208,8 +224,12 @@ class Broker:
         return job_id
 
     def recover(self):
+        """After a hub restart nobody waits for queued work any more: running jobs are
+        uncertain and pending ones expire, so a node never runs a stale request (an
+        "open <app>" or a voice ask) minutes after its requester was told it failed."""
         with self.db() as db:
             db.execute("UPDATE jobs SET state='uncertain' WHERE state='running'")
+            db.execute("UPDATE jobs SET state='expired' WHERE state='pending'")
 
     def claim(self, node, kinds):
         with self.db() as db:

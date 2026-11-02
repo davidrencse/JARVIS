@@ -71,10 +71,24 @@ def close_process(proc, reader):
         reader.join(timeout=1)
 
 
+def _tool_name(name):
+    """mcp__jarvis__open_app -> open_app: the name the rest of JARVIS knows the tool by."""
+    return name.split("__", 2)[-1] if name.startswith("mcp__") else name
+
+
 class FastLane:
-    def __init__(self, config, base, max_turns=25, timeout=90, command=None):
-        tier = config.get("models", {}).get("claude", {}).get("low", {})
-        self.model, self.effort = tier.get("model", "haiku"), tier.get("effort", "low")
+    def __init__(self, config, base, max_turns=25, timeout=90, command=None, tier="low",
+                 system=None, mcp_config=None, allowed_tools=(), builtin_tools=None,
+                 permission_mode="plan", persona=PERSONA):
+        """tier: models.claude.<tier> in config. system: extra system prompt, or a function
+        returning it (read at each spawn, so new profile facts show in the next session).
+        mcp_config: {"mcpServers": {...}} for the CLI's --mcp-config; allowed_tools: the
+        tools it may call without asking (e.g. "mcp__jarvis"); builtin_tools: the CLI's own
+        tools (default: the read-only lookups in LEAN_FLAGS)."""
+        settings = config.get("models", {}).get("claude", {}).get(tier, {})
+        defaults = {"low": ("haiku", "low"), "mid": ("sonnet", "medium"), "high": ("opus", "high")}
+        model, effort = defaults.get(tier, defaults["low"])
+        self.model, self.effort = settings.get("model", model), settings.get("effort", effort)
         self.base, self.max_turns, self.timeout = str(base), max_turns, timeout
         self.proc, self.lines, self.turns = None, None, 0
         self._reader = None
@@ -82,16 +96,32 @@ class FastLane:
         self.lock = threading.Lock()
         self.command = command  # tests substitute a fake CLI
         self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
+        self.system, self.mcp_config, self.allowed_tools = system, mcp_config, tuple(allowed_tools)
+        self.builtin_tools, self.permission_mode, self.persona = builtin_tools, permission_mode, persona
+        self.tool_log = []  # (name, ok, text) per finished tool call this turn, like ChatGPTLane
+
+    def _args(self, binary):
+        flags = list(LEAN_FLAGS)
+        if self.builtin_tools is not None:
+            flags[flags.index("--tools") + 1] = ",".join(self.builtin_tools) or ""
+        extra = self.system() if callable(self.system) else (self.system or "")
+        prompt = "\n\n".join(p for p in (self.persona, extra) if p)
+        args = [binary, "--print", "--input-format", "stream-json", "--output-format",
+                "stream-json", "--verbose", "--include-partial-messages",
+                "--model", self.model, "--effort", self.effort,
+                "--permission-mode", self.permission_mode, "--permission-prompts", "none",
+                *flags, "--append-system-prompt", prompt]
+        if self.mcp_config:
+            args += ["--mcp-config", json.dumps(self.mcp_config)]
+        if self.allowed_tools:
+            args += ["--allowedTools", ",".join(self.allowed_tools)]
+        return args
 
     def _spawn(self):
         binary = shutil.which("claude")
         if not binary and not self.command:
             raise RuntimeError("claude CLI not found on PATH.")
-        args = self.command or [binary, "--print", "--input-format", "stream-json", "--output-format",
-                "stream-json", "--verbose", "--include-partial-messages",
-                "--model", self.model, "--effort", self.effort,
-                "--permission-mode", "plan", "--permission-prompts", "none", *LEAN_FLAGS,
-                "--append-system-prompt", PERSONA]
+        args = self.command or self._args(binary)
         self.proc = subprocess.Popen(
             args, cwd=self.base, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -151,6 +181,7 @@ class FastLane:
         self.turns += 1
         deadline = time.monotonic() + self.timeout
         pending, spoke = "", False
+        calls, self.tool_log = {}, []  # tool_use id -> name; this turn's finished calls
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -165,14 +196,34 @@ class FastLane:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if self.on_tool and event.get("type") == "assistant":
+            if not isinstance(event, dict):  # a bare number or list on stdout: not an event
+                continue
+            if event.get("type") == "assistant":
                 for block in (event.get("message") or {}).get("content") or []:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
-                        try:
-                            self.on_tool(block.get("id"), block.get("name"), True, "")
-                        except Exception:  # reporting must never fail the turn
-                            pass
-            delta = (event.get("event") or {}).get("delta") or {}
+                        calls[block.get("id")] = str(block.get("name") or "")
+                        if self.on_tool:
+                            try:
+                                self.on_tool(block.get("id"), block.get("name"), None, "")
+                            except Exception:  # reporting must never fail the turn
+                                pass
+            if event.get("type") == "user":
+                content = (event.get("message") or {}).get("content")
+                for block in content if isinstance(content, list) else []:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        name = calls.get(block.get("tool_use_id"), "tool")
+                        ok = not block.get("is_error")
+                        body = block.get("content")
+                        text = body if isinstance(body, str) else " ".join(
+                            str(b.get("text", "")) for b in body or [] if isinstance(b, dict))
+                        self.tool_log.append((_tool_name(name), ok, text[:300]))
+                        if self.on_tool:
+                            try:
+                                self.on_tool(block.get("tool_use_id"), _tool_name(name), ok, text[:300])
+                            except Exception:
+                                pass
+            inner = event.get("event") if isinstance(event.get("event"), dict) else {}
+            delta = inner.get("delta") if isinstance(inner.get("delta"), dict) else {}
             if on_sentence and event.get("type") == "stream_event" and \
                     delta.get("type") == "text_delta":
                 pending += delta.get("text", "")

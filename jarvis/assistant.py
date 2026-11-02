@@ -68,6 +68,11 @@ def _situation_on(config):
 
 def lane_label(lane, text):
     """What the brain node of the connection tree is called for this request."""
+    if type(lane).__name__ == "Failover":
+        from .chatgpt import usage_limit
+        if usage_limit() or (lane.fallback is not None and lane.last is lane.fallback):
+            return "Claude · tools (ChatGPT over its limit)"
+        lane = lane.primary
     if hasattr(lane, "pick"):
         return "ChatGPT · tools" if lane.pick(text) == "act" else "ChatGPT · talk"
     return {"FastLane": "Claude fast lane", "ChatGPTLane": "ChatGPT"}.get(
@@ -206,8 +211,10 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
             try:
                 reply = _with_tools(lane, step, lambda: lane.ask(text, recalled(),
                                                                 on_sentence=on_sentence))
+                answered = getattr(lane, "last", lane)  # Failover: the lane that really answered
                 detail = {"lane": type(lane).__name__, "streamed": on_sentence is not None,
-                          "brain": "chatgpt" if "ChatGPT" in lane_label(lane, text) else
+                          "brain": "claude" if type(answered).__name__ == "FastLane" else
+                          "chatgpt" if "ChatGPT" in lane_label(lane, text) else
                           type(lane).__name__.lower()}
                 step("brain", "route", lane_label(lane, text), "answered")
                 _standin_done()
@@ -216,7 +223,8 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                 # then part of the request happened, and the reply must say so
                 detail = {"lane_error": str(exc)}
                 step("brain", "route", lane_label(lane, text), str(exc), "fail")
-                ran = list(getattr(lane, "tool_log", None) or ())
+                ran = list(getattr(exc, "tool_log", None) if hasattr(exc, "tool_log")
+                           else getattr(lane, "tool_log", None) or ())
                 if ran:
                     reply = _partial_reply(ran)
                     detail.update(state="partial", tools=[[str(t[0]), bool(t[1])] for t in ran])
@@ -382,8 +390,8 @@ def _run_waiting(store, spec, config, base, timeout, wait=None):
 
 
 def _fastlane(config, base, timeout):
-    from .fastlane import FastLane
-    return FastLane(config, base, timeout=min(timeout, 90))
+    from .inference import claude_lane, role
+    return claude_lane(config, base, "talk", timeout=min(timeout, role(config, "talk")["timeout"]))
 
 
 # While ChatGPT is over its plan's usage limit (hours, sometimes days), every request used to
@@ -778,8 +786,18 @@ def wake_word(text, words=WAKE_WORDS):
         if not match.group(1).strip() and WAKE_SUBJECT.match(match.group(2)):
             return None  # "So Jarvis said it would rain": about it, not to it
         return match.group(2).strip()
-    match = re.match(r"^\W*(.*?\w.*?)(?:\s*,\s*(?:" + names + r")\W*|\s+(?:" + names +
-                     r")\s*\?\W*)$", text, re.I | re.S)
-    if match and "," not in text[match.end(1):] and WAKE_OBJECT.search(match.group(1)):
+    # The name closing the request. Found as the leftmost place the closing form fits, a
+    # linear scan: the old lazy `^\W*(.*?\w.*?)(...)$` took 12 s on a 20k-character paste
+    # (audit 2026-11-01), and this runs on every request.
+    lead = re.match(r"\W*", text).end()
+    word = re.search(r"\w", text[lead:])
+    if not word:
+        return None
+    tail = re.compile(r"(?:\s*,\s*(?:" + names + r")\W*|\s+(?:" + names + r")\s*\?\W*)$", re.I | re.S)
+    match = tail.search(text, lead + word.end())
+    if not match:
+        return None
+    head = text[lead:match.start()]
+    if "," not in text[match.start():] and WAKE_OBJECT.search(head):
         return None  # "Who is Jarvis?", "Did you ask Jarvis?": a question about it
-    return match.group(1).strip() if match else None
+    return head.strip()

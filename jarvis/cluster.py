@@ -46,6 +46,26 @@ NODE_API_READ_UNDER = ("/api/jobs/", "/api/tasks/", "/api/plans/")  # + one id s
 NODE_API_SUBMIT = frozenset({"/api/ask", "/api/listen", "/api/confirm"})  # also needs "ask"
 
 
+def _name(node, config):
+    return str((config.get("devices", {}).get(node) or {}).get("name") or node).title()
+
+
+def _label(action):
+    return str(action).replace("_", " ")
+
+
+def _refresh_clipboard(state):
+    """Restart the clipboard watcher if it runs older code, in the background (never delays
+    the hub or the node starting)."""
+    def run():
+        try:
+            from .clipsync import refresh
+            refresh(str(state))
+        except Exception as exc:
+            print(f"JARVIS: clipboard watcher not refreshed: {exc}", flush=True)
+    threading.Thread(target=run, name="jarvis-clip-refresh", daemon=True).start()
+
+
 class NodeOffline(ConnectionError):
     """An enrolled node was offline before any job was enqueued; SSH is safe."""
 
@@ -414,6 +434,8 @@ class Hub:
         polls), or running a job. A stopped node is none of these within FRESH seconds, so
         callers fall back to SSH at once instead of queueing a job nobody will claim.
         (status["online"], the 75 s window, only says it was seen recently.)"""
+        if self.broker.busy_job(node):
+            return True  # single-threaded executor: no polling while a long job runs
         if not status.get("online"):
             return False
         with self._condition:
@@ -422,7 +444,7 @@ class Hub:
             return True
         if status.get("seen") and time.time() - status["seen"] < FRESH:
             return True
-        return self.broker.running(node) > 0
+        return False
 
     def _await_poll(self, node, status, seconds=3):
         """Seen lately but between polls (it just sent a result and is reconnecting): give
@@ -451,6 +473,13 @@ class Hub:
             raise ValueError(f"Node {node} is not enrolled for {kind} actions.")
         if not self.alive(node, status) and not self._await_poll(node, status):
             raise NodeOffline(f"Node {node} is offline. Start jarvis cluster node on that PC.")
+        if kind == "desktop" and isinstance(payload, dict) and payload.get("action") == "terminal":
+            from .terminal import TIMEOUT as terminal_timeout
+            timeout = max(timeout, terminal_timeout + 15)  # never give up before the command can
+        busy = self.broker.busy_job(node)
+        if busy:
+            raise RuntimeError(f"{_name(node, self.config)} is busy finishing {_label(busy['action'])}; "
+                               "try again in a moment.")
         if not _read_only(kind, payload) and status.get("code") != served_code(self.state):
             # Mismatched code can misread a newer job; refuse rather than guess.
             raise ValueError(f"{node} runs different JARVIS code ({status.get('code') or 'unknown'}, "
@@ -471,7 +500,12 @@ class Hub:
                                        f"Node action {job_id} is {job['state']}; do not automatically retry.")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError(f"Node action {job_id} has no confirmed result. It may have run; do not retry.")
+                    if kind in BULK:
+                        self.broker.compact(job_id)
+                    action = payload.get("action", kind) if isinstance(payload, dict) else kind
+                    raise TimeoutError(f"The {_label(action)} action on {_name(node, self.config)} has no confirmed "
+                                       "result. It may still be running, so don't repeat it "
+                                       f"(job {job_id}).")
                 self._condition.wait(remaining)
         raise RuntimeError(f"Main stopped while waiting for {job_id}; action outcome is uncertain.")
 
@@ -537,6 +571,7 @@ class Hub:
         except BaseException:
             self._lock = None
             raise RuntimeError("The main runtime is already running for this state directory.") from None
+        _refresh_clipboard(self.state)  # the hub restarts with every code change here
         try:
             self.server = make_server(self, host, port)
             if cert or key:
@@ -892,6 +927,7 @@ class NodeWorker:
 
     def run(self):
         from .locking import exclusive_lock
+        _refresh_clipboard(self.state)  # a node restarts after each code update: bring the watcher along
         try:
             with exclusive_lock(self.state / "cluster-node.lock"):
                 delay = 1
