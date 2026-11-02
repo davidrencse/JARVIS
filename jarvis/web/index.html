@@ -18,9 +18,11 @@
 <link rel="stylesheet" href="peripherals.css">
 <link rel="stylesheet" href="console.css">
 <link rel="stylesheet" href="lab.css">
+<link rel="stylesheet" href="cockpit.css">
 <link rel="stylesheet" href="settings.css">
 <link rel="stylesheet" href="files.css">
 <link rel="stylesheet" href="connections.css">
+<link rel="stylesheet" href="laptops.css">
 <link rel="stylesheet" href="voicesetup.css">
 <script src="theme.js"></script>
 <script src="esc.js"></script>
@@ -94,131 +96,122 @@
 
 
   <main class="stage" id="stage">
-    <!-- CONSOLE -->
-    <section class="view cx lab" id="view-console" data-title="Console">
+    <!-- CONSOLE: one fixed screen. Rail (tabs) | pipeline + trace | assistant; the gate sits below. -->
+    <section class="view cx ck" id="view-console" data-title="Console">
       <span id="clock-tz" class="sr"></span>
       <dl class="sr" id="clock-facts"></dl>
-      <div class="cx-main">
-      <header class="lab-head" aria-label="JARVIS at a glance">
-        <div class="lab-title"><h2>JARVIS <span>/</span> CONSOLE</h2><p>voice · parser · brain · machines</p></div>
-        <dl class="lab-stats" id="lab-stats">
+
+      <header class="ck-head lab-head" aria-label="JARVIS at a glance">
+        <h2 class="ck-name">JARVIS</h2>
+        <dl class="ck-stats lab-stats" id="lab-stats">
           <div><dt>Runs</dt><dd id="lab-s-runs">—</dd></div>
           <div><dt>Memory</dt><dd id="lab-s-memory">—</dd></div>
           <div><dt>Machines</dt><dd id="lab-s-machines">—</dd></div>
           <div><dt>Voice</dt><dd id="lab-s-voice">—</dd></div>
           <div><dt>Brain</dt><dd id="lab-s-brain">—</dd></div>
         </dl>
+        <p class="ck-funnel" id="ck-funnel" aria-live="polite" title="This session: requests, how they were handled, and how many needed your OK">No requests yet this session</p>
         <div class="lab-progress" aria-hidden="true"><i id="lab-progress"></i></div>
       </header>
-      <section class="lab-stage" id="lab-stage" aria-label="Pipeline wheel: every stage of the current request, live">
-        <canvas id="lab-wheel" aria-hidden="true"></canvas>
-        <div class="lab-tag" id="lab-tag" hidden><b></b><span></span></div>
-        <p class="lab-state" id="lab-state" role="status" aria-live="polite">Idle · waiting for “Jarvis, …”</p>
-      </section>
-      <section class="cx-hero" aria-label="Claude output, last 48 hours">
-        <header class="cx-rule"><h2>Claude output</h2><span>tokens per hour, last 48 hours</span>
-          <a class="cx-link" href="#credits">Credits</a></header>
-        <div class="cx-output-summary">
-          <div class="cx-ridge-read">
-            <p class="cx-big" id="ridge-total">—</p>
-            <p class="cx-big-sub">tokens in the last 24 hours</p>
-          </div>
-          <dl class="cx-kv" id="ridge-facts"></dl>
-        </div>
-        <div class="cx-ridge" role="group" tabindex="0" aria-label="Claude output by hour over 48 hours" aria-describedby="ridge-key-help">
-          <canvas id="cx-ridge" aria-hidden="true"></canvas>
-          <span class="cx-tip" id="ridge-tip" aria-hidden="true" hidden><span></span></span>
-          <span class="sr" id="ridge-key-help">Use the left and right arrow keys to inspect each hour. Home selects the oldest hour; End selects the newest.</span>
-          <span class="sr" id="ridge-point-readout" role="status" aria-live="polite" aria-atomic="true"></span>
-          <div class="cx-axis" id="ridge-axis" aria-hidden="true"></div>
-        </div>
-      </section>
 
-      <div class="signals" aria-label="Signals">
-        <article class="tile" id="sig-agent">
-          <header class="tile-h"><span class="t-idx">01</span><h2>Agent</h2><span class="t-flag" id="sig-agent-flag"></span></header>
-          <p class="dot-word" id="sig-state" aria-live="polite">Idle</p>
-          <canvas class="dm dm-face" id="dm-face" aria-hidden="true"></canvas>
-          <canvas class="dm dm-wave" id="dm-wave" aria-hidden="true"></canvas>
-          <dl class="t-stats" id="sig-agent-stats"></dl>
-        </article>
-        <article class="tile" id="sig-limit">
-          <header class="tile-h"><span class="t-idx">03</span><h2>Codex window</h2><span class="t-flag" id="sig-limit-flag"></span></header>
-          <div class="ring-wrap">
-            <div class="ring-box"><canvas class="dm dm-ring" id="dm-ring" aria-hidden="true"></canvas>
-              <div class="ring-mid"><b class="dot-num sm" id="sig-ring">—</b><span>left, 5 h</span></div></div>
-            <ul class="ring-legend" id="sig-ring-legend"></ul>
-          </div>
-        </article>
-        <article class="tile" id="sig-link">
-          <header class="tile-h"><span class="t-idx">04</span><h2>Zenbook link</h2><span class="t-flag" id="sig-link-flag"></span></header>
-          <canvas class="dm dm-trace" id="dm-trace" role="img" aria-label="Zenbook ping, checked every minute"></canvas>
-          <dl class="t-stats three" id="sig-link-stats"></dl>
-          <span class="t-pill" id="sig-link-pill">Checking</span>
-        </article>
-      </div>
+      <!-- Left rail: secondary status, one tab at a time -->
+      <aside class="ck-rail ck-box" aria-label="Status">
+        <div class="ck-tabs" role="tablist" aria-label="Status">
+          <button role="tab" type="button" id="ck-t-machines" aria-controls="ck-p-machines" aria-selected="true">Machines</button>
+          <button role="tab" type="button" id="ck-t-usage" aria-controls="ck-p-usage" aria-selected="false" tabindex="-1">Usage</button>
+          <button role="tab" type="button" id="ck-t-memory" aria-controls="ck-p-memory" aria-selected="false" tabindex="-1">Memory</button>
+          <button role="tab" type="button" id="ck-t-activity" aria-controls="ck-p-activity" aria-selected="false" tabindex="-1">Activity</button>
+        </div>
 
-      <div class="cx-grid">
-        <article class="card lab-trace" id="w-trace">
-          <header class="ph"><h2>Trace / last run</h2><span class="ph-meta" id="lab-trace-meta">no run yet</span></header>
+        <section class="ck-panel" id="ck-p-machines" role="tabpanel" aria-labelledby="ck-t-machines">
+          <div class="ck-sub cx-machines">
+            <header class="ck-subh"><h3>Machines and links</h3><span class="ph-meta" id="probe-checked">checking…</span>
+              <button class="ck-mini" id="probe-refresh" type="button">Check now</button></header>
+            <div class="link-status" id="link-status"><div class="skeleton" style="height:44px"></div></div>
+            <div class="machines" id="machines"></div>
+          </div>
+          <article class="ck-sub tile" id="sig-link">
+            <header class="ck-subh tile-h"><h3>Zenbook link</h3><span class="t-flag" id="sig-link-flag"></span><span class="t-pill" id="sig-link-pill">Checking</span></header>
+            <canvas class="dm dm-trace" id="dm-trace" role="img" aria-label="Zenbook ping, checked every minute"></canvas>
+            <dl class="t-stats three" id="sig-link-stats"></dl>
+          </article>
+        </section>
+
+        <section class="ck-panel" id="ck-p-usage" role="tabpanel" aria-labelledby="ck-t-usage" hidden>
+          <article class="ck-sub tile" id="sig-limit">
+            <header class="ck-subh tile-h"><h3>Codex window</h3><span class="t-flag" id="sig-limit-flag"></span></header>
+            <div class="ring-wrap">
+              <div class="ring-box"><canvas class="dm dm-ring" id="dm-ring" aria-hidden="true"></canvas>
+                <div class="ring-mid"><b class="dot-num sm" id="sig-ring">—</b><span>left, 5 h</span></div></div>
+              <ul class="ring-legend" id="sig-ring-legend"></ul>
+            </div>
+          </article>
+          <article class="ck-sub tile" id="sig-claude">
+            <header class="ck-subh tile-h"><h3>Claude window</h3><span class="t-flag" id="sig-claude-flag"></span></header>
+            <div class="ring-wrap">
+              <div class="ring-box"><canvas class="dm dm-ring" id="dm-ring-claude" aria-hidden="true"></canvas>
+                <div class="ring-mid"><b class="dot-num sm" id="sig-ring-claude">—</b><span>left, 5 h</span></div></div>
+              <ul class="ring-legend" id="sig-ring-claude-legend"></ul>
+            </div>
+          </article>
+          <div class="ck-sub cx-credits">
+            <header class="ck-subh"><h3>Other providers</h3><span class="legend" id="credits-mini-legend"></span><span class="ph-meta" id="credits-checked"></span>
+              <a class="ck-mini" href="#credits">All</a></header>
+            <div class="credit-rows" id="credit-rows"><div class="skeleton" style="height:120px"></div></div>
+          </div>
+          <div class="ck-sub ck-wallet" id="w-balance">
+            <header class="ck-subh"><h3>DeepSeek balance</h3><button class="ck-mini" type="button" id="bal-check">Check</button></header>
+            <p class="ck-kvrow"><span id="bal-sub">Checking the provider…</span><b id="bal-num">—</b></p>
+          </div>
+        </section>
+
+        <section class="ck-panel" id="ck-p-memory" role="tabpanel" aria-labelledby="ck-t-memory" hidden>
+          <div class="ck-sub files-card" id="w-recent">
+            <header class="ck-subh"><h3>Recent memory</h3><a class="ck-mini" href="#memory">Open</a></header>
+            <ol class="pill-list" id="recent-list"><li class="skeleton" style="height:44px"></li></ol>
+          </div>
+          <div class="ck-sub">
+            <header class="ck-subh"><h3>Memory graph</h3><a class="ck-mini" href="knowledge.html">Knowledge</a></header>
+            <canvas class="mini-graph" id="mini-graph" role="img" aria-label="Memory graph preview"></canvas>
+            <dl class="facts" id="heap-facts"></dl>
+            <div class="router-mini"><span id="router-meta" class="ph-meta"></span><div id="router-body"></div></div>
+          </div>
+        </section>
+
+        <section class="ck-panel" id="ck-p-activity" role="tabpanel" aria-labelledby="ck-t-activity" hidden>
+          <article class="ck-sub tile" id="sig-agent">
+            <header class="ck-subh tile-h"><h3>Agent</h3><span class="t-flag" id="sig-agent-flag"></span></header>
+            <p class="dot-word" id="sig-state" aria-live="polite">Idle</p>
+            <canvas class="dm dm-face" id="dm-face" aria-hidden="true"></canvas>
+            <canvas class="dm dm-wave" id="dm-wave" aria-hidden="true"></canvas>
+            <dl class="t-stats" id="sig-agent-stats"></dl>
+          </article>
+          <div class="ck-sub activity" id="w-activity">
+            <div class="u-tabs" role="tablist" aria-label="Activity">
+              <button role="tab" type="button" data-act-tab="requests" aria-selected="true">Requests</button>
+              <button role="tab" type="button" data-act-tab="providers" aria-selected="false" tabindex="-1">Providers</button>
+              <button role="tab" type="button" data-act-tab="memory" aria-selected="false" tabindex="-1">Memory</button>
+            </div>
+            <table class="book" id="act-table"><tbody><tr><td class="muted">Loading…</td></tr></tbody></table>
+          </div>
+        </section>
+      </aside>
+
+      <!-- Centre: what JARVIS is doing right now -->
+      <section class="ck-center" aria-label="Current request">
+        <section class="ck-box lab-stage" id="lab-stage" aria-label="Pipeline: every stage of the current request, live">
+          <canvas id="lab-wheel" aria-hidden="true"></canvas>
+          <div class="lab-tag" id="lab-tag" hidden><b></b><span></span></div>
+          <p class="lab-state" id="lab-state" role="status" aria-live="polite">Idle · waiting for “Jarvis, …”</p>
+        </section>
+        <article class="ck-box lab-trace" id="w-trace">
+          <header class="ph"><h2>Trace</h2><span class="ph-meta" id="lab-trace-meta">no run yet</span></header>
           <ol class="lab-steps" id="lab-steps" aria-live="polite"><li class="muted">Ask something and each stage appears here as it runs.</li></ol>
         </article>
-        <article class="card cx-w3 files-card" id="w-recent">
-          <header class="ph"><span class="ph-icon dark" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-database"/></svg></span><h2>Recent memory</h2>
-            <a class="round-btn sm" href="#memory" aria-label="Open memory"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-layout-grid"/></svg></a></header>
-          <ol class="pill-list" id="recent-list"><li class="skeleton" style="height:44px"></li></ol>
-        </article>
+      </section>
 
-        <article class="card cx-w3 cx-machines">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-laptop-minimal"/></svg></span><h2>Machines and links</h2>
-            <span class="ph-meta" id="probe-checked">checking…</span>
-            <button class="ph-action" id="probe-refresh" type="button"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg>Check now</button>
-            <a class="round-btn sm" href="#devices" aria-label="Open devices"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
-          <div class="link-status" id="link-status"><div class="skeleton" style="height:44px"></div></div>
-          <div class="machines" id="machines"></div>
-        </article>
-
-        <article class="card cx-w2 cx-credits">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-gauge"/></svg></span><h2>Credits</h2>
-            <span class="legend" id="credits-mini-legend"></span><span class="ph-meta" id="credits-checked"></span>
-            <a class="round-btn sm" href="#credits" aria-label="All providers"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a>
-          </header>
-          <div class="credit-rows" id="credit-rows"><div class="skeleton" style="height:180px"></div></div>
-        </article>
-
-        <article class="card wallet" id="w-balance">
-          <header class="wallet-h"><span class="mono-avatar" aria-hidden="true">D</span>
-            <div><b>DeepSeek</b><span>API balance, live</span></div>
-            <a class="round-btn sm" href="#credits" aria-label="All providers"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-gauge"/></svg></a></header>
-          <p class="wallet-big" id="bal-num">—</p>
-          <p class="wallet-sub" id="bal-sub">Checking the provider…</p>
-          <div class="wallet-actions">
-            <button class="pill-act" type="button" id="bal-check"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-refresh-cw"/></svg> Check now</button>
-            <a class="pill-act" href="#credits"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-keyboard"/></svg> Balances</a>
-          </div>
-        </article>
-
-        <article class="card cx-w2 activity" id="w-activity">
-          <div class="u-tabs" role="tablist" aria-label="Activity">
-            <button role="tab" type="button" data-act-tab="requests" aria-selected="true">Requests</button>
-            <button role="tab" type="button" data-act-tab="providers" aria-selected="false" tabindex="-1">Providers</button>
-            <button role="tab" type="button" data-act-tab="memory" aria-selected="false" tabindex="-1">Memory</button>
-          </div>
-          <table class="book" id="act-table"><tbody><tr><td class="muted">Loading…</td></tr></tbody></table>
-        </article>
-
-        <article class="card cx-w3">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-waypoints"/></svg></span><h2>Memory graph</h2>
-            <a class="round-btn sm" href="knowledge.html" aria-label="Open the knowledge engine"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-arrow-up-right"/></svg></a></header>
-          <canvas class="mini-graph" id="mini-graph" role="img" aria-label="Memory graph preview"></canvas>
-          <dl class="facts" id="heap-facts"></dl>
-          <div class="router-mini"><span id="router-meta" class="ph-meta"></span><div id="router-body"></div></div>
-        </article>
-      </div>
-      </div>
-
-      <aside class="card assistant col-thread cx-side" aria-label="Assistant">
-          <header class="ph"><span class="ph-icon" aria-hidden="true"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-audio-lines"/></svg></span><h2>Assistant</h2>
+      <aside class="ck-box assistant col-thread cx-side ck-side" aria-label="Assistant">
+          <header class="ph"><h2>Assistant</h2>
             <button class="ph-action" id="thread-clear" type="button">Clear</button></header>
           <section class="agent-screen" id="agent-screen" aria-label="Agent browser, live" hidden>
             <div class="as-bar">
@@ -246,9 +239,9 @@
             <img id="as-dlg-img" alt="The agent browser's current page, large">
           </dialog>
           <ol class="thread" id="thread" role="log" aria-label="Conversation"></ol>
-          <div class="listener-log" id="listener-log"></div>
+          <details class="ck-log"><summary>Listener log</summary><div class="listener-log" id="listener-log"></div></details>
           <div class="dock-home" id="dock-home"></div>
-        </aside>
+      </aside>
     </section>
 
     <!-- RUN: one plan on one screen -->
@@ -455,6 +448,20 @@
         </div>
       </div>
     </section>
+
+    <!-- THE GATE: everything JARVIS is waiting on you for. Always on the console; on other
+         views it appears only while something is waiting. -->
+    <section class="gate" id="gate" aria-label="Waiting for your OK" data-empty="true">
+      <header class="gate-h">
+        <h2 class="gate-title" id="gate-title">Nothing needs your OK</h2>
+        <p class="gate-hint" id="gate-hint">JARVIS stops here before it posts, buys, sends, or clicks something it can't name.</p>
+        <div class="gate-grants" id="gate-grants" aria-label="Sites you allowed"></div>
+        <button type="button" class="gate-hist-btn" id="gate-hist-btn" aria-expanded="false" aria-controls="gate-recent">Recent</button>
+      </header>
+      <p class="sr" id="gate-say" aria-live="assertive" aria-atomic="true"></p>
+      <ol class="gate-list" id="gate-list"></ol>
+      <ol class="gate-recent" id="gate-recent" hidden></ol>
+    </section>
   </main>
 
   <!-- COMMAND DOCK -->
@@ -514,9 +521,12 @@
 <script src="flow.js"></script>
 <script src="sharedinput.js"></script>
 <script src="peripherals.js"></script>
+<script src="laptops.js"></script>
 <script src="field.js"></script>
 <script src="wheel.js"></script>
 <script src="layout.js"></script>
+<script src="gate.js"></script>
+<script src="cockpit.js"></script>
 <script src="settings.js"></script>
 </body>
 </html>

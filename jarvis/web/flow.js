@@ -52,6 +52,8 @@
   const canvas = $(".flow-canvas"), svg = $(".flow-edges");
   let pending = [], confirmBusy = false;
   async function refreshConfirmations() {
+    // The page has the gate (gate.js): confirmations live there, not in the trace.
+    if (document.getElementById("gate")) { $(".flow-confirm").hidden = true; return; }
     if (confirmBusy) return;
     try {
       const data = await J.api("/api/confirm");
@@ -82,7 +84,7 @@
     finally { confirmBusy = false; await refreshConfirmations(); }
   });
   refreshConfirmations();
-  setInterval(refreshConfirmations, 5000);
+  if (!document.getElementById("gate")) setInterval(refreshConfirmations, 5000); // the gate polls otherwise
 
   $(".flow-pin").addEventListener("click", () => { pinned = !pinned; store.set("jarvis.flow.pin", pinned); sync(); });
   $(".flow-close").addEventListener("click", () => { hidden = true; pinned = false; store.set("jarvis.flow.pin", false); sync(); });

@@ -1,0 +1,283 @@
+/* Console ("cockpit"): one fixed screen, no page scroll on a laptop.
+   head ───────────────────────────────────────────────
+   rail (tabs)  │ pipeline (wheel)        │ assistant
+                │ trace                   │
+   ─────────────────────────────────────────────────────
+   gate: what JARVIS is waiting on you for (always on the console)
+   Colour means state only: ink = running, grey = done/idle, amber = needs you, red = failed. */
+
+:root {
+  --needs: #f0a640;          /* the one accent: JARVIS is waiting for David */
+  --needs-ink: #1a1206;
+  --needs-wash: rgba(240, 166, 64, .10);
+  --bad: #ef7a6c;
+  --ck-gap: 10px;
+}
+:root[data-theme="light"] {
+  --needs: #9a5600;
+  --needs-ink: #fff8ee;
+  --needs-wash: rgba(154, 86, 0, .10);
+  --bad: #b3261e;
+}
+
+/* ---------- the grid ---------- */
+#view-console.ck {
+  display: grid;
+  grid-template-columns: minmax(260px, 300px) minmax(0, 1fr) minmax(300px, 380px);
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-areas: "head head head" "rail center side";
+  gap: var(--ck-gap);
+  height: calc(100dvh - var(--ck-top, 120px) - var(--gate-h, 64px) - 6px);
+  padding-bottom: 0; margin-bottom: 0;
+  min-height: 380px;
+  align-items: stretch;
+  align-content: stretch;
+}
+#view-console.ck > * { align-self: stretch; min-height: 0; }
+/* The old console made the assistant a sticky column with its own height: undo that here. */
+#view-console.ck .ck-side { position: relative; top: auto; height: auto; max-height: none; min-height: 0; grid-column: auto; grid-row: auto; order: 0; }
+#view-console.ck[hidden] { display: none; }
+.ck-head { grid-area: head; }
+.ck-rail { grid-area: rail; }
+.ck-center { grid-area: center; display: grid; grid-template-rows: minmax(0, 1.5fr) minmax(0, 1fr); gap: var(--ck-gap); min-height: 0; }
+.ck-side { grid-area: side; }
+
+.ck-box {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  min-height: 0;
+  min-width: 0;
+}
+
+/* ---------- header: name, counters, funnel ---------- */
+.ck-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas: "name stats" "funnel funnel";
+  align-items: baseline;
+  gap: 6px 28px;
+  padding: 2px 2px 8px;
+  border-bottom: 1px solid var(--line);
+  position: relative;
+}
+.ck-name { grid-area: name; margin: 0; font: 600 15px/1 var(--sans); letter-spacing: .02em; }
+.ck-stats { grid-area: stats; display: flex; flex-wrap: wrap; gap: 4px 26px; margin: 0; justify-content: flex-end; }
+.ck-stats > div { display: flex; gap: 8px; align-items: baseline; }
+.ck-stats dt { font: 400 12px/1 var(--sans); color: var(--ink-3); text-transform: none; letter-spacing: 0; }
+.ck-stats dd { margin: 0; font: 500 12.5px/1 var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+.ck-funnel {
+  grid-area: funnel; margin: 0;
+  font: 400 12px/1.4 var(--mono); color: var(--ink-2);
+  text-wrap: pretty;
+}
+.ck-funnel b { color: var(--ink); font-weight: 500; }
+.ck-funnel .needs { color: var(--needs); }
+.ck-funnel .sep { color: var(--ink-3); padding: 0 .5em; }
+.ck-head .lab-progress { position: absolute; left: 0; right: 0; bottom: -1px; height: 1px; }
+
+/* ---------- rail with tabs ---------- */
+.ck-rail { display: flex; flex-direction: column; overflow: hidden; }
+.ck-tabs { display: flex; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.ck-tabs button {
+  flex: 1; min-width: 0; height: 36px; padding: 0 6px;
+  background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  font: 500 12px/1 var(--sans); color: var(--ink-3); cursor: pointer;
+}
+@media (hover: hover) { .ck-tabs button:hover { color: var(--ink-2); } }
+.ck-tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); }
+.ck-tabs button:focus-visible { outline-offset: -3px; }
+.ck-panel { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 12px 12px; scrollbar-width: thin; }
+.ck-panel[hidden] { display: none; }
+
+.ck-sub { padding: 10px 0 12px; border-top: 1px solid var(--line); }
+.ck-sub:first-child { border-top: 0; }
+.ck-subh { display: flex; align-items: baseline; gap: 4px 8px; margin: 0 0 8px; padding: 0; border: 0; flex-wrap: wrap; }
+.ck-subh h3 { white-space: nowrap; }
+.ck-subh h3 { margin: 0; font: 500 12.5px/1.2 var(--sans); color: var(--ink); text-transform: none; letter-spacing: 0; }
+.ck-subh h3::before { content: none; }
+.ck-subh .ph-meta, .ck-subh .t-flag { margin-left: auto; font: 400 11px/1 var(--mono); color: var(--ink-3); }
+.ck-subh .ph-meta + .ck-mini, .ck-subh .t-flag + .t-pill { margin-left: 8px; }
+.ck-mini {
+  margin-left: auto; height: 22px; padding: 0 8px; border-radius: var(--r-sm);
+  background: none; border: 1px solid var(--line-ctl); color: var(--ink-2);
+  font: 500 11px/20px var(--sans); text-decoration: none; cursor: pointer; white-space: nowrap;
+}
+.ck-mini:hover { color: var(--ink); border-color: var(--ink-2); }
+.ck-kvrow { display: flex; justify-content: space-between; gap: 12px; margin: 0; font: 400 12px/1.4 var(--sans); color: var(--ink-2); }
+.ck-kvrow b { font: 500 13px/1.4 var(--mono); color: var(--ink); }
+.ck-kvrow b small { font-size: 11px; color: var(--ink-3); }
+
+/* tiles moved into the rail: drop their old card chrome, keep their drawings */
+#view-console.ck .tile { background: none; border: 0; box-shadow: none; padding: 10px 0 12px; border-top: 1px solid var(--line); border-radius: 0; min-height: 0; }
+#view-console.ck .ck-panel > .tile:first-child { border-top: 0; }
+#view-console.ck .tile .dm-trace { width: 100%; height: 64px; }
+#view-console.ck .tile .dm-face { width: 96px; height: 96px; margin: 4px auto; display: block; }
+#view-console.ck .tile .dm-wave { width: 100%; height: 40px; }
+#view-console.ck .ring-wrap { gap: 14px; }
+#view-console.ck .cx-hero { background: none; border: 0; padding-left: 0; padding-right: 0; }
+#view-console.ck .cx-ridge { height: 110px; }
+#view-console.ck .cx-big { font-size: 26px; }
+#view-console.ck .mini-graph { width: 100%; height: 150px; }
+#view-console.ck .activity .book { font-size: 11.5px; }
+#view-console.ck .ph-icon, #view-console.ck .t-idx { display: none; }
+
+/* ---------- centre ---------- */
+#view-console.ck .lab-stage { height: auto; min-height: 0; grid-column: auto; }
+#view-console.ck .lab-state { font: 400 11.5px/1.3 var(--mono); white-space: nowrap; background: var(--bg); padding: 2px 6px 2px 0; }
+#view-console.ck .lab-trace { display: flex; flex-direction: column; padding: 10px 14px 8px; overflow: hidden; }
+#view-console.ck .lab-trace > .ph { display: flex; align-items: baseline; gap: 10px; margin: 0 0 6px; padding: 0; border: 0; }
+#view-console.ck .lab-trace h2, .ck-side > .ph h2 { margin: 0; font: 500 13px/1.2 var(--sans); text-transform: none; letter-spacing: 0; }
+#view-console.ck .lab-trace h2::before, .ck-side > .ph h2::before { content: none; }
+#view-console.ck .lab-trace .ph-meta { margin-left: auto; font: 400 11px/1 var(--mono); color: var(--ink-3); }
+#view-console.ck .lab-trace > :not(.ph) { min-height: 0; }
+#view-console.ck .lab-trace .flow.docked { flex: 1; min-height: 0; }
+#view-console.ck .lab-trace .flow.docked .flow-body { max-height: none; }
+#view-console.ck .lab-steps { max-height: none; overflow: auto; flex: 1; }
+#view-console.ck .lab-steps .k, #view-console.ck .lab-steps .s { text-transform: none; letter-spacing: 0; font-size: 11px; }
+
+/* ---------- assistant ---------- */
+.ck-side { display: flex; flex-direction: column; overflow: hidden; padding: 10px 14px 12px; }
+.ck-side > .ph { display: flex; align-items: baseline; gap: 8px; margin: 0 0 6px; padding: 0; border: 0; flex-shrink: 0; }
+.ck-side > .ph .ph-action { margin-left: auto; }
+.ck-side .thread { flex: 1; min-height: 0; overflow-y: auto; }
+.ck-log { flex-shrink: 0; border-top: 1px solid var(--line); padding: 6px 0 0; margin-top: 6px; }
+.ck-log summary { cursor: pointer; font: 400 11.5px/1.6 var(--sans); color: var(--ink-3); list-style: none; }
+.ck-log summary::-webkit-details-marker { display: none; }
+.ck-log summary::after { content: " +"; }
+.ck-log[open] summary::after { content: " −"; }
+.ck-log .listener-log { max-height: 120px; overflow-y: auto; }
+.ck-side .dock-home { flex-shrink: 0; }
+
+/* ---------- the gate ---------- */
+.gate {
+  position: fixed; z-index: 40;
+  left: var(--gate-left, 0); right: var(--gate-right, 0); bottom: var(--gate-bottom, 10px);
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  transition: border-color var(--t) var(--ease);
+}
+.gate[hidden] { display: none; }
+.gate[data-empty="false"] { border-color: var(--needs); }
+.gate-h { display: flex; align-items: center; gap: 14px; padding: 10px 14px; min-height: 44px; flex-wrap: wrap; }
+.gate-title { margin: 0; font: 500 13px/1.2 var(--sans); color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
+.gate-title::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); flex-shrink: 0; }
+.gate[data-empty="false"] .gate-title { color: var(--needs); }
+.gate[data-empty="false"] .gate-title::before { background: var(--needs); box-shadow: 0 0 0 4px var(--needs-wash); }
+.gate-hint { margin: 0; font: 400 12px/1.3 var(--sans); color: var(--ink-3); flex: 1; min-width: 200px; }
+.gate[data-empty="false"] .gate-hint { display: none; }
+.gate-grants { display: flex; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.gate-grant {
+  display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 4px 0 9px;
+  border: 1px solid var(--line-ctl); border-radius: 999px; font: 400 11.5px/1 var(--mono); color: var(--ink-2);
+}
+.gate-grant button { width: 18px; height: 18px; border: 0; border-radius: 50%; background: none; color: var(--ink-3); cursor: pointer; font: 400 13px/1 var(--sans); }
+.gate-grant button { position: relative; }
+.gate-grant button::after { content: ""; position: absolute; inset: -3px; } /* 24 px target */
+@media (hover: hover) { .gate-grant button:hover { background: var(--hover); color: var(--ink); } }
+.gate-hist-btn {
+  height: 26px; padding: 0 10px; border-radius: var(--r-sm); background: none;
+  border: 1px solid var(--line-ctl); color: var(--ink-2); font: 500 12px/1 var(--sans); cursor: pointer;
+}
+.gate-hist-btn[aria-expanded="true"] { color: var(--ink); border-color: var(--ink-2); }
+.gate-grants:empty + .gate-hist-btn { margin-left: auto; }
+
+.gate-list, .gate-recent { list-style: none; margin: 0; padding: 0 14px; }
+.gate-list:empty { display: none; }
+.gate-list { max-height: 38vh; overflow-y: auto; padding-bottom: 12px; }
+.gate-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "what acts" "meta acts" "clock clock";
+  gap: 4px 18px; align-items: center;
+  padding: 12px 0 10px; border-top: 1px solid var(--line);
+}
+.gate-item:first-child { border-top: 0; }
+.gate-what { grid-area: what; margin: 0; font: 400 15px/1.35 var(--sans); color: var(--ink); overflow-wrap: anywhere; }
+.gate-what .verb { font-weight: 600; }
+.gate-what .target { font-family: var(--mono); font-size: 13.5px; background: var(--hover); padding: 1px 6px; border-radius: var(--r-sm); }
+.gate-meta { grid-area: meta; margin: 0; display: flex; gap: 14px; flex-wrap: wrap; font: 400 12px/1.3 var(--sans); color: var(--ink-3); }
+.gate-meta .stakes-high { color: var(--needs); }
+.gate-meta .site { font-family: var(--mono); color: var(--ink-2); }
+.gate-acts { grid-area: acts; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.gate-btn {
+  height: 34px; padding: 0 14px; border-radius: var(--r-sm); cursor: pointer;
+  font: 500 13px/1 var(--sans); border: 1px solid var(--line-ctl); background: none; color: var(--ink);
+}
+@media (hover: hover) { .gate-btn:hover:not(:disabled) { border-color: var(--ink-2); background: var(--hover); } }
+.gate-btn.go { background: var(--needs); border-color: var(--needs); color: var(--needs-ink); }
+@media (hover: hover) { .gate-btn.go:hover:not(:disabled) { filter: brightness(1.08); background: var(--needs); } }
+.gate-btn:disabled { opacity: .5; cursor: default; }
+.gate-btn:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+/* Y / A / N work while focus is in that question, so show the keys only then. */
+.gate-btn kbd { display: none; font: 400 10.5px/1 var(--mono); opacity: .7; margin-left: 6px; }
+.gate-item:focus-within .gate-btn kbd { display: inline; }
+.gate-clock { grid-area: clock; display: flex; align-items: center; gap: 10px; font: 400 11px/1 var(--mono); color: var(--ink-3); }
+.gate-clock i { flex: 1; height: 2px; background: var(--track); position: relative; overflow: hidden; border-radius: 1px; }
+.gate-clock i::after { content: ""; position: absolute; inset: 0; width: var(--left, 100%); background: var(--needs); transition: width 1s linear; }
+.gate-clock.low { color: var(--needs); }
+
+.gate-recent { padding-bottom: 10px; max-height: 26vh; overflow-y: auto; }
+.gate-recent li { display: grid; grid-template-columns: 5.5em 6.5em minmax(0, 1fr); gap: 10px; padding: 5px 0; border-top: 1px solid var(--line); font: 400 12px/1.4 var(--sans); color: var(--ink-2); }
+.gate-recent time, .gate-recent .out { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.gate-recent .out.approved, .gate-recent .out.granted { color: var(--ink); }
+.gate-recent .out.expired { color: var(--needs); }
+.gate-recent .out.rejected { color: var(--bad); }
+.gate-recent .none { display: block; color: var(--ink-3); border: 0; }
+
+/* ---------- smaller screens: stack and let the page scroll ---------- */
+@media (max-width: 1180px) {
+  #view-console.ck { padding-bottom: var(--gate-h, 64px);
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+    grid-template-areas: "head head" "center side" "rail rail";
+    /* A fixed height: the assistant column scrolls inside it instead of growing with the thread. */
+    grid-template-rows: auto clamp(560px, 78dvh, 880px) minmax(360px, auto);
+    height: auto;
+  }
+}
+@media (max-width: 760px) {
+  #view-console.ck { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "side" "center" "rail"; grid-template-rows: auto 70dvh 80dvh auto; }
+  .ck-head { grid-template-columns: 1fr; grid-template-areas: "name" "stats" "funnel"; }
+  .ck-stats { justify-content: flex-start; }
+  .gate-item { grid-template-columns: minmax(0, 1fr); grid-template-areas: "what" "meta" "acts" "clock"; }
+  .gate-acts { justify-content: flex-start; }
+}
+@media (hover: none) { .gate-item:focus-within .gate-btn kbd { display: none; } }
+@media (max-width: 760px) { .gate-list { max-height: 34dvh; } .gate-hint { display: none; } }
+/* Short windows (or 200% zoom): keep most of the screen for the page; the list scrolls. */
+@media (max-height: 560px) { .gate-list { max-height: 26dvh; } .gate-h { padding-block: 6px; min-height: 36px; } .gate-meta > span:last-child { display: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .gate, .gate-clock i::after { transition: none; }
+}
+/* Keyboard focus and anchors never land under the fixed gate. */
+#stage { scroll-padding-block-end: var(--gate-h, 0px); }
+
+/* Claude output in the narrow rail: number on top, facts as key → value rows below. */
+#view-console.ck .cx-output-summary { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 8px 0 12px; align-items: start; }
+#view-console.ck .cx-kv { grid-template-columns: minmax(0, 1fr); row-gap: 4px; }
+#view-console.ck .cx-kv div { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 0; border: 0; }
+#view-console.ck .cx-kv dt { flex: 1 1 auto; min-width: 0; }
+#view-console.ck .cx-kv dd { flex: 0 0 auto; text-align: end; overflow-wrap: normal; white-space: nowrap; }
+#view-console.ck .ck-panel { overflow-x: hidden; }
+
+/* Assistant dock: tools on the first line(s), prompt and send always together on the last. */
+.ck-side .dock-row::after { content: ""; order: 9; flex-basis: 100%; height: 0; }
+.ck-side .seg button { padding: 0 7px; }
+.ck-side .mic { padding: 0 9px 0 8px; gap: 5px; }
+.dock-in-panel .ck-side .mic[data-mode="blocked"] { color: var(--needs); border-color: var(--needs); }
+.ck-side #prompt { flex: 1 1 0; }
+.ck-side #speak-toggle { order: 11; }
+.ck-side .send { order: 12; }
+
+/* Usage tab: Codex and Claude have their rings above, so the list shows the other providers.
+   The headline figure repeats the first meter, and in the narrow rail it wrapped under it. */
+#view-console.ck .credit-rows .cr[data-id="codex"], #view-console.ck .credit-rows .cr[data-id="claude"] { display: none; }
+#view-console.ck .credit-rows .cr:has(.meters) .cr-val { display: none; }
+
+/* The gate floats over every view while something waits: let each page scroll clear of it,
+   and keep toasts (including "couldn't send your answer") above it. */
+.stage { padding-bottom: calc(20px + var(--gate-pad, 0px)); }
+.toast { z-index: 45; bottom: max(140px, calc(var(--gate-h, 0px) + var(--gate-bottom, 10px) + 12px)); }

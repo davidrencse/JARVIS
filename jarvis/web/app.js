@@ -160,7 +160,7 @@
   }
   function renderCreditRows(list) {
     const ready = list.filter((r) => r.status !== "unconfigured"), idle = list.filter((r) => r.status === "unconfigured");
-    $("#credit-rows").innerHTML = ready.map((r) => `<div class="cr">${srcMark(r)}
+    $("#credit-rows").innerHTML = ready.map((r) => `<div class="cr" data-id="${esc(r.id)}">${srcMark(r)}
         <span class="cr-name">${esc(r.name)}<small>${esc(r.blurb)}</small></span>
         ${r.meters.length ? `<div class="meters">${meters(r)}</div>` : `<span class="cr-note">${esc(r.note)}</span>`}
         ${headline(r)}
@@ -228,7 +228,7 @@
       emit("credits", state.credits);
       renderCreditRows(state.credits);
       if (!$("#view-credits").hidden) renderCreditTable(state.credits);
-    } catch (e) { $("#credit-rows").innerHTML = `<div class="empty"><b>Couldn't read credits.</b>${esc(plainError(e.message))}</div>`; }
+    } catch (e) { $("#credit-rows").innerHTML = `<div class="empty"><b>Couldn't read credits.</b>${esc(plainError(e.message))} Check that JARVIS is running, then press Check now.</div>`; }
   }
   $("#credits-refresh").addEventListener("click", async () => { const b = $("#credits-refresh"); b.disabled = true; await refreshCredits(true); b.disabled = false; announce("Credits checked."); });
 
@@ -1066,13 +1066,16 @@
   // but only a request that starts with "Jarvis" is sent; the server drops everything
   // else. Push-to-talk (Space, or with always-on off) needs no wake word.
   const micBtn = $("#mic");
-  let firstListen = true, spaceAt = 0, micRetryDelay = 1000, micRetryTimer = null;
+  let firstListen = true, spaceAt = 0, micRetryDelay = 1000, micRetryTimer = null, micDenied = false;
   const LISTENING = [["listening for “Jarvis, …” · Esc cancels", "active"]];
   const idleTrace = () => trace(mic.active && handsFree ? LISTENING : []);
   const mic = new Mic({ wave: $("#mic-wave"), onLevel: (l) => (Terrain.level = l), onAutoStop: () => stopMic() });
   function syncMicBtn() {
     micBtn.setAttribute("aria-pressed", String(handsFree || mic.active));
-    micBtn.title = handsFree ? "Always listening, but only acts on requests that start with “Jarvis”. Click to stop listening."
+    // What the button shows: waiting for "Jarvis", hearing a request, or switched on but no mic.
+    micBtn.setAttribute("data-mode", mic.active ? (mic.wait ? "wake" : "talk") : micDenied ? "blocked" : "off");
+    micBtn.title = micDenied ? "Always listening is on, but this page can't use the microphone. Allow it in the browser's site settings, then click to try again."
+      : handsFree ? "Always listening, but only acts on requests that start with “Jarvis”. Click to stop listening."
       : "Talk: click to listen all the time, or tap Space when you're not typing";
   }
   function relisten() {
@@ -1093,12 +1096,15 @@
       await mic.start({ wait: handsFree && !ptt });
       if (!mic.active) return;
       micRetryDelay = 1000;
+      micDenied = false;
       syncMicBtn();
       // Don't wipe an answer's trace when listening resumes; it clears to "listening" later.
       if (!auto || !$("#trace").children.length) trace(mic.wait ? LISTENING : [["listening · no “Jarvis” needed · stops when you pause · Esc cancels", "active"]]);
       if (!auto) announce("Listening.");
       Terrain.redraw();
     } catch (e) {
+      micDenied = e.name === "NotAllowedError" || e.name === "SecurityError";
+      syncMicBtn();
       if (handsFree) {
         syncMicBtn();
         if (e.name !== "NotAllowedError" && e.name !== "SecurityError") {
