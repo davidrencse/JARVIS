@@ -690,11 +690,20 @@ def raise_window(window):
             user32.ShowWindow(window["id"], 9)  # SW_RESTORE: a minimised window can't take focus
         ok = bool(user32.SetForegroundWindow(window["id"]))
         if not ok or int(user32.GetForegroundWindow()) != window["id"]:
-            # Windows only lets the foreground process hand focus away; a tapped Alt (down
-            # then up at once, nothing held) makes this process eligible. Standard, momentary.
-            user32.keybd_event(0x12, 0, 0, 0)
-            user32.keybd_event(0x12, 0, 2, 0)
-            ok = bool(user32.SetForegroundWindow(window["id"]))
+            # Windows only lets the foreground's input queue hand focus away, so join it for
+            # the moment of the switch (as overlay.focus does). No synthetic Alt tap: Lan
+            # Mouse's keyboard hook swallowed it and left Alt confused.
+            kernel32 = ctypes.windll.kernel32
+            me = kernel32.GetCurrentThreadId()
+            current = user32.GetForegroundWindow()
+            other = user32.GetWindowThreadProcessId(current, None) if current else 0
+            joined = bool(other and other != me and user32.AttachThreadInput(me, other, True))
+            try:
+                user32.BringWindowToTop(window["id"])
+                ok = bool(user32.SetForegroundWindow(window["id"]))
+            finally:
+                if joined:
+                    user32.AttachThreadInput(me, other, False)
     elif _backend() == "macos":
         name = macos_app_name(window["app"])
         ok = bool(name) and _osascript(f'tell application "{name}" to activate').returncode == 0
@@ -743,13 +752,18 @@ def _hypr_pointer_focus(address, window):
     except (StopIteration, KeyError, TypeError, ValueError, IndexError, OSError,
             subprocess.SubprocessError):
         return False
-    _run("hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {x}, y = {y} }})")
-    _run("hyprctl", "dispatch", f'hl.dsp.focus({{ window = hl.get_window("address:{address}") }})')
-    if _focused_now(window, wait=0.4):
-        return True
-    if len(back) == 2:  # fail-safe: leave the pointer exactly where David had it
-        _run("hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {back[0]}, y = {back[1]} }})")
-    return False
+    landed = False
+    try:
+        _run("hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {x}, y = {y} }})")
+        _run("hyprctl", "dispatch", f'hl.dsp.focus({{ window = hl.get_window("address:{address}") }})')
+        landed = bool(_focused_now(window, wait=0.4))
+    finally:
+        if not landed and len(back) == 2:  # fail-safe: leave the pointer where David had it
+            try:
+                _run("hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {back[0]}, y = {back[1]} }})")
+            except (OSError, subprocess.SubprocessError):
+                pass
+    return landed
 
 
 def close_app(name):
@@ -1111,7 +1125,12 @@ def scroll(spec):
     return True, f"Scrolled {direction}."
 
 
-BROWSER_BLOCKED = {"browser_file_upload", "browser_run_code_unsafe", "browser_evaluate"}
+BROWSER_BLOCKED = {"browser_file_upload", "browser_drop", "browser_run_code_unsafe",
+                   "browser_evaluate"}
+# Playwright tool arguments that name files: uploads read them, and `filename`/output paths
+# are written relative to the CLI's cwd (the repo), so a page could steer an overwrite.
+PLAYWRIGHT_BLOCKED_ARGS = {"filename", "path", "paths", "file", "files", "filepath", "outputpath",
+                           "outputdir", "output_dir", "outputfile", "savepath", "downloadpath"}
 AGENT_BROWSER_BLOCKED = {"agent_browser_eval"}
 # agent-browser tool arguments that become CLI flags: raw extra flags, other sessions or
 # saved states, TLS trust, JS checks, and screenshot files written to disk.
@@ -1153,6 +1172,23 @@ def _local_address(url):
     return None
 
 
+def _file_args(value):
+    """First file-naming argument key found anywhere in a Playwright tool's arguments."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if str(key).lower() in PLAYWRIGHT_BLOCKED_ARGS:
+                return str(key)
+            found = _file_args(item)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found = _file_args(item)
+            if found:
+                return found
+    return None
+
+
 def approve_browser(params):
     """JARVIS's answer when Codex asks to run an MCP tool. Only the JARVIS browsers;
     never the blocked tools; navigation only to public http(s) pages, so no file:// reads of
@@ -1162,9 +1198,14 @@ def approve_browser(params):
     message = params.get("message", "")
     tool = message.split('"')[1] if message.count('"') >= 2 else ""
     args = (params.get("_meta") or {}).get("tool_params") or {}
+    if not isinstance(args, dict):
+        return False, "the tool arguments are not readable"
     if server == "playwright":
         if not tool.startswith("browser_") or tool in BROWSER_BLOCKED:
             return False, f"{tool or 'unknown tool'} is not allowed"
+        bad = _file_args(args)
+        if bad:
+            return False, f"argument {bad} is not allowed"
     elif server == "agent_browser":
         if not tool.startswith("agent_browser_") or tool in AGENT_BROWSER_BLOCKED:
             return False, f"{tool or 'unknown tool'} is not allowed"
@@ -1195,9 +1236,12 @@ def browser_mcp(state_dir, engines=BROWSER_ENGINES):
     if "playwright" in engines:
         profile = state / "browser-profile"
         profile.mkdir(parents=True, exist_ok=True)
+        output = state / "browser-output"  # throwaway: nothing lands in the repo
+        output.mkdir(parents=True, exist_ok=True)
         servers["playwright"] = {
             "command": npx,
             "args": ["-y", PLAYWRIGHT_MCP, "--browser", "chrome", "--user-data-dir", str(profile),
+                     "--output-dir", str(output),
                      # Clicked links and page requests to the console; not a full boundary
                      # (redirects pass), so approve_browser checks every address as well.
                      "--blocked-origins", ";".join(CONSOLE_ORIGINS)],

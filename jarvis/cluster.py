@@ -12,6 +12,7 @@ import secrets
 import select
 import socket
 import ssl
+import subprocess
 import threading
 import time
 import urllib.error
@@ -128,6 +129,15 @@ def redeem_invite(config, state, client=None):
         private, public = keypair(note["node_id"])
         pending = note["pending"] = {"token": secrets.token_urlsafe(32), "private": private, "public": public}
         save_json(path, note)
+    # The main swaps the invite's SSH key for ours before it replies. If the reply is lost
+    # the tunnel must still get in, so the proposed key sits beside the invite key (the
+    # tunnel offers both) until the redeem is confirmed.
+    pending_key = Path(state) / PENDING_KEY
+    try:
+        if not pending_key.exists() or pending_key.read_text(encoding="ascii") != pending["private"]:
+            _private_file(pending_key, pending["private"])
+    except OSError:
+        pass
     client = client or Client(config, state)
     body = {"public_key": pending["public"], "token": pending["token"]}
     try:
@@ -149,10 +159,14 @@ def redeem_invite(config, state, client=None):
                            or Path(state) / "cluster-node.key"), pending["private"])
     note.pop("redeem", None)
     note.pop("pending", None)
+    pending_key.unlink(missing_ok=True)
     note["token"] = client.token = answer["token"]
     client.invite = False
     save_json(path, note)
     return {"token": True, "ssh_key": bool(answer.get("key_rotated"))}
+
+
+PENDING_KEY = "cluster-node-pending.key"  # read by cluster_tunnel.command
 
 
 class HubRefused(RuntimeError):
@@ -714,6 +728,15 @@ def make_server(hub, host, port):
                         # (jarvis send / clipboard sync), but nothing else.
                         (self.path == "/v1/control" and "files" in caps and
                          data.get("kind") == "transfer" and data.get("node") == hub.main)):
+                    if self.path == "/v1/control" and "owner" not in caps:
+                        # A node is never the owner: it may not run things on the main (only
+                        # hand it a transfer) nor start a shell anywhere.
+                        if data.get("node") == hub.main and data.get("kind") != "transfer":
+                            raise PermissionError("Nodes can't run actions on the main PC.")
+                        payload = data.get("payload")
+                        if (data.get("kind") == "desktop" and isinstance(payload, dict)
+                                and payload.get("action") == "terminal"):
+                            raise PermissionError("Nodes can't run terminal commands.")
                     timeout = data.get("timeout", 45)
                     if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 1800:
                         raise ValueError("Action timeout must be 1-1800 seconds.")
@@ -781,6 +804,7 @@ class NodeWorker:
         self.config, self.state = config, Path(state).resolve()
         self.client = Client(config, state)
         self.executor = executor or (lambda kind, payload: execute_local(kind, payload, config, state))
+        self._acts_locally = executor is None  # a test's stand-in executor: don't touch real Lan Mouse
         self.stop_event = threading.Event()
         self.outbox = self.state / "cluster-outbox.json"
         self.thread = None
@@ -881,22 +905,26 @@ class NodeWorker:
         want = response.get("code")
         if want and want != self.code:
             job = response.get("job")
-            if job:
-                # This poll also claimed a job, built for code we're about to replace. Say
-                # so at once (not run, safe to ask again) instead of dropping it, which left
-                # the caller waiting out its timeout with an uncertain outcome.
-                message = {"id": job["id"], "failed": True, "result": {
-                    "error": "Not run: this node was updating its code. Try again in a minute."}}
-                save_json(self.outbox, {"main_device": self.client.main, "message": message})
-                self._send_result(message)
             try:
                 if self._pull_update(want):
                     self.restarting = True
+                    if job:
+                        # This poll also claimed a job, built for code we're about to replace.
+                        # Say so at once (not run, safe to ask again) instead of dropping it.
+                        message = {"id": job["id"], "failed": True, "result": {
+                            "error": "Not run: this node was updating its code. Try again in a minute."}}
+                        save_json(self.outbox, {"main_device": self.client.main, "message": message})
+                        self._send_result(message)
                     return False
-            except (OSError, ValueError, RuntimeError) as exc:
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 print(f"JARVIS node: code update failed: {exc}", flush=True)
-            if job:
-                # Already reported "not run": running it now would contradict that.
+            if job and not _read_only(job.get("kind"), job.get("payload") or {}):
+                # No update happened, but the main built this job for different code: only
+                # read-only jobs are safe to run on ours.
+                message = {"id": job["id"], "failed": True, "result": {
+                    "error": "Not run: this node's code differs from the main's. Try again in a minute."}}
+                save_json(self.outbox, {"main_device": self.client.main, "message": message})
+                self._send_result(message)
                 self._record(results_sent=1)
                 return True
         job = response.get("job")
@@ -925,11 +953,25 @@ class NodeWorker:
         self._record(results_sent=1)
         return True
 
+    def _input_guard(self):
+        """Lan Mouse off while this laptop and its peer are apart (sharedinput.guard), checked
+        once a minute on its own thread so a slow check never delays a poll."""
+        from . import sharedinput
+        while not self.stop_event.wait(60):
+            try:
+                sharedinput.guard(self.state)
+            except Exception as exc:  # never let the guard take the node down
+                print(f"JARVIS node: Lan Mouse guard: {exc}", flush=True)
+
     def run(self):
         from .locking import exclusive_lock
         _refresh_clipboard(self.state)  # a node restarts after each code update: bring the watcher along
         try:
             with exclusive_lock(self.state / "cluster-node.lock"):
+                # Only the agent holding the lock guards Lan Mouse (a console's in-process
+                # worker that loses the lock must not start a second guard).
+                if self._acts_locally and (self.config.get("lan_mouse") or {}).get("off_when_apart", True):
+                    threading.Thread(target=self._input_guard, name="lanmouse-guard", daemon=True).start()
                 delay = 1
                 while not self.stop_event.is_set() and not self.restarting:
                     if self._rejoined():  # before redeem_invite, which would use the stale client
@@ -940,7 +982,7 @@ class NodeWorker:
                         redeem_invite(self.config, self.state, self.client)
                         worked = self.once()
                         delay = 1
-                    except (OSError, ValueError, RuntimeError) as exc:
+                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                         print(f"JARVIS node: {exc}", flush=True)
                         worked = False
                         delay = min(delay * 2, 15)

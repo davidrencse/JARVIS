@@ -61,7 +61,7 @@ def main():
     cb.add_argument("value", nargs="?", help="autostart: on|off")
     cb.add_argument("--device", help="the other laptop (default: every peer)")
     lm = sub.add_parser("lanmouse", help="Lan Mouse: start/stop, pairing, fingerprints, config")
-    lm.add_argument("action", choices=("start", "stop", "status", "pair", "fingerprint", "config"))
+    lm.add_argument("action", choices=("start", "stop", "status", "pair", "fingerprint", "config", "guard", "nearby"))
     lm.add_argument("--device", default="local",
                     help="start/stop/status/fingerprint: which computer (default: this one); pair: the peer")
     lm.add_argument("--peer-name", help="config: the other laptop's hostname")
@@ -179,6 +179,8 @@ def main():
     ev.add_argument("--no-save", action="store_true", help="don't append to .jarvis/eval/runs.jsonl")
     ev.add_argument("--json", action="store_true", help="machine-readable output")
     sub.add_parser("brain-tools", help="The brain's tools as an MCP server on stdio (for a Claude brain)")
+    bp = sub.add_parser("browser-proxy", help="A JARVIS browser behind its click gate, on stdio (for a Claude brain)")
+    bp.add_argument("server", help="playwright or agent_browser")
     st = sub.add_parser("selftest", help="Live checks with PASS/WARN/FAIL flags")
     st.add_argument("suite", choices=("keyboard",))
     st.add_argument("--capture", action="store_true",
@@ -293,6 +295,13 @@ def main():
                     raise ValueError("Usage: jarvis lanmouse pair --device PEER --position left|right|top|bottom "
                                      "(the side of this screen the peer sits on)")
                 emit(sharedinput.pair(config, args.state, remote.resolve(args.device), args.position, remote))
+            elif args.action == "nearby":  # read-only: are the laptops together?
+                emit(sharedinput.peer_nearby())
+            elif args.action == "guard":  # one reading; the IP watcher runs it every 30 s
+                if not (config.get("lan_mouse") or {}).get("off_when_apart", True):
+                    emit({"action": None, "note": "lan_mouse.off_when_apart is false in jarvis.config.json."})
+                else:
+                    emit(sharedinput.guard(args.state))
             elif args.action in ("start", "stop", "status"):
                 ok, text = sharedinput.control(args.action) if here else \
                     remote.call(args.device, "lan_mouse", args.action)
@@ -369,6 +378,9 @@ def main():
         elif args.command == "brain-tools":
             from .tools_mcp import serve
             return serve(config, base, args.state)
+        elif args.command == "browser-proxy":
+            from .browser_proxy import serve as relay
+            return relay(config, base, args.state, args.server)
         elif args.command == "eval":
             from . import scorecard
             report = scorecard.run(config, base, args.state, args.cases or scorecard.CASES,

@@ -114,11 +114,45 @@ def png_decode(data):
     return width, height, rows
 
 
+MAX_PURE_PIXELS = 1_500_000  # the pure-Python converters take ~10 s for 1080p: skip above this
+
+
+def _pillow():
+    try:
+        from PIL import Image
+        return Image
+    except Exception:
+        return None
+
+
 def dib_to_png(dib):
     """CF_DIB (BITMAPINFOHEADER + pixels, 24 or 32 bpp) -> PNG bytes."""
     size, width, height, _, bits, compression = struct.unpack("<IiiHHI", dib[:20])
     if bits not in (24, 32) or compression not in (0, 3):
         raise ValueError("unsupported bitmap")
+    image = _pillow()
+    if image is not None:
+        try:
+            import io
+            offset = size + (12 if compression == 3 and size == 40 else 0)
+            h = abs(height)
+            stride = ((width * bits + 31) // 32) * 4
+            mode = "BGRA" if bits == 32 else "BGR"
+            img = image.frombuffer(mode, (width, h), bytes(dib[offset:offset + stride * h]),
+                                   "raw", mode, stride, 1 if height < 0 else -1)
+            if bits == 32:
+                img = img.convert("RGBA")
+                if not any(img.getchannel("A").getdata()):
+                    img.putalpha(255)  # a 32-bpp DIB with no alpha at all is opaque
+            else:
+                img = img.convert("RGBA")
+            out = io.BytesIO()
+            img.save(out, "PNG")
+            return out.getvalue()
+        except Exception:
+            pass  # fall back to the pure-Python path
+    if width * abs(height) > MAX_PURE_PIXELS:
+        raise ValueError("bitmap too large to convert without Pillow")
     offset = size + (12 if compression == 3 and size == 40 else 0)
     stride = ((width * bits + 31) // 32) * 4
     top_down, height = height < 0, abs(height)
@@ -140,6 +174,21 @@ def dib_to_png(dib):
 
 def png_to_dib(png):
     """PNG bytes -> CF_DIB (32 bpp, bottom-up BGRA)."""
+    image = _pillow()
+    if image is not None:
+        try:
+            import io
+            img = image.open(io.BytesIO(png)).convert("RGBA")
+            width, height = img.size
+            pixels = img.tobytes("raw", "BGRA", 0, -1)  # bottom-up
+            head = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 32, 0, len(pixels),
+                               2835, 2835, 0, 0)
+            return head + pixels
+        except Exception:
+            pass  # fall back to the pure-Python path
+    width, height = struct.unpack(">II", png[16:24]) if len(png) >= 24 else (0, 0)
+    if width * height > MAX_PURE_PIXELS:
+        raise ValueError("image too large to convert without Pillow")
     width, height, rows = png_decode(png)
     pixels = bytearray()
     for row in reversed(rows):
@@ -148,6 +197,16 @@ def png_to_dib(png):
             pixels += bytes((b, g, r, a))
     head = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 32, 0, len(pixels), 2835, 2835, 0, 0)
     return head + bytes(pixels)
+
+
+def _die_with_parent():
+    """Linux: have the kernel kill wl-paste if this process dies without cleaning up
+    (SIGKILL, crash), so no `wl-paste --watch` is orphaned. Never raises."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, 15, 0, 0, 0)  # PR_SET_PDEATHSIG, SIGTERM
+    except Exception:
+        pass
 
 
 # ---- clipboards --------------------------------------------------------------------------
@@ -208,7 +267,8 @@ class Wayland:
         """Calls changed() on every clipboard change until the watcher dies."""
         proc = self.watcher = subprocess.Popen(["wl-paste", "--watch", "echo"],
                                                stdout=subprocess.PIPE,
-                                               stderr=subprocess.DEVNULL, env=self.env)
+                                               stderr=subprocess.DEVNULL, env=self.env,
+                                               preexec_fn=_die_with_parent)
         try:
             for _ in proc.stdout:
                 changed()
@@ -288,7 +348,10 @@ class Windows:
                 return ("png", data) if data else None
             if self.u.IsClipboardFormatAvailable(self.CF_DIB):
                 dib = self._get(self.CF_DIB)
-                return ("png", dib_to_png(dib)) if dib else None
+                try:
+                    return ("png", dib_to_png(dib)) if dib else None
+                except (ValueError, struct.error, IndexError, TypeError):
+                    return None
         finally:
             self.u.CloseClipboard()
         return None
@@ -297,7 +360,7 @@ class Windows:
         if kind == "png":
             try:
                 dib = png_to_dib(data)
-            except (ValueError, struct.error, zlib.error):
+            except (ValueError, struct.error, zlib.error, IndexError, TypeError, OSError):
                 dib = None  # an unusual PNG: browsers and Office still read the PNG format
         self._open()
         try:
@@ -604,6 +667,7 @@ def run(config, state, device_name=None):
     os.makedirs(os.path.join(state, "logs"), exist_ok=True)
     _record_code(state)
     log = _log_line(os.path.join(state, "logs", "clipboard.log"))
+    _own_pid_file(state)
     if enabled(config):
         with open(os.path.join(state, "clipboard.pid"), "w") as pid:
             pid.write(str(os.getpid()))
@@ -629,13 +693,82 @@ def run(config, state, device_name=None):
 PID, STARTUP_NAME, UNIT_NAME = "clipboard.pid", "JARVIS Clipboard.vbs", "jarvis-clipboard.service"
 
 
+def _own_pid_file(state):
+    """Make a SIGTERM unwind the watcher (so `finally` reaps wl-paste) and remove the pid
+    file when it exits, so a reused PID is never mistaken for it."""
+    import atexit
+    import signal
+    mine = os.getpid()
+
+    def cleanup():
+        try:
+            path = os.path.join(state, PID)
+            with open(path) as f:
+                if f.read().strip() == str(mine):
+                    os.remove(path)
+        except OSError:
+            pass
+
+    atexit.register(cleanup)
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    except (ValueError, OSError):  # not the main thread
+        pass
+
+
+def _is_watcher(pid):
+    """After a reboot a stale clipboard.pid can name an unrelated process: check it is
+    really `jarvis ... clipboard run` before trusting it (or killing it)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().split(b"\0")
+    except OSError:
+        if os.name != "nt" and os.path.isdir("/proc"):
+            return False  # /proc exists but this pid doesn't: gone
+        return _windows_is_python(pid)
+    if stat.rpartition(")")[2].split()[:1] == ["Z"]:
+        return False
+    return b"jarvis" in cmdline and b"clipboard" in cmdline and b"run" in cmdline
+
+
+def _windows_is_python(pid):
+    """No /proc: on Windows at least require the process to be a Python interpreter; elsewhere
+    the liveness probe is all there is."""
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            buf, size = ctypes.create_unicode_buffer(1024), ctypes.c_ulong(1024)
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf,
+                                                                   ctypes.byref(size))
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        return bool(ok) and "python" in os.path.basename(buf.value).lower()
+    except Exception:
+        return True
+
+
 def _pid(state):
     from .daemon import _alive
+    path = os.path.join(state, PID)
     try:
-        pid = int(open(os.path.join(state, PID)).read().strip())
+        with open(path) as f:
+            pid = int(f.read().strip())
     except (OSError, ValueError):
         return None
-    return pid if _alive(pid) else None
+    if _alive(pid) and _is_watcher(pid):
+        return pid
+    try:
+        os.remove(path)  # stale: the process is gone or the PID was reused
+    except OSError:
+        pass
+    return None
 
 
 def status(state):

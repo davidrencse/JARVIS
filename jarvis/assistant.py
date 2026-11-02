@@ -228,6 +228,14 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                 if ran:
                     reply = _partial_reply(ran)
                     detail.update(state="partial", tools=[[str(t[0]), bool(t[1])] for t in ran])
+                elif getattr(exc, "spoken", False):
+                    # Failover already let part of an answer be heard: answering again
+                    # (stand-in or one-shot) would repeat it.
+                    reply = ("I hit ChatGPT's usage limit partway through that answer. "
+                             "Ask again in a moment if you need the rest."
+                             if "usage limit" in str(exc).lower() else
+                             "That answer was cut off partway through. "
+                             "Ask again if you need the rest.")
                 elif "usage limit" in str(exc).lower() and \
                         routing.get("simple_provider", "claude") == "claude":
                     reply = _standin_reply(text, recalled(), config, base, timeout,
@@ -419,8 +427,22 @@ def _standin_reply(text, recall, config, base, timeout, on_sentence, step, detai
 def _standin_done():
     with _STANDIN["lock"]:
         lane, _STANDIN["lane"] = _STANDIN["lane"], None
-    if lane is not None:
+    if lane is None:
+        return
+    lock = getattr(lane, "lock", None)
+    if lock is not None and not lock.acquire(blocking=False):
+        # Mid-turn on another request: closing now would cut its answer. Park it again so
+        # the next _standin_done closes it.
+        with _STANDIN["lock"]:
+            if _STANDIN["lane"] is None:
+                _STANDIN["lane"] = lane
+                return
+        lock = None  # a newer stand-in took the slot: this one is orphaned, close it below
+    try:
         lane.close()
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 def _direct_reply(provider, text, recall, config, base, timeout, detail):

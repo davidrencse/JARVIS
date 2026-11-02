@@ -18,8 +18,10 @@ harmless can still pass. It narrows the risk; it doesn't remove it.
 import re
 import threading
 import time
+from urllib.parse import urlparse
 
-WAIT = 180  # seconds the browser waits for David before the action is declined
+WAIT = 180  # seconds the browser waits for David on a high-stakes action before declining
+LOW_WAIT = 60  # ...and on a low-stakes one (an unnamed element, a plain typed field)
 COMMIT = re.compile(
     r"\b(send|sent|post|posting|publish|submit|tweet|retweet|repost|reply|comment|share|"
     r"buy|purchase|pay|checkout|check out|place order|order now|donate|subscribe|"
@@ -40,8 +42,34 @@ OTP_STRONG = re.compile(r"\b(otp|2fa|mfa|two[- ]?factor|verification|one[- ]time
                         re.I)
 CHANGE_PASSWORD = re.compile(r"\b(change|update|reset|set)\b[^.]{0,25}\bpass(?:word|code)\b|"
                              r"\bpass(?:word|code)\b[^.]{0,15}\b(change|update|reset)\b", re.I)
+# Arguments that say how to act, not what is being acted on.
+NOT_LABEL = {"button", "modifiers", "type", "direction", "state", "timeout", "accept",
+             "promptText", "slowly", "submit", "doubleClick"}
+REFERENCE = re.compile(r"^@?[a-z]{0,3}\d+(?:[a-z]\d+)*$", re.I)  # @e12, e12, f1e3
 _TYPED = {}  # server -> was the last field typed into a search box (Enter is then harmless)
 _LOCK = threading.Lock()
+
+# What the page looks like, learned from the browser's own replies (browser_proxy.Relay feeds
+# these; the Codex lane never sees tool results, so there it stays empty and questions fall
+# back to what the model said). server -> {"url": str, "refs": {"e12": (role, name)}}.
+# Playwright MCP: `- button "Post" [ref=e12]` and `- Page URL: https://x.com/home`;
+# agent-browser: the same lines, refs renumbered by each snapshot (used as @e12).
+PAGES = {}
+# role, optional quoted name, then the bracketed attributes: the element's own ref is in those.
+# Anything after the colon is page text and is never read.
+SNAP_LINE = re.compile(r'^\s*-\s*([A-Za-z][\w-]*)\s*(?:"((?:[^"\\]|\\.)*)")?\s*((?:\[[^\]]*\]\s*)*)')
+REF_IN_ATTRS = re.compile(r"\bref=([A-Za-z0-9_]+)")
+URL_LINE = re.compile(r"^\s*-?\s*Page URL:\s*(\S+)", re.I | re.M)
+# Only these tools' results carry a snapshot of the page; get_text, read, console, evaluate...
+# return page-controlled text that must never rewrite refs or the URL.
+SNAPSHOT_TOOL = re.compile(r"(?:^|_)(?:snapshot|navigate|goto|open|click|type|press|select|hover|"
+                           r"fill|tabs?|drag|back|forward|reload|dialog|check|scroll|wait)", re.I)
+PAGE_STATE = re.compile(r"^#{1,4}\s*Page state\s*$", re.I | re.M)
+FENCE = re.compile(r"^```.*$", re.M)
+SHARED_SUFFIXES = ("github.io", "vercel.app", "netlify.app", "pages.dev", "herokuapp.com",
+                   "web.app", "firebaseapp.com", "blogspot.com", "workers.dev", "onrender.com",
+                   "glitch.me")
+VERBS = ("click", "type", "press", "select", "dialog", "other")
 
 
 def _tool(params):
@@ -93,6 +121,21 @@ def _typed(args):
     return out
 
 
+def _label(args):
+    """The human-readable words describing what a call acts on (element names, labels,
+    selectors with words in them); bare refs like @e12 and option flags don't count."""
+    words = []
+    for key, value in args.items():
+        if key in NOT_LABEL or key in ("text", "value", "values"):
+            continue
+        for item in _strings(value):
+            item = item.strip()
+            if item and not REFERENCE.match(item):
+                words.append(item)
+    label = " ".join(words)
+    return label if re.search(r"[A-Za-z]{3,}", label) else ""
+
+
 def blocked(tool, args):
     """Why this browser call is refused outright (credentials, card numbers, password
     changes), whatever rules.confirm says; None otherwise. `tool` is the MCP tool name."""
@@ -119,73 +162,289 @@ def blocked(tool, args):
     return None
 
 
-def commits(params):
-    """Why this browser tool call would commit something as David, or None."""
+def _clean(text, limit=60):
+    text = re.sub(r"\s+", " ", str(text or "").replace('\\"', '"')).strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _snapshot_part(text):
+    """(header, body): the text to read for the URL and for refs. A "### Page state" section
+    (the last one: earlier sections hold page-controlled results) is cut down to its header
+    lines and the fenced snapshot; text without one is used whole by callers that know it is
+    a snapshot."""
+    marks = list(PAGE_STATE.finditer(text))
+    if not marks:
+        return None
+    section = text[marks[-1].end():]
+    nxt = re.search(r"^#{1,4}\s", section, re.M)
+    section = section[:nxt.start()] if nxt else section
+    fences = list(FENCE.finditer(section))
+    if len(fences) >= 2:
+        return section[:fences[0].start()], section[fences[0].end():fences[-1].start()]
+    if fences:
+        return section[:fences[0].start()], section[fences[0].end():]
+    return section, section
+
+
+def observe(server, text, tool=None):
+    """Learn refs and the page URL from a tool result's text. `tool` is the tool that produced
+    it: only snapshot-bearing tools count ("" = unknown: then a "Page state" section is
+    required); None = a caller that already knows this is a snapshot. Page text is data: it
+    only ever names things in David's question, and only a snapshot section is read."""
+    if not isinstance(text, str) or not text:
+        return
+    if tool is not None and tool and not SNAPSHOT_TOOL.search(str(tool)):
+        return
+    part = _snapshot_part(text)
+    if part is None:
+        if tool is not None and not tool:
+            return
+        part = (text, text)
+    header, body = part
+    refs = {}
+    for line in body.splitlines():
+        match = SNAP_LINE.match(line)
+        found = REF_IN_ATTRS.search(match.group(3)) if match else None
+        if found:
+            refs[found.group(1)] = (match.group(1), _clean(match.group(2)))
+    url = URL_LINE.search(header)
+    with _LOCK:
+        page = PAGES.setdefault(server, {"url": "", "refs": {}})
+        if url and url.group(1) != page["url"]:
+            page["url"], page["refs"] = url.group(1), {}
+        if refs:
+            if "agent" in server:  # renumbered by every snapshot
+                page["refs"] = refs
+            else:
+                page["refs"].update(refs)
+
+
+def observe_result(server, result, tool=None):
+    """observe() over an MCP tools/call result ({"content": [{"type": "text", ...}]})."""
+    content = result.get("content") if isinstance(result, dict) else None
+    for part in content if isinstance(content, list) else ():
+        if isinstance(part, dict) and part.get("type") == "text":
+            observe(server, part.get("text"), "" if tool is None else tool)
+
+
+NAVIGATING = re.compile(r"navigate|goto|open|tab|back|forward|reload|close", re.I)
+
+
+def _forget_typing(server, tool):
+    """Enter is only exempt right after typing into a search box: anything else between
+    (a click, a navigation, a tab switch) ends that."""
+    if not re.search(r"type|fill", str(tool), re.I) and \
+            (INTERACTIVE.search(str(tool)) or NAVIGATING.search(str(tool))):
+        with _LOCK:
+            _TYPED[server] = False
+
+
+def observe_call(server, tool, args):
+    """A navigation names the next page before its result arrives; old refs are void."""
+    _forget_typing(server, tool)
+    url = args.get("url") if isinstance(args, dict) else None
+    if re.search(r"navigate|goto|open", str(tool), re.I) and isinstance(url, str):
+        with _LOCK:
+            PAGES[server] = {"url": url, "refs": {}}
+
+
+def site_of(url):
+    """x.com for https://mobile.x.com/home; None when there is no usable host."""
+    try:
+        host = (urlparse(url or "").hostname or "").lower()
+    except ValueError:
+        return None
+    if not host:
+        return None
+    parts = host.split(".")
+    if len(parts) < 2 or re.fullmatch(r"[\d.]+", host):
+        return host
+    if any(host == suffix or host.endswith("." + suffix) for suffix in SHARED_SUFFIXES):
+        return host  # tenants of a shared suffix are different sites
+    if len(parts) >= 3 and len(parts[-1]) == 2 and parts[-2] in ("co", "com", "org", "net", "gov", "ac", "edu"):
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def _ref_of(item):
+    for key in ("ref", "target", "selector"):
+        value = item.get(key)
+        if isinstance(value, str) and REFERENCE.match(value.strip()):
+            return value.strip()
+    return None
+
+
+def enrich(server, args):
+    """`args` plus a "resolved" entry (`button "Post"`) wherever a ref names an element the
+    last snapshot described, at the top level and in each fill_form field. blocked() and
+    commits() read it like any other description of the target."""
+    with _LOCK:
+        refs = dict((PAGES.get(server) or {}).get("refs") or {})
+    if not refs or not isinstance(args, dict):
+        return args
+
+    def resolve(item):
+        ref = _ref_of(item)
+        hit = refs.get(ref.lstrip("@")) if ref else None
+        return f'{hit[0]} "{hit[1]}"' if hit and hit[1] else None
+
+    out = dict(args)
+    found = resolve(args)
+    if found:
+        out["resolved"] = found
+    if isinstance(args.get("fields"), list):
+        fields = []
+        for item in args["fields"]:
+            found = resolve(item) if isinstance(item, dict) else None
+            fields.append({**item, "resolved": found} if found else item)
+        out["fields"] = fields
+    return out
+
+
+def _verb(tool):
+    if re.search(r"dialog", tool, re.I):
+        return "dialog"
+    if re.search(r"type|fill", tool, re.I):
+        return "type"
+    if re.search(r"press|key", tool, re.I):
+        return "press"
+    if re.search(r"select", tool, re.I):
+        return "select"
+    return "click" if re.search(r"click", tool, re.I) else "other"
+
+
+def judge(params):
+    """None when the call may run unasked; else what David is asked: {"question", "reason",
+    "verb", "target", "site", "stakes": "high"|"low", "named"}. high: commit words, Enter,
+    submit, a page dialog. named: something says what the element is (grants need that)."""
     server, tool = params.get("serverName") or "", _tool(params)
     args = (params.get("_meta") or {}).get("tool_params") or {}
     if not INTERACTIVE.search(tool):
         return None
+    args = enrich(server, args)
+    with _LOCK:
+        site = site_of((PAGES.get(server) or {}).get("url"))
+    verb = _verb(tool)
+    resolved = args.get("resolved")
+    element = args.get("element") if isinstance(args.get("element"), str) else ""
+    target = resolved or (f"“{_clean(element)}”" if element.strip() else None)
+    where = f" on {site}" if site else ""
+    named = bool(_label(args))
+
+    def out(reason, stakes, question, suffix=""):
+        return {"question": question + where + suffix, "reason": reason, "verb": verb,
+                "target": target, "site": site, "stakes": stakes, "named": named}
+
     if "dialog" in tool:
-        return "accept a page dialog" if args.get("accept", True) else None
-    # What the model says it's acting on: element descriptions, labels, selectors. Typed
-    # text itself is left out; a message body saying "post" doesn't make typing a commit.
+        return out("accept a page dialog", "high", "accept a page dialog") \
+            if args.get("accept", True) else None
     described = " ".join(s for k, v in args.items() if k not in ("text", "value", "values")
                          for s in _strings(v))
     typing = re.search(r"type|fill", tool, re.I)
     if typing:
+        # The element the ref resolves to wins over what the model called it.
+        searching = bool(SEARCH.search(resolved or described))
         with _LOCK:
-            _TYPED[server] = bool(SEARCH.search(described))
-        if args.get("submit") and not SEARCH.search(described):
-            return f"type and submit into {described[:60] or 'a field'}"
+            _TYPED[server] = searching
+        field = target or "a field the page didn't name"
+        if args.get("submit") and not searching:
+            return out(f"type and submit into {described[:60] or 'a field'}", "high",
+                       f"type into {field}", " (presses Enter)")
+        if not searching and any(re.search(r"[\r\n]", text) for _, text in _typed(args)):
+            return out(f"type text with a line break (presses Enter) into {described[:60] or 'a field'}",
+                       "high", f"type into {field}", " (presses Enter)")
+        if not searching and not named:
+            return out("type into a field the page didn't name", "low", f"type into {field}")
         return None
     if re.search(r"press|key", tool, re.I):
         key = " ".join(_strings(args)).strip().lower()
         with _LOCK:
             searching = _TYPED.get(server, False)
         if key in ("enter", "return", "numpadenter", "control+enter", "meta+enter") and not searching:
-            return f"press {key} after typing"
+            return out(f"press {key} after typing", "high", f"press {key} after typing")
         return None
+    name = re.sub(r"^(?:agent_)?browser_", "", tool).replace("_", " ")
+    ref = _ref_of(args)
     found = COMMIT.search(described)
-    return f"{tool.split('_', 1)[-1]} “{found.group(0)}” ({described[:60]})" if found else None
+    if found:
+        return out(f"{name} “{found.group(0)}” ({described[:60]})", "high",
+                   f"{name} {target or described[:60]}")
+    if not named:  # only a ref/selector like @e12: nothing says what it commits
+        shown = f"an element the page didn't name ({ref})" if ref else "an element the page didn't name"
+        return out(f"{name} on {described[:30] or 'an unnamed element'} (no label)", "low",
+                   f"{name} {shown}")
+    return None
 
 
-def gate(policy, config, state, wait=WAIT, queue=None):
+def commits(params):
+    """Why this browser tool call would commit something as David, or None."""
+    found = judge(params)
+    return found["reason"] if found else None
+
+
+def gate(policy, config, state, wait=None, queue=None):
     """approve(params) for the Codex lane: `policy` first (actions.approve_browser), then
-    David's OK for anything that commits. Blocks the tool call while it waits."""
+    David's OK for anything that commits. Blocks the tool call while it waits. `wait`
+    overrides the defaults (WAIT for high stakes, LOW_WAIT for low). While David's "allow on
+    this site" grant for a (site, verb) lasts, low-stakes calls of that kind pass; never
+    commit-like ones, refusals, or calls where the site or the element isn't known."""
     def approve(params):
         ok, why = policy(params)
         if not ok:
             return ok, why
-        refusal = blocked(_tool(params), (params.get("_meta") or {}).get("tool_params"))
+        server = params.get("serverName") or ""
+        raw = (params.get("_meta") or {}).get("tool_params")
+        refusal = blocked(_tool(params), enrich(server, raw) if isinstance(raw, dict) else raw)
         if refusal:  # not a question: refused even under rules.confirm: never
             return False, refusal
-        action = commits(params)
-        if not action:
+        info = judge(params)
+        if not info:
             return ok, why
         from .gates import asks_now
         if not asks_now(config, state):  # rules.confirm: never (read live)
             return ok, why
-        return ask(action, config, state, wait, queue)
+        try:
+            from .confirm import ConfirmQueue
+            here = queue or ConfirmQueue(state)
+            if info["stakes"] == "low" and info["site"] and info["named"] and \
+                    hasattr(here, "has_grant") and here.has_grant(info["site"], info["verb"]):
+                return True, f"allowed by David's {info['verb']} grant for {info['site']}"
+            seconds = wait if wait is not None else (WAIT if info["stakes"] == "high" else LOW_WAIT)
+            return ask(info["question"], config, state, seconds, here, info=info)
+        except Exception as exc:  # can't ask David: refuse rather than wave through
+            return False, f"Couldn't ask David ({type(exc).__name__}): {info['question']}"
     return approve
 
 
-def ask(action, config, state, wait=WAIT, queue=None):
+def ask(action, config, state, wait=WAIT, queue=None, info=None):
     from .assistant import confirmation_origin
-    from .confirm import ConfirmQueue
+    from .confirm import ConfirmQueue, notify
     queue = queue or ConfirmQueue(state)
     origin = confirmation_origin(config, state)
+    info = info or {}
+    browser = {"site": info.get("site"), "verb": info.get("verb") or "other",
+               "target": info.get("target"), "stakes": info.get("stakes") or "high",
+               "named": bool(info.get("named")), "expires_at": round(time.time() + wait, 1)}
     item = queue.park({"intent": "browser_action", "device": origin,
-                       "args": {"text": f"let the browser {action}"}}, origin, "console")
+                       "args": {"text": f"let the browser {action}", "browser": browser}},
+                      origin, "console")
+    notify(f"let the browser {action}")
     number, deadline = int(item["id"][1:]), time.monotonic() + wait
+    timed_out = f"David didn't answer in {wait:g} s (timed out): {action}"
     while time.monotonic() < deadline:
         status = queue.status(number)
         if status == "approved":
             return True, f"David approved: {action}"
-        if status in ("rejected", "expired"):
-            return False, f"David didn't approve: {action}"
+        if status == "rejected":
+            return False, f"David declined: {action}"
+        if status == "expired":
+            return False, timed_out
         time.sleep(0.5)
     try:
-        queue.reject(item["id"])
+        if hasattr(queue, "expire_item"):
+            queue.expire_item(item["id"])
+        else:
+            queue.reject(item["id"])
     except ValueError:
         pass  # answered or expired at the last moment; still declined here
-    return False, f"No answer within {wait} s: {action}"
+    return False, timed_out

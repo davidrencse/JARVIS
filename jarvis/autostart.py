@@ -110,14 +110,23 @@ def install(name, title, argv, enable=True):
             subprocess.run(["launchctl", "unload", "-w", str(target)], capture_output=True, timeout=15)
             target.unlink(missing_ok=True)
     else:
+        existed = target.is_file()
         if enable:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(systemd_unit(title, argv), encoding="utf-8")
-        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
-        subprocess.run(["systemctl", "--user", "enable" if enable else "disable", "--now", target.name],
-                       check=True, timeout=15)
-        if not enable:
+            unit = systemd_unit(title, argv)
+            changed = not existed or target.read_text(encoding="utf-8") != unit
+            target.write_text(unit, encoding="utf-8")
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
+            subprocess.run(["systemctl", "--user", "enable", "--now", target.name],
+                           check=True, timeout=15)
+            if existed and changed:  # already running on the old ExecStart
+                subprocess.run(["systemctl", "--user", "restart", target.name],
+                               check=True, timeout=15)
+        elif existed:  # never turned on: nothing to disable
+            subprocess.run(["systemctl", "--user", "disable", "--now", target.name],
+                           check=True, timeout=15)
             target.unlink(missing_ok=True)
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
     return {"autostart": enable, "path": str(target)}
 
 
