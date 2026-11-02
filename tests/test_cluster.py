@@ -241,11 +241,13 @@ class ClusterHTTPTests(unittest.TestCase):
             self.assertEqual(future.result(timeout=1), {"ok": True, "text": "node done"})
         self.assertEqual(executed, [("desktop", {"action": "volume", "arg": "5"})])
 
-    def test_node_can_control_main_only_through_main_endpoint(self):
+    def test_console_node_cannot_run_actions_on_main(self):
+        # CAPABILITIES includes the opt-in "console": still not the owner.
         with patch("jarvis.cluster.execute_local", return_value={"ok": True}) as execute:
-            self.assertEqual(self.client.request("/v1/control", {
-                "node": "main", "kind": "desktop", "payload": {"action": "volume", "arg": "5"}}), {"ok": True})
-        execute.assert_called_once()
+            with self.assertRaisesRegex(RuntimeError, "can't run actions on the main"):
+                self.client.request("/v1/control", {
+                    "node": "main", "kind": "desktop", "payload": {"action": "volume", "arg": "5"}})
+        execute.assert_not_called()
         with self.assertRaisesRegex(RuntimeError, "cannot use"):
             self.client.request("/v1/action", {"node": "main", "kind": "inventory", "payload": {}})
 

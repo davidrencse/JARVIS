@@ -178,3 +178,85 @@ class RefreshTests(unittest.TestCase):
                     mock.patch.object(clipsync, "stop") as stop:
                 self.assertFalse(clipsync.refresh(state, log=lambda *_: None))
             stop.assert_not_called()
+
+
+class PidIdentityTests(unittest.TestCase):
+    def test_reused_pid_is_not_the_watcher_and_pid_file_is_removed(self):
+        with tempfile.TemporaryDirectory() as state:
+            pidfile = os.path.join(state, clipsync.PID)
+            with open(pidfile, "w") as f:
+                f.write(str(os.getpid()))  # alive, but this test runner is not `clipboard run`
+            with mock.patch.object(clipsync, "_is_watcher", return_value=False):
+                self.assertIsNone(clipsync._pid(state))
+            self.assertFalse(os.path.exists(pidfile))
+
+    def test_stop_never_signals_an_unrelated_process(self):
+        with tempfile.TemporaryDirectory() as state:
+            with open(os.path.join(state, clipsync.PID), "w") as f:
+                f.write(str(os.getpid()))
+            with mock.patch.object(clipsync, "_is_watcher", return_value=False), \
+                    mock.patch("os.kill") as kill, \
+                    mock.patch("subprocess.run") as run:
+                self.assertFalse(clipsync.stop(state)["stopped"])
+            self.assertNotIn(15, [c.args[1] for c in kill.call_args_list])  # only the 0 probe
+            run.assert_not_called()
+
+    def test_real_watcher_cmdline_is_accepted(self):
+        argv = b"python\0-m\0jarvis\0--state\0s\0clipboard\0run\0"
+        reads = {"/proc/9/stat": "9 (python) S 1", "/proc/9/cmdline": argv}
+
+        def fake_open(path, mode="r"):
+            return io.BytesIO(reads[path]) if "b" in mode else io.StringIO(reads[path])
+
+        with mock.patch("builtins.open", fake_open):
+            self.assertTrue(clipsync._is_watcher(9))
+            reads["/proc/9/cmdline"] = b"sshd\0-D\0"
+            self.assertFalse(clipsync._is_watcher(9))
+
+    def test_pid_file_removed_when_watcher_exits(self):
+        import atexit
+        with tempfile.TemporaryDirectory() as state:
+            pidfile = os.path.join(state, clipsync.PID)
+            with open(pidfile, "w") as f:
+                f.write(str(os.getpid()))
+            registered = []
+            with mock.patch.object(atexit, "register", registered.append), \
+                    mock.patch("signal.signal") as sig:
+                clipsync._own_pid_file(state)
+            handler = sig.call_args[0][1]
+            with self.assertRaises(SystemExit):  # SIGTERM unwinds so `finally` reaps wl-paste
+                handler(15, None)
+            registered[0]()
+            self.assertFalse(os.path.exists(pidfile))
+
+
+class ImageFallbackTests(unittest.TestCase):
+    def test_truncated_png_falls_back_to_png_only(self):
+        board = clipsync.Windows.__new__(clipsync.Windows)
+        board.png, board.CF_DIB = 7, 8
+        board.u = mock.Mock()
+        board._open = mock.Mock()
+        puts = []
+        board._put = lambda fmt, data: puts.append(fmt)
+        png = png_encode(2, 2, [bytes(8), bytes(8)], alpha=True)
+        for boom in (IndexError, TypeError):
+            puts.clear()
+            with mock.patch.object(clipsync, "png_to_dib", side_effect=boom):
+                board.write("png", png)
+            self.assertEqual(puts, [7])
+
+    def test_pure_python_skipped_above_size_limit(self):
+        png = png_encode(2, 2, [bytes(8), bytes(8)], alpha=True)
+        with mock.patch.object(clipsync, "_pillow", return_value=None), \
+                mock.patch.object(clipsync, "MAX_PURE_PIXELS", 3):
+            with self.assertRaises(ValueError):
+                png_to_dib(png)
+
+    def test_pillow_and_pure_python_agree(self):
+        rows = [bytes([255, 0, 0, 255, 0, 255, 0, 128]), bytes([0, 0, 255, 255, 9, 9, 9, 0])]
+        png = png_encode(2, 2, rows, alpha=True)
+        with mock.patch.object(clipsync, "_pillow", return_value=None):
+            pure = png_to_dib(png)
+        if clipsync._pillow() is not None:
+            self.assertEqual(png_to_dib(png), pure)
+            self.assertEqual(png_decode(dib_to_png(pure)), (2, 2, rows))

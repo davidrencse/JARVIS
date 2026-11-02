@@ -94,6 +94,89 @@ class FailoverTests(unittest.TestCase):
         self.assertTrue(self.made[0].closed)
         self.assertIsNone(lane.fallback)
 
+    def test_a_busy_lane_is_closed_only_after_its_ask_returns(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+
+        class Slow(Lane):
+            def ask(self, *a, **k):
+                started.set()
+                release.wait(5)
+                return "slow"
+        primary = Slow()
+        lane = self.failover(primary)
+        with limited(False):
+            t = threading.Thread(target=lambda: lane.ask("first"))
+            t.start()
+            started.wait(5)
+            with limited():
+                lane.ask("second")  # the stand-in needs the profile: primary is mid-turn
+            self.assertFalse(primary.closed)
+            release.set()
+            t.join(5)
+        self.assertTrue(primary.closed)
+
+    def test_an_idle_primary_is_closed_for_the_stand_in(self):
+        primary = Lane()
+        lane = self.failover(primary)
+        with limited():
+            lane.ask("hi")
+        self.assertTrue(primary.closed)
+
+    def test_a_busy_standin_is_not_closed_under_its_ask(self):
+        import threading
+        started, release = threading.Event(), threading.Event()
+        standin = Lane("c")
+        orig = standin.ask
+
+        def slow(*a, **k):
+            started.set()
+            release.wait(5)
+            return orig(*a, **k)
+        standin.ask = slow
+        lane = Failover(Lane("p"), lambda: standin)
+        with limited():
+            t = threading.Thread(target=lambda: lane.ask("x"))
+            t.start()
+            started.wait(5)
+        with limited(False):
+            lane.ask("y")  # ChatGPT is back and retires the busy stand-in
+        self.assertFalse(standin.closed)
+        release.set()
+        t.join(5)
+        self.assertTrue(standin.closed)
+
+    def test_the_stand_in_is_retired_before_chatgpt_answers(self):
+        order = []
+        primary = Lane("ChatGPT answered.")
+        lane = self.failover(primary)
+        with limited():
+            lane.ask("hi")
+        standin = self.made[0]
+        standin.close = lambda: order.append("closed")
+        orig = primary.ask
+        primary.ask = lambda *a, **k: (order.append("asked"), orig(*a, **k))[1]
+        with limited(False):
+            lane.ask("again")
+        self.assertEqual(order, ["closed", "asked"])
+
+    def test_tool_log_comes_from_the_exception_when_the_lane_was_reset(self):
+        err = RuntimeError(str(LIMIT))
+        err.tool_log = [("open_app", True, "ok")]
+        lane = self.failover(Lane(error=err))  # lane.tool_log is reset by another request
+        lane.primary.ask = mock.Mock(side_effect=err)
+        lane.primary.tool_log = []
+        with limited(False), self.assertRaises(RuntimeError):
+            lane.ask("hi")
+        self.assertEqual(self.made, [])
+
+    def test_a_limit_after_output_is_marked_spoken(self):
+        lane = self.failover(Lane(error=LIMIT, speak="Sure."))
+        with limited(False):
+            with self.assertRaises(RuntimeError) as ctx:
+                lane.ask("hi", on_sentence=lambda s: None)
+        self.assertTrue(ctx.exception.spoken)
+
     def test_tool_reports_follow_the_lane_that_answered(self):
         seen = []
         lane = self.failover(Lane())

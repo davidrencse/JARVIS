@@ -157,6 +157,24 @@ class ConsolidateTest(Base):
         self.assertTrue(cons.enabled({"memory": {"consolidate": True}}))
 
 
+class MalformedReplyTest(unittest.TestCase):
+    def test_wrong_types_change_nothing_instead_of_raising(self):
+        for reply in ('{"items":[{"kind":"fact","text":"x","sources":["m1"],"same_as":["a"]}]}',
+                      '{"items":[{"kind":"fact","text":"x","sources":"m1"}]}',
+                      '{"items":[{"kind":"fact","text":"x","sources":["m1"],"replaces":5}]}',
+                      '{"items":5,"closed":7,"dropped":"d"}',
+                      '{"items":[],"closed":{"a":1},"dropped":3}'):
+            items, closed, dropped = cons.parse(reply, {"m1"}, [])
+            self.assertEqual((closed, dropped), ([], []), reply)
+            self.assertTrue(all(i["same_as"] is None and i["replaces"] == [] for i in items), reply)
+
+    def test_list_same_as_keeps_the_item_without_a_merge(self):
+        items, _, _ = cons.parse(
+            '{"items":[{"kind":"fact","text":"x","sources":["m1"],"same_as":["a"]}]}', {"m1"}, [])
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["same_as"])
+
+
 class CorrectionTest(Base):
     def test_detects_corrections_only(self):
         for text in ("no, I meant the Dell", "No I meant on the laptop", "nope, not that one",

@@ -523,3 +523,26 @@ class UsageLimitFallbackTests(unittest.TestCase):
         reader.lane.ask.side_effect = RuntimeError("ChatGPT turn failed: boom")
         with mock.patch("jarvis.chatgpt.usage_limit", return_value=""), self.assertRaises(RuntimeError):
             reader.ask("hi")  # other errors are still errors
+
+
+class ClaudeLaneClosesWhenChatGPTRecoversTests(unittest.TestCase):
+    def test_claude_lane_closed_after_a_chatgpt_reading(self):
+        claude = mock.MagicMock()
+        chat = mock.MagicMock()
+        chat.ask.return_value = '{"mode": "converse"}'
+        reader = interpret.Interpreter({"devices": {}}, ".", lane=chat)
+        reader.claude = claude
+        with mock.patch("jarvis.chatgpt.usage_limit", return_value=""):
+            self.assertEqual(reader.ask("hi"), '{"mode": "converse"}')
+        claude.close.assert_called_once()
+        self.assertIsNone(reader.claude)
+
+    def test_claude_lane_stays_while_chatgpt_is_limited(self):
+        claude = mock.MagicMock()
+        claude.ask.return_value = "{}"
+        reader = interpret.Interpreter({"devices": {}}, ".", lane=mock.MagicMock())
+        reader.claude = claude
+        reader._claude_prompt = lambda p: p
+        with mock.patch("jarvis.chatgpt.usage_limit", return_value="until 11 PM"):
+            reader.ask("hi")
+        claude.close.assert_not_called()
