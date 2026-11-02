@@ -2,6 +2,7 @@
 
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -156,7 +157,7 @@ def run(args, config, base):
         for node in nodes:  # one failing node must not stop the rest
             try:
                 reports.append(update(config, state, node, rollback=args.rollback))
-            except (OSError, ValueError, RuntimeError) as exc:
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 if args.value:
                     raise
                 reports.append({"node": node, "updated": False, "error": str(exc)})

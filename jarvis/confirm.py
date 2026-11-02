@@ -3,7 +3,11 @@
 import hashlib
 import hmac
 import json
+import os
 import re
+import shutil
+import sqlite3
+import subprocess
 import time
 
 from .history import KEEP_DAYS, History
@@ -22,6 +26,42 @@ def summary(command):
     return re.sub(r"\s+", " ", f"{what} on the {command['device']}").strip()
 
 
+GRANT_SECONDS = 600  # "allow on this site" lasts ten minutes
+RECENT = 10
+
+
+def notify(text):
+    """Best-effort desktop nudge that David's OK is wanted. Never raises, never waits
+    more than 3 s; silent off Linux or without notify-send (and under JARVIS_NO_NOTIFY)."""
+    try:
+        if os.environ.get("JARVIS_NO_NOTIFY"):
+            return False
+        from .platforms import detect
+        exe = shutil.which("notify-send") if detect()["os"] == "linux" else None
+        if not exe:
+            return False
+        subprocess.run([exe, "-a", "JARVIS", "-u", "critical", "JARVIS needs your OK",
+                        str(text)[:300]], timeout=3, capture_output=True, check=False)
+        return True
+    except Exception:
+        return False
+
+
+def describe(item):
+    """The structured fields the console shows for a pending item (see ConfirmQueue.listing)."""
+    command = item.get("command") or {}
+    args = command.get("args") if isinstance(command.get("args"), dict) else {}
+    if command.get("intent") != "browser_action":
+        return {"kind": "command", "expires_at": item.get("expires"), "can_grant": False}
+    meta = args.get("browser") if isinstance(args.get("browser"), dict) else {}
+    stakes = "low" if meta.get("stakes") == "low" else "high"
+    site, verb = meta.get("site") or None, meta.get("verb")
+    verb = verb if verb in ("click", "type", "press", "select", "dialog", "other") else "other"
+    return {"kind": "browser", "site": site, "verb": verb, "target": meta.get("target") or None,
+            "stakes": stakes, "expires_at": meta.get("expires_at") or item.get("expires"),
+            "can_grant": stakes == "low" and bool(site) and bool(meta.get("named"))}
+
+
 def prompt(item):
     return (f"I need your OK to {item['summary']}. "
             f"Say 'Jarvis, yes' or press Confirm ({item['id']}).")
@@ -36,6 +76,14 @@ class ConfirmQueue:
                 number INTEGER PRIMARY KEY AUTOINCREMENT, summary TEXT NOT NULL,
                 command TEXT NOT NULL, hash TEXT NOT NULL, origin TEXT NOT NULL,
                 created REAL NOT NULL, expires REAL NOT NULL, status TEXT NOT NULL)""")
+            for column in ("resolved REAL", "note TEXT"):  # added later: older files lack them
+                try:
+                    db.execute("ALTER TABLE confirmations ADD COLUMN " + column)
+                except sqlite3.OperationalError:
+                    pass
+            db.execute("""CREATE TABLE IF NOT EXISTS site_grants(
+                site TEXT NOT NULL, verb TEXT NOT NULL, expires REAL NOT NULL,
+                PRIMARY KEY(site, verb))""")
 
     @staticmethod
     def _item(row):
@@ -63,9 +111,27 @@ class ConfirmQueue:
         return item
 
     def expire(self):
+        now = time.time()
         with self.history.connect() as db:
-            return db.execute("UPDATE confirmations SET status='expired' WHERE status='pending' AND expires<=?",
-                              (time.time(),)).rowcount
+            count = db.execute("UPDATE confirmations SET status='expired', resolved=expires "
+                               "WHERE status='pending' AND expires<=?", (now,)).rowcount
+            # A browser ask carries its own (shorter) deadline.
+            for row in db.execute("SELECT number, command FROM confirmations WHERE status='pending'").fetchall():
+                try:
+                    args = json.loads(row["command"]).get("args") or {}
+                    due = float((args.get("browser") or {}).get("expires_at") or 0)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if due and due <= now:
+                    count += db.execute("UPDATE confirmations SET status='expired', resolved=? "
+                                        "WHERE number=? AND status='pending'", (now, row["number"])).rowcount
+            return count
+
+    def expire_item(self, id):
+        """The waiting caller gave up: 'expired', not 'rejected', so the trace says why."""
+        with self.history.connect() as db:
+            db.execute("UPDATE confirmations SET status='expired', resolved=? WHERE number=? AND status='pending'",
+                       (time.time(), int(str(id)[1:])))
 
     def pending(self, origin=None):
         self.expire()
@@ -103,7 +169,8 @@ class ConfirmQueue:
             if not hmac.compare_digest(digest, row["hash"]) or (
                     hash is not None and not hmac.compare_digest(str(hash), digest)):
                 raise ValueError("The command changed; request a new confirmation.")
-            db.execute("UPDATE confirmations SET status='approved' WHERE number=?", (row["number"],))
+            db.execute("UPDATE confirmations SET status='approved', resolved=? WHERE number=?",
+                       (time.time(), row["number"]))
             self.history.record_confirmation(db, "C" + str(row["number"]), origin, "approve", digest)
             return json.loads(row["command"])
 
@@ -118,6 +185,59 @@ class ConfirmQueue:
         with self.history.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = self._resolve(db, id, origin)
-            db.execute("UPDATE confirmations SET status='rejected' WHERE number=?", (row["number"],))
+            db.execute("UPDATE confirmations SET status='rejected', resolved=? WHERE number=?",
+                       (time.time(), row["number"]))
             self.history.record_confirmation(db, "C" + str(row["number"]), row["origin"], "reject", row["hash"])
 
+
+    # -- "allow on this site for 10 min" ----------------------------------------------------
+    def grant(self, site, verb, seconds=GRANT_SECONDS):
+        if not site or verb not in ("click", "type", "press", "select"):
+            raise ValueError("A grant needs a site and a click, type, press or select.")
+        with self.history.connect() as db:
+            db.execute("INSERT OR REPLACE INTO site_grants(site,verb,expires) VALUES(?,?,?)",
+                       (str(site).lower(), verb, time.time() + seconds))
+
+    def has_grant(self, site, verb):
+        with self.history.connect() as db:
+            row = db.execute("SELECT 1 FROM site_grants WHERE site=? AND verb=? AND expires>?",
+                             (str(site).lower(), verb, time.time())).fetchone()
+        return row is not None
+
+    def grants(self):
+        now = time.time()
+        with self.history.connect() as db:
+            db.execute("DELETE FROM site_grants WHERE expires<=?", (now,))
+            rows = db.execute("SELECT site, verb, expires FROM site_grants ORDER BY site, verb").fetchall()
+        return [{"site": r["site"], "verb": r["verb"], "expires_at": r["expires"]} for r in rows]
+
+    def revoke(self, site, verb):
+        with self.history.connect() as db:
+            return db.execute("DELETE FROM site_grants WHERE site=? AND verb=?",
+                              (str(site).lower(), verb)).rowcount
+
+    def grant_item(self, identifier, origin, hash=None):
+        """Approve this item and allow its (site, verb) for GRANT_SECONDS. Only a low-stakes
+        browser item with a known site and a named element; commit-like asks never."""
+        mine = [i for i in self.pending(origin) if i["id"].upper() == str(identifier).upper()]
+        info = describe(mine[0]) if mine else None
+        if not info or not info["can_grant"]:
+            raise ValueError("That one can't be allowed for a whole site; approve it once instead.")
+        command = self.approve(identifier, origin, hash=hash)
+        self.grant(info["site"], info["verb"])
+        with self.history.connect() as db:
+            db.execute("UPDATE confirmations SET note='granted' WHERE number=?", (int(str(identifier)[1:]),))
+        return command, info
+
+    def listing(self, origin=None):
+        """What the console shows: pending items (id, summary, hash, ... plus describe()'s
+        kind/site/verb/target/stakes/expires_at/can_grant), active grants, last RECENT outcomes."""
+        pending = [{**i, **describe(i)} for i in self.pending(origin)]
+        with self.history.connect() as db:
+            rows = db.execute("SELECT number, summary, status, note, resolved, created FROM confirmations "
+                              "WHERE status!='pending' ORDER BY COALESCE(resolved, created) DESC, number DESC "
+                              "LIMIT ?", (RECENT,)).fetchall()
+        recent = [{"id": "C" + str(r["number"]), "summary": r["summary"],
+                   "outcome": "granted" if r["note"] == "granted" else r["status"],
+                   "at": r["resolved"] or r["created"]} for r in rows]
+        return {"pending": pending, "grants": self.grants(), "recent": recent}

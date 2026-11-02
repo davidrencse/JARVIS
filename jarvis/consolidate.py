@@ -162,22 +162,26 @@ def parse(raw, ids, known):
             if found.group(2) == "lesson" and found.group(3).startswith(RAW_CORRECTION):
                 raw_notes.add(found.group(1))
     items = []
-    for item in data.get("items") or []:
+    def listed(value):
+        return value if isinstance(value, list) else []
+    for item in listed(data.get("items")):
         if not isinstance(item, dict) or item.get("kind") not in KNOWLEDGE_KINDS:
             continue
         text = " ".join(str(item.get("text") or "").split())
-        sources = [s for s in item.get("sources") or [] if isinstance(s, str) and s in ids]
+        sources = [s for s in listed(item.get("sources")) if isinstance(s, str) and s in ids]
         if not text or len(text) > 400 or not sources:
             continue  # every item must trace back to something David or JARVIS said
         same = item.get("same_as")
-        replaces = [r for r in item.get("replaces") or [] if isinstance(r, str) and r in kinds]
+        if not isinstance(same, str):
+            same = None
+        replaces = [r for r in listed(item.get("replaces")) if isinstance(r, str) and r in kinds]
         items.append({"kind": item["kind"], "text": text, "sources": sorted(set(sources)),
                       "same_as": same if kinds.get(same) == item["kind"] else None,
                       "replaces": [r for r in dict.fromkeys(replaces) if r != same]})
         if len(items) >= MAX_ITEMS:
             break
-    closed = [c for c in data.get("closed") or [] if isinstance(c, str) and kinds.get(c) == "loop"]
-    dropped = [d for d in data.get("dropped") or [] if isinstance(d, str) and d in raw_notes
+    closed = [c for c in listed(data.get("closed")) if isinstance(c, str) and kinds.get(c) == "loop"]
+    dropped = [d for d in listed(data.get("dropped")) if isinstance(d, str) and d in raw_notes
                and not any(d in item["replaces"] for item in items)]
     return items, list(dict.fromkeys(closed)), list(dict.fromkeys(dropped))
 

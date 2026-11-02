@@ -113,7 +113,9 @@ def command(config, state, target):
     port = int(config.get("cluster", {}).get("listen_port", DEFAULT_PORT))
     if not 1 <= port <= 65535:
         raise ValueError("Invalid cluster listen port.")
-    return [*_ssh_args(binary, machine.get("identity_file")), *pinned_host(machine, state),
+    pending = Path(state) / "cluster-node-pending.key" if state is not None else None
+    extra = ["-i", str(pending)] if pending and pending.exists() else []  # see cluster.redeem_invite
+    return [*_ssh_args(binary, machine.get("identity_file")), *extra, *pinned_host(machine, state),
             "-N", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=2", "-L" if mode(config) == "forward" else "-R",
             f"127.0.0.1:{port}:127.0.0.1:{port}", target]

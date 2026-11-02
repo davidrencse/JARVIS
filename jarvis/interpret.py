@@ -95,7 +95,9 @@ class Interpreter:
             if not usage_limit():
                 from .inference import is_limit
                 try:
-                    return self._lane().ask(prompt)
+                    reading = self._lane().ask(prompt)
+                    self._close_claude()  # ChatGPT answered: the Claude lane has no more use
+                    return reading
                 except Exception as exc:
                     if self.lane is not None:
                         self.lane.close()  # start clean next time
@@ -106,6 +108,14 @@ class Interpreter:
             # a stand-in brain that has no tools (audit 2026-11-01). The menu travels with
             # the prompt: a Claude session doesn't hold the ChatGPT thread's instructions.
             return self._claude().ask(self._claude_prompt(prompt))
+
+    def _close_claude(self):
+        claude, self.claude = getattr(self, "claude", None), None
+        if claude is not None:
+            try:
+                claude.close()
+            except Exception:
+                pass
 
     def _claude(self):
         if getattr(self, "claude", None) is None:

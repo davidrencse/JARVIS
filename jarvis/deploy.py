@@ -119,9 +119,12 @@ def code_key(state):
     if not key.is_file():
         key.parent.mkdir(parents=True, exist_ok=True)
         public.unlink(missing_ok=True)
-        subprocess.run([_keygen(), "-q", "-t", "ed25519", "-N", "", "-C", SIGN_NAMESPACE,
-                        "-f", str(key)], check=True, capture_output=True, timeout=30,
-                       creationflags=FLAGS)
+        try:
+            subprocess.run([_keygen(), "-q", "-t", "ed25519", "-N", "", "-C", SIGN_NAMESPACE,
+                            "-f", str(key)], check=True, capture_output=True, timeout=30,
+                           creationflags=FLAGS)
+        except subprocess.SubprocessError as exc:
+            raise RuntimeError(f"Couldn't make the code-signing key: {exc}") from None
     line = " ".join(public.read_text(encoding="ascii").split()[:2])
     if not CODE_KEY.fullmatch(line):
         raise ValueError(f"{public} is not an ed25519 public key.")
@@ -131,9 +134,12 @@ def code_key(state):
 def sign(data, state):
     """An armored SSH signature of `data` by the main's code-signing key."""
     code_key(state)
-    out = subprocess.run([_keygen(), "-Y", "sign", "-q", "-f", str(Path(state) / SIGNING_KEY),
-                          "-n", SIGN_NAMESPACE], input=data, capture_output=True, timeout=30,
-                         creationflags=FLAGS)
+    try:
+        out = subprocess.run([_keygen(), "-Y", "sign", "-q", "-f", str(Path(state) / SIGNING_KEY),
+                              "-n", SIGN_NAMESPACE], input=data, capture_output=True, timeout=30,
+                             creationflags=FLAGS)
+    except subprocess.SubprocessError as exc:
+        raise RuntimeError(f"Couldn't sign the code bundle: {exc}") from None
     if out.returncode or b"BEGIN SSH SIGNATURE" not in out.stdout:
         raise RuntimeError("Couldn't sign the code bundle: "
                            + out.stderr.decode("utf-8", "replace").strip()[-200:])
@@ -149,9 +155,12 @@ def verify(data, signature, key):
         signers, sig = Path(folder) / "signers", Path(folder) / "code.sig"
         signers.write_text(f'{SIGN_NAMESPACE} namespaces="{SIGN_NAMESPACE}" {key}\n', encoding="ascii")
         sig.write_text(signature, encoding="ascii")
-        out = subprocess.run([_keygen(), "-Y", "verify", "-f", str(signers), "-I", SIGN_NAMESPACE,
-                              "-n", SIGN_NAMESPACE, "-s", str(sig)], input=data,
-                             capture_output=True, timeout=30, creationflags=FLAGS)
+        try:
+            out = subprocess.run([_keygen(), "-Y", "verify", "-f", str(signers), "-I", SIGN_NAMESPACE,
+                                  "-n", SIGN_NAMESPACE, "-s", str(sig)], input=data,
+                                 capture_output=True, timeout=30, creationflags=FLAGS)
+        except subprocess.SubprocessError:
+            return False
     return out.returncode == 0
 
 
@@ -288,13 +297,19 @@ def _ssh(config, state, node):
     return [*_ssh_args(binary, machine.get("identity_file")), *pinned_host(machine, state), "-T"], targets, folder
 
 
+PIP_SSH_TIMEOUT = 720
+
+
 def _remote(config, state, node, command, stdin=b"", timeout=120):
     """Run `command` on the node (stdin piped in) over the first target that answers."""
     argv, targets, _ = _ssh(config, state, node)
     last = ""
     for target in targets:
-        out = subprocess.run([*argv, target, command], input=stdin, capture_output=True,
-                             timeout=timeout, creationflags=NO_WINDOW)
+        try:
+            out = subprocess.run([*argv, target, command], input=stdin, capture_output=True,
+                                 timeout=timeout, creationflags=NO_WINDOW)
+        except subprocess.SubprocessError as exc:
+            raise RuntimeError(f"ssh to {node} failed: {exc}") from None
         if out.returncode == 255:  # ssh itself failed: next address
             last = out.stderr.decode("utf-8", "replace").strip()[-200:]
             continue
@@ -382,7 +397,9 @@ def update(config, state, node, rollback=False):
                   f"[ -n \"$deps\" ] && {{ timeout 600 {py} -m pip install --quiet --disable-pip-version-check -e . "
                   f"|| echo 'pip install failed or timed out (600 s); the node may need its requirements installed by hand' >&2; }}; "
                   f"{_restart(kernel)}; echo ok")
-        code, out, err = _remote(config, state, node, _bash(script), stdin=package(source(state)))
+        # Longer than the script's own `timeout 600` pip install, or ssh is cut mid-install.
+        code, out, err = _remote(config, state, node, _bash(script), stdin=package(source(state)),
+                                 timeout=PIP_SSH_TIMEOUT)
         if code or "ok" not in out:
             raise RuntimeError(err.strip()[-300:] or f"Update failed ({code}); the node kept its code.")
     deadline = time.monotonic() + WAIT
@@ -397,7 +414,7 @@ def update(config, state, node, rollback=False):
         # leaving the node dead until someone notices.
         try:
             back = update(config, state, node, rollback=True)
-        except (OSError, ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             back = {"error": str(exc)}
         restored = back.get("after") or back.get("expected")
         return {"node": node, "updated": False, "rolled_back": "error" not in back,

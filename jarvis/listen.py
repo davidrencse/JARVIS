@@ -13,6 +13,7 @@ Speaker model: SPEAKER_MODEL_URL below, saved to .jarvis/voice/.
 
 import json
 import os
+import time
 from pathlib import Path
 
 RATE = 16000
@@ -74,12 +75,32 @@ def _input_device(sd, preferred=None):
     """The mic chosen in voice setup if it is still plugged in. Otherwise, on Linux, ALSA's
     "default" is the raw sound card unless pipewire-alsa is installed, and a DSP mic read
     that way is pure silence. Go through PipeWire (or Pulse) instead."""
-    names = {d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0}
-    if preferred and preferred in names:
-        return preferred
+    devices = [(i, d) for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
+    names = {d["name"] for _, d in devices}
+    if preferred is not None and (preferred in names or preferred in (i for i, _ in devices)):
+        return _resolve_device(sd, devices, preferred)
     if os.name == "nt":
         return None
     return next((n for n in ("pipewire", "pulse") if n in names), None)
+
+
+def _resolve_device(sd, devices, preferred):
+    """ONE device index for the saved mic name. On Windows the same name exists under MME,
+    DirectSound and WASAPI, and sounddevice refuses a name that matches several."""
+    if isinstance(preferred, int):
+        return preferred
+    matches = [(i, d) for i, d in devices if d["name"] == preferred]
+    if len(matches) == 1:
+        return matches[0][0]
+    if os.name == "nt":
+        try:
+            apis = sd.query_hostapis()
+            for i, d in matches:
+                if "wasapi" in str(apis[d["hostapi"]]["name"]).lower():
+                    return i
+        except Exception:
+            pass
+    return matches[0][0]
 
 
 def input_devices():
@@ -339,8 +360,10 @@ class LiveMic:
                 return
 
     def close(self):
-        self.stream.stop()
-        self.stream.close()
+        try:
+            self.stream.stop()
+        finally:
+            self.stream.close()
 
 
 def save_wav(path, audio):
@@ -432,11 +455,23 @@ class VoicePrint:
         """Add the last verified clip: called once the transcript also starts with 'Jarvis',
         which is strong evidence it was David talking to JARVIS."""
         if self.last_embedding is not None and self.path.is_file():
-            self._add(json.loads(self.path.read_text(encoding="utf-8")), self.last_embedding)
+            self._add(self._load(), self.last_embedding)
             self.last_embedding = None
 
     def _save(self, data):
-        self.path.write_text(json.dumps(data), encoding="utf-8")
+        # voice service and console transcribe both read and write this file
+        from .fsio import atomic_write
+        atomic_write(self.path, json.dumps(data))
+
+    def _load(self):
+        """The voiceprint, tolerating a read that races another process's write."""
+        for attempt in range(3):
+            try:
+                return json.loads(self.path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
 
     def enroll(self, clips):
         if len(clips) < 3:
@@ -471,7 +506,7 @@ class VoicePrint:
         result = self.enroll(clips)
         others = sorted(glob.glob(str(self.dir / "impostors" / "*.wav")))
         if others:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = self._load()
             scores = [self.score(self._embed(load(p)), data["profile"]) for p in others]
             result["impostor_max"] = round(max(scores), 3)
             result["safe"] = max(scores) < data["threshold"]
@@ -483,7 +518,7 @@ class VoicePrint:
         _np()  # fail early with the install hint if numpy is missing
         if not self.path.is_file():
             raise RuntimeError("No voiceprint yet. Run: python -m jarvis voice enroll")
-        data = json.loads(self.path.read_text(encoding="utf-8"))
+        data = self._load()
         if data.get("model") != self.model.name:
             raise RuntimeError("Voiceprint was made with a different speaker model. "
                                "Run: jarvis voice recalibrate")
