@@ -23,6 +23,21 @@ class SystemDesignTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_stores_survive_files_vanishing_mid_walk(self):
+        from unittest import mock
+        from jarvis import sysview
+        real = Path.stat
+        def flaky(self, *a, **k):
+            if self.name == "ghost.txt":
+                raise FileNotFoundError(str(self))
+            return real(self, *a, **k)
+        kb = Path(self.tmp.name, "kb")
+        kb.mkdir(exist_ok=True)
+        (kb / "ghost.txt").write_text("x")
+        with mock.patch.object(Path, "stat", flaky):
+            rows = sysview.stores(self.console)
+        self.assertTrue(rows)
+
     def test_every_module_belongs_to_a_station(self):
         loose = [m["name"] for m in self.data["modules"] if m["station"] == "other" and m["name"] != "__init__"]
         self.assertEqual(loose, [], "add new modules to a station in jarvis/sysview.py")

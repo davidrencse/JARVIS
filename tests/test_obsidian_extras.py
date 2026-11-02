@@ -42,6 +42,14 @@ class Case(unittest.TestCase):
 
 
 class BriefingTests(Case):
+    def test_impossible_task_dates_never_crash_the_briefing(self):
+        (self.root / "courses" / "os.md").write_text(
+            "---\ntitle: Operating Systems\ntype: course\nstatus: active\n---\n\n"
+            "- [ ] Bad date 📅 2026-02-30\n- [ ] Assignment 2 — due October 13, 2026\n", encoding="utf-8")
+        self.vault.invalidate() if hasattr(self.vault, "invalidate") else None
+        for question in ("brief me", "what's overdue", "what's due this week"):
+            self.assertIsInstance(answer(question, self.vault, Tasks(self.vault), NOW), str)
+
     def test_brief_reads_calendar_tasks_and_deadlines(self):
         brief = answer("Jarvis, brief me", self.vault, self.tasks, NOW)
         self.assertEqual(brief, "Good morning, David. It's Thursday, October 22nd. Today you have "

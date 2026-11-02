@@ -1,12 +1,9 @@
 """Nodes get only tested code (release.cut), and a node rolls back code that won't start
 (release.guard). The test suite itself is never run here: `tests` is a stand-in."""
 
-import json
-import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch

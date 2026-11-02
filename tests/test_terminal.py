@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -10,6 +11,24 @@ from jarvis.chatgpt import ConfirmGate
 from jarvis.confirm import ConfirmQueue
 
 CONFIG = {"devices": {"dell": {}, "zenbook": {}}, "cluster": {"enabled": False}}
+
+
+@unittest.skipIf(os.name == "nt", "POSIX process groups")
+class TimeoutTests(unittest.TestCase):
+    def test_timeout_kills_the_whole_tree_and_explains(self):
+        import time
+        tmp = tempfile.mkdtemp()
+        marker = Path(tmp) / "alive"
+        command = f"(sleep 1.5; touch {marker}) & sleep 30"
+        with mock.patch.object(terminal, "TIMEOUT", 1):
+            start = time.time()
+            ok, text = terminal.run(json.dumps({"command": command, "cwd": tmp}))
+        self.assertFalse(ok)
+        self.assertLess(time.time() - start, 8)
+        self.assertIn("stopped after 1 s", text)
+        self.assertIn("builds, servers", text)
+        time.sleep(1.2)
+        self.assertFalse(marker.exists())  # the backgrounded grandchild died too
 
 
 class AuditBypassTests(unittest.TestCase):
@@ -252,3 +271,19 @@ class RoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuotesAndStateParentTests(unittest.TestCase):
+    """Audit 2026-11-01 follow-ups to read_only()."""
+
+    def test_a_quoted_pipe_is_one_step(self):
+        from jarvis.terminal import read_only
+        self.assertTrue(read_only("grep -E 'a|b' notes.txt"))
+        self.assertTrue(read_only('grep -E "x|y" a.txt | sort'))
+        self.assertFalse(read_only("grep 'a|b' notes.txt | sh"))  # the real pipe still counts
+
+    def test_stopping_above_app_state_is_not_only_looking(self):
+        from jarvis.terminal import read_only
+        for command in ("cd .local", "cd ~/.var", "cd Library", "cd ~/.local && ls"):
+            self.assertFalse(read_only(command), command)
+        self.assertTrue(read_only("cd ~/projects && ls"))

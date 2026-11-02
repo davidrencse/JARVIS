@@ -93,6 +93,15 @@ class TaskCase(unittest.TestCase):
         return (self.root / rel).read_text(encoding="utf-8")
 
 
+class ImpossibleDateTests(TaskCase):
+    def test_impossible_dates_are_no_date(self):
+        from jarvis.tasks import parse_line as parse_task
+        task = parse_task("- [ ] Pay rent 📅 2026-02-30")
+        self.assertIsNone(task["due"])
+        self.assertIsNone(parse_task("- [ ] x [due:: 2026-13-01]")["due"])
+        self.assertEqual(parse_task("- [ ] x 📅 2026-02-28")["due"], "2026-02-28")
+
+
 class AgendaTests(TaskCase):
     def test_buckets(self):
         a = self.tasks.agenda(TODAY)

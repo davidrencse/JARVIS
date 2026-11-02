@@ -671,10 +671,13 @@ class VoiceWorkflowTests(Temp):
                 patch("jarvis.speech.Voice", return_value=voice), \
                 patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
                 patch("jarvis.chatgpt.make_lane", return_value=brain), \
-                patch("jarvis.daemon.parse_for", create=True), \
+                patch("jarvis.actions.launch_desktop_entry", return_value=(True, "Opened Spotify.")) as launch, \
+                patch("jarvis.remote.Remote.call", return_value=(True, "Opened Spotify.")) as acted, \
                 patch.object(daemon, "foreground_priority"):
+            # Never the real app (2026-11-01: this test launched it on every suite run).
             with self.assertRaises(KeyboardInterrupt):
                 daemon.listen_loop(str(self.base), CONFIG, ROOT)
+        self.assertTrue(launch.called or any("Spotify" in str(c) for c in acted.call_args_list))
         said = [c.args[0] for c in voice.say.call_args_list]
         self.assertIn("Open what?", said)
         self.assertIn(daemon.UNCLEAR, said)  # "Alel." is asked again, not answered

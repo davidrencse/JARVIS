@@ -106,6 +106,32 @@ class VoiceSetupTest(unittest.TestCase):
             self.assertTrue(mic.closed)
             self.assertIn("JARVIS", said[0])
 
+    def test_mic_only_tunes_the_mic_and_keeps_the_voiceprint(self):
+        # 2026-11-01: voice status said mic_tuned false; the full setup re-enrolls for that.
+        from jarvis.onboard import MIC_DONE, VoiceSetup
+        with tempfile.TemporaryDirectory() as d:
+            self.run_setup(d, FakeMic())  # an enrolled voice first
+            voice = Path(d) / "voice"
+            (voice / "mic.json").unlink()
+            before = (voice / "voiceprint.json").read_bytes()
+            clips = sorted(p.name for p in (voice / "enroll").iterdir())
+            said, daemon = [], FakeDaemon(True, d)
+            setup = VoiceSetup(d, {}, say=said.append, open_mic=lambda tuning: FakeMic(), daemon=daemon)
+            with mock.patch("jarvis.listen._vad_model", return_value=None), \
+                    mock.patch("jarvis.listen.VoicePrint._embed", fake_embed):
+                setup.start(mic_only=True)
+                setup._thread.join(60)
+            view = setup.status()
+            self.assertEqual(view["step"], "done", view.get("error"))
+            self.assertTrue(view["result"]["test_passed"])
+            self.assertEqual(view["result"]["voiceprint"], "kept")
+            self.assertTrue((voice / "mic.json").is_file())
+            self.assertEqual((voice / "voiceprint.json").read_bytes(), before)  # never learned from
+            self.assertEqual(sorted(p.name for p in (voice / "enroll").iterdir()), clips)
+            self.assertEqual(said[-1], MIC_DONE)
+            self.assertNotIn("teach me your voice", " ".join(said))
+            self.assertEqual(daemon.calls, ["stop", "start"])
+
     def test_cancel_keeps_the_old_voiceprint_and_clips(self):
         with tempfile.TemporaryDirectory() as d:
             voice = Path(d) / "voice"
@@ -120,7 +146,6 @@ class VoiceSetupTest(unittest.TestCase):
             self.assertEqual(daemon.calls, ["stop", "start"])  # it was on before, so it's on again
 
     def test_cancel_after_the_voiceprint_is_made_still_changes_nothing(self):
-        from jarvis.listen import ENROLL_PHRASES
         with tempfile.TemporaryDirectory() as d:
             voice = Path(d) / "voice"
             (voice / "enroll").mkdir(parents=True)

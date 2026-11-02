@@ -56,6 +56,29 @@ class ConsoleSecurity(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_ipv6_host_and_ascii_digit_helpers(self):
+        from jarvis.ui import _host_name
+        self.assertEqual(_host_name("[::1]:7777"), "::1")
+        self.assertEqual(_host_name("[::1]"), "::1")
+        self.assertEqual(_host_name("LocalHost:80"), "localhost")
+        self.assertEqual(self.raw("GET", "/api/confirm", host=f"[::1]:{self.port}")[0], 200)
+
+    def test_oversize_body_gets_413_not_reset(self):
+        from jarvis.ui import MAX_AUDIO
+        size = MAX_AUDIO + 1000
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=20)
+        try:
+            conn.putrequest("POST", "/api/listen", skip_host=True)
+            conn.putheader("Host", f"127.0.0.1:{self.port}")
+            conn.putheader("X-JARVIS", "1")
+            conn.putheader("Content-Length", str(size))
+            conn.endheaders(b"\0" * size)
+            res = conn.getresponse()
+            self.assertEqual(res.status, 413)
+            self.assertEqual(json.loads(res.read())["error"], "Too large.")
+        finally:
+            conn.close()
+
     # --- Host allow-list -------------------------------------------------
     def test_allowed_hosts_pass_get(self):
         for host in (f"127.0.0.1:{self.port}", "127.0.0.1", "localhost", f"localhost:{self.port}",
@@ -88,10 +111,9 @@ class ConsoleSecurity(unittest.TestCase):
             with self.subTest(host=host):
                 self.assertEqual(self.raw("GET", "/api/confirm", host=host)[0], 403)
 
-    def test_bracketed_ipv6_host_is_refused_by_current_code(self):
-        # Behavior pin: "[::1]:port" splits on ':' to "[" -> "" so IPv6 literals never match,
-        # even though "::1" is in the allow-list. Fails closed (safe), just unusable.
-        self.assertEqual(self.raw("GET", "/api/confirm", host=f"[::1]:{self.port}")[0], 403)
+    def test_bracketed_ipv6_host_is_allowed(self):
+        self.assertEqual(self.raw("GET", "/api/confirm", host=f"[::1]:{self.port}")[0], 200)
+        self.assertEqual(self.raw("GET", "/api/confirm", host="[::2]:80")[0], 403)
 
     # --- Sec-Fetch-Site --------------------------------------------------
     def test_cross_site_fetch_metadata_rejected_even_with_good_host(self):

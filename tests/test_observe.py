@@ -194,6 +194,15 @@ class RunTests(unittest.TestCase):
         self.assertEqual((ok, text), (False, "Can't observe: no hyprctl"))
 
 
+class HyprlandTimeoutTests(unittest.TestCase):
+    def test_hyprctl_timeout_becomes_lookup_error(self):
+        with mock.patch.object(observe.shutil, "which", return_value="/usr/bin/hyprctl"), \
+                mock.patch.object(observe.subprocess, "run",
+                                  side_effect=observe.subprocess.TimeoutExpired("hyprctl", 5)):
+            with self.assertRaises(LookupError):
+                observe._windows_hyprland()
+
+
 class PlaybackVolumeValidateTests(unittest.TestCase):
     def test_playback_commands_allowlisted(self):
         from jarvis.registry import MEDIA

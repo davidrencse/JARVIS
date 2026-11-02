@@ -417,6 +417,21 @@ class ToolTests(VaultCase):
         box = Toolbox(tools, None)
         self.assertEqual(box.call("vault_world", {})[0], True)
 
+    def test_string_tags_are_one_tag(self):
+        tools = VaultTools(self.vault, Memory(self.state))
+        ok, text = tools.call("vault_capture", {"title": "Tagged", "body": "Body", "tags": "work"})
+        self.assertTrue(ok, text)
+        fields, _ = split_frontmatter(self.read(json.loads(text)["path"]))
+        self.assertEqual(fields["tags"], ["work"])
+
+    def test_clip_checks_writability_before_fetching(self):
+        vault = Vault(self.vault.root, Path(self.tmp.name, "ro-state") if hasattr(self, "tmp") else self.state,
+                      {"write": False})
+        def fetch(url):
+            raise AssertionError("fetched before the write check")
+        with self.assertRaisesRegex(ValueError, "writes are off"):
+            vault.clip("https://example.com/x", fetch=fetch)
+
     def test_mcp_server_is_read_only_by_default(self):
         tools = VaultTools(self.vault, write=False, channel="mcp")
         init = handle(tools, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -459,7 +474,10 @@ class WiringTests(VaultCase):
                 "vault": {"path": str(self.root), "write": True}}
 
     def test_make_lane_gives_the_brain_the_vault(self):
-        brain = make_lane(self.config(), self.root, self.state)
+        from jarvis.inference import Failover
+        wrapped = make_lane(self.config(), self.root, self.state)
+        self.assertIsInstance(wrapped, Failover)  # Claude stands in while ChatGPT is limited
+        brain = wrapped.primary
         self.assertIsInstance(brain, Brain)
         names = {s["name"] for s in brain.act.tools.specs()}
         self.assertLessEqual({"vault_search", "vault_log", "vault_capture", "conversation_recent"},
@@ -472,6 +490,7 @@ class WiringTests(VaultCase):
         lane = make_lane({"actions": {"enabled": False}, "vault": {"path": str(self.root / "gone")}},
                          self.root, self.state)
         # Missing vault: no crash, and the brain keeps its own long-term memory.
+        lane = lane.primary
         self.assertIsInstance(lane, Brain)
         names = {s["name"] for s in lane.act.tools.specs()}
         self.assertLessEqual({"memory_remember", "memory_search", "conversation_recent"}, names)

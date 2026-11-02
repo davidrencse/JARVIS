@@ -552,3 +552,17 @@ class UncertainRefusalTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StepCrashTests(unittest.TestCase):
+    def test_a_step_that_crashes_still_ends_and_releases_its_dependents(self):
+        # Audit 2026-11-01: an exception outside remote.call left no outcome, so a dependent
+        # step waited forever.
+        cmds = [{"id": "c1", "intent": "open_app", "device": "zenbook", "args": {"name": "Chrome"},
+                 "depends_on": []},
+                {"id": "c2", "intent": "open_app", "device": "zenbook", "args": {"name": "Spotify"},
+                 "depends_on": ["c1"]}]
+        with mock.patch.object(pipeline.INFLIGHT, "claim", side_effect=KeyError("boom")):
+            out = pipeline._execute(cmds, mock.MagicMock(), lambda *a, **k: None)
+        self.assertEqual(out["c1"]["state"], "pre_effect_failure")
+        self.assertEqual(out["c2"]["state"], "not_sent")
