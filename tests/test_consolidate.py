@@ -32,6 +32,26 @@ class Base(unittest.TestCase):
         return item["id"]
 
 
+class CutoffTest(unittest.TestCase):
+    def test_midnight_is_right_on_a_dst_change_day(self):
+        import os, time
+        if not hasattr(time, "tzset"):
+            self.skipTest("no tzset")
+        old = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            # 2026-11-01: clocks fall back at 02:00; local midnight is still EDT (UTC-4).
+            now = datetime(2026, 11, 1, 18, 0, tzinfo=timezone.utc)  # 13:00 EST
+            self.assertEqual(cons._cutoff(now), datetime(2026, 11, 1, 4, 0, tzinfo=timezone.utc))
+        finally:
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+
+
 class ConsolidateTest(Base):
     def test_items_are_stored_linked_and_checked(self):
         m1 = self.said("David", "My dentist is Dr Lee, appointment on Friday")

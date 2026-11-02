@@ -353,6 +353,19 @@ class ThreeWayTests(Temp):
 
 
 class VaultSyncTests(Temp):
+    def test_same_filename_in_different_folders_gets_separate_pages(self):
+        from jarvis.vault import Vault
+        root = Path(self.tmp.name, "vault2")
+        for folder, name in (("courses", "Courses"), ("projects", "Projects")):
+            (root / folder).mkdir(parents=True)
+            (root / folder / "README.md").write_text(
+                f"---\ntitle: {name} readme\n---\n# {name}\n\n{name} notes live in this folder.\n")
+        vault = Vault(root, Path(self.tmp.name, "vstate2"))
+        self.kb.sync_vault(vault)
+        pages = self.kb.pages()
+        self.assertEqual({pages[s]["title"] for s in ("courses-readme", "projects-readme")},
+                         {"Courses readme", "Projects readme"})
+
     def test_notes_become_one_page_each_and_only_changes_are_reread(self):
         from jarvis.vault import Vault
         root = Path(self.tmp.name, "vault")

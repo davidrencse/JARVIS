@@ -109,6 +109,44 @@ class SendTests(unittest.TestCase):
                                      capture_output=True)
         self.assertEqual(out.returncode, 0, out.stderr)
 
+    def test_linux_paste_saves_any_clipboard_type_and_checks_wtype(self):
+        script = grokbot.LINUX_SCRIPT
+        self.assertNotIn('OLD=$(', script)
+        self.assertIn("wl-paste --list-types", script)
+        self.assertIn('wl-copy --type "$OLDTYPE"', script)
+        self.assertIn("wl-copy --clear", script)
+        self.assertIn("jarvis-clip-transient", script)
+        self.assertIn("wtype failed", script)
+
+    @unittest.skipIf(os.name == "nt", "needs bash")
+    def test_linux_paste_restores_image_and_reports_wtype_failure(self):
+        # Run only the clipboard/paste tail against fake commands in a temp bin dir.
+        script = grokbot.LINUX_SCRIPT
+        tail = script[script.index("PREV=$(active)"):]
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = Path(tmp, "bin"); bindir.mkdir()
+            clip = Path(tmp, "clip")
+            clip.write_bytes(b"\x89PNGdata")
+            log = Path(tmp, "log")
+            def fake(name, body):
+                f = bindir / name; f.write_text("#!/bin/bash\n" + body); f.chmod(0o755)
+            fake("wl-paste", f'if [ "$1" = --list-types ]; then echo image/png; else cat {clip}; fi')
+            fake("wl-copy", f'echo "wl-copy $*" >> {log}; if [ "$1" = --clear ]; then : > {clip}; '
+                            f'else cat > {clip}; fi')
+            fake("wtype", "exit ${WTYPE_RC:-0}")
+            head = ('active() { echo W1; }\nfocus() { return 0; }\nwin() { echo 5; }\n'
+                    'A=W1\nP=prompt\nset -u\n')
+            for rc, ok in (("0", True), ("3", False)):
+                clip.write_bytes(b"\x89PNGdata")
+                env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
+                       "XDG_RUNTIME_DIR": tmp, "WTYPE_RC": rc}
+                out = grokbot.subprocess.run(["bash", "-c", head + tail], capture_output=True,
+                                             text=True, env=env)
+                self.assertEqual(clip.read_bytes(), b"\x89PNGdata")  # image restored
+                self.assertIn("--type image/png", log.read_text())
+                self.assertEqual("ok=1" in out.stdout, ok, out)
+                self.assertEqual("error=wtype failed" in out.stdout, not ok, out)
+
     @patch.dict(os.environ, {}, clear=True)
     @patch.object(grokbot, "WINDOWS", False)
     @patch.object(grokbot.socket, "gethostname", return_value="arch_main")

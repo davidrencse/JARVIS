@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 import uuid
@@ -95,6 +96,26 @@ class BrokerTests(unittest.TestCase):
         restarted.recover()
         self.assertEqual(restarted.get(job)["state"], "uncertain")
         self.assertIsNone(restarted.claim("node", {"desktop"}))
+
+    def test_pending_jobs_expire_on_recover_and_never_run_late(self):
+        queued = self.broker.enqueue("node", "main", "desktop", {"action": "open", "arg": "x"})
+        asked = self.broker.enqueue("main", "node", "ask", {"text": "hi"})
+        self.broker.recover()
+        restarted = Broker(self.tmp.name)
+        restarted.recover()
+        self.assertIsNone(restarted.claim("node", {"desktop"}))
+        self.assertIsNone(restarted.claim("main", {"ask"}))
+        self.assertEqual(restarted.get(queued)["state"], "expired")
+        self.assertEqual(restarted.get(asked)["state"], "expired")
+
+    def test_busy_job_names_running_action_until_deadline_and_grace(self):
+        job = self.broker.enqueue("node", "main", "desktop", {"action": "terminal", "arg": "x"}, timeout=45)
+        self.assertIsNone(self.broker.busy_job("node"))
+        self.broker.claim("node", {"desktop"})
+        self.assertEqual(self.broker.busy_job("node")["action"], "terminal")
+        with self.broker.db() as db:
+            db.execute("UPDATE jobs SET deadline=? WHERE id=?", (time.time() - 60, job))
+        self.assertIsNone(self.broker.busy_job("node"))
 
     def test_duplicate_request_id_is_idempotent_but_cannot_change_payload(self):
         key = uuid.uuid4().hex
@@ -634,6 +655,7 @@ class ConnectedAndAliveTests(unittest.TestCase):
         hub = Hub(configuration(), tmp.name, Path(tmp.name) / "main")
         hub.broker = Mock()
         hub.broker.running.return_value = running
+        hub.broker.busy_job.return_value = {"action": "build", "id": "j"} if running else None
         return hub
 
     def test_alive_rules(self):
@@ -642,6 +664,38 @@ class ConnectedAndAliveTests(unittest.TestCase):
         self.assertTrue(self.hub().alive("node", {"online": True, "seen": now - 2}))
         self.assertFalse(self.hub().alive("node", {"online": True, "seen": now - 30}))
         self.assertTrue(self.hub(running=1).alive("node", {"online": True, "seen": now - 30}))
+
+    def test_busy_node_is_alive_even_when_offline_window_passed(self):
+        self.assertTrue(self.hub(running=1).alive("node", {"online": False, "seen": time.time() - 200}))
+
+    def test_dispatch_to_busy_node_says_busy_not_offline(self):
+        hub = self.hub(running=1)
+        hub.config = {"devices": {"dell": {"name": "dell"}}}
+        hub.main = "main"
+        hub.broker.nodes.return_value = [{"id": "dell", "capabilities": ["desktop"], "online": False,
+                                          "seen": 0}]
+        with self.assertRaises(RuntimeError) as caught:
+            hub.dispatch("dell", "desktop", {"action": "volume", "arg": "5"})
+        self.assertIn("Dell is busy finishing build", str(caught.exception))
+
+    def test_terminal_dispatch_waits_past_terminal_timeout(self):
+        from jarvis import terminal
+        hub = self.hub()
+        hub.config = {"devices": {"dell": {"name": "dell"}}}
+        hub.main = "main"
+        hub.broker.nodes.return_value = [{"id": "dell", "capabilities": ["desktop"], "online": True,
+                                          "seen": time.time()}]
+        hub.broker.enqueue.return_value = "j" * 32
+        hub.broker.get.return_value = {"state": "running"}
+        hub.broker.busy_job.return_value = None
+        with patch("jarvis.cluster.served_code", return_value=None), \
+                patch.object(hub.stop_event, "is_set", return_value=False), \
+                patch("time.monotonic", side_effect=[0, 0, 10 ** 6]):
+            with self.assertRaises(TimeoutError) as caught:
+                hub.dispatch("dell", "desktop", {"action": "terminal", "arg": "ls"}, timeout=5)
+        self.assertGreaterEqual(hub.broker.enqueue.call_args.args[4], terminal.TIMEOUT + 10)
+        self.assertIn("terminal action on Dell", str(caught.exception))
+        self.assertIn("may still be running", str(caught.exception))
 
     def test_alive_follows_held_poll_sockets(self):
         import socket

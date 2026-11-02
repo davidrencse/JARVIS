@@ -3,7 +3,7 @@ Cases are real voice requests from the memory heap (2026-10-24..30) unless marke
 
 import unittest
 
-from jarvis.fragments import complete, judge
+from jarvis.fragments import complete, completes, judge
 
 RAMBLE = ("is nice. Jarvis could guarantee me maybe draw, which is kind of what I want. When you "
           "made that? But the fintech guy, like, I don't know, I talk to him a lot. He's like, "
@@ -42,6 +42,14 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(judge("spotify", understood=lambda t: True)[0], "keep")
         self.assertEqual(judge("spotify", understood=lambda t: False)[0], "unclear")
         self.assertEqual(judge("spotify", understood=lambda t: 1 / 0)[0], "unclear")  # never raises
+
+    def test_only_the_missing_part_is_joined(self):
+        # Audit 2026-11-01: "never mind" after "Open what?" became "open up never mind".
+        self.assertTrue(completes("open up", "Spotify"))
+        self.assertTrue(completes("go to my Arch Linux and open up", "Chrome"))
+        for rest in ("never mind", "cancel", "what time is it", "open up Spotify", "open Chrome"):
+            self.assertFalse(completes("open up", rest), rest)
+        self.assertFalse(completes("open up", "spotify", understood=lambda t: True))
 
     def test_halves_join(self):
         self.assertEqual(complete("open up", "Spotify."), "open up Spotify.")

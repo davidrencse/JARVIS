@@ -128,3 +128,32 @@ class PreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UsageLimitFallbackTests(unittest.TestCase):
+    def test_claude_checks_the_handoff_while_chatgpt_is_out(self):
+        # Audit 2026-11-01: over the ChatGPT limit, every Grok request failed its preflight.
+        import json as _json
+        from unittest import mock
+        from jarvis import grok_preflight
+        asked = []
+
+        class Lane:
+            def __init__(self, *a, **k):
+                pass
+
+            def ask(self, prompt):
+                asked.append(prompt)
+                return _json.dumps({"decision": "forward", "task": "Check my inbox", "reply": "",
+                                    "checks": {c: True for c in grok_preflight.CHECKS}})
+
+            def close(self):
+                pass
+        with mock.patch("jarvis.chatgpt.usage_limit", return_value="until 10:56 PM"), \
+                mock.patch("jarvis.fastlane.FastLane", Lane), \
+                mock.patch.object(grok_preflight, "chatgpt_lane") as chatgpt:
+            result = grok_preflight.assess("check my inbox", {}, ".")
+        self.assertEqual(result["decision"], "forward")
+        chatgpt.assert_not_called()
+        self.assertEqual(len(asked), 2)  # draft and review, each a fresh Claude session
+        self.assertTrue(all(p.startswith(grok_preflight.INSTRUCTIONS) for p in asked))

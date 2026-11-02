@@ -133,6 +133,12 @@ class DesktopToolTests(unittest.TestCase):
         self.assertTrue(self.tools.call("open_app", {"name": "notepad"})[0])
         self.assertEqual(launch.call_args.args[0]["Name"], "Notepad")
 
+    def test_list_apps_wildcards_list_everything(self):
+        everything = self.tools.call("list_apps", {"query": ""})
+        for query in ("*", "all", "All", "everything"):  # what models write (eval 2026-11-02)
+            self.assertEqual(self.tools.call("list_apps", {"query": query}), everything, query)
+        self.assertNotEqual(self.tools.call("list_apps", {"query": "chrome"}), everything)
+
     def test_open_app_needs_a_matching_app(self):
         self.assertFalse(self.tools.call("open_app", {"name": "photoshop"})[0])
 

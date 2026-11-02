@@ -457,3 +457,69 @@ class FailoverReplyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UsageLimitFallbackTests(unittest.TestCase):
+    """2026-11-01: over the ChatGPT limit, loosely worded commands reached a tool-less
+    stand-in brain; the interpreter now reads them on the Claude subscription."""
+
+    def test_claude_reads_the_request_with_the_menu(self):
+        from unittest import mock
+        from jarvis import interpret as interp
+        asked = []
+
+        class Lane:
+            def __init__(self, *a, **k):
+                pass
+
+            def ask(self, prompt, *a, **k):
+                asked.append(prompt)
+                return '{"mode": "act", "commands": [{"intent": "volume", "device": "dell", "args": {"level": "down"}}]}'
+
+            def close(self):
+                pass
+        config = {"devices": {"dell": {}, "zenbook": {}}, "cluster": {"main_device": "zenbook"}}
+        reader = interp.Interpreter(config, ".")
+        reader._lane = mock.MagicMock(side_effect=AssertionError("ChatGPT must not be asked"))
+        with mock.patch("jarvis.chatgpt.usage_limit", return_value="until 11:34 PM"), \
+                mock.patch("jarvis.fastlane.FastLane", Lane), \
+                mock.patch.object(interp, "interpreter", return_value=reader):
+            read = interp.interpret("make the music quieter on the dell", config, ".", "zenbook")
+        self.assertEqual(read["commands"][0]["intent"], "volume")
+        self.assertIn("MENU (data):", asked[0])
+        self.assertTrue(asked[0].startswith(interp.INSTRUCTIONS))
+
+    def test_a_stalled_chatgpt_reading_goes_to_claude(self):
+        """2026-11-02 eval: a ChatGPT turn stalled 57 s on "what time is it"; past
+        PATIENCE the reading comes from Claude instead of not at all."""
+        from unittest import mock
+        from jarvis import interpret as interp
+
+        class Stalled:
+            closed = False
+
+            def ask(self, prompt):
+                raise RuntimeError("ChatGPT lane timed out.")
+
+            def close(self):
+                self.closed = True
+
+        class Claude:
+            def __init__(self, *a, **k):
+                pass
+
+            def ask(self, prompt, *a, **k):
+                return '{"mode": "converse"}'
+
+            def close(self):
+                pass
+        reader = interp.Interpreter({"devices": {}}, ".", lane=Stalled())
+        stalled = reader.lane
+        with mock.patch("jarvis.chatgpt.usage_limit", return_value=""), \
+                mock.patch("jarvis.fastlane.FastLane", Claude):
+            self.assertEqual(reader.ask("what time is it"), '{"mode": "converse"}')
+        self.assertTrue(stalled.closed)  # the stalled turn's leftovers never reach the next ask
+        reader.lane = mock.MagicMock()
+        reader.lane.ask.side_effect = RuntimeError("ChatGPT turn failed: boom")
+        with mock.patch("jarvis.chatgpt.usage_limit", return_value=""), self.assertRaises(RuntimeError):
+            reader.ask("hi")  # other errors are still errors

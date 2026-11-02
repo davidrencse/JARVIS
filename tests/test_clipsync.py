@@ -4,7 +4,9 @@ import io
 import os
 import queue
 import struct
+import tempfile
 import threading
+from unittest import mock
 import unittest
 
 from jarvis import clipsync
@@ -76,6 +78,33 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(rows[1], bytes([11, 21, 31, 255, 16, 26, 36, 255]))
 
 
+class LineEndingAndTransientTests(unittest.TestCase):
+    def test_crlf_and_lf_text_digest_alike(self):
+        self.assertEqual(clipsync.digest("text", b"a\r\nb"), clipsync.digest("text", b"a\nb"))
+        self.assertNotEqual(clipsync.digest("png", b"a\r\nb"), clipsync.digest("png", b"a\nb"))
+
+    def test_applied_crlf_text_does_not_echo(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(clipsync, "local_clipboard") as lc:
+            clipsync.apply(tmp, "text", b"one\r\ntwo")
+            self.assertEqual(clipsync._applied(tmp), clipsync.digest("text", b"one\ntwo"))
+
+    def test_wayland_skips_jarvis_transient_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            board = clipsync.Wayland.__new__(clipsync.Wayland)
+            board.env = {"XDG_RUNTIME_DIR": tmp}
+            with open(os.path.join(tmp, clipsync.TRANSIENT), "w") as f:
+                f.write(clipsync.digest("text", b"grok prompt"))
+            def paste(*args):
+                if "--list-types" in args:
+                    return b"text/plain\n"
+                return b"grok prompt"
+            board._paste = paste
+            self.assertIsNone(board.read())
+            os.utime(os.path.join(tmp, clipsync.TRANSIENT), (1, 1))  # stale marker
+            self.assertEqual(board.read(), ("text", b"grok prompt"))
+
+
 class SyncTests(unittest.TestCase):
     def test_copies_flow_both_ways_without_echo(self):
         dell, zen = Board(("text", b"old dell")), Board(("text", b"old zen"))
@@ -122,3 +151,30 @@ class SyncTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RefreshTests(unittest.TestCase):
+    """Audit 2026-11-01: the watcher is its own long-lived process; code updates never reached it."""
+
+    def test_a_watcher_on_old_code_is_restarted_and_current_one_left_alone(self):
+        import tempfile
+        from unittest import mock
+        from jarvis import clipsync
+        with tempfile.TemporaryDirectory() as state:
+            with open(f"{state}/{clipsync.CODE_FILE}", "w") as f:
+                f.write("old")
+            alive = iter([4242, None, None])
+            with mock.patch.object(clipsync, "_pid", side_effect=lambda s: next(alive, None)), \
+                    mock.patch("jarvis.deploy.code_fingerprint", return_value="new"), \
+                    mock.patch.object(clipsync, "stop") as stop, \
+                    mock.patch.object(clipsync, "start", return_value={"started": True}) as start:
+                self.assertTrue(clipsync.refresh(state, log=lambda *_: None))
+            stop.assert_called_once()
+            start.assert_called_once()
+            with open(f"{state}/{clipsync.CODE_FILE}", "w") as f:
+                f.write("new")
+            with mock.patch.object(clipsync, "_pid", return_value=4242), \
+                    mock.patch("jarvis.deploy.code_fingerprint", return_value="new"), \
+                    mock.patch.object(clipsync, "stop") as stop:
+                self.assertFalse(clipsync.refresh(state, log=lambda *_: None))
+            stop.assert_not_called()
