@@ -185,7 +185,7 @@ body { font: 500 15px/1.45 var(--sans); letter-spacing: 0; }
 .hdr-pill .i { width: 17px; height: 17px; }
 .time-pill .sep { width: 1px; height: 22px; background: var(--line-2); }
 .search-pill { padding: 0 18px 0 5px; min-width: 240px; }
-.search-pill label { flex: 1; display: flex; }
+.search-pill label { flex: 1; display: flex; min-width: 0; }
 .search-pill input { flex: 1; border: 0; outline: none; background: none; font: 550 14px var(--sans); color: var(--ink); min-width: 0; }
 .search-pill input::placeholder { color: var(--ink-3); }
 .topbar-right { display: flex; align-items: center; gap: 8px; }
@@ -661,3 +661,20 @@ html:not([data-view="console"]) .range { display: none; }
   .ring-box, .dm-ring { width: 120px; height: 120px; }
   .book .num:nth-child(3) { display: none; }
 }
+/* Phones and 200% zoom: the one-row dock left the prompt a few letters wide. Tools on top, prompt + send below. */
+@media (max-width: 900px) {
+  .shell > .dock .dock-row { flex-wrap: wrap; }
+  .shell > .dock #prompt { order: 10; flex: 1 1 calc(100% - 56px); }
+  .shell > .dock .send { order: 11; }
+}
+
+/* Mic states, readable at a glance (the bare waveform read as a scribbled-out box).
+   wake = always on, waiting for "Jarvis"; talk = hearing a request; blocked = on, but no mic access. */
+.mic[aria-pressed="true"]::after { content: "Listening"; }
+.mic[aria-pressed="true"] .mic-wave { opacity: 0; }
+.mic[data-mode="talk"]::after { content: ""; }
+.mic[data-mode="talk"] .mic-wave { opacity: 1; }
+.mic[data-mode="blocked"] { width: auto; background: none; color: var(--needs, #f0a640); border-color: currentColor; }
+.mic[data-mode="blocked"]::after { content: "Mic blocked"; }
+.dock-in-panel .assistant .mic[aria-pressed="true"]:not([data-mode="blocked"]) { color: var(--inv-ink); }
+.mic[aria-pressed="true"]:not([data-mode="talk"]) { width: auto; }

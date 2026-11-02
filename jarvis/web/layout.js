@@ -97,7 +97,7 @@
     ["latency", "#stat-latency", null, null, 1, 1],
     ["voice", "#stat-voice", null, null, 1, 1],
     ["machines", ".cx-machines", "Machines and links", "Each computer and the links between them.", 2, 1],
-    ["output", "#view-console .cx-hero", "Claude output", "Tokens per hour over 48 hours.", 2, 1],
+    ["claude", "#sig-claude", "Claude window", "Claude usage left in this window.", 1, 1],
     ["activity", "#w-activity", "Activity", "Requests, providers and memory, as a ledger.", 2, 1],
     ["link", "#sig-link", "Zenbook link", "Ping trace to the other laptop.", 1, 1],
     ["balance", "#w-balance", "DeepSeek balance", "Live API balance.", 1, 1],

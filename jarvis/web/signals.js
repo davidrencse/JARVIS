@@ -143,11 +143,12 @@
 
   // ---------- 02 Claude tokens ----------
   async function loadTokens() {
-    if (!$("#sig-tok")) return; // shown by the console's ridge now
-    let u; try { u = await J.api("/api/usage?hours=48"); } catch (e) { $("#sig-tok").textContent = "—"; return; }
-    const cur = u.output.slice(24), prev = u.output.slice(0, 24);
+    let u; try { u = await J.api("/api/usage?hours=48"); } catch (e) { if ($("#sig-tok")) $("#sig-tok").textContent = "—"; return; }
+    const cur = u.output.slice(-24), prev = u.output.slice(0, -24);
     const total = cur.reduce((a, b) => a + b, 0), before = prev.reduce((a, b) => a + b, 0);
-    const replies = u.replies.slice(24).reduce((a, b) => a + b, 0);
+    if (claudeTokens !== total) { claudeTokens = total; limit(); }
+    if (!$("#sig-tok")) return; // the old tokens tile is gone from the console
+    const replies = u.replies.slice(-24).reduce((a, b) => a + b, 0);
     $("#sig-tok").textContent = compact(total);
     bars($("#dm-bars"), cur);
     $("#sig-tok-stats").innerHTML = `<div><dt>Replies</dt><dd>${fmt.format(replies)}</dd></div>`;
@@ -160,17 +161,33 @@
   let credits = J.state.credits;
   const until = (iso) => { const s = Math.max(0, (Date.parse(iso) - Date.now()) / 1000);
     return s < 3600 ? Math.max(1, Math.round(s / 60)) + " min" : s < 86400 ? Math.round(s / 3600) + " h" : Math.round(s / 86400) + " d"; };
-  function limit() {
-    const codex = credits?.find((r) => r.id === "codex"), [five, week] = codex?.meters || [];
+  // One ring per subscription window (Codex is the brain, Claude the failover): the same
+  // picture for both, so the two quotas read side by side.
+  const row = (k, v, tone) => `<li class="${tone || ""}"><i aria-hidden="true"></i><span>${esc(k)}</span><b>${esc(v)}</b></li>`;
+  function windowTile(id, ids, extra) {
+    const prov = credits?.find((r) => r.id === id), meters = prov?.meters || [];
+    const five = meters.find((m) => /5.?h/i.test(m.label || "")) || meters[0];
+    const week = meters.find((m) => /week/i.test(m.label || "")) || meters[1];
     const left = five ? Math.max(0, 100 - (five.pct ?? 0)) : null;
-    ring($("#dm-ring"), left);
-    $("#sig-ring").textContent = left == null ? "—" : Math.round(left) + "%";
-    $("#sig-limit").classList.toggle("low", left != null && left < 15);
-    $("#sig-limit-flag").textContent = five?.resets_at ? "resets in " + until(five.resets_at) : "";
-    const row = (k, v, tone) => `<li class="${tone || ""}"><i aria-hidden="true"></i><span>${esc(k)}</span><b>${esc(v)}</b></li>`;
-    $("#sig-ring-legend").innerHTML = codex ? row("5 h used", five ? Math.round(five.pct ?? 0) + "%" : "—", "lit") +
-      row("Week left", week ? Math.round(100 - (week.pct ?? 0)) + "%" : "—", "half") +
-      row("Week resets", week?.resets_at ? until(week.resets_at) : "—", "off") : row("No Codex data", "—", "off");
+    const name = id === "claude" ? "Claude" : "Codex";
+    const canvas = $(ids.ring);
+    ring(canvas, left);
+    canvas.setAttribute("role", "img");
+    canvas.setAttribute("aria-label", left == null ? `${name}: no window data` : `${name}: ${Math.round(left)}% of the 5-hour window left`);
+    $(ids.num).textContent = left == null ? "—" : Math.round(left) + "%";
+    $(ids.tile).classList.toggle("low", left != null && left < 15);
+    $(ids.flag).textContent = five?.resets_at ? "resets in " + until(five.resets_at) : "";
+    $(ids.legend).innerHTML = prov && meters.length
+      ? row("5 h used", five ? Math.round(five.pct ?? 0) + "%" : "—", "lit") +
+        row("Week left", week ? Math.round(100 - (week.pct ?? 0)) + "%" : "—", "half") +
+        row("Week resets", week?.resets_at ? until(week.resets_at) : "—", "off") + (extra || "")
+      : row(prov?.status === "error" ? `${name} usage can't be read` : `No ${name} data yet`, "—", "off") + (extra || "");
+  }
+  let claudeTokens = null;
+  function limit() {
+    windowTile("codex", { ring: "#dm-ring", num: "#sig-ring", tile: "#sig-limit", flag: "#sig-limit-flag", legend: "#sig-ring-legend" });
+    windowTile("claude", { ring: "#dm-ring-claude", num: "#sig-ring-claude", tile: "#sig-claude", flag: "#sig-claude-flag", legend: "#sig-ring-claude-legend" },
+      claudeTokens == null ? "" : row("Output, 24 h", compact(claudeTokens) + " tok", "off"));
     drawBalance();
   }
 
