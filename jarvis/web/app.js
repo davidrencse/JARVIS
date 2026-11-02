@@ -810,12 +810,13 @@
   }
   function setLive(on) {
     screenView.live = on; clearTimeout(screenView.timer);
+    const gen = screenView.gen = (screenView.gen || 0) + 1;  // only the newest chain may run
     $("#scr-live")?.setAttribute("aria-pressed", String(on));
     if (!on) return paintScreen();
     const tick = async () => {
-      if (!screenView.live) return;
+      if (!screenView.live || gen !== screenView.gen) return;
       if (!$("#view-devices").hidden && document.visibilityState === "visible") await snapScreen();
-      if (screenView.live) screenView.timer = setTimeout(tick, 3000);
+      if (screenView.live && gen === screenView.gen) screenView.timer = setTimeout(tick, 3000);
     };
     tick();
   }
