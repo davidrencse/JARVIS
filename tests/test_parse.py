@@ -54,6 +54,22 @@ class ParserTests(unittest.TestCase):
         got = parse("open blender", DEVICES, "dell", apps={"dell": ["Blender"]})
         self.assertEqual(got["commands"][0]["args"], {"name": "Blender"})
 
+    def test_whisper_opened_at_the_start_is_open(self):
+        def cmds(text):
+            got = parse(text, DEVICES, "dell", main="dell")
+            return [[c["intent"], c["device"], c["args"]] for c in got["commands"] or []]
+        self.assertEqual(cmds("opened Spotify here."), [["open_app", "dell", {"name": "Spotify"}]])
+        self.assertEqual(cmds("opened Discord on Arch and then Steam."),
+                         [["open_app", "zenbook", {"name": "Discord"}],
+                          ["open_app", "zenbook", {"name": "Steam"}]])
+        self.assertEqual(cmds("hey jarvis, opened chrome"), [["open_app", "dell", {"name": "Chrome"}]])
+        self.assertEqual(cmds("Opened up Google Chrome."), [["open_app", "dell", {"name": "Chrome"}]])
+
+    def test_opened_elsewhere_or_as_past_tense_is_not_an_action(self):
+        for text in ("I opened it yesterday", "opened it yesterday", "opened the door",
+                     "open chrome and opened steam"):
+            self.assertIsNone(parse(text, DEVICES, "dell", main="dell")["commands"], text)
+
     def test_link_path_keeps_its_case(self):
         # Video ids are case-sensitive: v=dqw4w9wgxcq is a different (or no) video.
         for text, url in (("open youtube.com/watch?v=dQw4w9WgXcQ",
