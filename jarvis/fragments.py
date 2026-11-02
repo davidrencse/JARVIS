@@ -98,6 +98,22 @@ def judge(text, follow_up=False, understood=None):
     return "keep", ""
 
 
+def completes(prefix, rest, understood=None):
+    """Is `rest` the missing part of the cut-off `prefix` ("Spotify" after "open up"), or a
+    request of its own: "never mind", "what time is it", the whole command said again?"""
+    words = _words(rest)
+    if not words or " ".join(words) in SHORT_OK or QUESTION.match(str(rest)):
+        return False
+    if words[0] in VERBS or words[0] in _words(prefix)[:1]:
+        return False  # "open up Spotify" said again in full
+    try:
+        if understood and understood(rest):
+            return False  # complete by itself
+    except Exception:
+        pass
+    return len(words) <= 6
+
+
 def complete(prefix, rest):
     """The cut-off command and its missing part, as one request ("open up" + "Spotify")."""
     return f"{str(prefix).strip().rstrip('.,!?')} {str(rest).strip()}".strip()

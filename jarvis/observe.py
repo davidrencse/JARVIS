@@ -215,8 +215,11 @@ def _windows_hyprland():
         raise LookupError("observing windows needs Hyprland (hyprctl)")
 
     def query(*args):
-        out = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True,
-                             timeout=5).stdout
+        try:
+            out = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True,
+                                 timeout=5).stdout
+        except subprocess.TimeoutExpired:
+            raise LookupError("hyprctl timed out") from None
         return json.loads(out or "null")
 
     active = (query("activewindow") or {}).get("address")

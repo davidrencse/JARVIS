@@ -477,9 +477,9 @@ class VoicePrint:
             result["safe"] = max(scores) < data["threshold"]
         return result
 
-    def verify(self, audio, threshold=None):
+    def verify(self, audio, threshold=None, learn=True):
         """(accepted, score). Confident matches join the profile so it adapts to the
-        real mic and room; borderline ones never do."""
+        real mic and room; borderline ones never do. learn=False only scores (a mic check)."""
         _np()  # fail early with the install hint if numpy is missing
         if not self.path.is_file():
             raise RuntimeError("No voiceprint yet. Run: python -m jarvis voice enroll")
@@ -492,7 +492,7 @@ class VoicePrint:
         score = self.score(embedding, profile)
         limit = data["threshold"] if threshold is None else threshold
         self.last_embedding = embedding if score >= limit else None
-        if score >= data["threshold"] + self.ADAPT_MARGIN and "profile" in data:
+        if learn and score >= data["threshold"] + self.ADAPT_MARGIN and "profile" in data:
             self._add(data, embedding)
             self.last_embedding = None  # already learned
         return score >= limit, round(score, 3)

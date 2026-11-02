@@ -512,6 +512,7 @@ class KnowledgeBase:
     def __init__(self, root, state=None, settings=None, on_event=None, today=None):
         self.root = Path(root).expanduser().resolve()
         self.raw, self.wiki = self.root / "raw", self.root / "wiki"
+        self._page_cache, self._page_cache_lock = {}, threading.Lock()
         for folder in (self.raw, self.wiki, self.root / "checks"):
             folder.mkdir(parents=True, exist_ok=True)
         self.settings = settings or {}
@@ -720,10 +721,10 @@ class KnowledgeBase:
         reconfirms what still holds. Daily notes, templates and the archive stay out."""
         seen = self.bot("reader").get("vault", {})
         added, unchanged, failed = [], 0, []
-        for note in vault.notes():
+        notes = [n for n in vault.notes() if not n["path"].startswith(skip) and n["path"].endswith(".md")]
+        stems = Counter(Path(n["path"]).stem for n in notes)
+        for note in notes:
             rel = note["path"]
-            if rel.startswith(skip) or not rel.endswith(".md"):
-                continue
             path = vault.root / rel
             try:
                 digest_hex = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -733,7 +734,8 @@ class KnowledgeBase:
                 unchanged += 1
                 continue
             try:
-                result = self.ingest(path, title=note.get("title") or None, page=Path(rel).stem)
+                result = self.ingest(path, title=note.get("title") or None, page=Path(rel).stem if stems[Path(rel).stem] == 1
+                                  else Path(rel).with_suffix("").as_posix())
             except (ValueError, OSError) as exc:
                 failed.append({"path": rel, "error": str(exc)})
                 continue
@@ -830,7 +832,10 @@ class KnowledgeBase:
         unchanged page is never re-parsed; only changed, new and gone files cost anything.
         The default hands back private copies (writers mutate pages); read-only callers such
         as recall pass shared=True and get the cached objects, which they must not modify."""
-        cache = self.__dict__.setdefault("_page_cache", {})
+        with self._page_cache_lock:
+            return self._pages_locked(self._page_cache, shared)
+
+    def _pages_locked(self, cache, shared):
         pages = {}
         for path in sorted(self.wiki.glob("*.md")):
             if path.stem == "index":

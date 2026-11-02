@@ -122,6 +122,24 @@ def fast_path(text, config, state, step=None, origin=None, origin_class="owner",
                         source="Parser", detail="no model", started=started)
 
 
+def _refused(commands, config, base=None):
+    """The turn result when a command hits gates.hard_deny, else None. Every path that runs
+    commands checks this, not only the brain's tool gate: the interpreter offers `terminal`
+    too (audit 2026-11-01: an interpreted `rm .../jarvis.config.json` ran under confirm never)."""
+    for command in commands:
+        name = "terminal" if command.get("intent") == "terminal" else None
+        if name is None:
+            continue
+        why = gates.hard_deny(name, command.get("args") or {}, config, base)
+        if why:
+            reply = f"Refused: {why}."
+            return {"reply": reply, "commands": commands, "checks": [], "gates_ms": 0,
+                    "outcomes": [{"id": c["id"], "state": "not_sent", "ok": False,
+                                  "text": reply if c is command else "Held: a step in this request was refused."}
+                                 for c in commands]}
+    return None
+
+
 def run_commands(text, commands, config, state, step=None, origin=None, origin_class="owner",
                  remote=None, app_exists=None, history=None, on_begin=None, channel="cli",
                  source="Parser", detail="no model", started=None):
@@ -138,6 +156,10 @@ def run_commands(text, commands, config, state, step=None, origin=None, origin_c
             or any(c["intent"] not in DIRECT for c in commands)):
         return None
     parse_ms = _ms(started)
+    refused = _refused(commands, config)
+    if refused:
+        step("parse", "root", source, refused["reply"], "fail")
+        return refused
     if on_begin:
         on_begin(commands)
     step("parse", "root", source,
@@ -280,6 +302,9 @@ def run_confirmed(command, config, state, step=None, origin=None, origin_class="
     if command.get("intent") not in DIRECT or command.get("depends_on"):
         raise ValueError("This confirmed command cannot run independently.")
     history = _history(state) if history is None else history
+    refused = _refused([command], config)
+    if refused:
+        return refused
     result = _run_turn([command], config.get("devices", {}), origin, origin_class,
                        remote, app_exists, step, history, confirmed=True)
     _record({"request": uuid.uuid4().hex, "text": "Confirmed: " + str(command),
@@ -341,6 +366,17 @@ def _execute(commands, remote, step, request=None, skip=None):
     outcomes, lock, skip = {}, threading.Lock(), skip or {}
 
     def run(command):
+        # Every command ends with an outcome, whatever raises: a step that dies without one
+        # left its dependents waiting forever (audit 2026-11-01).
+        try:
+            run_one(command)
+        except Exception as exc:
+            with lock:
+                outcomes.setdefault(command["id"], {
+                    "id": command["id"], "state": "pre_effect_failure", "ok": False,
+                    "text": f"That step failed before it ran: {type(exc).__name__}."})
+
+    def run_one(command):
         action, arg = DIRECT[command["intent"]]
         label = f"{command['intent']} · {command['device']}"
         skipped = skip.get(command["id"], frozenset())

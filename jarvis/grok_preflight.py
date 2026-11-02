@@ -62,17 +62,23 @@ def assess(request, config, base, infer=None):
     """Return {decision, task, reply, checks}; fail closed on bad inference output."""
     if infer is not None:
         return _assess(request, infer)
-    lane = None
+    from .inference import ask as infer_role
+    shared = {}
 
     def infer(prompt):
-        nonlocal lane
-        lane = lane or chatgpt_lane(config, base)
-        return lane.ask(prompt)
+        # ChatGPT first, Claude while its plan is over the limit; a new thread (or Claude
+        # session) for each call, so the review never sees the draft. Both ChatGPT passes
+        # share one Codex process (a cold start is ~4 s).
+        from .chatgpt import usage_limit
+        if not usage_limit() and "lane" not in shared:
+            shared["lane"] = chatgpt_lane(config, base)
+        return infer_role(config, base, "grok_check", prompt, instructions=INSTRUCTIONS,
+                          lane=shared.get("lane"))
     try:
         return _assess(request, infer)
     finally:
-        if lane is not None:
-            lane.close()
+        if "lane" in shared:
+            shared["lane"].close()
 
 
 def _assess(request, infer):

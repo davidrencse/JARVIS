@@ -76,6 +76,11 @@ SITES = {
     "instagram reels": "https://www.instagram.com/reels", "reels": "https://www.instagram.com/reels",
 }
 DOMAIN = re.compile(r"(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(/\S*)?\Z")
+FILE_EXTENSIONS = frozenset(
+    "py md txt json html htm sh exe js ts jsx tsx css csv pdf doc docx xls xlsx ppt pptx png "
+    "jpg jpeg gif webp zip rar tar gz tgz 7z log yaml yml toml ini cfg conf bat ps1 msi dmg iso "
+    "mp3 mp4 wav flac mov mkv rs go cpp hpp java rb php sql db sqlite xml svg jar apk deb rpm "
+    "ipynb lua kt swift odt ods rtf epub".split())
 # A link's path and query keep their case ("watch?v=dQw4w9WgXcQ"); only the rest is lowered.
 URL_PATH = re.compile(r"\b((?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,})(/\S*)", re.I)
 
@@ -484,7 +489,14 @@ def _site(obj):
     if name in SITES:
         return SITES[name]
     match = DOMAIN.match(obj)
-    return f"https://{match.group(1)}{match.group(2) or ''}" if match else None
+    if not match:
+        return None
+    # "open main.py", "open notes.txt", "run setup.exe": a file, not a site (audit
+    # 2026-11-01: they became https://main.py...). With a scheme, www. or a path, a link.
+    tld = match.group(1).rsplit(".", 1)[-1]
+    if tld in FILE_EXTENSIONS and not match.group(2) and not re.match(r"(?:https?://|www\.)", obj):
+        raise Unsure(f"is {match.group(1)} a file or a website?")
+    return f"https://{match.group(1)}{match.group(2) or ''}"
 
 
 def _command(clause, catalog):

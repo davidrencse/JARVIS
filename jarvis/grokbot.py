@@ -159,17 +159,31 @@ for i in range(0, len(keys), 200):
   exit 0
 }
 PREV=$(active)
-OLD=$(timeout 2 wl-paste -n -t text/plain 2>/dev/null || true)
+# Save whatever the clipboard holds, of any type (an image, say), not just text.
+SAVED=$(mktemp)
+trap 'rm -f "$SAVED"' EXIT
+OLDTYPE=""
+TYPES=$(timeout 2 wl-paste --list-types 2>/dev/null || true)
+if [ -n "$TYPES" ]; then
+  if printf '%s\n' "$TYPES" | grep -qx 'image/png'; then OLDTYPE="image/png"
+  else OLDTYPE=$(printf '%s\n' "$TYPES" | head -n1); fi
+  timeout 5 wl-paste -t "$OLDTYPE" > "$SAVED" 2>/dev/null || OLDTYPE=""
+fi
 # Never paste unless Grok Bot really has focus: the keys would land in whatever does.
 focus "$A" || { echo "error=Couldn't bring Grok Bot to the front, so nothing was typed."; exit 5; }
 sleep 0.15
+# Tell clipsync this copy is JARVIS's own transient one (it skips a matching digest for 60s).
+printf 'text\0%s' "$P" | sha256sum | cut -d' ' -f1 > "$XDG_RUNTIME_DIR/jarvis-clip-transient" 2>/dev/null || true
 printf %s "$P" | wl-copy >/dev/null 2>&1
-wtype -M ctrl v -m ctrl
+RC=0
+wtype -M ctrl v -m ctrl || RC=$?
 sleep 0.15
-wtype -k Return
+[ "$RC" -eq 0 ] && { wtype -k Return || RC=$?; }
 sleep 0.3
 if [ -n "$PREV" ] && [ "$PREV" != "$A" ]; then focus "$PREV" || true; fi
-if [ -n "$OLD" ]; then printf %s "$OLD" | wl-copy >/dev/null 2>&1; fi
+if [ -n "$OLDTYPE" ] && [ -s "$SAVED" ]; then wl-copy --type "$OLDTYPE" < "$SAVED" >/dev/null 2>&1
+else wl-copy --clear >/dev/null 2>&1 || true; fi
+[ "$RC" -eq 0 ] || { echo "error=wtype failed (exit $RC), so the prompt may not have been typed."; exit 6; }
 echo "ok=1"
 echo "workspace=$(win workspace)"
 """

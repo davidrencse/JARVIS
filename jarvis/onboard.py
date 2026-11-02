@@ -28,6 +28,9 @@ LEVEL = "Now say: Hey Jarvis, can you hear me?"
 ENROLL = "Good. Now read each line on the screen, the way you'd normally talk to me."
 TEST = "Last one. Say: Jarvis, what time is it?"
 DONE = "All set. Just say Jarvis whenever you need me."
+MIC_INTRO = ("Let's tune the microphone to this room. It takes about twenty seconds. "
+             "First, stay quiet for a moment.")
+MIC_DONE = "Mic tuned. I kept your voice as it was."
 LEVEL_PHRASE, TEST_PHRASE = "Hey Jarvis, can you hear me?", "Jarvis, what time is it?"
 QUIET_SECONDS, ATTEMPTS = 2.0, 3
 KEPT = ("mic.json", "voiceprint.json", "enroll")  # what a run that doesn't finish puts back
@@ -80,15 +83,17 @@ class VoiceSetup:
         return input_devices()
 
     # ---- control ---------------------------------------------------------------------
-    def start(self, device=None):
-        """device: a mic name, "" for the system default, None to keep the saved choice."""
+    def start(self, device=None, mic_only=False):
+        """device: a mic name, "" for the system default, None to keep the saved choice.
+        mic_only: tune the mic to the room (quiet + level) and check one phrase against the
+        voiceprint David already has; enrollment is skipped and the voiceprint never changes."""
         with self._lock:
             if self.view["running"]:
                 raise RuntimeError("Voice setup is already running.")
             self._cancel.clear()
             self.view = {**self._idle(), "running": True, "step": "starting",
                          "device": device or None, "message": "Getting the microphone ready"}
-            self._thread = threading.Thread(target=self._run, args=(device,),
+            self._thread = threading.Thread(target=self._run, args=(device, mic_only),
                                             name="voice-setup", daemon=True)
             self._thread.start()
         return self.status()
@@ -134,7 +139,7 @@ class VoiceSetup:
         if self._cancel.is_set():
             raise Cancelled()
 
-    def _run(self, device):
+    def _run(self, device, mic_only=False):
         daemon = self._daemon_mod()
         was_listening = daemon._pid(self.state) is not None
         finished, mic = False, None
@@ -152,13 +157,16 @@ class VoiceSetup:
             if device is not None:  # no choice given (`jarvis voice enroll`): keep the saved mic
                 tuning["device"] = device or None
             mic = self._mic = self._open(tuning)
-            self._speak(INTRO, mic)
+            self._speak(MIC_INTRO if mic_only else INTRO, mic)
             noise_rms, noise_probs = self._quiet(mic)
             tuning.update(self._level(mic, tuning, noise_rms, noise_probs))
-            clips = self._enroll(mic, tuning)
-            result = self._finish(mic, tuning, clips)
+            if mic_only:
+                result = self._mic_check(mic, tuning)
+            else:
+                clips = self._enroll(mic, tuning)
+                result = self._finish(mic, tuning, clips)
             finished = True
-            self._set(step="done", result=result, message=DONE, phrase="")
+            self._set(step="done", result=result, message=MIC_DONE if mic_only else DONE, phrase="")
         except Cancelled:
             self._set(step="cancelled", message="Setup cancelled. Nothing "
                       "was changed.", phrase="")
@@ -334,6 +342,23 @@ class VoiceSetup:
                 self.view["warning"] = ""
         return clips
 
+    def _mic_check(self, mic, tuning):
+        """The new cutoffs, heard through the voiceprint David already has: one phrase."""
+        from .listen import VoicePrint, mic_settings
+        result = {"mic": mic_settings(self.state), "voiceprint": "kept"}
+        self._speak(TEST, mic)
+        self._set(step="test", message="Say the line below")
+        audio = self._record(mic, tuning, TEST_PHRASE)
+        if audio is not None:
+            ok, score = VoicePrint(self.state, self.config).verify(audio, learn=False)
+            result.update(test_score=score, test_passed=bool(ok))
+        else:
+            result.update(test_score=None, test_passed=None)
+        self._speak(MIC_DONE if result.get("test_passed") is not False else
+                    "Mic tuned. That last one was a weak match for your voice; if I start "
+                    "missing you, run the full voice setup.", mic)
+        return result
+
     def _finish(self, mic, tuning, clips):
         from .listen import VoicePrint
         self._set(step="learning", message="Learning your voice", phrase="")
@@ -363,7 +388,7 @@ class _Reader:
         self.read = read
 
 
-def run_terminal(state, config, device=None, out=None, poll=0.1, setup=None):
+def run_terminal(state, config, device=None, out=None, poll=0.1, setup=None, mic_only=False):
     """`jarvis voice enroll`: the same guided setup in a terminal, so it needs no console
     and no browser. JARVIS speaks each cue; the line to read is printed large, with a live
     mic meter. Ctrl+C cancels and leaves the old voiceprint as it was."""
@@ -389,7 +414,7 @@ def run_terminal(state, config, device=None, out=None, poll=0.1, setup=None):
                 out.write("\r" + " " * 40 + "\r\n" + "\n".join(lines) + "\n")
                 out.flush()
     setup.on_change = show
-    setup.start(device)
+    setup.start(device, mic_only=mic_only)
     try:
         while True:
             view = setup.status()

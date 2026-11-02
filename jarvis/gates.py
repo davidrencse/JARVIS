@@ -131,20 +131,57 @@ def _under(path, root):
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
+# Login and key files no command may touch, read-only or not: their contents would go to
+# the model, and from there anywhere (audit 2026-11-01: `cat ~/.codex/auth.json`,
+# `curl -d @$HOME/.codex/auth.json ...`). Matched on the raw text, quotes and all.
+SECRET_TEXT = re.compile(
+    r"\.codex[/\\]+auth|\.claude[/\\]+\.?credentials|\.ssh(?:[/\\]|\b)|[/\\]id_(?:rsa|ed25519|ecdsa|dsa)\b|"
+    r"\.gnupg\b|\.password-store\b|\.aws[/\\]+credentials|\.config[/\\]+gh[/\\]+hosts|"
+    r"\.netrc\b|\.git-credentials\b|\bcode-signing\.key\b|cluster-owner\.token", re.I)
+# JARVIS's own config, state and gate code, named anywhere in a command that changes things
+# ("python -c \"open('.../jarvis.config.json','w')\"" slipped past the path check).
+OWN_TEXT = re.compile(r"jarvis\.config\.json|(?:^|[\s'\"=/\\(])\.jarvis(?:[/\\'\"\s)]|$)|JARVIS\.md", re.I)
+# Running whatever a pipe or a decode produces: never from the brain.
+PIPE_TO_SHELL = re.compile(r"\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|fish|ksh|pwsh|powershell|python3?|perl|ruby|node)\b|"
+                           r"\b(?:iex|invoke-expression)\b|\beval\s|base64\s+(?:-d|--decode)\b[^|]*\|", re.I)
+PROTECTED_NAMES = (".ssh", ".codex", ".claude", ".jarvis", ".gnupg", "jarvis.config.json",
+                   "JARVIS.md", "auth.json", "id_rsa", "id_ed25519", ".credentials.json")
+
+
+def _globbed_secret(command):
+    """A glob that could expand to a protected name (`~/.s?h/id_ed25519`, `jarvis.conf*.json`)."""
+    import fnmatch
+    for word in re.split(r"[\s'\"=;|&()<>]+", command):
+        if not any(c in word for c in "*?["):
+            continue
+        for part in re.split(r"[/\\]+", word):
+            if any(c in part for c in "*?[") and any(fnmatch.fnmatchcase(name.lower(), part.lower())
+                                                       for name in PROTECTED_NAMES):
+                return True
+    return False
+
+
 def _terminal_denial(args, config, base):
     from . import terminal
     command = str((args or {}).get("command") or "")
     cwd_arg = (args or {}).get("cwd")
+    if SECRET_TEXT.search(command) or SECRET_TEXT.search(str(cwd_arg or "")):
+        return "JARVIS never reads or sends login, key or token files"
     if terminal.read_only(command, cwd_arg):
         return None
     if CREDENTIAL_CMD.search(command):
         return "JARVIS never enters passwords, tokens or keys"
+    if PIPE_TO_SHELL.search(command):
+        return "JARVIS doesn't run code piped or decoded into a shell"
+    if OWN_TEXT.search(command) or _globbed_secret(command):
+        return "JARVIS's own config, state and keys are off limits"
     repo = Path(base).resolve() if base else Path(__file__).resolve().parent.parent
     repo_s = str(repo).replace("\\", "/")
     home = _abs("~", "/")
     vaults = [_abs(v, "/") for v in _vault_paths(config)]
     own = [repo_s + "/jarvis.config.json", repo_s + "/.jarvis", repo_s + "/JARVIS.md",
-           home + "/.ssh"] + [h + "/.jarvis" for h in (home,)]
+           repo_s + "/jarvis",  # its own gate code: `tee .../jarvis/gates.py`, `rm -rf .../jarvis`
+           home + "/.ssh", home + "/.codex", home + "/.claude"] + [h + "/.jarvis" for h in (home,)]
     here = _abs(cwd_arg, terminal.cwd()) if cwd_arg else _abs(terminal.cwd(), "/")
     for step in SEPARATORS.split(command):
         words = terminal._words(step) or [(w, w) for w in step.split()]
