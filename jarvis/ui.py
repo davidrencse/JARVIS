@@ -37,6 +37,27 @@ WEB = Path(__file__).resolve().parent / "web"
 TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
          ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml",
          ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8"}
+
+
+def _host_name(header):
+    """Host header -> bare lowercase hostname; handles "[::1]:7777"."""
+    header = header.strip()
+    if header.startswith("["):
+        return header[1:].partition("]")[0].lower()
+    return header.split(":")[0].lower()
+
+
+class _Counted:
+    """Wraps a body stream, counting bytes read, so the unread rest can be drained."""
+    def __init__(self, stream):
+        self.stream, self.n = stream, 0
+
+    def read(self, size=-1):
+        data = self.stream.read(size)
+        self.n += len(data)
+        return data
+
+
 MAX_AUDIO = 16000 * 4 * 45  # 45 s of float32 mono at 16 kHz
 # Tags the assistant puts on every exchange; as graph hubs they'd cluster unrelated items.
 BOOKKEEPING_TAGS = {"inbound", "outbound", "simple", "medium", "complex", "plan", "result"}
@@ -996,7 +1017,7 @@ class Console:
     def voice_setup_action(self, body):
         setup, action = self.voice_setup(), body.get("action")
         if action == "start":
-            return setup.start(body.get("device"))  # "" is the system default
+            return setup.start(body.get("device"), mic_only=bool(body.get("mic_only")))  # "" is the system default
         if action == "cancel":
             return setup.cancel()
         if action == "autostart":
@@ -1076,11 +1097,13 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, status, body, ctype="application/json; charset=utf-8", cache=False,
-              disposition=None):
+              disposition=None, close=False):
         data = body if isinstance(body, bytes) else json.dumps(body, default=str).encode()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        if close:
+            self.send_header("Connection", "close")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
@@ -1097,7 +1120,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _allowed(self):
-        host = (self.headers.get("Host") or "").split(":")[0].strip("[]").lower()
+        host = _host_name(self.headers.get("Host") or "")
         # Browsers label requests made by other sites; nothing here is for them.
         site = self.headers.get("Sec-Fetch-Site")
         return host in self.hosts and site in (None, "same-origin", "none")
@@ -1117,10 +1140,34 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         return self._send(HTTPStatus.FORBIDDEN, {"error": "Refused."})
 
+    DRAIN_CAP = 512 * 1024 * 1024
+
+    def _drain(self, left):
+        """Read and discard an unread request body (bounded, with an idle timeout, after the
+        error has been sent) so the
+        client receives our error instead of a reset when the connection closes."""
+        if left <= 0:
+            return
+        try:
+            self.connection.settimeout(10)
+            left = min(left, self.DRAIN_CAP)
+            while left > 0:
+                block = self.rfile.read(min(1 << 20, left))
+                if not block:
+                    break
+                left -= len(block)
+        except OSError:
+            pass
+
+    def _reject_body(self, status, message, length):
+        self.close_connection = True
+        self._send(status, {"error": message}, close=True)
+        self._drain(length)
+
     def _events(self, query):
         """Server-Sent Events: what a reconnecting tab missed (Last-Event-ID), then live."""
         after = self.headers.get("Last-Event-ID") or query.get("after") or ""
-        sub, backlog = self.console.bus.subscribe(int(after) if after.isdigit() else None)
+        sub, backlog = self.console.bus.subscribe(int(after) if re.fullmatch(r"\d+", after, re.ASCII) else None)
 
         def write(event, with_id=True):
             head = f"id: {event['seq']}\n" if with_id else ""
@@ -1152,11 +1199,11 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.console.bus.unsubscribe(sub)
 
-    def _fail(self, exc):
+    def _fail(self, exc, close=False):
         status = (HTTPStatus.NOT_FOUND if isinstance(exc, LookupError) else
                   HTTPStatus.BAD_REQUEST if isinstance(exc, ValueError) else
                   HTTPStatus.INTERNAL_SERVER_ERROR)
-        self._send(status, {"error": str(exc) or type(exc).__name__})
+        self._send(status, {"error": str(exc) or type(exc).__name__}, close=close)
 
     def do_GET(self):
         if not self._allowed():
@@ -1254,20 +1301,26 @@ class Handler(BaseHTTPRequestHandler):
         c = self.console
         if url.path == "/api/kb/upload":  # streamed to the knowledge inbox
             self.connection.settimeout(60)  # a stalled client can't pin this thread
+            stream = _Counted(self.rfile)
             try:
                 return self._send(HTTPStatus.OK, c.kb_upload(
-                    self.rfile, length, parse_qs(url.query).get("name", [""])[-1]))
+                    stream, length, parse_qs(url.query).get("name", [""])[-1]))
             except Exception as exc:
-                return self._fail(exc)
+                self.close_connection = True
+                self._fail(exc, close=True)
+                return self._drain(length - stream.n)
         if url.path == "/api/send":  # streamed to disk, never held in memory
             query = {k: v[-1] for k, v in parse_qs(url.query).items()}
+            stream = _Counted(self.rfile)
             try:
                 return self._send(HTTPStatus.OK, c.send_file(
-                    self.rfile, length, query.get("name", ""), query.get("device")))
+                    stream, length, query.get("name", ""), query.get("device")))
             except Exception as exc:
-                return self._fail(exc)
+                self.close_connection = True
+                self._fail(exc, close=True)
+                return self._drain(length - stream.n)
         if length > MAX_AUDIO:
-            return self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Too large."})
+            return self._reject_body(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Too large.", length)
         raw = self.rfile.read(length) if length else b""
         try:
             if url.path == "/api/listen":

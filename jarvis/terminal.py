@@ -108,8 +108,8 @@ def read_only(command, cwd=None):
         return False
     # Where each && step runs: `cd .local && cd share && cat x` reads ~/.local/share/x.
     here = _join(globals()["cwd"](), str(cwd)) if cwd else globals()["cwd"]()
-    for chain in command.split("&&"):
-        for n, segment in enumerate(chain.split("|")):
+    for chain in _outside_quotes(command, "&&"):
+        for n, segment in enumerate(_outside_quotes(chain, "|")):
             if not _looks(segment.strip()):
                 return False
             if n == 0:
@@ -121,6 +121,34 @@ def read_only(command, cwd=None):
             if n and segment.split()[0].lower() not in PIPE_OK:
                 return False
     return True
+
+
+def _outside_quotes(text, sep):
+    """`text` split on `sep` where it isn't inside quotes: `grep -E 'a|b' notes` is one step
+    (audit 2026-11-01: it was cut in two and asked for an OK)."""
+    parts, start, quote, i = [], 0, None, 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif text.startswith(sep, i):
+            parts.append(text[start:i])
+            i += len(sep)
+            start = i
+            continue
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+# Folders one step above app state (.local/share, .var/app, Library/Keychains): a cd that
+# stops there makes the next relative read land inside it. On another PC JARVIS can't see
+# where an earlier command left the shell (audit 2026-11-01: `cd .local` on the Dell, then
+# `cat share/...`), so stopping there is not "only looks".
+STATE_PARENTS = frozenset({".local", ".var", "library", "appdata", "application support"})
 
 
 def _norm(value):
@@ -152,7 +180,10 @@ def _walk(segment, here):
     if name in CD:
         if any(value == "-" for value, _ in words[1:]):
             return None
-        return paths[-1] if paths else str(Path.home())
+        dest = paths[-1] if paths else str(Path.home())
+        if posixpath.basename(dest.rstrip("/")).lower() in STATE_PARENTS:
+            return None
+        return dest
     return here
 
 
@@ -326,6 +357,43 @@ def _argv(command, folder):
     return [shell, "-c", script]
 
 
+def _kill_tree(proc):
+    """Kill the shell and everything it started (builds, servers, grandchildren)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
+                           timeout=10, creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_shell(argv, folder):
+    """(returncode, stdout, stderr, timed_out). On timeout the whole process tree dies and
+    the pipes are drained with a bounded wait, so a grandchild holding them can't hang us."""
+    extra = ({"creationflags": NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+             else {"start_new_session": True})
+    proc = subprocess.Popen(argv, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace",
+                            stdin=subprocess.DEVNULL, **extra)
+    try:
+        out, err = proc.communicate(timeout=TIMEOUT)
+        return proc.returncode, out, err, False
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out = err = ""
+        return None, out or "", err or "", True
+
+
 def run(spec):
     """(ok, text) for one command. spec: JSON {"command", "cwd"?} or the command itself."""
     try:
@@ -343,22 +411,21 @@ def run(spec):
             return False, f"No such folder: {wanted}"
         folder = str(wanted.resolve())
     try:
-        out = subprocess.run(_argv(command, folder), cwd=folder, capture_output=True,
-                             text=True, encoding="utf-8", errors="replace", timeout=TIMEOUT,
-                             stdin=subprocess.DEVNULL,
-                             creationflags=NO_WINDOW)
-    except subprocess.TimeoutExpired:
-        return False, f"Stopped after {TIMEOUT} s (interactive programs can't run here)."
+        code, stdout, stderr, timed_out = _run_shell(_argv(command, folder), folder)
     except OSError as exc:
         return False, f"Couldn't start a shell: {exc}"
-    text, _, where = out.stdout.rpartition(MARK)
+    if timed_out:
+        return False, (f"The command was stopped after {TIMEOUT} s and everything it started was "
+                       "killed. Long-running commands (builds, servers, watchers) and interactive "
+                       "programs can't run through this tool.")
+    text, _, where = stdout.rpartition(MARK)
     if not _:  # the shell died before printing its folder
-        text, where = out.stdout, folder
+        text, where = stdout, folder
     where = where.strip() or folder
     if Path(where).is_dir() and not SECRET.search(where) and not _private(where) \
             and not APP_STATE.search(where):
         _CWD["path"] = where  # a cd persists, like a real terminal (never into a secret folder)
-    body = (text.rstrip() + ("\n" + out.stderr.rstrip() if out.stderr.strip() else "")).strip()
+    body = (text.rstrip() + ("\n" + stderr.rstrip() if stderr.strip() else "")).strip()
     if len(body) > MAX_OUTPUT:
         body = body[:MAX_OUTPUT] + f"\n... ({len(body) - MAX_OUTPUT} more characters cut)"
-    return out.returncode == 0, f"{body or '(no output)'}\n[exit {out.returncode} · cwd {where}]"
+    return code == 0, f"{body or '(no output)'}\n[exit {code} · cwd {where}]"

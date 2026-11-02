@@ -923,6 +923,7 @@ class Vault:
         The page is untrusted: it is stored as quoted material, never auto-recalled
         (reference/ is excluded from recall), and private or local addresses are refused."""
         when = when or datetime.now()
+        self._check_writable("reference/_clip-check.md")  # refuse before fetching anything
         page = (fetch or fetch_page)(str(url or "").strip())
         title = re.sub(r"\s+", " ", title or page["title"] or page["url"]).strip()[:120]
         name = slug(title) or slug(urllib.parse.urlparse(page["url"]).netloc)
@@ -1379,7 +1380,8 @@ class VaultTools:
             if name == "vault_capture":
                 return True, json.dumps(self.vault.capture(
                     str(args.get("title", "")), str(args.get("body", "")),
-                    args.get("tags") or [], str(args.get("kind") or "note"), self.channel))
+                    [args["tags"]] if isinstance(args.get("tags"), str) else args.get("tags") or [],
+                    str(args.get("kind") or "note"), self.channel))
             if name == "vault_append":
                 return True, json.dumps(self.vault.append(
                     str(args.get("note", "")), str(args.get("text", "")),

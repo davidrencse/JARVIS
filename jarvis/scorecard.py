@@ -160,7 +160,6 @@ def score_decider(cases, folds=FOLDS):
     fold. Also the confidence threshold whose precision reaches decide.TARGET, and how
     many requests it would cover; `ready` only when every option has decide.MIN_LABELS
     labels as well. None when the embedding model isn't there (nothing to measure)."""
-    import math
     from . import decide
     from .embed import embed
     scored = [c for c in cases if mode_for(c)]

@@ -59,6 +59,14 @@ INBOX, INBOX_SECTION = "tasks.md", "Inbox"
 TASK_SECTIONS = ("Tasks", "Next step", "Next steps", "To do", "Todo", "Action items")
 
 
+def _valid_date(value):
+    """The ISO date text if it is a real calendar date (not 2026-02-30), else None."""
+    try:
+        return date.fromisoformat(str(value or "").strip()[:10]).isoformat()
+    except ValueError:
+        return None
+
+
 def parse_date(text, today=None, roll=True):
     """YYYY-MM-DD from ISO dates and the ways people say them: today, tomorrow, friday,
     next week, in 3 days, +2w, Oct 27, October 27 2026. None for empty; ValueError if
@@ -106,7 +114,7 @@ def parse_line(line, written=None):
             "indent": len(match.group("indent").expandtabs(4)), "priority": None, "recur": None,
             **dict.fromkeys(("due", "scheduled", "start", "created", "done", "cancelled"))}
     for sign, value in DATE_FIELD.findall(body):
-        task[DATES[sign]] = value
+        task[DATES[sign]] = _valid_date(value)
     if (prio := PRIO_FIELD.search(body)):
         task["priority"] = PRIORITY[prio.group(1)]
     if (recur := RECUR_FIELD.search(body)):
@@ -116,7 +124,8 @@ def parse_line(line, written=None):
         if key == "priority":
             task["priority"] = task["priority"] or (value.lower() if value.lower() in RANK else None)
         else:
-            task[{"completion": "done"}.get(key, key)] = task[{"completion": "done"}.get(key, key)] or value[:10]
+            field = {"completion": "done"}.get(key, key)
+            task[field] = task[field] or _valid_date(value)
     text = RECUR_FIELD.sub("", body)
     for pattern in (DATE_FIELD, PRIO_FIELD, OTHER_FIELD, INLINE, BLOCK_ID):
         text = pattern.sub("", text)
@@ -190,7 +199,8 @@ class Tasks:
         title = str(fields.get("title") or full.stem)
         daily, is_today = rel.startswith("daily/"), rel == today_rel
         written = DATE_IN.search(str(fields.get("created") or ""))
-        written = date.fromisoformat(written.group(0)) if written else today
+        written = _valid_date(written.group(0)) if written else None
+        written = date.fromisoformat(written) if written else today
         closed = str(fields.get("status", "")).lower() in ("completed", "archived", "done")
         found, section, fenced, seen = [], "", False, {}
         for number, line in enumerate(text.splitlines(), 1):

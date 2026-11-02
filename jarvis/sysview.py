@@ -30,7 +30,7 @@ STATIONS = [
     {"id": "think", "title": "Think", "verb": "answers",
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",
-     "modules": ["chatgpt", "fastlane", "runner", "orchestrator", "prompts", "adapters",
+     "modules": ["chatgpt", "fastlane", "inference", "tools_mcp", "runner", "orchestrator", "prompts", "adapters",
                  "claude_auth", "grok_preflight", "usage"]},
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
@@ -201,9 +201,21 @@ def stores(console):
 
     def size(path):
         path = Path(path)
-        if path.is_file():
-            return path.stat().st_size
-        return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) if path.is_dir() else 0
+        try:
+            if path.is_file():
+                return path.stat().st_size
+        except OSError:
+            return 0
+        if not path.is_dir():
+            return 0
+        total = 0
+        for p in path.rglob("*"):
+            try:  # a file deleted mid-walk is simply skipped
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                continue
+        return total
 
     mem = console.memory.stats()
     kb = console.kb().snapshot()["stats"]
