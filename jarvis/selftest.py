@@ -300,6 +300,42 @@ def guard_released(since):
     return any(re.search(GUARD_RELEASED, l) for l in log_lines(since))
 
 
+def _captured_checks(probe, stress, out):
+    """What runs while the cursor is on the ASUS; check_capture hands it back afterwards
+    even when this raises."""
+    refocused = probe.focused()
+    if not refocused:
+        # never type into a window we couldn't bring to the front
+        got, owner = None, _user32().GetForegroundWindow() or 0
+    else:
+        got, _ = probe.type("abc")
+        owner = _user32().GetForegroundWindow() or 0
+    if not refocused:
+        out.append(result("injected keys stay on Dell while captured", "WARN",
+                          "skipped typing: the test window could not take focus"))
+    elif got == "abc":
+        out.append(result("injected keys stay on Dell while captured", "PASS",
+                          "software keystrokes reached the Dell window"))
+    elif owner != probe.hwnd:
+        out.append(result("injected keys stay on Dell while captured", "WARN",
+                          f"inconclusive: the test window lost focus (foreground {owner:#x}); "
+                          "something else was clicked or popped up mid-test"))
+    else:
+        out.append(result("injected keys stay on Dell while captured", "FAIL",
+                          f"window kept focus but received {got!r}; injected keys were swallowed"))
+    if stress:
+        # A fast gaming mouse: 1000 reports/s for 2 s, as tiny jiggles that barely move
+        # the ASUS cursor. (An unpaced 8,500/s flood starved the link; no real mouse does that.)
+        t0, n = time.perf_counter(), 2000
+        for i in range(n):
+            move_mouse(1 if i % 2 else -1, 0)
+            while time.perf_counter() < t0 + (i + 1) / 1000:
+                pass
+        took = time.perf_counter() - t0
+        out.append(result("stress: 1000 Hz mouse for 2 s", "PASS",
+                          f"{n} moves in {took:.2f} s without the hook stalling"))
+
+
 def check_capture(probe, stress=False):
     out = []
     start = datetime.now(timezone.utc).replace(microsecond=0)
@@ -329,34 +365,13 @@ def check_capture(probe, stress=False):
         out.append(check_typing(probe, "Dell typing after unanswered hand-over"))
         return out
     out.append(result("ASUS acknowledges hand-over", "PASS", "peer answered"))
-    refocused = probe.focused()
-    got, _ = probe.type("abc")
-    owner = _user32().GetForegroundWindow() or 0
-    if got == "abc":
-        out.append(result("injected keys stay on Dell while captured", "PASS",
-                          "software keystrokes reached the Dell window"))
-    elif not refocused or owner != probe.hwnd:
-        out.append(result("injected keys stay on Dell while captured", "WARN",
-                          f"inconclusive: the test window lost focus (foreground {owner:#x}); "
-                          "something else was clicked or popped up mid-test"))
-    else:
-        out.append(result("injected keys stay on Dell while captured", "FAIL",
-                          f"window kept focus but received {got!r}; injected keys were swallowed"))
-    if stress:
-        # A fast gaming mouse: 1000 reports/s for 2 s, as tiny jiggles that barely move
-        # the ASUS cursor. (An unpaced 8,500/s flood starved the link; no real mouse does that.)
-        t0, n = time.perf_counter(), 2000
-        for i in range(n):
-            move_mouse(1 if i % 2 else -1, 0)
-            while time.perf_counter() < t0 + (i + 1) / 1000:
-                pass
-        took = time.perf_counter() - t0
-        out.append(result("stress: 1000 Hz mouse for 2 s", "PASS",
-                          f"{n} moves in {took:.2f} s without the hook stalling"))
-    release_from = datetime.now(timezone.utc).replace(microsecond=0)
-    for _ in range(80):  # move right on the ASUS until it crosses back to the Dell
-        move_mouse(80, 0)
-        probe.pump(0.01)
+    try:
+        _captured_checks(probe, stress, out)
+    finally:  # always hand the cursor back, whatever happened above
+        release_from = datetime.now(timezone.utc).replace(microsecond=0)
+        for _ in range(80):  # move right on the ASUS until it crosses back to the Dell
+            move_mouse(80, 0)
+            probe.pump(0.01)
     released = wait_log(r"releasing capture", release_from, 4)
     out.append(result("capture releases back to Dell", "PASS" if released else "FAIL",
                       "cursor returned" if released else

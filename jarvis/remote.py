@@ -31,6 +31,9 @@ from pathlib import Path
 
 from .platforms import NO_WINDOW
 
+# Never via http_proxy: the tunnel token is for loopback only.
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 # ssh stderr that means no session ever opened, so the command can't have run there.
 PRE_SESSION = re.compile(r"ssh: connect to host|Could not resolve hostname|kex_exchange_identification|"
                          r"banner exchange|Host key verification failed|Permission denied \(", re.I)
@@ -273,7 +276,8 @@ class Remote:
         try:
             # urlopen wraps connect/send errors in URLError; reading the reply raises plain
             # OSError, and by then the node has the command.
-            with urllib.request.urlopen(req, timeout=45) as res:
+            # No proxy: the node's token must go to the loopback tunnel only.
+            with _NO_PROXY.open(req, timeout=45) as res:
                 body = _loads(res.read())
         except urllib.error.HTTPError as exc:
             try:

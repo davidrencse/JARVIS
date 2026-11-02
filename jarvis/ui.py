@@ -929,12 +929,27 @@ class Console:
     def confirmations(self):
         from .confirm import ConfirmQueue
         from .assistant import confirmation_origin
-        return {"pending": ConfirmQueue(self.state).pending(confirmation_origin(self.config, self.state))}
+        return ConfirmQueue(self.state).listing(confirmation_origin(self.config, self.state))
 
     def confirmation(self, body):
-        from .assistant import confirm_pending
+        from .assistant import confirm_pending, confirmation_origin
+        from .confirm import ConfirmQueue
+        if body.get("action") == "revoke":
+            site, verb = body.get("site"), body.get("verb")
+            if not isinstance(site, str) or not isinstance(verb, str) or not site or not verb:
+                raise ValueError("Choose the site and the kind of action to stop allowing.")
+            removed = ConfirmQueue(self.state).revoke(site, verb)
+            self.bus.publish("turn.confirm", {"handled": None})
+            return {"reply": f"No longer allowing {verb} on {site}.", "revoked": bool(removed)}
         if not isinstance(body.get("id"), str):
             raise ValueError("Choose a confirmation ID.")
+        if body.get("action") == "grant":
+            command, info = ConfirmQueue(self.state).grant_item(
+                body["id"], confirmation_origin(self.config, self.state), hash=body.get("hash"))
+            self.bus.publish("turn.confirm", {"handled": body["id"]})
+            return {"reply": f"Okay, allowing {info['verb']} on {info['site']} for 10 minutes.",
+                    "commands": [command], "outcomes": [],
+                    "grant": {"site": info["site"], "verb": info["verb"]}}
         result = confirm_pending(self.config, self.state, body["id"], body.get("action"),
                                  hash=body.get("hash"))
         self.bus.publish("turn.confirm", {"handled": body["id"]})

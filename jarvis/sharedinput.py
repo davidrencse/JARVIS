@@ -356,17 +356,192 @@ def start():
     return {"started": False, "note": "Lan Mouse didn't come up; check its log.", **lan_mouse_status()}
 
 
-def stop():
+def stop(sharing_only=False):
+    """Stop Lan Mouse. sharing_only keeps the IP watcher running (the guard lives in it)."""
     if os.name == "nt":
         _run("taskkill", "/IM", "lan-mouse.exe", "/F", timeout=15)
     else:
         units = _units()
+        if sharing_only:
+            units = [u for u in units if u != "lan-mouse-ipwatch.service"]
         if units:
             _run("systemctl", "--user", "stop", *units, timeout=30)
         if shutil.which("pkill"):
             _run("pkill", "-x", "lan-mouse")
             _run("pkill", "-x", "lan-mouse-jarvi")
     return {"stopped": not lan_mouse_status()["running"], **lan_mouse_status()}
+
+
+# -- off while the laptops are apart -----------------------------------------------------------
+# Sharing a mouse with a laptop that isn't on the desk is useless, and an edge that hands the
+# pointer to an unseen screen is how input gets "stuck". Tailscale already knows how the two
+# reach each other: a private (LAN) direct address means the same local network; a public
+# endpoint, a DERP relay or an offline peer means apart. guard() runs on a timer (the Arch
+# IP watcher, the node agent on Windows) and stops Lan Mouse after two "apart" readings in a
+# row; it starts it again only if it was the one that stopped it, so a manual stop sticks.
+# This only stops the sharing daemon: each laptop's own keyboard and mouse are untouched.
+GUARD_FILE = "lanmouse-guard.json"
+GUARD_STREAK = 2  # readings in a row before acting (30-60 s apart): a brief relay doesn't flap it
+
+
+def _tailscale_status():
+    exe = shutil.which("tailscale")
+    if not exe and os.name == "nt":
+        guess = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tailscale" / "tailscale.exe"
+        exe = str(guess) if guess.is_file() else None
+    if not exe:
+        return None
+    out = _run(exe, "status", "--json", timeout=8)
+    if out.returncode:
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def _private(ip):
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    # 100.64.0.0/10 is Tailscale's own range: reachable from anywhere, so it says nothing.
+    return addr.is_private and not addr.is_loopback and not addr.is_link_local \
+        and addr not in ipaddress.ip_network("100.64.0.0/10")
+
+
+VIRTUAL_IF = re.compile(r"^(lo|tailscale|docker|br-|veth|virbr|vEthernet|Loopback|zt|wg)", re.I)
+
+
+def local_networks():
+    """This computer's real LAN subnets (Wi-Fi/Ethernet), virtual and VPN interfaces left out.
+    A home LAN can use any range (David's uses 172.1.x, which isn't RFC1918), so "same subnet
+    as me" is the test, not "private address"."""
+    import ipaddress
+    pairs = []  # (interface, "ip/prefix")
+    if os.name == "nt":
+        out = _run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+                   "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { $_.InterfaceAlias + '|' + "
+                   "$_.IPAddress + '/' + $_.PrefixLength }", timeout=10)
+        pairs = [tuple(line.strip().rsplit("|", 1)) for line in out.stdout.splitlines() if "|" in line]
+    elif shutil.which("ip"):
+        for line in _run("ip", "-4", "-o", "addr").stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] == "inet":
+                pairs.append((parts[1], parts[3]))
+    nets = []
+    for name, cidr in pairs:
+        if VIRTUAL_IF.match(name or ""):
+            continue
+        try:
+            net = ipaddress.ip_interface(cidr).network
+        except ValueError:
+            continue
+        if net.prefixlen >= 8 and not net.is_loopback and net.prefixlen < 32:
+            nets.append(net)
+    return nets
+
+
+def _in(ip, nets):
+    import ipaddress
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in n for n in nets)
+
+
+def peer_nearby(config=None, status=None, nets=None):
+    """{near: True|False|None, peer, why}. Together on any local evidence; apart only on
+    positive evidence (online over a public address, or offline with no local sign);
+    None means it can't tell, and the guard then leaves things alone."""
+    config = read_config() if config is None else config
+    clients = (config or {}).get("clients") or []
+    if not clients:
+        return {"near": None, "peer": None, "why": "Lan Mouse has no peer configured."}
+    names = {str(c.get("hostname") or "").lower().removesuffix(".local") for c in clients} - {""}
+    ips = {ip for c in clients for ip in (c.get("ips") or [])}
+    status = _tailscale_status() if status is None else status
+    if not status or status.get("BackendState", "Running") != "Running":
+        return {"near": None, "peer": None, "why": "Tailscale isn't running here."}
+    nets = local_networks() if nets is None else nets
+    matches = [p for p in (status.get("Peer") or {}).values()
+               if str(p.get("HostName") or "").lower() in names or ips & set(p.get("TailscaleIPs") or [])]
+    if not matches:
+        return {"near": None, "peer": None, "why": "The Lan Mouse peer isn't in the tailnet."}
+    # A re-registered machine leaves a stale offline twin: prefer the live one.
+    p = sorted(matches, key=lambda m: (not m.get("Online"), not (ips & set(m.get("TailscaleIPs") or []))))[0]
+    name = p.get("HostName")
+    cur = str(p.get("CurAddr") or "")
+    host = cur.rsplit(":", 1)[0].strip("[]") if cur else ""
+    if host and (_in(host, nets) or _private(host)):
+        return {"near": True, "peer": name, "why": f"{name} is on this network ({host})."}
+    lan = sorted(ip for ip in ips if _in(ip, nets) and not ip.startswith("100."))
+    if lan:  # the IP watcher only writes addresses it just found
+        return {"near": True, "peer": name, "why": f"{name} has an address on this network ({lan[0]})."}
+    if not p.get("Online"):
+        return {"near": False, "peer": name, "why": f"{name} is offline and not on this network."}
+    if host:
+        return {"near": False, "peer": name, "why": f"{name} is on another network ({host})."}
+    return {"near": None, "peer": name, "why": f"Tailscale hasn't talked to {name} lately; can't tell."}
+
+
+def _notify(text):
+    if os.name == "nt" or not shutil.which("notify-send") or os.environ.get("JARVIS_NO_NOTIFY"):
+        return
+    try:
+        _run("notify-send", "-a", "JARVIS", "Lan Mouse", text)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _save_memo(path, memo):
+    from .fsio import atomic_write
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, json.dumps(memo))
+    except OSError:
+        pass
+
+
+def guard(state, nearby=None, status_fn=None, start_fn=None, stop_fn=None):
+    """One reading: stop Lan Mouse when the laptops are apart, start it again when they're
+    back together (only if this guard stopped it). A start by hand while apart is an override:
+    left alone until the laptops have been together again. Returns what it saw and did."""
+    nearby = nearby or peer_nearby
+    status_fn, start_fn = status_fn or lan_mouse_status, start_fn or start
+    stop_fn = stop_fn or (lambda: stop(sharing_only=True))  # never the IP watcher that runs us
+    path = Path(state) / GUARD_FILE
+    try:
+        memo = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        memo = {}
+    reading = nearby()
+    near = reading["near"]
+    memo["apart"] = memo.get("apart", 0) + 1 if near is False else 0
+    memo["together"] = memo.get("together", 0) + 1 if near is True else 0
+    running = status_fn()["running"]
+    if running and memo.get("stopped_by_guard"):
+        memo["stopped_by_guard"], memo["override"] = False, True  # David started it by hand
+    if near is True:
+        memo["override"] = False
+    action = None
+    if memo["apart"] >= GUARD_STREAK and running and not memo.get("override"):
+        action = "stopped"
+        memo["stopped_by_guard"] = True
+    elif memo["together"] >= GUARD_STREAK and memo.get("stopped_by_guard") and not running:
+        action = "started"
+        memo["stopped_by_guard"] = False
+    _save_memo(path, memo)  # before acting, so a crash mid-action can't lose what we did
+    if action == "stopped":
+        stop_fn()
+        _notify(f"Sharing is off: {reading['why']} It comes back when the laptops are together again.")
+    elif action == "started":
+        start_fn()
+        _notify(f"Sharing is back on: {reading['why']}")
+    return {**reading, "running": status_fn()["running"] if action else running, "action": action,
+            "stopped_by_guard": bool(memo.get("stopped_by_guard")), "override": bool(memo.get("override"))}
 
 
 def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None):

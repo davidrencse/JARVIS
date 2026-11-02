@@ -230,7 +230,13 @@ def _parse(text, devices, origin, main, apps):
         raise Unsure("a correction or command follows \"that's it\"")
     text = TRAILER.sub("", text)
     # Filler leaves its comma behind ("open chrome, please." -> "open chrome, "): strip it.
-    text = _spelled(re.sub(r"\s+", " ", FILLER.sub(" ", text)).strip(" ,;"))
+    text = re.sub(r"\s+", " ", FILLER.sub(" ", text)).strip(" ,;")
+    # Whisper hears a spoken "open" as "opened" ("opened spotify here"): the request's first
+    # word only. Mid-sentence "opened" and past-tense talk ("opened it yesterday") stay put.
+    # "opened up chrome" is the same mishearing of "open up chrome".
+    text = _spelled(re.sub(r"^opened\s+(?!(?:it|that|this|them|those|these|the|my|a|an|"
+                           r"yesterday|today|earlier|already|last|before|and)\b)", "open ", text,
+                           flags=re.I))
     if not text:
         raise Unsure("nothing left after the wake word")
     agent = bool(AGENT_BROWSER.search(text))

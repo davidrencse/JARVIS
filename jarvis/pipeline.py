@@ -317,15 +317,17 @@ _HISTORIES, _HISTORIES_LOCK = {}, threading.Lock()
 
 
 def _history(state):
-    """One History per state directory; None (no checks, no records) if it can't open."""
+    """One History per state directory; None (no checks, no records) while it can't open.
+    A failed open is not cached: the next call tries again."""
     key = str(state)
     with _HISTORIES_LOCK:
-        if key not in _HISTORIES:
+        if _HISTORIES.get(key) is None:
             try:
                 from .history import History
                 _HISTORIES[key] = History(state)
             except Exception:
-                _HISTORIES[key] = None
+                _HISTORIES.pop(key, None)
+                return None
         return _HISTORIES[key]
 
 
