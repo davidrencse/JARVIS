@@ -283,9 +283,28 @@ voice (…, near miss)" marks clips that scored above `near_miss` but lacked the
 | Grok Bot / Muse | their own subscriptions | browser/app agents |
 
 Failover: when ChatGPT reports a usage limit, `chatgpt.note_usage_limit` parses "try again
-at 8:00 PM", every later call skips ChatGPT until then, and `assistant._failover_reply`
-answers with the Claude CLI. If Claude is signed out, the reply says so. When testing the
-Claude CLI from inside a Claude session, strip `CLAUDE_*` and `ANTHROPIC_*` env vars.
+at 8:00 PM", every later call skips ChatGPT until then, and Claude answers instead. If
+Claude is signed out, the reply says so. When testing the Claude CLI from inside a Claude
+session, strip `CLAUDE_*` and `ANTHROPIC_*` env vars.
+
+The inference layer (`inference.py`) is the one place that picks the model for each part.
+Add new model calls through it, never as a bare `ChatGPTLane`/`FastLane`:
+
+- Roles `talk`, `tools`, `interpret`, `grok_check` and `consolidate`, each with a Claude tier
+  and a timeout. Override them in config under `inference.roles.<role>` (`tier`, `timeout`).
+  `inference.failover: false` turns the brain's failover off.
+- `Failover` wraps the brain: ChatGPT first, then Claude while ChatGPT is limited. It also
+  fails over when the limit hits mid-answer, but only if nothing was spoken yet and no tool
+  ran. Starting the stand-in closes ChatGPT's lanes (one Chrome per browser profile); the
+  stand-in closes again on ChatGPT's next answer.
+- `claude_brain` is the stand-in brain. It has the same instructions, context and tools:
+  the toolbox comes over MCP (`tools_mcp.py`, `jarvis brain-tools`) behind the same
+  ConfirmGate. The signed-in browsers come through `browser_proxy.py` (`jarvis
+  browser-proxy <server>`), a relay that runs `approve_browser` and `browser_gate` on every
+  call. Codex does that for ChatGPT itself; the Claude CLI has no per-call approval hook.
+- `ask()` is for stateless questions (consolidation, Grok preflight), with the same failover.
+- The interpreter gives ChatGPT `PATIENCE` (12 s), then reads the request with Claude:
+  ChatGPT turns sometimes stall for about 60 s.
 
 ## 8 Memory and the two vaults
 
