@@ -16,6 +16,9 @@ def call(tool, server="playwright", **args):
 class CommitDetectionTest(unittest.TestCase):
     def setUp(self):
         browser_gate._TYPED.clear()
+        browser_gate.PAGES.clear()
+        # Search boxes count only when a snapshot shows them (not the model's own words).
+        browser_gate.observe("playwright", '- searchbox "Search" [ref=e11]\n- textbox "Message to Sam" [ref=e2]')
 
     def test_reading_and_moving_around_never_ask(self):
         for params in (call("browser_navigate", url="https://x.com"), call("browser_snapshot"),
@@ -28,7 +31,7 @@ class CommitDetectionTest(unittest.TestCase):
             self.assertIsNotNone(commits(call("browser_click", element=label, ref="e1")), label)
 
     def test_enter_asks_unless_the_last_field_was_a_search_box(self):
-        commits(call("browser_type", element="Search box", ref="e1", text="weather"))
+        commits(call("browser_type", element="Search box", ref="e11", text="weather"))
         self.assertIsNone(commits(call("browser_press_key", key="Enter")))
         commits(call("browser_type", element="Message to Sam", ref="e2", text="hi"))
         self.assertIsNotNone(commits(call("browser_press_key", key="Enter")))
@@ -36,7 +39,7 @@ class CommitDetectionTest(unittest.TestCase):
 
     def test_type_with_submit_and_dialogs(self):
         self.assertIsNotNone(commits(call("browser_type", element="Comment", ref="e1", text="x", submit=True)))
-        self.assertIsNone(commits(call("browser_type", element="Search", ref="e1", text="x", submit=True)))
+        self.assertIsNone(commits(call("browser_type", element="Search", ref="e11", text="x", submit=True)))
         self.assertIsNotNone(commits(call("browser_handle_dialog", accept=True)))
         self.assertIsNone(commits(call("browser_handle_dialog", accept=False)))
 

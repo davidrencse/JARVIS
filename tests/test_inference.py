@@ -146,7 +146,7 @@ class FailoverTests(unittest.TestCase):
         t.join(5)
         self.assertTrue(standin.closed)
 
-    def test_the_stand_in_is_retired_before_chatgpt_answers(self):
+    def test_the_stand_in_is_retired_after_chatgpt_answers(self):  # was: before (race audit bug 2)
         order = []
         primary = Lane("ChatGPT answered.")
         lane = self.failover(primary)
@@ -158,7 +158,7 @@ class FailoverTests(unittest.TestCase):
         primary.ask = lambda *a, **k: (order.append("asked"), orig(*a, **k))[1]
         with limited(False):
             lane.ask("again")
-        self.assertEqual(order, ["closed", "asked"])
+        self.assertEqual(order, ["asked", "closed"])
 
     def test_tool_log_comes_from_the_exception_when_the_lane_was_reset(self):
         err = RuntimeError(str(LIMIT))

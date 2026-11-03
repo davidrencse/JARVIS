@@ -56,8 +56,9 @@ class GateTests(unittest.TestCase):
         for text in ("hi\n", "hi\r"):
             self.assertTrue(browser_gate.commits(
                 params("s", "browser_type", element="Message box", text=text, slowly=True)))
+        browser_gate.observe("ss", '- searchbox "Search" [ref=e1]')  # only a snapshot proves a search box
         self.assertIsNone(browser_gate.commits(
-            params("s", "browser_type", element="Search box", text="hi\n")))
+            params("ss", "browser_type", element="Search box", ref="e1", text="hi\n")))
 
     def test_card_check_kept(self):
         self.assertTrue(browser_gate.blocked("browser_type", {"element": "Number", "text": "4111 1111 1111 1111"}))
