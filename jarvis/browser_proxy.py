@@ -67,6 +67,7 @@ class Relay:
         self.stdin, self.stdout = stdin, stdout
         self.hidden = set(spec.get("disabled_tools") or ())
         self.lists, self.lock = set(), threading.Lock()  # ids of tools/list requests in flight
+        self.calls = {}  # id -> tool name of tools/call requests in flight
 
     def _write(self, message):
         line = message if isinstance(message, str) else json.dumps(message, ensure_ascii=False)
@@ -102,9 +103,16 @@ class Relay:
             return
         with self.lock:
             listed = self._listed(message.get("id"))
+            try:
+                tool = self.calls.pop(message.get("id"), "")
+            except TypeError:
+                tool = ""
         result = message["result"]
-        from .browser_gate import observe_result
-        observe_result(self.name, result)  # snapshots name refs for David's questions
+        if not listed:
+            from .browser_gate import observe_result
+            # Snapshots name refs for David's questions; only a snapshot-bearing tool's reply
+            # counts, never page text a read tool returned.
+            observe_result(self.name, result, tool)
         tools = result.get("tools") if isinstance(result, dict) else None
         if listed and isinstance(tools, list):
             result["tools"] = [t for t in tools if not isinstance(t, dict)
@@ -162,6 +170,11 @@ class Relay:
                     if ok:
                         from .browser_gate import observe_call
                         observe_call(self.name, tool, args)
+                        try:
+                            with self.lock:
+                                self.calls[message.get("id")] = tool
+                        except TypeError:
+                            pass
                     if not ok:
                         if "id" in message:
                             self._refuse(message["id"], why)

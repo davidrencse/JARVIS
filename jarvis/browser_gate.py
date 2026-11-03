@@ -121,17 +121,25 @@ def _typed(args):
     return out
 
 
+LABEL_KEYS = ("resolved", "element")
+
+
 def _label(args):
-    """The human-readable words describing what a call acts on (element names, labels,
-    selectors with words in them); bare refs like @e12 and option flags don't count."""
+    """The human-readable words naming what a call acts on: the accessible name a ref resolved
+    to or the `element` description. Raw selectors (button:nth-of-type(3), div > span), bare
+    refs like @e12 and option flags never count: nothing says what they commit."""
     words = []
-    for key, value in args.items():
-        if key in NOT_LABEL or key in ("text", "value", "values"):
-            continue
-        for item in _strings(value):
-            item = item.strip()
-            if item and not REFERENCE.match(item):
-                words.append(item)
+
+    def collect(item):
+        for key in LABEL_KEYS:
+            value = item.get(key)
+            if isinstance(value, str) and value.strip() and not REFERENCE.match(value.strip()):
+                words.append(value.strip())
+
+    collect(args)
+    for item in args.get("fields") if isinstance(args.get("fields"), list) else ():
+        if isinstance(item, dict):
+            collect(item)
     label = " ".join(words)
     return label if re.search(r"[A-Za-z]{3,}", label) else ""
 
@@ -274,6 +282,21 @@ def _ref_of(item):
     return None
 
 
+def _lookup(server, item):
+    """(role, name) the last snapshot gave the ref `item` points at, or None."""
+    with _LOCK:
+        refs = dict((PAGES.get(server) or {}).get("refs") or {})
+    ref = _ref_of(item) if isinstance(item, dict) else None
+    return refs.get(ref.lstrip("@")) if ref else None
+
+
+def _is_search(server, item):
+    """Only what the snapshot shows counts: a searchbox, or a name that says search. The
+    model's own description of an unresolved ref is not evidence."""
+    hit = _lookup(server, item)
+    return bool(hit) and (hit[0].lower() == "searchbox" or bool(SEARCH.search(hit[1] or "")))
+
+
 def enrich(server, args):
     """`args` plus a "resolved" entry (`button "Post"`) wherever a ref names an element the
     last snapshot described, at the top level and in each fill_form field. blocked() and
@@ -319,6 +342,8 @@ def judge(params):
     submit, a page dialog. named: something says what the element is (grants need that)."""
     server, tool = params.get("serverName") or "", _tool(params)
     args = (params.get("_meta") or {}).get("tool_params") or {}
+    if not re.search(r"press|key", tool, re.I):  # press reads and clears it below
+        _forget_typing(server, tool)
     if not INTERACTIVE.search(tool):
         return None
     args = enrich(server, args)
@@ -342,8 +367,9 @@ def judge(params):
                          for s in _strings(v))
     typing = re.search(r"type|fill", tool, re.I)
     if typing:
-        # The element the ref resolves to wins over what the model called it.
-        searching = bool(SEARCH.search(resolved or described))
+        items = [i for i in (args.get("fields") if isinstance(args.get("fields"), list) else [args])
+                 if isinstance(i, dict)]
+        searching = bool(items) and all(_is_search(server, i) for i in items)
         with _LOCK:
             _TYPED[server] = searching
         field = target or "a field the page didn't name"
@@ -353,18 +379,34 @@ def judge(params):
         if not searching and any(re.search(r"[\r\n]", text) for _, text in _typed(args)):
             return out(f"type text with a line break (presses Enter) into {described[:60] or 'a field'}",
                        "high", f"type into {field}", " (presses Enter)")
+        for item in items:  # a checkbox/radio/combobox value is a choice, like a clicked option
+            kind = str(item.get("type") or "").lower()
+            chosen = " ".join(s for k in ("value", "values") for s in _strings(item.get(k, "")))
+            found = COMMIT.search(chosen) if kind in ("checkbox", "radio", "combobox") else None
+            if found:
+                return out(f"set {kind} to “{found.group(0)}” ({_clean(chosen, 40)})", "high",
+                           f"set {target or described[:60] or kind} to {_clean(chosen, 40)}")
         if not searching and not named:
             return out("type into a field the page didn't name", "low", f"type into {field}")
         return None
     if re.search(r"press|key", tool, re.I):
-        key = " ".join(_strings(args)).strip().lower()
+        # \n and \r are Enter to Playwright; any combo ending in Enter submits.
         with _LOCK:
             searching = _TYPED.get(server, False)
-        if key in ("enter", "return", "numpadenter", "control+enter", "meta+enter") and not searching:
-            return out(f"press {key} after typing", "high", f"press {key} after typing")
+            _TYPED[server] = False
+        for text in _strings(args):
+            if re.search(r"[\r\n]", text):
+                final = "enter"
+            else:
+                final = text.lower().split("+")[-1].strip()
+            if final in ("enter", "return", "numpadenter") and not searching:
+                key = text.strip().lower() or "enter"
+                key = "enter" if re.search(r"[\r\n]", text) else key
+                return out(f"press {key} after typing", "high", f"press {key} after typing")
         return None
     name = re.sub(r"^(?:agent_)?browser_", "", tool).replace("_", " ")
     ref = _ref_of(args)
+    described = " ".join(s for k, v in args.items() if k not in ("text",) for s in _strings(v))
     found = COMMIT.search(described)
     if found:
         return out(f"{name} “{found.group(0)}” ({described[:60]})", "high",
@@ -431,20 +473,29 @@ def ask(action, config, state, wait=WAIT, queue=None, info=None):
     notify(f"let the browser {action}")
     number, deadline = int(item["id"][1:]), time.monotonic() + wait
     timed_out = f"David didn't answer in {wait:g} s (timed out): {action}"
-    while time.monotonic() < deadline:
-        status = queue.status(number)
-        if status == "approved":
-            return True, f"David approved: {action}"
-        if status == "rejected":
-            return False, f"David declined: {action}"
-        if status == "expired":
-            return False, timed_out
-        time.sleep(0.5)
+    answered = False
     try:
-        if hasattr(queue, "expire_item"):
-            queue.expire_item(item["id"])
-        else:
-            queue.reject(item["id"])
-    except ValueError:
-        pass  # answered or expired at the last moment; still declined here
-    return False, timed_out
+        while time.monotonic() < deadline:
+            status = queue.status(number)
+            if status == "approved":
+                answered = True
+                return True, f"David approved: {action}"
+            if status == "rejected":
+                answered = True
+                return False, f"David declined: {action}"
+            if status == "expired":
+                answered = True
+                return False, timed_out
+            if hasattr(queue, "expire_safely"):
+                queue.expire_safely()
+            time.sleep(0.5)
+        return False, timed_out
+    finally:
+        if not answered:  # timed out, or the poll itself failed: never leave it approvable
+            try:
+                if hasattr(queue, "expire_item"):
+                    queue.expire_item(item["id"])
+                else:
+                    queue.reject(item["id"])
+            except Exception:
+                pass  # answered or expired at the last moment; still declined here

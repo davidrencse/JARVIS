@@ -169,14 +169,18 @@ class FastLane:
         if not self.proc or self.proc.poll() is not None or self.turns >= self.max_turns:
             self.close()
             self._spawn()
+        # close() may run from another thread mid-turn: work on locals, never self.proc.
+        proc, lines = self.proc, self.lines
+        if proc is None or lines is None:
+            raise RuntimeError("Fast lane was closed.")
         recall = self.held.fresh(recall)
         notes = "\n".join(f"- {r}" for r in recall) or "- (none new this conversation)"
         message = f"{now_line()}\nMemory recall:\n{notes}\n\nDavid: {text}"
         try:
-            self.proc.stdin.write(json.dumps({"type": "user", "message": {
+            proc.stdin.write(json.dumps({"type": "user", "message": {
                 "role": "user", "content": message}}) + "\n")
-            self.proc.stdin.flush()
-        except OSError as exc:  # the child died between the poll above and this write
+            proc.stdin.flush()
+        except (OSError, ValueError, AttributeError) as exc:  # the child died between the poll above and this write
             raise RuntimeError(f"Fast lane process is gone: {exc}") from None
         self.turns += 1
         deadline = time.monotonic() + self.timeout
@@ -187,7 +191,7 @@ class FastLane:
             if remaining <= 0:
                 raise RuntimeError("Fast lane timed out.")
             try:
-                line = self.lines.get(timeout=remaining)
+                line = lines.get(timeout=remaining)
             except queue.Empty:
                 raise RuntimeError("Fast lane timed out.") from None
             if line is None:

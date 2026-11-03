@@ -944,6 +944,8 @@ class Console:
         if not isinstance(body.get("id"), str):
             raise ValueError("Choose a confirmation ID.")
         if body.get("action") == "grant":
+            if not isinstance(body.get("hash"), str) or not body["hash"]:
+                raise ValueError("Allowing a site needs the hash of the question you saw.")
             command, info = ConfirmQueue(self.state).grant_item(
                 body["id"], confirmation_origin(self.config, self.state), hash=body.get("hash"))
             self.bus.publish("turn.confirm", {"handled": body["id"]})

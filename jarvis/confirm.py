@@ -28,6 +28,7 @@ def summary(command):
 
 GRANT_SECONDS = 600  # "allow on this site" lasts ten minutes
 RECENT = 10
+BARE_YES_DELAY = 3  # seconds before a bare spoken "yes" may approve a browser question
 
 
 def notify(text):
@@ -141,7 +142,7 @@ class ConfirmQueue:
                               (origin,) if origin is not None else ()).fetchall()
         return [self._item(r) for r in rows]
 
-    def _resolve(self, db, identifier, origin):
+    def _resolve(self, db, identifier, origin, bare_guard=False):
         if identifier is None:
             rows = db.execute("SELECT * FROM confirmations WHERE status='pending' AND origin=? AND expires>? ORDER BY number",
                               (origin, time.time())).fetchall()
@@ -149,6 +150,12 @@ class ConfirmQueue:
                 raise ValueError("Which one? " + " or ".join("C" + str(r["number"]) for r in rows))
             if not rows:
                 raise ValueError("No pending confirmation for this device.")
+            if bare_guard and time.time() - rows[0]["created"] < BARE_YES_DELAY and \
+                    '"intent":"browser_action"' in rows[0]["command"]:
+                # A bare "yes" may have been about something else; a browser ask just parked
+                # needs its ID or the Confirm button.
+                raise ValueError(f"That browser question just came up; say 'yes C{rows[0]['number']}' "
+                                 "or press Confirm.")
             return rows[0]
         if not re.fullmatch(r"[cC][1-9][0-9]*", str(identifier)):
             raise ValueError("Use a confirmation ID such as C7.")
@@ -162,9 +169,10 @@ class ConfirmQueue:
     def approve(self, id_or_None, origin, hash=None):
         if not origin:
             raise ValueError("A confirmation needs an origin device.")
+        self.expire()  # an expired item can't be approved, whatever its deadline said
         with self.history.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = self._resolve(db, id_or_None, origin)
+            row = self._resolve(db, id_or_None, origin, bare_guard=True)
             digest = hashlib.sha256(row["command"].encode()).hexdigest()
             if not hmac.compare_digest(digest, row["hash"]) or (
                     hash is not None and not hmac.compare_digest(str(hash), digest)):
@@ -175,11 +183,32 @@ class ConfirmQueue:
             return json.loads(row["command"])
 
     def status(self, number):
-        """pending, approved, rejected or expired; browser_gate polls this while it waits."""
-        self.expire()
+        """pending, approved, rejected or expired; browser_gate polls this while it waits.
+        Read-only: a locked database can't make the poll fail mid-wait (see expire_safely)."""
         with self.history.connect() as db:
-            row = db.execute("SELECT status FROM confirmations WHERE number=?", (number,)).fetchone()
-        return row["status"] if row else None
+            row = db.execute("SELECT status, expires, command FROM confirmations WHERE number=?",
+                             (number,)).fetchone()
+        if row is None:
+            return None
+        if row["status"] != "pending":
+            return row["status"]
+        now = time.time()
+        try:
+            due = float((((json.loads(row["command"]).get("args") or {}).get("browser") or {})
+                         .get("expires_at")) or 0)
+        except (ValueError, TypeError, AttributeError):
+            due = 0
+        return "expired" if row["expires"] <= now or (due and due <= now) else "pending"
+
+    def expire_safely(self, tries=3):
+        """expire() that rides out a briefly locked database."""
+        for attempt in range(tries):
+            try:
+                return self.expire()
+            except sqlite3.OperationalError:
+                if attempt == tries - 1:
+                    return 0
+                time.sleep(0.1)
 
     def reject(self, id, origin=None):
         with self.history.connect() as db:
