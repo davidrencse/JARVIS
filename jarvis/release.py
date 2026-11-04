@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .deploy import PACKAGE, SKIP, _files, code_fingerprint
+from .deploy import EXCLUDE, PACKAGE, SKIP, _files, code_fingerprint
 
 RELEASE = "code-release"        # in the main's state folder: jarvis/, pyproject.toml, release.json
 FAILED = "code-release-failed.json"
@@ -83,7 +83,12 @@ def source(state):
 
 def settled(root=PACKAGE, quiet=QUIET, now=None):
     """True when no package file was saved in the last `quiet` seconds."""
-    newest = max((p.stat().st_mtime for p in _files(Path(root))), default=0)
+    newest = 0
+    for path in _files(Path(root)):
+        try:
+            newest = max(newest, path.stat().st_mtime)
+        except OSError:
+            continue  # vanished since the listing
     return (now or time.time()) - newest >= quiet
 
 
@@ -163,7 +168,7 @@ def _cut(state, repo, quiet, tests):
         fresh, final = state / (RELEASE + ".new"), release_dir(state)
         shutil.rmtree(fresh, ignore_errors=True)
         fresh.mkdir()
-        shutil.copytree(stage / "jarvis", fresh / "jarvis", ignore=shutil.ignore_patterns(*SKIP, "*.pyc"))
+        shutil.copytree(stage / "jarvis", fresh / "jarvis", ignore=shutil.ignore_patterns(*SKIP, "*.pyc", *EXCLUDE))
         if (stage / "pyproject.toml").is_file():
             shutil.copy2(stage / "pyproject.toml", fresh / "pyproject.toml")
     if code_fingerprint(fresh / "jarvis") != code:
@@ -189,7 +194,7 @@ def backup(state, repo=None):
     target = Path(state) / BACKUP
     fresh = Path(state) / (BACKUP + ".new")
     shutil.rmtree(fresh, ignore_errors=True)
-    shutil.copytree(repo / "jarvis", fresh / "jarvis", ignore=shutil.ignore_patterns(*SKIP, "*.pyc"))
+    shutil.copytree(repo / "jarvis", fresh / "jarvis", ignore=shutil.ignore_patterns(*SKIP, "*.pyc", *EXCLUDE))
     if (repo / "pyproject.toml").is_file():
         shutil.copy2(repo / "pyproject.toml", fresh / "pyproject.toml")
     shutil.rmtree(target, ignore_errors=True)
@@ -241,7 +246,10 @@ def is_bad(state, code):
 
 # Stdlib only, and written out before the update: it must work when the new code doesn't.
 GUARD = r'''
-import json, os, shutil, subprocess, sys, time
+import fnmatch, json, os, shutil, subprocess, sys, time
+EXCLUDE = ("*.pre-*", "*~", "*.swp", ".#*", "*.tmp")  # as deploy.EXCLUDE
+def excluded(name):
+    return any(fnmatch.fnmatchcase(name, x) for x in EXCLUDE)
 repo, state, want, wait, mode = sys.argv[1:6]
 argv = sys.argv[6:]
 wait = float(wait)
@@ -259,8 +267,8 @@ def confirmed():
         return False
 time.sleep(2)  # let the old process exit and free its lock
 proc = subprocess.Popen(argv) if mode == "launch" else None
-deadline = time.time() + wait
-while time.time() < deadline and not confirmed():
+deadline = time.monotonic() + wait  # monotonic: a suspended laptop doesn't eat the wait
+while time.monotonic() < deadline and not confirmed():
     if proc is not None and proc.poll() is not None:
         break
     time.sleep(1)
@@ -279,6 +287,8 @@ keep = set()
 for base, dirs, files in os.walk(os.path.join(prev, "jarvis")):
     dirs[:] = [d for d in dirs if d != "__pycache__"]
     for name in files:
+        if excluded(name):
+            continue
         rel = os.path.relpath(os.path.join(base, name), prev)
         keep.add(os.path.normcase(rel))
         target = os.path.join(repo, rel)
@@ -290,7 +300,7 @@ for base, dirs, files in os.walk(os.path.join(repo, "jarvis")):
     dirs[:] = [d for d in dirs if d != "__pycache__"]
     for name in files:
         path = os.path.join(base, name)
-        if not name.endswith(".pyc") and os.path.normcase(os.path.relpath(path, repo)) not in keep:
+        if not name.endswith(".pyc") and not excluded(name) and os.path.normcase(os.path.relpath(path, repo)) not in keep:
             os.remove(path)
 if os.path.isfile(os.path.join(prev, "pyproject.toml")):
     shutil.copyfile(os.path.join(prev, "pyproject.toml"), os.path.join(repo, "pyproject.toml"))
@@ -299,6 +309,7 @@ with open(os.path.join(state, "cluster-code-bad.json"), "w", encoding="utf-8") a
 log("restored the previous code; starting it")
 if mode == "launch":
     sys.exit(subprocess.call(argv))
+subprocess.call(["systemctl", "--user", "reset-failed", "jarvis-cluster"])  # crash loop: start limit
 subprocess.call(["systemctl", "--user", "restart", "jarvis-cluster"])
 '''
 
@@ -318,7 +329,9 @@ def guard(state, want, argv=None, systemd=False, repo=None, wait=GUARD_WAIT):
         # A child of the unit dies with its cgroup when the unit restarts: run as its own unit.
         command = ["systemd-run", "--user", "--collect", "--quiet",
                    "--unit", f"jarvis-code-guard-{int(time.time())}", *command]
-        subprocess.Popen(command, close_fds=True, start_new_session=True)
+        # Waited for: the unit exits right after this, and its cgroup kill would take a
+        # still-running systemd-run client (and the watchdog it was queuing) with it.
+        subprocess.run(command, close_fds=True, timeout=15, check=False)
         return command
     flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
              | getattr(subprocess, "CREATE_NO_WINDOW", 0))

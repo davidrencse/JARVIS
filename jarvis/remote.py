@@ -39,12 +39,14 @@ PRE_SESSION = re.compile(r"ssh: connect to host|Could not resolve hostname|kex_e
                          r"banner exchange|Host key verification failed|Permission denied \(", re.I)
 
 ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media",
-           "volume", "scroll", "browse", "observe", "input_info", "screen", "lan_mouse", "terminal", "clipboard")
+           "volume", "scroll", "browse", "observe", "input_info", "screen", "lan_mouse", "terminal", "clipboard",
+           "computer", "spotify", "app_ui")
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
        "focus_window": "name", "close_app": "name", "media": "command", "volume": "level",
        "scroll": "spec", "browse": "spec", "observe": "predicate", "input_info": "query",
-       "screen": "spec", "lan_mouse": "command", "terminal": "spec", "clipboard": "command"}
+       "screen": "spec", "lan_mouse": "command", "terminal": "spec", "clipboard": "command",
+       "computer": "spec", "spotify": "spec", "app_ui": "spec"}
 # Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
 SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
@@ -95,8 +97,9 @@ def session_env():
     return env
 
 
-def run_here(action, arg, tools=None):
-    """(ok, text) for one action on this laptop."""
+def run_here(action, arg, tools=None, config=None, state=None):
+    """(ok, text) for one action on this laptop. config/state only where David can be
+    asked (the main): app_ui then sends always_ask clicks to his confirm queue."""
     if action not in ACTIONS:
         return False, f"Unknown desktop action {action}."
     if os.name != "nt" and not (os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY")):
@@ -110,6 +113,15 @@ def run_here(action, arg, tools=None):
     if action == "screen":  # read-only: a snapshot for the Devices view's screen viewer
         from .screen import run
         return run(arg)
+    if action == "spotify":  # play a track/album/playlist or open Spotify's search
+        from .actions import spotify
+        return spotify(arg)
+    if action == "computer":  # screenshot / mouse / keyboard (control.py, its own safety checks)
+        from .control import run
+        return run(arg)
+    if action == "app_ui":  # accessibility-tree reads and actions (app_ui.py, its own checks)
+        from .app_ui import run
+        return run(arg, config=config, state=state) if config is not None else run(arg)
     if action == "input_info":  # read-only: screens and Lan Mouse, for Settings
         from .sharedinput import run
         return run(arg)
@@ -122,9 +134,9 @@ def run_here(action, arg, tools=None):
     if action == "clipboard":  # start / stop / status / autostart this computer's clipboard sync
         from .clipsync import control
         return control(arg)
-    if tools is None:
-        from .actions import DesktopTools
-        tools = DesktopTools()
+    if tools is None:  # the process-wide one, so its installed-app list stays cached
+        from .pipeline import _local_tools
+        tools = _local_tools()
     return tools.call(action, {ARG[action]: arg})
 
 
@@ -190,7 +202,9 @@ class Remote:
                 # This machine acts itself. On a node this matters: the main's SSH fallback
                 # runs `jarvis desktop ...` here, and routing that back through the main
                 # would send it to this (stopped) node agent again.
-                return run_here(action, arg, self.tools)
+                # Only the main can ask David, so only there does app_ui get the config.
+                return run_here(action, arg, self.tools,
+                                **({"config": self.config, "state": self.state} if local == main else {}))
             try:
                 payload = {"action": action, "arg": arg}
                 if local != main:
@@ -214,7 +228,7 @@ class Remote:
             except (OSError, ValueError, RuntimeError) as exc:
                 return False, str(exc)
         if not device or device == self.here():
-            return run_here(action, arg, self.tools)
+            return run_here(action, arg, self.tools, config=self.config, state=self.state)
         if device not in self.machines:
             return False, f"Unknown laptop {device!r}; known: {', '.join(self.names())}."
         try:

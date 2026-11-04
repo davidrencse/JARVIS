@@ -14,6 +14,8 @@ COMPLEX = re.compile(
     r"website|game|engine|infrastructure|feature set|mvp)\b|"
     r"\b(production|end[- ]to[- ]end|full[- ]stack|from scratch|multi[- ]agent|large project)\b",
     re.I | re.S)
+# "in my Chrome", "using my browser", "on my own chrome": David's real signed-in Chrome.
+MY_BROWSER = re.compile(r"\b(?:my|my own|david'?s)\s+(?:google\s+)?(?:chrome|browser)\b", re.I)
 WEB = re.compile(
     r"https?://|\bwww\.|\b(instagram|twitter|x\.com|tiktok|linkedin|reddit|facebook|youtube|"
     r"gmail|inbox|discord|telegram|notion|canvas|brightspace|website|web ?page|browser|log ?in|"
@@ -31,7 +33,9 @@ def classify(text, override=None):
             raise ValueError("tier must be simple, medium, or complex.")
         return {"tier": override, "reasons": ["owner override"]}
     reasons = []
-    if COMPLEX.search(text):
+    # COMPLEX rescans the rest of the text after every verb: quadratic on a long paste
+    # (2.6 s on "build " * 4000, audit 2026-11-04), so only the opening part is searched.
+    if COMPLEX.search(text[:2000]):
         reasons.append("multi-part build or production work")
     if len(text) > 600:
         reasons.append("long brief")
@@ -49,6 +53,8 @@ def grok_first(text, config):
     (default: email, logged-in sites, the web, anything naming Grok) or "all"."""
     if not grok_available(config):
         return False
+    if MY_BROWSER.search(text) and "chrome" in (config.get("actions", {}).get("browser_engines") or ()):
+        return False  # he asked for his own browser: the brain drives it (actions "chrome" server)
     return config.get("routing", {}).get("grok_scope", "accounts") == "all" or bool(WEB.search(text))
 
 
