@@ -79,10 +79,16 @@ class RelayTests(unittest.TestCase):
             replies = run([click], confirm="always")
         self.assertTrue(replies[1]["result"]["isError"])
         self.assertIn("Post", ask.call_args.args[0])
-        with mock.patch("jarvis.browser_gate.ask") as ask:  # full permissions: no question
-            replies = run([click], confirm="never")
+        # Full permissions: a plain commit runs unasked, but posting as David still asks
+        # (rules.always_ask, agreed 2026-11-03).
+        submit = call(1, "browser_click", element="Save changes button", ref="e13")
+        with mock.patch("jarvis.browser_gate.ask") as ask:
+            replies = run([submit], confirm="never")
         ask.assert_not_called()
         self.assertNotIn("isError", replies[1]["result"])
+        with mock.patch("jarvis.browser_gate.ask", return_value=(False, "no")) as ask:
+            replies = run([click], confirm="never")
+        ask.assert_called_once()
 
     def test_a_broken_check_refuses(self):
         def broken(params):

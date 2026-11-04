@@ -172,6 +172,16 @@ class ClusterHTTPTests(unittest.TestCase):
         save_json(self.state / "cluster-node.json", {"node_id": "node", "main_device": "main", "token": token})
         self.client = Client(self.node, self.state)
 
+    def test_signing_failure_fails_the_job_instead_of_leaving_it_running(self):
+        job = self.hub.broker.enqueue("node", "main", "inventory", {})
+        with patch("jarvis.deploy.sign_job", side_effect=RuntimeError("ssh-keygen broke")):
+            with self.assertRaises(RuntimeError):
+                self.client.request("/v1/poll", {})
+        found = self.hub.broker.get(job)
+        self.assertEqual(found["state"], "failed")
+        self.assertIn("sign", found["result"]["error"])
+        self.assertIsNone(self.hub.broker.busy_job("node"))
+
     def test_node_request_runs_on_main_with_origin_and_is_idempotent(self):
         key = uuid.uuid4().hex
         self.assertEqual(self.client.ask("hello", timeout=3, request_id=key)["reply"], "main answered")
@@ -692,7 +702,7 @@ class ConnectedAndAliveTests(unittest.TestCase):
         hub.broker.busy_job.return_value = None
         with patch("jarvis.cluster.served_code", return_value=None), \
                 patch.object(hub.stop_event, "is_set", return_value=False), \
-                patch("time.monotonic", side_effect=[0, 0, 10 ** 6]):
+                patch("time.monotonic", side_effect=[0] + [10 ** 6] * 5):
             with self.assertRaises(TimeoutError) as caught:
                 hub.dispatch("dell", "desktop", {"action": "terminal", "arg": "ls"}, timeout=5)
         self.assertGreaterEqual(hub.broker.enqueue.call_args.args[4], terminal.TIMEOUT + 10)
@@ -714,3 +724,91 @@ class ConnectedAndAliveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuditThreeTests(unittest.TestCase):
+    def hub(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        hub = Hub(configuration(), tmp.name, Path(tmp.name) / "main")
+        hub.broker = Mock()
+        return hub
+
+    def test_tls_handshake_is_done_per_request_with_a_deadline(self):
+        import ssl
+        from jarvis.cluster import make_server
+        server = make_server(Mock(), "127.0.0.1", 0)
+        self.addCleanup(server.server_close)
+        stalled = Mock(spec=ssl.SSLSocket)
+        stalled.do_handshake.side_effect = TimeoutError("silent client")
+        with self.assertRaises(TimeoutError):
+            server.finish_request(stalled, ("1.2.3.4", 1))
+        stalled.settimeout.assert_called_with(10)
+
+    def test_ask_worker_survives_a_broker_error(self):
+        hub = self.hub()
+        calls = []
+
+        def claim(*args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("database is locked")
+            hub.stop_event.set()
+            return None
+        hub.broker.claim.side_effect = claim
+        with patch.object(hub.stop_event, "wait", return_value=False):
+            hub._asks()
+        self.assertEqual(len(calls), 2)
+
+    def test_keep_up_survives_a_failing_step(self):
+        hub = self.hub()
+        hub.config = {"cluster": {"auto_release": True}}
+        steps = []
+
+        def update(settle=20):
+            steps.append(1)
+            if len(steps) == 1:
+                raise FileNotFoundError("4913")
+        with patch.object(hub, "_auto_update", side_effect=update), \
+                patch("jarvis.release.due", return_value=False), \
+                patch.object(hub.stop_event, "wait", side_effect=[False, False, True]):
+            hub._keep_up()
+        self.assertEqual(len(steps), 2)
+
+
+class NodeAuditTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        save_json(self.state / "cluster-node.json",
+                  {"node_id": "node", "main_device": "main", "token": "t" * 40})
+        self.node = configuration("node")
+
+    def test_outbox_for_another_main_is_set_aside_and_polling_continues(self):
+        worker = NodeWorker(self.node, self.state, executor=Mock())
+        save_json(worker.outbox, {"main_device": "old", "message": {"id": "x"}})
+        worker.client.request = Mock(return_value={"job": None, "code": worker.code})
+        worker._send_result = Mock()
+        self.assertFalse(worker.once())
+        worker._send_result.assert_not_called()
+        self.assertFalse(worker.outbox.exists())
+        self.assertTrue((self.state / "cluster-outbox.old.json").exists())
+
+    def test_oversized_result_is_replaced_by_a_failure(self):
+        worker = NodeWorker(self.node, self.state, executor=Mock(return_value={"screen": "x" * 4_100_000}))
+        job = {"id": uuid.uuid4().hex, "kind": "inventory", "deadline": time.time() + 5, "payload": {}}
+        worker.client.request = Mock(return_value={"job": job, "code": worker.code})
+        sent = []
+        worker._send_result = sent.append
+        worker.once()
+        self.assertTrue(sent[0]["failed"])
+        self.assertIn("too large", sent[0]["result"]["error"])
+
+    def test_unpinned_node_does_not_download_or_back_up(self):
+        worker = NodeWorker(self.node, self.state, executor=Mock())
+        worker.client.request = Mock()
+        with patch("jarvis.release.backup") as backup:
+            self.assertFalse(worker._pull_update("other-code"))
+        worker.client.request.assert_not_called()
+        backup.assert_not_called()

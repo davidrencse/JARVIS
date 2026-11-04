@@ -4,8 +4,10 @@ import io
 import os
 import queue
 import struct
+import json
 import tempfile
 import threading
+import time
 from unittest import mock
 import unittest
 
@@ -230,6 +232,17 @@ class PidIdentityTests(unittest.TestCase):
             self.assertFalse(os.path.exists(pidfile))
 
 
+class AppliedExpiryTests(unittest.TestCase):
+    def test_applied_digest_expires(self):
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch.object(clipsync, "local_clipboard", return_value=Board()):
+            clipsync.apply(state, "text", b"hello")
+            self.assertEqual(clipsync._applied(state), clipsync.digest("text", b"hello"))
+            later = clipsync.time.time() + clipsync.APPLIED_TTL + 1
+            with mock.patch.object(clipsync.time, "time", return_value=later):
+                self.assertIsNone(clipsync._applied(state))
+
+
 class ImageFallbackTests(unittest.TestCase):
     def test_truncated_png_falls_back_to_png_only(self):
         board = clipsync.Windows.__new__(clipsync.Windows)
@@ -260,3 +273,86 @@ class ImageFallbackTests(unittest.TestCase):
         if clipsync._pillow() is not None:
             self.assertEqual(png_to_dib(png), pure)
             self.assertEqual(png_decode(dib_to_png(pure)), (2, 2, rows))
+
+
+class WatcherLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = tmp.name
+
+    def test_start_detaches_from_the_callers_systemd_unit(self):
+        with mock.patch.object(clipsync, "_pid", side_effect=[None, 4242, 4242, 4242]), \
+                mock.patch.object(clipsync, "_unit_installed", return_value=False), \
+                mock.patch("jarvis.daemon._under_systemd_unit", return_value=True), \
+                mock.patch("jarvis.daemon.shutil.which", return_value="/usr/bin/systemd-run"), \
+                mock.patch.object(clipsync.subprocess, "Popen") as popen, \
+                mock.patch("time.sleep"):
+            out = clipsync.start(self.state)
+        self.assertTrue(out["started"])
+        self.assertEqual(popen.call_args.args[0][:3], ["systemd-run", "--user", "--scope"])
+
+    def test_start_prefers_restarting_the_installed_unit(self):
+        with mock.patch.object(clipsync, "_pid", side_effect=[None, 4242, 4242, 4242]), \
+                mock.patch.object(clipsync, "_unit_installed", return_value=True), \
+                mock.patch.object(clipsync.subprocess, "run",
+                                  return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch.object(clipsync.subprocess, "Popen") as popen, \
+                mock.patch("time.sleep"):
+            out = clipsync.start(self.state)
+        self.assertTrue(out["started"])
+        self.assertEqual(run.call_args.args[0], ["systemctl", "--user", "restart", "jarvis-clipboard.service"])
+        popen.assert_not_called()
+
+    def test_refresh_restarts_the_unit_instead_of_killing_the_watcher(self):
+        with open(os.path.join(self.state, clipsync.CODE_FILE), "w") as f:
+            f.write("old")
+        with mock.patch.object(clipsync, "_pid", return_value=7), \
+                mock.patch("jarvis.deploy.code_fingerprint", return_value="new"), \
+                mock.patch.object(clipsync, "_unit_installed", return_value=True), \
+                mock.patch.object(clipsync, "stop") as stop, \
+                mock.patch.object(clipsync, "start", return_value={"started": True}) as start:
+            self.assertTrue(clipsync.refresh(self.state, log=lambda _: None))
+        stop.assert_not_called()
+        start.assert_called_once()
+
+    def test_refresh_survives_a_fingerprint_oserror(self):
+        with mock.patch.object(clipsync, "_pid", return_value=7), \
+                mock.patch("jarvis.deploy.code_fingerprint", side_effect=OSError("gone")):
+            self.assertFalse(clipsync.refresh(self.state, log=lambda _: None))
+
+    def test_pasted_copy_is_still_ours_after_a_long_push(self):
+        board = Board(("text", b"x"))
+        with mock.patch.object(clipsync, "local_clipboard", return_value=board):
+            clipsync.apply(self.state, "text", b"x")
+        now = time.time()
+        saved = os.path.join(self.state, clipsync.APPLIED)
+        # pasted 1 s into a push that ran 20 s and just ended
+        busy = (now - 21, now - 0.5)
+        with open(saved, "w") as f:
+            json.dump({"digest": clipsync.digest("text", b"x"), "at": now - 20}, f)
+        self.assertIsNone(clipsync._applied(self.state))
+        self.assertEqual(clipsync._applied(self.state, busy), clipsync.digest("text", b"x"))
+
+    def test_connect_does_not_hang_on_non_json_greeting(self):
+        order = []
+        proc = mock.MagicMock()
+        proc.stdout.readline.return_value = b"Welcome banner\n"
+        proc.kill.side_effect = lambda: order.append("kill")
+        proc.stderr.read.side_effect = lambda n: order.append("read") or b"boom"
+        with mock.patch.object(clipsync.shutil, "which", return_value="/usr/bin/ssh"), \
+                mock.patch("jarvis.transfer._check_target"), \
+                mock.patch("jarvis.transfer._ssh_args", return_value=["ssh"]), \
+                mock.patch.object(clipsync, "_pinned_host", return_value=[]), \
+                mock.patch.object(clipsync.subprocess, "Popen", return_value=proc):
+            with self.assertRaisesRegex(RuntimeError, "SSH failed"):
+                clipsync.connect({"target": "me@host"}, Board(), lambda _: None)
+        self.assertLess(order.index("kill"), order.index("read"))
+
+
+class AlphaTests(unittest.TestCase):
+    @unittest.skipIf(clipsync._pillow() is None, "Pillow not installed")
+    def test_opaque_32bpp_dib_gets_full_alpha(self):
+        header = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 32, 0, 4, 0, 0, 0, 0)
+        png = dib_to_png(header + bytes([10, 20, 30, 0]))
+        self.assertEqual(png_decode(png)[2][0][3], 255)

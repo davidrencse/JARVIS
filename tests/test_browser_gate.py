@@ -98,6 +98,19 @@ class GateTest(unittest.TestCase):
         self.assertEqual(queue.rejected, ["C1"])
 
 
+class LateApprovalTest(unittest.TestCase):
+    """audit 2026-11-04: an approval landing after the last poll was reported as a timeout."""
+
+    def test_approval_after_the_last_poll_is_honoured(self):
+        # Polls at 0 s and 0.5 s see "pending"; David approves at 0.8 s, before the loop's
+        # next check at 1.0 s finds the deadline passed. Withdrawing is then a no-op.
+        queue = FakeQueue("approved", after=0.8)
+        with mock.patch("jarvis.assistant.confirmation_origin", return_value="dell"), \
+                mock.patch("jarvis.confirm.notify"):
+            ok, why = browser_gate.ask("click Post", {}, "state", wait=0.8, queue=queue)
+        self.assertTrue(ok, why)
+        self.assertIn("approved", why)
+
 class QueueRoundTripTest(unittest.TestCase):
     def test_console_approval_releases_the_waiting_browser(self):
         from jarvis.assistant import confirm_pending

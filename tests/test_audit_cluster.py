@@ -307,6 +307,22 @@ class PullUpdateTests(unittest.TestCase):
             update.assert_not_called()
 
 
+    def test_auto_update_leaves_self_pulling_ssh_node_alone(self):
+        # SSH push and the node's own pull of the same release raced over one folder.
+        config = configuration()
+        with tempfile.TemporaryDirectory() as tmp:
+            hub = Hub(config, tmp, tmp)
+            hub.broker.enroll("node")
+            hub.broker.heartbeat("node", {"code": "old", "pulls": "yes"})
+            with patch("jarvis.deploy.update") as update:
+                hub._auto_update(settle=0)
+            update.assert_not_called()
+            hub.broker.heartbeat("node", {"code": "old", "pulls": "no"})  # an older node: pushed
+            with patch("jarvis.deploy.update", return_value={"after": "new"}) as update:
+                hub._auto_update(settle=0)
+            update.assert_called_once()
+
+
 class SshUpdateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
