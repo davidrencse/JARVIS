@@ -141,7 +141,7 @@ class Broker:
 
     def heartbeat(self, node, info):
         # Never accept agent-provided paths, shell commands, or credentials as config.
-        safe = {k: str(info.get(k, ""))[:120] for k in ("hostname", "platform", "version", "code")}
+        safe = {k: str(info.get(k, ""))[:120] for k in ("hostname", "platform", "version", "code", "pulls")}
         with self.db() as db:
             db.execute("UPDATE nodes SET seen=?,info=? WHERE id=?", (time.time(), json.dumps(safe), node))
 
@@ -304,7 +304,12 @@ class Broker:
             late = row["deadline"] + (GRACE if state == "running" else 0) < time.time()
             if state in ("pending", "running") and late:
                 state = "expired" if state == "pending" else "uncertain"
-                db.execute("UPDATE jobs SET state=? WHERE id=?", (state, job_id))
+                # Only if it is still what we read: a result that just landed wins.
+                changed = db.execute("UPDATE jobs SET state=? WHERE id=? AND state=?",
+                                     (state, job_id, row["state"])).rowcount
+                if not changed:
+                    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                    state = row["state"]
         return {"id": row["id"], "node": row["node"], "kind": row["kind"], "state": state,
                 "result": json.loads(held["result"] if held and "result" in held else row["result"])
                 if row["result"] is not None else None}

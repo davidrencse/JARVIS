@@ -32,6 +32,7 @@ from .topology import DEFAULT_PORT, endpoint, identity, is_node, request_from
 _HUBS = {}
 MAX_PROTOCOL = 65536
 MAX_RESULT = 4_000_000
+HANDSHAKE_TIMEOUT = 10  # seconds a TLS client has to finish its handshake
 POLL_WAIT = 25
 WAIT_HOLD = 20  # seconds a requester asks the hub to hold a job-result request
 FRESH = 10  # seconds after a check-in that a node counts as alive between polls
@@ -412,12 +413,15 @@ class Hub:
             return
         auto = (self.config.get("cluster") or {}).get("auto_release", True)
         while True:
-            # Never under tests: a release runs the whole suite.
-            if auto and not _under_tests() and due(self.state):
-                report = cut(self.state)
-                print(f"JARVIS: release {report.get('code')}: "
-                      f"{'released' if report.get('released') else report.get('note')}", flush=True)
-            self._auto_update(settle=0)
+            try:
+                # Never under tests: a release runs the whole suite.
+                if auto and not _under_tests() and due(self.state):
+                    report = cut(self.state)
+                    print(f"JARVIS: release {report.get('code')}: "
+                          f"{'released' if report.get('released') else report.get('note')}", flush=True)
+                self._auto_update(settle=0)
+            except Exception as exc:  # a file saved mid-copy must not end auto-update for good
+                print(f"JARVIS: auto-update step failed: {exc}", flush=True)
             if self.stop_event.wait(every):
                 return
 
@@ -433,7 +437,7 @@ class Hub:
         want = served_code(self.state)
         pushed = self.__dict__.setdefault("_pushed", {})
         for status in self.broker.nodes():
-            if (not status["online"] or status.get("code") == want
+            if (not status["online"] or status.get("code") == want or status.get("pulls") == "yes"
                     or not is_ssh_node(self.config, status["id"]) or pushed.get(status["id"]) == want):
                 continue
             pushed[status["id"]] = want
@@ -525,29 +529,36 @@ class Hub:
 
     def _asks(self):
         while not self.stop_event.is_set():
-            with self._condition:
-                job = self.broker.claim(self.main, {"ask"})
-                if not job and not self.stop_event.is_set():
-                    self._condition.wait()
-                    continue
-            if not job:
-                continue
             try:
-                with request_from(job["requester"]):
-                    if self.ask_handler:
-                        result = self.ask_handler(job["payload"], job["requester"])
-                    else:
-                        result = self._console_ask(job)
-                self.broker.finish(job["id"], self.main, result)
+                self._ask_once()
+            except Exception as exc:  # e.g. sqlite "database is locked": keep serving asks
+                print(f"JARVIS: ask worker error: {exc}", flush=True)
+                self.stop_event.wait(1)
+
+    def _ask_once(self):
+        with self._condition:
+            job = self.broker.claim(self.main, {"ask"})
+            if not job and not self.stop_event.is_set():
+                self._condition.wait()
+                return
+        if not job:
+            return
+        try:
+            with request_from(job["requester"]):
+                if self.ask_handler:
+                    result = self.ask_handler(job["payload"], job["requester"])
+                else:
+                    result = self._console_ask(job)
+            self.broker.finish(job["id"], self.main, result)
+            with self._condition:
+                self._condition.notify_all()
+        except Exception as exc:
+            try:
+                self.broker.finish(job["id"], self.main, {"error": str(exc)}, failed=True)
                 with self._condition:
                     self._condition.notify_all()
-            except Exception as exc:
-                try:
-                    self.broker.finish(job["id"], self.main, {"error": str(exc)}, failed=True)
-                    with self._condition:
-                        self._condition.notify_all()
-                except (LookupError, ValueError):
-                    pass  # shutdown/recovery made this outcome explicitly uncertain
+            except (LookupError, ValueError):
+                pass  # shutdown/recovery made this outcome explicitly uncertain
 
     def _console_ask(self, job):
         if self.console is None:
@@ -594,7 +605,10 @@ class Hub:
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                 context.minimum_version = ssl.TLSVersion.TLSv1_2
                 context.load_cert_chain(cert, key)
-                self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+                # Handshake in the request thread (ui.ConsoleServer), not in accept(): one
+                # silent client must not stall the whole hub.
+                self.server.socket = context.wrap_socket(self.server.socket, server_side=True,
+                                                         do_handshake_on_connect=False)
             self.broker.recover()
             _HUBS[str(self.state)] = self
             self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -711,9 +725,24 @@ def make_server(hub, host, port):
                                 if remaining <= 0:
                                     break
                                 hub._condition.wait(remaining)
+                                if not _connected(self.connection):
+                                    break  # the node hung up: a job claimed now would be lost
                                 job = hub.broker.claim(node, kinds)
                         finally:
                             hub._polling[node].discard(self.connection)
+                    if job is not None:
+                        from .deploy import sign_job
+                        try:
+                            job = sign_job(job, node, hub.state)  # the node runs only what verifies
+                        except Exception as exc:  # don't leave the job running and the node busy
+                            with hub._condition:
+                                try:
+                                    hub.broker.finish(job["id"], node, {"error": f"couldn't sign the job: {exc}"},
+                                                      failed=True)
+                                except (LookupError, ValueError):
+                                    pass
+                                hub._condition.notify_all()
+                            raise
                     return self._send(200, {"job": job, "main_device": hub.main,
                                              "code": served_code(hub.state)})
                 if self.path == "/v1/result" and "owner" not in caps:
@@ -770,7 +799,16 @@ def make_server(hub, host, port):
             except (ValueError, TypeError, OSError, RuntimeError) as exc:
                 self._send(400, {"error": str(exc)})
 
-    return ConsoleServer((host, port), MainHandler)
+    class HubServer(ConsoleServer):
+        def finish_request(self, request, client_address):
+            # TLS handshake here, in the per-request thread and with a deadline (see Hub.start).
+            if isinstance(request, ssl.SSLSocket):
+                request.settimeout(HANDSHAKE_TIMEOUT)
+                request.do_handshake()  # raises (and the request is dropped) on a stalled client
+                request.settimeout(None)
+            super().finish_request(request, client_address)
+
+    return HubServer((host, port), MainHandler)
 
 
 def dispatch(config, state, node, kind, payload, timeout=45):
@@ -839,6 +877,14 @@ class NodeWorker:
             print(f"JARVIS node: main rejected result {message.get('id')} for good ({exc}); dropped.", flush=True)
         self.outbox.unlink(missing_ok=True)
 
+    def _can_pull(self):
+        """This node pulls signed releases itself (it pinned the main's code key), so the main
+        needn't push them over SSH too: both at once raced over the same folders."""
+        try:
+            return bool(json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8")).get("code_key"))
+        except (OSError, ValueError, AttributeError):
+            return False
+
     def _pull_update(self, want):
         """The main runs other code: fetch, verify and install it, then restart. Tried once
         per target fingerprint per 10 minutes so a bad package can't loop the node, and never
@@ -859,6 +905,8 @@ class NodeWorker:
             key = json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8")).get("code_key")
         except (OSError, ValueError):
             key = None
+        if not key:
+            return False  # apply_bundle would refuse an unpinned bundle; don't fetch and back up for it
         bundle = self.client.request("/v1/code", timeout=60)
         backup(self.state)  # what the watchdog restores if the new code won't start
         count = apply_bundle(bundle, key)  # installs changed requirements before its start check
@@ -882,13 +930,18 @@ class NodeWorker:
         if self.outbox.exists():
             note = json.loads(self.outbox.read_text(encoding="utf-8"))
             if note.get("main_device") != self.client.main:
-                raise ValueError("An unsent result belongs to the previous main PC; inspect cluster-outbox.json.")
-            self._send_result(note["message"])
-            self._record(results_resent=1)
+                # Never the new main's job: set it aside so polling goes on.
+                old = str(note.get("main_device") or "unknown").replace("/", "_")
+                aside = self.outbox.with_name(f"{self.outbox.stem}.{old}{self.outbox.suffix}")
+                self.outbox.replace(aside)
+                print(f"JARVIS node: unsent result belonged to previous main {old}; moved to {aside.name}.", flush=True)
+            else:
+                self._send_result(note["message"])
+                self._record(results_resent=1)
         try:
             response = self.client.request("/v1/poll", {"hostname": platform.node(),
                                 "platform": platform.system(), "version": __version__,
-                                "code": self.code},
+                                "code": self.code, "pulls": "yes" if self._can_pull() else "no"},
                                 timeout=POLL_WAIT + 10)
         except (OSError, ValueError, RuntimeError) as exc:
             self._record(polls_failed=1, outages=0 if self._down else 1,
@@ -930,6 +983,14 @@ class NodeWorker:
         job = response.get("job")
         if not job:
             return False
+        refusal = self._untrusted(job)
+        if refusal:  # never ran: report it if this really is the main, else nobody listens
+            print(f"JARVIS node: refused job {str(job.get('id'))[:40]}: {refusal}", flush=True)
+            if isinstance(job.get("id"), str):
+                message = {"id": job["id"], "failed": True,
+                           "result": {"error": f"Not run: the node refused it ({refusal})."}}
+                self._send_result(message)
+            return True
         try:
             # Time the job on our own clock: the main's wall clock may differ from ours.
             if "remaining" in job:
@@ -948,10 +1009,42 @@ class NodeWorker:
                 # The executor started, so part of the action may already have happened.
                 message = {"id": job["id"], "failed": True, "result": {
                     "error": f"{exc} (the node crashed mid-action; it may have run, so it wasn't retried)"}}
+        if len(json.dumps(message).encode()) > MAX_RESULT - 1000:
+            # The main answers an oversized body 400 and the result would be dropped unseen.
+            message = {"id": message["id"], "failed": True, "result": {
+                "error": "result too large to send back (it may have run)"}}
         save_json(self.outbox, {"main_device": self.client.main, "message": message})
         self._send_result(message)
         self._record(results_sent=1)
         return True
+
+    def _untrusted(self, job):
+        """Why a polled job must not run, or None. With a pinned code key (every node paired
+        since code signing) each job must carry the main's signature for this node, be fresh,
+        and not have run before (a captured job replayed by a port squatter)."""
+        try:
+            pinned = json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pinned = {}
+        key, me = pinned.get("code_key"), pinned.get("node_id")
+        if not key:
+            return None  # paired before signing existed: nothing to check against
+        from .deploy import verify_job
+        why = verify_job(job, me, key)
+        if why:
+            return why
+        seen_path = self.state / "cluster-jobs-seen.json"
+        try:
+            seen = json.loads(seen_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            seen = {}
+        now = time.time()
+        seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and now - v < 3600}
+        if job["id"] in seen:
+            return "already run once (replayed)"
+        seen[job["id"]] = now
+        save_json(seen_path, seen)
+        return None
 
     def _input_guard(self):
         """Lan Mouse off while this laptop and its peer are apart (sharedinput.guard), checked
@@ -959,7 +1052,7 @@ class NodeWorker:
         from . import sharedinput
         while not self.stop_event.wait(60):
             try:
-                sharedinput.guard(self.state)
+                sharedinput.guard_for(self.config, self.state)
             except Exception as exc:  # never let the guard take the node down
                 print(f"JARVIS node: Lan Mouse guard: {exc}", flush=True)
 

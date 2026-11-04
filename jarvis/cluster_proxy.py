@@ -130,6 +130,15 @@ def proxy_handler(client, overlay=None, setup=None, local=None):
                                            timeout=60, headers=headers, method="POST" if post else "GET")
                 except urllib.error.HTTPError as exc:
                     response = exc  # forward the main's structured error and status
+                    # Another process here redeemed the invite: reload the token and retry once
+                    # (only without a body; a streamed upload can't be sent twice).
+                    if exc.code == 403 and not length and getattr(client, "invite", False) \
+                            and client._reload():
+                        try:
+                            response = client.open(self.path, None, timeout=60, headers=headers,
+                                                   method="POST" if post else "GET")
+                        except urllib.error.HTTPError as again:
+                            response = again
                 self.send_response(response.status)
                 for name in ("Content-Type", "Content-Length", "Cache-Control",
                              "Content-Disposition", "X-Content-Type-Options"):

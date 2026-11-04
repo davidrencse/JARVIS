@@ -142,7 +142,7 @@ def dib_to_png(dib):
                                    "raw", mode, stride, 1 if height < 0 else -1)
             if bits == 32:
                 img = img.convert("RGBA")
-                if not any(img.getchannel("A").getdata()):
+                if img.getchannel("A").getextrema()[1] == 0:
                     img.putalpha(255)  # a 32-bpp DIB with no alpha at all is opaque
             else:
                 img = img.convert("RGBA")
@@ -494,10 +494,20 @@ def apply(state, kind, data):
     local_clipboard().write(kind, data)
 
 
-def _applied(state):
+APPLIED_TTL = 5.0  # seconds a pasted-in copy is recognised as the peer's
+
+
+def _applied(state, busy=None):
+    """busy = (start, end) of the last push: it blocks the watcher, so a paste made while it ran
+    is aged from the moment the watcher is free to read it, not from the paste."""
     try:
         with open(os.path.join(state, APPLIED), encoding="utf-8") as f:
-            return json.load(f).get("digest")
+            saved = json.load(f)
+        at = float(saved.get("at") or 0)
+        if busy and busy[0] <= at <= busy[1]:
+            at = busy[1]
+        # Only the paste we just made: later, the same text copied here is a new copy.
+        return saved.get("digest") if time.time() - at <= APPLIED_TTL else None
     except (OSError, ValueError, AttributeError):
         return None
 
@@ -510,6 +520,7 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
     board = board or local_clipboard()
     log = log or _log_line(os.path.join(state, "logs", "clipboard.log"))
     last = [None]
+    busy = [None]
     try:
         current = board.read()
         if current:  # don't push whatever happened to be copied before starting
@@ -530,14 +541,16 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
         if key == last[0]:
             return
         last[0] = key
-        if key == _applied(state):  # the other laptop's copy, just pasted in here
+        if key == _applied(state, busy[0]):  # the other laptop's copy, just pasted in here
             return
+        began = time.time()
         for target in targets:
             try:
                 push(config, state, target, io.BytesIO(data), len(data), dest="clipboard", kind=kind)
                 log(f"sent {kind} ({len(data)} bytes) to {target}")
             except Exception as exc:  # offline peer, hub restarting: skip this copy
                 log(f"not sent to {target}: {exc}")
+        busy[0] = (began, time.time())
 
     log(f"linked with {', '.join(targets)} over the cluster")
     while True:
@@ -607,6 +620,7 @@ def connect(device, board, log, target=None, state=None):
         try:
             status = json.loads(hello)
         except ValueError:
+            proc.kill()  # the peer is waiting on stdin: its stderr never ends otherwise
             err = proc.stderr.read(2000).decode(errors="replace").strip().splitlines()
             raise RuntimeError("SSH failed: " + (err[-1] if err else "no response")) from None
         if not status.get("ready"):
@@ -641,20 +655,24 @@ def refresh(state, log=print):
     try:
         from .deploy import code_fingerprint
         live = code_fingerprint()
+    except Exception:
+        return False
+    try:
         with open(os.path.join(state, CODE_FILE)) as f:
             started = f.read().strip()
     except OSError:
         started = None
-    except Exception:
-        return False
     if started == live:
         return False
-    stop(state)
-    for _ in range(50):
-        if not _pid(state):
-            break
-        time.sleep(0.1)
-    result = start(state)
+    if _unit_installed():
+        result = start(state)  # restarts the unit, so systemd keeps owning the watcher
+    else:
+        stop(state)
+        for _ in range(50):
+            if not _pid(state):
+                break
+            time.sleep(0.1)
+        result = start(state)
     log(f"clipboard watcher restarted on the current code ({live}): {result.get('started')}")
     return bool(result.get("started"))
 
@@ -795,9 +813,24 @@ def start(state, device_name=None):
     os.makedirs(os.path.join(state, "logs"), exist_ok=True)
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
              if os.name == "nt" else 0)
+    if not device_name and _unit_installed():
+        try:
+            done = subprocess.run(["systemctl", "--user", "restart", UNIT_NAME],
+                                  capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            done = None
+        if done is not None and done.returncode == 0:
+            for _ in range(40):
+                time.sleep(0.25)
+                if _pid(state):
+                    return {"started": True, **status(state)}
+            return {"started": False, "note": "Didn't come up; check the log.", **status(state)}
     args = [sys.executable, "-m", "jarvis", "--state", state, "clipboard", "run"]
     if device_name:
         args += ["--device", device_name]
+    if os.name != "nt":  # out of the caller's cgroup, so restarting jarvis-cluster keeps it
+        from .daemon import _detach_from_unit
+        args = _detach_from_unit(args)
     subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, creationflags=flags,
                      start_new_session=os.name != "nt", close_fds=True,
@@ -818,6 +851,16 @@ def stop(state):
     else:
         os.kill(pid, 15)
     return {"stopped": True, "pid": pid}
+
+
+def _unit_installed():
+    """The Linux systemd user unit is installed and runs `clipboard run`."""
+    if os.name == "nt" or not shutil.which("systemctl"):
+        return False
+    try:
+        return "clipboard run" in _startup_file().read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 def _startup_file():
