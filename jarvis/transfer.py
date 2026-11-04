@@ -58,6 +58,8 @@ def safe_name(name):
     name = name[:200].rstrip(". ") or "file"
     if re.fullmatch(r"CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", name.split(".")[0], re.I):
         name = "_" + name
+    if not re.match(r"[A-Za-z0-9_]", name):  # NAME (inbox/get) needs one of these first
+        name = "_" + name
     return name[:200]
 
 

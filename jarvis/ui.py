@@ -61,7 +61,8 @@ class _Counted:
 MAX_AUDIO = 16000 * 4 * 45  # 45 s of float32 mono at 16 kHz
 # Tags the assistant puts on every exchange; as graph hubs they'd cluster unrelated items.
 BOOKKEEPING_TAGS = {"inbound", "outbound", "simple", "medium", "complex", "plan", "result"}
-SKIP = {".git", "__pycache__", ".jarvis", "jarvis.egg-info", "node_modules", ".pytest_cache"}
+SKIP = {".git", "__pycache__", ".jarvis", "jarvis.egg-info", "node_modules", ".pytest_cache",
+        ".venv", ".ruff_cache", ".playwright-mcp", ".codex", ".claude", ".learnings"}
 
 # External systems a module talks to, detected from its source text.
 EXTERNALS = (
@@ -136,6 +137,7 @@ class Console:
         self.bus, self.watcher = Bus(), None
         self._lane = self._speaker = self._agent = self._setup = None
         self._lane_lock = threading.Lock()
+        self._kb_lock = threading.Lock()
 
     # ---- live: event stream, warm brain, speech ---------------------------------------
     def start_live(self, warm=True):
@@ -428,10 +430,11 @@ class Console:
 
     # ---- knowledge engine ------------------------------------------------------------
     def kb(self):
-        if getattr(self, "_kb", None) is None:
-            from .knowledge import kb_for
-            self._kb = kb_for(self.config, self.state, on_event=lambda kind, data: self.bus.publish(kind, data))
-        return self._kb
+        with self._kb_lock:  # two first requests must not build two engines with two locks
+            if getattr(self, "_kb", None) is None:
+                from .knowledge import kb_for
+                self._kb = kb_for(self.config, self.state, on_event=lambda kind, data: self.bus.publish(kind, data))
+            return self._kb
 
     def kb_command(self, text):
         """The knowledge console's command line. Runs in the background; progress and the
@@ -836,7 +839,17 @@ class Console:
         seconds = round(len(audio) / RATE, 2)
         # The background listener shares the mic and answers every "Jarvis, ..." itself;
         # answering here too would run each request twice.
-        listener = daemon._pid(self.state) is not None
+        # A node's console forwards its mic here: the main's listener and voiceprint belong to
+        # the main's own mic, so neither judges (or learns from) a clip from another laptop.
+        from .topology import ORIGIN, identity
+        try:
+            main = identity(self.config)[1]
+        except (ValueError, KeyError, TypeError):
+            main = None
+        from_node = ORIGIN.get() not in (None, main)
+        listener = daemon._pid(self.state) is not None and not from_node
+        if from_node:
+            verify = False
         if wake and listener:
             return {"text": "", "listener": True, "seconds": seconds}
         with self._voice_lock:
@@ -1106,6 +1119,7 @@ def _hw_ram(hw):
 
 
 class Handler(BaseHTTPRequestHandler):
+    timeout = 60  # a stalled client can't pin a thread in a body read; /events lifts it
     console = None
     hosts = ()
     server_version = "JARVIS"
@@ -1132,7 +1146,8 @@ class Handler(BaseHTTPRequestHandler):
                              "default-src 'self'; connect-src 'self' https://api.open-meteo.com "
                              "wss://api.elevenlabs.io "
                              "https://geocoding-api.open-meteo.com; img-src 'self' data:; "
-                             "style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'")
+                             "style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; "
+                             "base-uri 'none'; form-action 'none'; object-src 'none'")
         self.end_headers()
         self.wfile.write(data)
 
@@ -1183,6 +1198,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _events(self, query):
         """Server-Sent Events: what a reconnecting tab missed (Last-Event-ID), then live."""
+        self.connection.settimeout(None)  # the stream idles between keep-alives
         after = self.headers.get("Last-Event-ID") or query.get("after") or ""
         sub, backlog = self.console.bus.subscribe(int(after) if re.fullmatch(r"\d+", after, re.ASCII) else None)
 
@@ -1244,6 +1260,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/memory/item": lambda: c.memory.get(query.get("id", "")),
             "/api/route": lambda: c.route(query.get("text", ""), query.get("tier") or None),
             "/api/voice": lambda: c.daemon("status"),
+            "/api/voice/level": lambda: __import__("jarvis.daemon", fromlist=["level"]).level(c.state),
             "/api/voice/setup": lambda: c.voice_setup().status(),
             "/api/voice/devices": lambda: {"devices": c.voice_setup().devices()},
             "/api/settings": lambda: __import__("jarvis.settings", fromlist=["read"]).read(c.config, c.state),
@@ -1266,6 +1283,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/vault/brief": c.vault_brief,
             "/api/kb/state": lambda: c.kb().snapshot(),
             "/api/system/design": lambda: __import__("jarvis.sysview", fromlist=["design"]).design(c),
+            "/api/system/components": lambda: __import__("jarvis.sysview", fromlist=["components"]).components(c),
             "/api/kb/graph": lambda: c.kb().graph(),
             "/api/kb/page": lambda: c.kb().page(query.get("slug", "")),
         }

@@ -517,7 +517,11 @@ class Vault:
         # A word David uses as a note's link label names that note outright, as its title
         # would: it ranks with the best match ("my OS midterm" -> the OS course, not the
         # daily notes that link to it).
-        named = {path for word in terms(query) for path, _ in [self._labels_or_none(word)] if path}
+        try:
+            labels = self.labels()  # once: each call takes the refresh lock and counts the index
+        except Exception:
+            labels = {}
+        named = {path for word in terms(query) for path, _ in [labels.get(word, (None, None))] if path}
         if named and results:
             top = max(r["score"] for r in results)
             for r in results:
@@ -1029,6 +1033,21 @@ class Vault:
                 "merge_in_progress": (self.root / ".git" / "MERGE_HEAD").exists()}
 
 
+def _on_lan(address):
+    """True for an address on one of this computer's own subnets (David's 172.1.x LAN reads
+    as global to Python) or an IPv4 address wrapped in NAT64."""
+    try:
+        if isinstance(address, ipaddress.IPv6Address):
+            if address.ipv4_mapped:
+                address = address.ipv4_mapped
+            elif address in ipaddress.ip_network("64:ff9b::/96"):
+                return True
+        from .sharedinput import local_networks
+        return any(address in net for net in local_networks(families=(4, 6)) if net.version == address.version)
+    except Exception:
+        return True  # can't tell where this computer's LAN is: fail closed
+
+
 def _public(url):
     """Refuse anything but http(s) to a public address: clipping must not become a way
     to read this laptop's own services (the console on 127.0.0.1) or the LAN."""
@@ -1042,7 +1061,7 @@ def _public(url):
         raise ValueError(f"Can't resolve {parts.hostname}.") from exc
     for info in infos:
         address = ipaddress.ip_address(info[4][0].split("%")[0])
-        if not address.is_global:
+        if not address.is_global or _on_lan(address):
             raise ValueError(f"{parts.hostname} is a local or private address; not clipping it.")
     # Keep every validated answer so a failed address can fall through to another
     # without resolving the hostname again (which would reopen DNS rebinding).
