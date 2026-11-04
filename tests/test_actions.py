@@ -71,6 +71,37 @@ class ApprovalTests(unittest.TestCase):
             self.assertIn(str(Path(d).resolve() / "browser-profile"), spec["args"])
             self.assertIn("http://127.0.0.1:7777", spec["args"][spec["args"].index("--blocked-origins") + 1])
 
+    def test_my_chrome_server_attaches_by_extension_with_saved_token(self):
+        with tempfile.TemporaryDirectory() as d, patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PLAYWRIGHT_MCP_EXTENSION_TOKEN", None)
+            spec = browser_mcp(d, ["chrome"]).get("chrome")
+            if spec is None:
+                self.skipTest("npx not installed")
+            self.assertIn("--extension", spec["args"])
+            self.assertNotIn("--user-data-dir", spec["args"])
+            self.assertIn("browser_evaluate", spec["disabled_tools"])
+            self.assertNotIn("env", spec)  # no token saved: the extension asks David
+            (Path(d) / "chrome-extension-token").write_text("tok\n")
+            spec = browser_mcp(d, ["chrome"])["chrome"]
+            self.assertEqual(spec["env"], {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "tok"})
+            self.assertNotIn("chrome", browser_mcp(d, ["playwright"]))
+
+    def test_my_chrome_policy_keeps_gates_and_off_limits(self):
+        def chrome(tool, **args):
+            return {**approval(tool, **args), "serverName": "chrome"}
+        with patch("jarvis.actions.socket.getaddrinfo",
+                   return_value=[(2, 1, 6, "", ("93.184.215.14", 0))]):
+            self.assertTrue(approve_browser(chrome("browser_navigate", url="https://mail.google.com/"))[0])
+            self.assertTrue(approve_browser(chrome("browser_snapshot"))[0])
+            for bad in (chrome("browser_navigate", url="https://myaccount.google.com/security"),
+                        chrome("browser_navigate", url="https://passwords.google.com"),
+                        chrome("browser_navigate", url="file:///etc/passwd"),
+                        chrome("browser_evaluate", function="() => document.cookie"),
+                        chrome("browser_file_upload", paths=["/home/jdoe/.ssh/id_ed25519"])):
+                self.assertFalse(approve_browser(bad)[0], bad)
+            # Off limits only in his own Chrome; JARVIS's profile has no such sign-ins.
+            self.assertTrue(approve_browser(approval("browser_navigate", url="https://myaccount.google.com"))[0])
+
     def test_agent_browser_policy(self):
         def ab(tool, **args):
             return {**approval(tool, **args), "serverName": "agent_browser"}
@@ -107,6 +138,71 @@ class ApprovalTests(unittest.TestCase):
                 "env_vars": ["DISPLAY"]}})
         self.assertIn('mcp_servers.agent_browser.env.AGENT_BROWSER_PROFILE="C:\\\\x\\\\p"', args)
         self.assertIn('mcp_servers.agent_browser.env_vars=["DISPLAY"]', args)
+
+
+class HomeNetworkTests(unittest.TestCase):
+    def test_browser_never_opens_home_lan_or_cgnat(self):
+        import ipaddress
+        from jarvis import actions
+        lan = [ipaddress.ip_network("172.1.0.0/16")]  # David's home LAN: not RFC1918
+        with patch.object(actions, "_own_networks", return_value=lan):
+            for url in ("http://172.1.0.1/", "http://172.1.4.20:7777/", "http://100.101.102.103/",
+                        "http://[fd00::1]/", "http://192.0.0.8/"):
+                self.assertFalse(approve_browser(approval("browser_navigate", url=url))[0], url)
+            with patch("jarvis.actions.socket.getaddrinfo",
+                       return_value=[(2, 1, 6, "", ("172.1.0.1", 0))]):  # a public name for the router
+                self.assertFalse(approve_browser(approval("browser_navigate", url="http://evil.example"))[0])
+            self.assertTrue(approve_browser(approval("browser_navigate", url="http://93.184.215.14/"))[0])
+
+    def test_global_ipv6_on_own_subnet_is_local(self):
+        import ipaddress
+        from jarvis import actions
+        nets = [ipaddress.ip_network("172.1.0.0/16"), ipaddress.ip_network("2601:1::/64")]
+        with patch("jarvis.sharedinput.local_networks", return_value=nets) as read:
+            actions._NETS["at"] = 0.0
+            self.assertIsNotNone(actions._local_address("http://[2601:1::9]/"))
+            self.assertIsNone(actions._local_address("http://[2606:4700::1111]/"))
+        read.assert_called_with(families=(4, 6))
+        actions._NETS["at"] = 0.0
+
+    def test_own_networks_cached_and_failure_safe(self):
+        from jarvis import actions
+        with patch("jarvis.sharedinput.local_networks", side_effect=OSError("no ip")) as nets:
+            actions._NETS["at"] = 0.0
+            self.assertEqual(actions._own_networks(), [])
+            self.assertEqual(actions._own_networks(), [])
+        self.assertEqual(nets.call_count, 1)
+        actions._NETS["at"] = 0.0
+
+
+class SpotifyPlayingCheckTests(unittest.TestCase):
+    def test_failed_metadata_read_is_not_playing(self):
+        import json
+        from types import SimpleNamespace
+        from jarvis import actions
+
+        def run(*args):
+            if args[:2] == ("playerctl", "-l"):
+                return SimpleNamespace(returncode=0, stdout="spotify\n", stderr="")
+            if "status" in args:
+                return SimpleNamespace(returncode=0, stdout="Playing", stderr="")  # the old track
+            if "metadata" in args and "trackid" in args[-1] and run.before:
+                run.before = False
+                return SimpleNamespace(returncode=0, stdout="/com/spotify/track/old", stderr="")
+            if "metadata" in args:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no player")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        run.before = True
+        clock = iter(range(0, 1000))
+        with patch.object(actions, "_run", side_effect=run), \
+                patch.object(actions, "_backend", return_value="hyprland"), \
+                patch.object(actions.os, "name", "posix"), \
+                patch.object(actions.shutil, "which", return_value="/usr/bin/playerctl"), \
+                patch.object(actions.time, "monotonic", side_effect=lambda: next(clock)), \
+                patch.object(actions.time, "sleep"):
+            ok, said = actions.spotify(json.dumps({"action": "play", "target": "album:4LH4d3cOWNNsVw41Gqt2kv"}))
+        self.assertFalse(ok, said)
+        self.assertIn("didn't report playing", said)
 
 
 class DesktopToolTests(unittest.TestCase):
@@ -183,7 +279,7 @@ for line in sys.stdin:
         assert p["approvalPolicy"] == "on-request"
         assert [t["name"] for t in p["dynamicTools"]] == ["open_app", "list_apps", "terminal", "open_url",
                                                           "open_page", "close_app", "focus_window",
-                                                          "media", "scroll", "volume"]
+                                                          "media", "scroll", "spotify", "computer", "app_ui", "volume"]
         send({"method": "mcpServer/startupStatus/updated", "params": {"name": "playwright", "status": "ready"}})
         send({"id": rid, "result": {"thread": {"id": "t1"}}})
     elif meth == "turn/start":
@@ -235,5 +331,76 @@ class ActionLaneTests(unittest.TestCase):
         self.assertIn("playwright.browser_navigate", [n for _, n, _ in seen])
 
 
+class CloseByTitleTests(unittest.TestCase):
+    def test_browser_tab_title_never_closes_the_browser(self):
+        from jarvis import actions
+        tab = {"app": "google-chrome", "title": "Spotify Wrapped 2026 - YouTube", "id": "0x1", "focused": False}
+        with patch.object(actions, "open_windows", return_value=[tab]), \
+                patch.object(actions, "_close", return_value=True) as close:
+            ok, text = actions.close_app("spotify")
+        self.assertFalse(ok)
+        self.assertIn("isn't running", text)
+        close.assert_not_called()
+
+    def test_vs_code_does_not_match_android_studio(self):
+        from jarvis import actions
+        studio = {"app": "jetbrains-studio", "title": "MyApp", "id": "0x2", "focused": False}
+        with patch.object(actions, "open_windows", return_value=[studio]), \
+                patch.object(actions, "_close", return_value=True) as close:
+            ok, _ = actions.close_app("vs code")
+        self.assertFalse(ok)
+        close.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+FAKE_USAGE_SERVER = r'''
+import json, sys
+def send(m): print(json.dumps(m), flush=True)
+for line in sys.stdin:
+    m = json.loads(line)
+    meth, rid = m.get("method"), m.get("id")
+    if meth == "initialize":
+        send({"id": rid, "result": {}})
+    elif meth == "thread/start":
+        send({"id": rid, "result": {"thread": {"id": "t1"}}})
+    elif meth == "turn/start":
+        for n in (10, 5):
+            send({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+                  "last": {"inputTokens": n, "outputTokens": 1}, "total": {"inputTokens": 99}}}})
+        send({"method": "item/agentMessage/delta", "params": {"itemId": "a", "delta": "ok"}})
+        send({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+'''
+
+
+class AuditTwoLaneTests(unittest.TestCase):
+    def test_turn_usage_sums_every_request(self):
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d, "usage_server.py")
+            script.write_text(FAKE_USAGE_SERVER, encoding="utf-8")
+            lane = ChatGPTLane({}, d, timeout=20, command=[sys.executable, str(script)])
+            try:
+                lane.ask("hi")
+            finally:
+                lane.close()
+        self.assertEqual((lane.last_usage["inputTokens"], lane.last_usage["outputTokens"]), (15, 2))
+
+    def test_limited_fast_path_leaves_tool_log_alone(self):
+        lane = ChatGPTLane({}, ".", timeout=20)
+        lane.tool_log = [("x", True, "")]
+        with patch("jarvis.chatgpt.usage_limit", return_value="try later"):
+            with self.assertRaises(RuntimeError) as ctx:
+                lane.ask("hi")
+        self.assertEqual(lane.tool_log, [("x", True, "")])
+        self.assertEqual(ctx.exception.tool_log, [])
+
+    def test_startup_deadline_capped_by_lane_timeout(self):
+        lane = ChatGPTLane({}, ".", timeout=3)
+        seen = []
+        lane._send = lambda m: None
+        lane._next = lambda deadline: (seen.append(deadline - __import__("time").monotonic()),
+                                       {"id": lane.next_id, "result": {}})[1]
+        lane._request("initialize", {})
+        self.assertLess(seen[0], 3.5)

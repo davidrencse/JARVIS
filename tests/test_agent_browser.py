@@ -213,3 +213,40 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuditModelsTests(unittest.TestCase):
+    def test_starting_a_second_auto_scroll_stops_the_first(self):
+        agent_browser.stop_scrolling()
+        started = []
+        with mock.patch.object(agent_browser, "running", return_value=True), \
+                mock.patch.object(agent_browser.threading, "Thread") as thread:
+            thread.return_value.start.side_effect = lambda: started.append(1)
+            spec = {"action": "scroll", "mode": "auto", "direction": "down"}
+            agent_browser.browse(spec)
+            first = agent_browser._SCROLLER["stop"]
+            agent_browser.browse(spec)
+            second = agent_browser._SCROLLER["stop"]
+        agent_browser.stop_scrolling()
+        self.assertIsNot(first, second)
+        self.assertTrue(first.is_set())
+
+    def test_frames_do_not_respawn_the_checks_on_every_poll(self):
+        agent_browser._FRAME_CACHE.clear()
+        calls = []
+
+        def fake(*args, **_):
+            calls.append(args[0])
+            if args[0] == "screenshot":
+                Path(args[1]).write_bytes(b"jpg")
+                return True, {}
+            return True, {args[1]: "x"}
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch.object(agent_browser, "running", return_value=True) as running, \
+                mock.patch.object(agent_browser, "run", side_effect=fake):
+            agent_browser.frame(state)
+            agent_browser.frame(state)
+        agent_browser._FRAME_CACHE.clear()
+        self.assertEqual(running.call_count, 1)
+        self.assertEqual(calls.count("get"), 2)  # url + title once, not twice
+        self.assertEqual(calls.count("screenshot"), 2)

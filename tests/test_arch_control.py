@@ -113,14 +113,16 @@ class LinuxControlTests(unittest.TestCase):
         self.assertIn("Several windows match", text)
         self.assertFalse([a for a in calls if a[1] == "dispatch"])
         with self.run_with(calls, replies):
-            self.assertTrue(actions.close_app("pinterest")[0])
+            ok, text = actions.close_app("pinterest")  # a lone browser tab title: not an app
+        self.assertFalse(ok)
+        self.assertIn("isn't running", text)
 
     def test_close_falls_back_to_the_classic_dispatcher(self, _which):
         calls = []
         replies = lambda a: (done(self.CLIENTS) if a[1] == "clients" else
                              done("ok") if a[2] == "closewindow" else done("invalid dispatcher"))
         with self.run_with(calls, replies):
-            self.assertTrue(actions.close_app("youtube")[0])
+            self.assertTrue(actions.close_app("google chrome")[0])
         self.assertEqual(calls[-1], ("hyprctl", "dispatch", "closewindow", "address:0x55aa"))
 
     def test_media_and_volume(self, _which):

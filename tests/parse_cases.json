@@ -93,7 +93,7 @@
                 ["open_app", "dell", {"name": "Spotify"}, []]]},
     {"text": "open discord on arch and then steam",
      "expect": [["open_app", "zenbook", {"name": "Discord"}, []],
-                ["open_app", "zenbook", {"name": "Steam"}, []]]},
+                ["open_app", "zenbook", {"name": "Steam"}, ["c1"]]]},
     {"text": "open spotify and discord",
      "expect": [["open_app", "dell", {"name": "Spotify"}, []],
                 ["open_app", "dell", {"name": "Discord"}, []]]},

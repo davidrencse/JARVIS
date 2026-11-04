@@ -2,8 +2,10 @@
 and the cached vector matrix. Everything is faked; nothing touches a network or a CLI."""
 
 import hashlib
+import json
 import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -307,3 +309,72 @@ class CachedVectors(Temp):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuditModelsFixes(Temp):
+    """audit3 (models slice): per-turn tool log, limit hand-off, pick memo, tool crashes."""
+
+    def test_turn_log_is_not_wiped_by_the_next_turn_on_the_lane(self):
+        from jarvis.chatgpt import Brain
+        lane = ChatGPTLane({}, self.base)
+        replies = []
+
+        def fake(text, recall, on_sentence):
+            lane.tool_log = []
+            if text.startswith("A"):
+                lane.tool_log.append(("list_apps", True, "ok"))
+                return "I can't open that app, it isn't installed"
+            return "fine"
+
+        class Chat:
+            tool_log = []
+        brain = Brain(Chat(), lane, wants=lambda t: True)
+        real_ask = lane.ask
+
+        def ask(text, recall=(), on_sentence=None):
+            out = real_ask(text, recall, on_sentence)
+            if text.startswith("A") and not replies:
+                replies.append(1)  # request B takes the lane before A reads its log
+                other = threading.Thread(target=real_ask, args=("B other", (), None))
+                other.start()
+                other.join()
+            return out
+        with patch.object(lane, "_ask", side_effect=fake), patch.object(lane, "ask", side_effect=ask):
+            reply = brain._act("A open nothing", (), None)
+        self.assertIn("isn't installed", reply)  # no GROUND_RETRY nudge: list_apps did run
+
+    def test_pick_is_remembered_for_the_same_text(self):
+        from jarvis.chatgpt import Brain
+        brain = Brain(object(), object(), decider=True)
+        with patch("jarvis.decide.wants_tools", return_value=True) as decided:
+            self.assertEqual(brain.pick("do the thing"), "act")
+            self.assertEqual(brain.pick("do the thing"), "act")
+        self.assertEqual(decided.call_count, 1)
+
+    def test_a_crashing_tool_fails_the_call_not_the_turn(self):
+        lane = ChatGPTLane({}, self.base)
+        sent = []
+
+        class Boom:
+            def call(self, name, args):
+                raise OSError("database is locked")
+        lane.tools = Boom()
+        lane._send = sent.append
+        lane._tool = lambda *a: None
+        lane._handle(json.dumps({"method": "item/tool/call", "id": 7,
+                                 "params": {"tool": "terminal", "arguments": {}}}))
+        self.assertFalse(sent[0]["result"]["success"])
+        self.assertIn("database is locked", sent[0]["result"]["contentItems"][0]["text"])
+
+    def test_limit_is_seeded_from_the_environment_value(self):
+        import time
+        from jarvis import chatgpt
+        saved = dict(chatgpt._LIMIT)
+        self.addCleanup(chatgpt._LIMIT.update, saved)
+        chatgpt._LIMIT.update(until=0.0, text="")
+        chatgpt.seed_usage_limit(str(time.time() + 3600))
+        self.assertTrue(chatgpt.usage_limit())
+        chatgpt._LIMIT.update(until=0.0, text="")
+        chatgpt.seed_usage_limit("garbage")
+        chatgpt.seed_usage_limit(str(time.time() - 5))
+        self.assertEqual(chatgpt.usage_limit(), "")
