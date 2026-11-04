@@ -32,7 +32,8 @@ intake → instant phrases → strict parser (`parse.py`, free) → intent regis
 → gates (`gates.py`) → history checks (`history.py`) → direct executor (`remote.call`)
 → on-screen check (`observe.py`) → record.
 
-Only what the parser can't resolve goes on to:
+Only what the parser can't resolve goes on to (requests `brain.judge` marks as several jobs or hard
+thinking are planned by `brain.py` across model levels L1-L3 first):
 1. the interpreter (`interpret.py`, ChatGPT lane);
 2. then the brain (`inference.py`): ChatGPT via the Codex subscription, failing over to the
    Claude CLI on usage limits;
@@ -113,11 +114,29 @@ He answers in the console gate or by saying "Jarvis, yes".
   - Confirm no horizontal scroll and that the prompt isn't covered.
   - Headless Chrome denies the mic, so "Mic blocked" there is expected.
 
+## Terminal safety (brain commands run unasked under `rules.confirm: never`)
+- On Linux every JARVIS terminal command runs in a bubblewrap sandbox (`terminal.sandbox`): secrets,
+  browser profiles and `.jarvis/` are hidden; JARVIS's code/config and the vault are read-only. Off switch:
+  `terminal.sandbox: false`. Windows/macOS have no sandbox: `gates.hard_deny` is the only barrier there.
+- Even under `confirm: never`, buying/paying and sending/posting as David wait for his OK
+  (`rules.always_ask`, default `["money", "messages"]`; browser clicks and Grok tasks). The
+  desktop `computer` tool can't tell what a pixel click buys, so this doesn't cover it.
+- `gates.hard_deny` fails closed on shapes it can't read (substitutions, shells fed text, inline code that
+  deletes, wildcards near protected folders). Add new bypass finds to `tests/test_gates_redteam.py`.
+
 ## Input sharing and desktop control
+- **Desktop control (`control.py`, the `computer` tool):** JARVIS sees the screen and uses mouse/keyboard.
+  Stop it with SUPER+SHIFT+ESCAPE, `jarvis control stop`, or "Jarvis, stop controlling my computer".
+  It pauses when David moves the mouse. Tests must use a fake backend (`act(..., impl=Fake())`).
 - **Lan Mouse:**
   - A JARVIS-patched build: source `~/src/lan-mouse-jarvis`, binary `~/.local/bin/lan-mouse-jarvis`,
     user service `lan-mouse`.
-  - Start it on demand with `jarvis lanmouse start`. Don't re-enable login autostart unless asked.
+  - Autostart (David asked 2026-11-03): after each boot the guard brings it up once both PCs read
+    together, and keeps it off while apart. Arch runs the guard from `lan-mouse-ipwatch.service`
+    (enabled at login; `lan-mouse.service` stays disabled), Windows from the node agent. Opt out with
+    `lan_mouse.autostart: false`. A stop by hand sticks until the next boot.
+  - Windows: start Lan Mouse via `explorer.exe` (`%LOCALAPPDATA%\lan-mouse\start-now.vbs`); a child of
+    the node's command shell dies with it.
   - wlroots virtual-pointer events need nonzero, increasing timestamps, or Qt never sees a
     double-click. The patch uses `CLOCK_MONOTONIC` for that.
 - **Off while apart:** `jarvis lanmouse guard` stops Lan Mouse after two checks in a row show
