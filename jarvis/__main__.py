@@ -70,6 +70,8 @@ def main():
     lm.add_argument("--position", help="config: side of this screen the peer sits on")
     lm.add_argument("--capture-backend", help="config: e.g. layer-shell on Hyprland")
     lm.add_argument("--output", help="config: write here instead of printing")
+    ct = sub.add_parser("control", help="Desktop control (mouse/keyboard): stop, resume, status")
+    ct.add_argument("action", choices=("stop", "resume", "status"))
     dk = sub.add_parser("desktop", help="Open an app or link here (the other laptop calls this)")
     from .remote import ACTIONS
     dk.add_argument("action", choices=ACTIONS)  # focus_window was missing, so SSH callers failed
@@ -180,7 +182,7 @@ def main():
     ev.add_argument("--json", action="store_true", help="machine-readable output")
     sub.add_parser("brain-tools", help="The brain's tools as an MCP server on stdio (for a Claude brain)")
     bp = sub.add_parser("browser-proxy", help="A JARVIS browser behind its click gate, on stdio (for a Claude brain)")
-    bp.add_argument("server", help="playwright or agent_browser")
+    bp.add_argument("server", help="chrome, playwright or agent_browser")
     st = sub.add_parser("selftest", help="Live checks with PASS/WARN/FAIL flags")
     st.add_argument("suite", choices=("keyboard",))
     st.add_argument("--capture", action="store_true",
@@ -191,6 +193,16 @@ def main():
     args = parser.parse_args()
     from .platforms import private_dir
     private_dir(args.state)  # tokens, keys and memory live here: this account only
+    if args.command == "control":  # the desktop control fail-safe (control.py): needs no config or identity
+        from . import control
+        if args.action == "stop":
+            ok, text = control.stop(args.state)
+        elif args.action == "resume":
+            ok, text = control.resume(args.state)
+        else:
+            ok, text = True, ("stopped" if control._stopped(args.state) else "ready")
+        emit({"ok": ok, "text": text})
+        return 0
     try:
         config_path = Path(args.config).resolve()
         base = config_path.parent
@@ -301,7 +313,7 @@ def main():
                 if not (config.get("lan_mouse") or {}).get("off_when_apart", True):
                     emit({"action": None, "note": "lan_mouse.off_when_apart is false in jarvis.config.json."})
                 else:
-                    emit(sharedinput.guard(args.state))
+                    emit(sharedinput.guard_for(config, args.state))
             elif args.action in ("start", "stop", "status"):
                 ok, text = sharedinput.control(args.action) if here else \
                     remote.call(args.device, "lan_mouse", args.action)
@@ -377,7 +389,7 @@ def main():
             return 1 if any(r["flag"] == "FAIL" for r in results) else 0
         elif args.command == "brain-tools":
             from .tools_mcp import serve
-            return serve(config, base, args.state)
+            return serve(config, base, args.state, config_path=args.config)
         elif args.command == "browser-proxy":
             from .browser_proxy import serve as relay
             return relay(config, base, args.state, args.server)
@@ -612,7 +624,14 @@ def task_command(args, config):
                          note=args.note, channel="cli")
         emit({k: made.get(k) for k in ("id", "text", "due", "priority", "path", "existing")})
     else:
-        emit(tasks.update(value, action, args.to, channel="cli"))
+        new_value = args.to or (args.due if action in ("due", "scheduled") else
+                                args.priority if action == "priority" else None)
+        if action in ("due", "scheduled", "priority"):
+            if not new_value:  # an empty value used to clear the field silently
+                raise ValueError(f"task {action} needs --to <value> (use --to none to clear it).")
+            if action == "priority" and new_value.lower() == "none":
+                new_value = ""
+        emit(tasks.update(value, action, new_value, channel="cli"))
     return 0
 
 

@@ -42,6 +42,10 @@ FLAGS = NO_WINDOW
 _SCROLLER = {"stop": None}
 _SCROLLER_LOCK = threading.Lock()
 _FRAME_LOCK = threading.Lock()
+# The live view polls every 400-700 ms; "is it open" (a CLI spawn plus a /proc scan) and the
+# page's url/title (two more spawns) only need refreshing every few seconds.
+FRAME_CACHE_S = 3.0
+_FRAME_CACHE = {}  # (kind, state_dir) -> (time, value)
 
 
 def env(state_dir=None, headed=True):
@@ -222,9 +226,33 @@ def _page(state_dir=None):
     return page
 
 
+def _cached(kind, state_dir, compute, clock=time.monotonic):
+    key = (kind, str(state_dir))
+    now = clock()
+    hit = _FRAME_CACHE.get(key)
+    if hit and now - hit[0] < FRAME_CACHE_S:
+        return hit[1]
+    value = compute(state_dir)
+    _FRAME_CACHE[key] = (now, value)
+    return value
+
+
+def _is_open(state_dir):
+    """running(), but an "open" answer is trusted for FRAME_CACHE_S; "closed" never is."""
+    key = ("running", str(state_dir))
+    hit = _FRAME_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < FRAME_CACHE_S:
+        return True
+    if running(state_dir):
+        _FRAME_CACHE[key] = (time.monotonic(), True)
+        return True
+    _FRAME_CACHE.clear()
+    return False
+
+
 def frame(state_dir=None):
     """{"open": False} or {"open": True, "url", "title", "image": JPEG bytes}."""
-    if not running(state_dir):
+    if not _is_open(state_dir):
         return {"open": False}
     path = Path(state_dir or STATE).resolve() / "agent-browser-frame.jpg"
     with _FRAME_LOCK:  # two console tabs polling must not write one file at once
@@ -236,7 +264,7 @@ def frame(state_dir=None):
             image = path.read_bytes()
         except OSError as exc:
             return {"open": True, "error": str(exc)}
-    return {"open": True, **_page(state_dir), "image": image}
+    return {"open": True, **_cached("page", state_dir, _page), "image": image}
 
 
 def _scroll_loop(stop, direction, every, state_dir, clock=time.monotonic):
@@ -299,8 +327,10 @@ def browse(spec, state_dir=None):
             except (TypeError, ValueError):
                 every = SCROLL_EVERY
             stop = threading.Event()
-            with _SCROLLER_LOCK:
-                _SCROLLER["stop"] = stop
+            with _SCROLLER_LOCK:  # swap atomically: a scroll started meanwhile must stay stoppable
+                replaced, _SCROLLER["stop"] = _SCROLLER["stop"], stop
+            if replaced:
+                replaced.set()
             threading.Thread(target=_scroll_loop, args=(stop, direction, every, state_dir),
                              name="jarvis-agent-scroll", daemon=True).start()
             return True, (f"Scrolling the agent browser every {every:g} seconds. "
@@ -310,6 +340,7 @@ def browse(spec, state_dir=None):
             (False, f"The agent browser couldn't scroll: {data}")
     if action == "close":
         stop_scrolling()
+        _FRAME_CACHE.clear()
         if not running(state_dir):
             return True, "The agent browser was already closed."
         ok, data = run("close", state_dir=state_dir, timeout=20)
