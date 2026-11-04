@@ -108,9 +108,35 @@ def asks_now(config, state=None):
 CREDENTIAL_CMD = re.compile(
     r"\bsudo\s+(?:-\w*S\w*|--stdin)\b|--password\b|--passwd\b|--passphrase\b|--with-token\b|"
     r"\bpasswd\b|\bchpasswd\b|\bsshpass\b|\bgh\s+auth\s+(?:login|token)\b|\bssh-keygen\b|"
-    r"\bssh-add\b|\bsecret-tool\s+store\b|\bgit\s+credential\b|\bpass\s+(?:insert|edit)\b", re.I)
+    r"\bssh-add\b|\bsecret-tool\s+store\b|\bgit\s+credential\b|\bpass\s+(?:insert|edit)\b|"
+    r"\bcmdkey\b.*\s/pass|\bnet\s+use\b.*\s/user|\bconvertto-securestring\b|"
+    r"\bsudo(?:\s+(?:-[ugpCghrtTU]\s+\S+|--\w[\w-]*(?:=\S+)?|-\w+))*?\s+(?:-\w*[SA]\w*|--stdin|--askpass)\b|"
+    r"\bSUDO_ASKPASS=|\bgh\s+auth\b|"
+    r"\b(?:docker|podman|helm|oras)\s+login\b|\bnpm\s+(?:login|adduser)\b|\bgcloud\s+auth\b|\baz\s+login\b|"
+    r"\baws\s+configure\b|\bhtpasswd\b|\bnet\s+user\s+\S+\s+\S+|\bkeyring\s+set\b", re.I)
 RM_NAMES = frozenset({"rm", "rmdir", "remove-item", "ri", "rd", "del", "erase", "unlink"})
-SEPARATORS = re.compile(r"&&|\|\||[;|\n]")
+# Every way bash starts another command: lists, pipes, background &, subshells, groups and
+# substitutions (audit 2026-11-03: `(rm -rf ~)`, `true & rm -rf ~` and `$(rm -rf ~)` got past).
+SEPARATORS = re.compile(r"&&|\|\||\$\(|[;|\n&()`]|(?<![^\s;&|)])\{(?=\s)|(?<=[\s;])\}")  # { } only as groups
+# Words that run the next word as the command: `/bin/rm`, `env rm`, `timeout 5 rm`, `then rm`.
+WRAPPERS = frozenset({"sudo", "doas", "command", "builtin", "env", "nice", "ionice", "nohup", "timeout",
+                      "time", "stdbuf", "setsid", "chrt", "taskset", "xargs", "busybox", "exec",
+                      "then", "do", "else", "elif", "if", "while", "until", "!", "nocorrect", "noglob"})
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "busybox", "pwsh", "powershell", "cmd"})
+
+
+def _command_name(values):
+    """(index, name) of the word that really runs: wrappers, their options and VAR=x skipped,
+    paths cut to the program's name (/usr/bin/rm -> rm, rm.exe -> rm)."""
+    i = 0
+    while i < len(values):
+        word = values[i]
+        base = re.sub(r"\.exe$", "", word.replace("\\", "/").rsplit("/", 1)[-1].lower())
+        if base in WRAPPERS or word.startswith("-") or re.fullmatch(r"\w+=.*|\d+[smhd]?", word):
+            i += 1
+            continue
+        return i, base
+    return len(values), ""
 
 
 def _vault_paths(config):
@@ -123,7 +149,87 @@ def _abs(path, here):
     text = os.path.expanduser(os.path.expandvars(str(path).replace("\\", "/")))
     if not (text.startswith("/") or re.match(r"[A-Za-z]:", text)):
         text = posixpath.join(str(here).replace("\\", "/"), text)
+    text = re.sub(r"^/{2,}", "/", text)  # bash reads //home as /home; normpath keeps the //
     return posixpath.normpath(text).rstrip("/") or "/"
+
+
+# Any home folder or drive root, on any OS: `rm -rf C:\Users\jdoe` on the Dell is checked on
+# the main, whose own home is /home/jdoe.
+TOP_FOLDERS = re.compile(r"^(?:/|/home/[^/]+|/root|/Users/[^/]+|[a-z]:/?|[a-z]:/users(?:/[^/]+)?)$", re.I)
+EXPANDS = re.compile(r"[$`*?\[{]|^~[^/]|%\w+%")
+
+# Shapes a text check can't see through, refused outright when they could delete or run other
+# code (red team 2026-11-03). Fail-closed: the brain can always write the command out plainly.
+_DELETE = r"(?:rm|rmdir|rd|del|erase|remove-item|ri|unlink|shred|truncate)(?:\.exe)?"
+_SHELL = r"(?:bash|sh|zsh|dash|ksh|fish|pwsh|powershell|cmd)(?:\.exe)?"
+STRUCTURAL = [
+    (re.compile(r"(?:^|[\s;&|({`])(?:\S*/)?" + _DELETE + r"\b.*(?:\$\(|`|<\()|(?:\$\(|`|<\().*\b" + _DELETE + r"\b", re.I),
+     "deletes can't use command substitution; name the target plainly"),
+    (re.compile(r"\b(?:xargs|parallel)\b[^|;&]*\b(?:" + _DELETE + r"|" + _SHELL + r"|find)\b", re.I),
+     "xargs/parallel can't feed deletes or shells"),
+    (re.compile(r"\b" + _SHELL + r"\b[^|;&]*(?:<<<|<\(|<<|\s<\s)", re.I),
+     "JARVIS doesn't run code fed to a shell from text"),
+    (re.compile(r">\s*['\"]?([^\s'\";&|]+).*\b(?:" + _SHELL + r"|source|python3?|perl|ruby|node)\s+['\"]?\1\b", re.I),
+     "JARVIS doesn't write a script and run it in one go"),
+    (re.compile(r"\b(?:python3?|perl|ruby|node|php|awk|gawk|mawk|lua|deno|bun)\b.*(?:rmtree|remove|unlink|rmdir|"
+                r"system\s*\(|\bexec|spawn|popen|subprocess|child_process|\brm\s+-)", re.I),
+     "inline code that deletes or runs commands isn't allowed; use plain commands"),
+    (re.compile(r"\bi`?e`?x\b|invoke-?expression|\bCDPATH=", re.I), "JARVIS doesn't evaluate built-up commands"),
+    (re.compile(r"\b(?:start-process|saps|start)\b.*\b" + _SHELL + r"\b", re.I),
+     "JARVIS doesn't start a shell through Start-Process"),
+    (re.compile(r"\btar\b.*--remove-files", re.I), "tar --remove-files deletes what it archives"),
+    (re.compile(r"\[(?:system\.)?io\.(?:directory|file|fileinfo|directoryinfo)\]::(?:delete|move|replace)\b", re.I),
+     "JARVIS doesn't delete or move files through .NET calls; use plain commands"),
+    (re.compile(r"(?:^|[\s(,'\"])(?:env|cert|hk(?:cu|lm|cr|u|cc)|wsman|variable):|\\\\[\w.-]+\\|-computername\b|"
+                r"\benter-pssession\b|\binvoke-command\b.*-computer", re.I),
+     "JARVIS doesn't read PowerShell's env, certificate or registry drives, or other machines"),
+    (re.compile(r"scriptblock\]::create|invoke-command\b.*-scriptblock|\bnew-module\b", re.I),
+     "JARVIS doesn't run PowerShell built from text"),
+    (re.compile(r"\b\w[\w-]*\s*\(\s*\)\s*\{", re.I), "JARVIS doesn't define shell functions"),
+    (re.compile(r"\b(?:node|deno|bun|python3?|perl|ruby|php)\b.*(?:rmSync|rmdirSync|unlinkSync|rimraf|rmtree|"
+                r"homedir|expanduser|Path\.home|os\.remove|os\.unlink|shutil)", re.I),
+     "inline code that deletes files isn't allowed; use plain commands"),
+    (re.compile(r"\bgit\b.*\b(?:stash\b.*(?:-u|--include-untracked|--all)|reset\b.*--hard|checkout\b.*\s--\s|"
+                r"clean\b.*-\w*[fdx])", re.I), "JARVIS doesn't run git commands that throw work away"),
+    (re.compile(r"\|\s*(?:remove-item|ri|rm|del|erase)\b[^|;&]*-r", re.I),
+     "piping a listing into a recursive delete isn't allowed"),
+]  # what bash fills in at run time: unknowable here
+
+
+# Folder moves the cwd tracking below can't follow (audit 2026-11-04: `cd /tmp; cd -; rm -rf
+# projects` deleted ~/projects): back-jumps, the directory stack, and $PWD/$OLDPWD, which _abs
+# would fill in from JARVIS's own environment, not the shell's.
+_CDWORD = r"(?:cd|chdir|pushd|set-location|sl)"
+_CDOPTS = r"(?:\s+(?:--|-[LPe@]+))*"  # `cd -P -`, `cd -- -`: options before the dash
+CWD_JUMP = re.compile(
+    r"(?:^|[\s;&|(){])" + _CDWORD + _CDOPTS + r"\s+-(?:\s|$|[;&|)}])|"
+    r"(?:^|[\s;&|(){])pushd(?:\s*(?:$|[;&|)}])|\s+[+-]\d)|"
+    r"(?:^|[\s;&|(){])(?:popd|pop-location)(?=\s|$|[;&|)}])|"
+    r"(?:^|[\s=:'\"(])~[-+](?:[/\\'\"\s;&|)}]|$)|\$\{?OLDPWD\b|\$env:OLDPWD\b", re.I)
+# $PWD is JARVIS's own folder until a cd/pushd/popd runs; after one it is unknowable here.
+_PWD_USE = re.compile(r"\$\{?PWD\b|\$env:PWD\b", re.I)
+_ANY_CD = re.compile(r"(?:^|[\s;&|(){])(?:" + _CDWORD[3:-1] + r"|popd|pop-location)(?=\s|$|[;&|)}])", re.I)
+
+
+def _pwd_after_cd(text):
+    m = _PWD_USE.search(text)
+    return bool(m and _ANY_CD.search(text[:m.start()]))
+
+
+REPO_BUILD = frozenset({"node_modules", "dist", "build", "__pycache__", ".pytest_cache", ".ruff_cache",
+                        ".mypy_cache", "coverage"})  # rebuilt by the tools: fine to delete
+
+
+def _repo_keeps(path, repo_s):
+    """True when deleting `path` (inside the repo) would hit .git, .venv or a top-level folder
+    of the repo (or something in one); build and cache folders may go, and so may names
+    that don't exist yet."""
+    parts = [p for p in path[len(repo_s):].split("/") if p]
+    if not parts:
+        return True
+    if any(p.casefold() in REPO_BUILD for p in parts):
+        return False
+    return parts[0].casefold() in (".git", ".venv") or os.path.isdir(os.path.join(repo_s, parts[0]))
 
 
 def _under(path, root):
@@ -142,7 +248,9 @@ SECRET_TEXT = re.compile(
 # ("python -c \"open('.../jarvis.config.json','w')\"" slipped past the path check).
 OWN_TEXT = re.compile(r"jarvis\.config\.json|(?:^|[\s'\"=/\\(])\.jarvis(?:[/\\'\"\s)]|$)|JARVIS\.md", re.I)
 # Running whatever a pipe or a decode produces: never from the brain.
-PIPE_TO_SHELL = re.compile(r"\|\s*(?:sudo\s+)?(?:sh|bash|zsh|dash|fish|ksh|pwsh|powershell|python3?|perl|ruby|node)\b|"
+PIPE_TO_SHELL = re.compile(r"(?:^|[\s;&|])(?:source|\.)\s+(?:<\(|/dev/stdin|/dev/fd|/proc/self/fd)|"
+                           r"(?:\|&?|>\()\s*(?:(?:sudo|env|doas|command|exec|nice|nohup|stdbuf|time|busybox)\b(?:\s+-\S+(?:\s+\w+)?)*\s+)*"
+                           r"[\"']?(?:\S*/)?(?:sh|bash|zsh|dash|fish|ksh|pwsh|powershell|cmd|python3?|perl|ruby|node)(?:\.exe)?[\"']?(?:\s|$|\b)|"
                            r"\b(?:iex|invoke-expression)\b|\beval\s|base64\s+(?:-d|--decode)\b[^|]*\|", re.I)
 PROTECTED_NAMES = (".ssh", ".codex", ".claude", ".jarvis", ".gnupg", "jarvis.config.json",
                    "JARVIS.md", "auth.json", "id_rsa", "id_ed25519", ".credentials.json")
@@ -161,10 +269,77 @@ def _globbed_secret(command):
     return False
 
 
-def _terminal_denial(args, config, base):
+_VAR_USE = re.compile(r"\$\{?([A-Za-z_]\w*)\}?(?!\w)")
+NESTING = 8  # bash -c / variable-filled re-checks deep enough to stop judging: refused
+
+
+def _home_variants(command, config):
+    r"""The command with home variables and same-command assignments filled in, once per home
+    it could mean (this PC's and each Windows home the vault paths name): `$env:USERPROFILE\
+    Documents\Vault` and `V=~/vault; echo x >> $V/n` are judged as the paths they become."""
+    homes = {os.path.expanduser("~")}
+    for path in _vault_paths(config):
+        found = re.match(r"([A-Za-z]:[\\/]Users[\\/][^\\/]+)", str(path))
+        if found:
+            homes.add(found.group(1))
+    names = r"\$\{?env:(?:USERPROFILE|HOME)\}?|%(?:USERPROFILE|HOMEPATH|HOME)%|\$\{?HOME\}?"
+    # Left to right, each use filled in from the assignments before it, never into an
+    # assignment's own value (audit 2026-11-04: `export PATH=$PATH:/x` doubled on every pass
+    # until MemoryError). The filled text is capped: None means too big to judge, refuse.
+    limit, known, parts, at, size = max(4000, 4 * len(command)), {}, [], 0, 0
+
+    def fill(piece):
+        nonlocal size
+        def use(m):
+            nonlocal size
+            value = known.get(m.group(1), m.group(0))
+            size += len(value)
+            if size > limit:
+                raise OverflowError
+            return value
+        return _VAR_USE.sub(use, piece)
+    try:
+        for m in re.finditer(r"(?:^|[\s;&])([A-Za-z_]\w*)=([^\s;&|]+)", command):
+            size += m.start(2) - at
+            parts.append(fill(command[at:m.start(2)]))
+            known[m.group(1)] = value = fill(m.group(2))
+            parts.append(value)
+            at = m.end(2)
+        parts.append(fill(command[at:]))
+    except OverflowError:
+        return None
+    text = "".join(parts)
+    if len(text) > limit:
+        return None
+    out = []
+    if text != command or re.search(names, text, re.I):
+        for home in homes:
+            out.append(re.sub(names, lambda _: home, text, flags=re.I))
+    return out
+
+
+def _terminal_denial(args, config, base, depth=0, expand=True):
     from . import terminal
     command = str((args or {}).get("command") or "")
+    if depth > NESTING:
+        return "that command nests too deeply for JARVIS to check"
+    variants = _home_variants(command, config) if expand else []
+    if variants is None:
+        return "JARVIS can't check that command: its variables grow too large"
+    for variant in variants:
+        if variant != command:  # already filled in: judged as is, never expanded again
+            found = _terminal_denial({**(args or {}), "command": variant}, config, base, depth + 1, False)
+            if found:
+                return found
     cwd_arg = (args or {}).get("cwd")
+    if _PWD_USE.search(command) and not _pwd_after_cd(command):
+        # $PWD before any cd is the folder the command starts in: judged as that path
+        # (_abs would read JARVIS's own environment instead).
+        start = str(cwd_arg or terminal.cwd())
+        filled = re.sub(r"\$\{PWD\}|\$PWD\b|\$env:PWD\b", lambda _: start, command, flags=re.I)
+        found = _terminal_denial({**(args or {}), "command": filled}, config, base, depth + 1, False)
+        if found:
+            return found
     if SECRET_TEXT.search(command) or SECRET_TEXT.search(str(cwd_arg or "")):
         return "JARVIS never reads or sends login, key or token files"
     if terminal.read_only(command, cwd_arg):
@@ -181,41 +356,186 @@ def _terminal_denial(args, config, base):
     vaults = [_abs(v, "/") for v in _vault_paths(config)]
     own = [repo_s + "/jarvis.config.json", repo_s + "/.jarvis", repo_s + "/JARVIS.md",
            repo_s + "/jarvis",  # its own gate code: `tee .../jarvis/gates.py`, `rm -rf .../jarvis`
+           repo_s + "/.git",  # David's local history: he commits himself
            home + "/.ssh", home + "/.codex", home + "/.claude"] + [h + "/.jarvis" for h in (home,)]
     here = _abs(cwd_arg, terminal.cwd()) if cwd_arg else _abs(terminal.cwd(), "/")
-    for step in SEPARATORS.split(command):
+    # Quotes and backslashes removed: p\asswd, pass''wd and "gh" are what the shell runs.
+    plain = re.sub(r"[\\'\"]", "", command)
+    if CREDENTIAL_CMD.search(plain):
+        return "JARVIS never enters passwords, tokens or keys"
+    if PIPE_TO_SHELL.search(plain):
+        return "JARVIS doesn't run code piped or decoded into a shell"
+    for pattern, why in STRUCTURAL:
+        if pattern.search(command) or pattern.search(plain):
+            return why
+    if CWD_JUMP.search(command) or CWD_JUMP.search(plain) or _pwd_after_cd(command) or _pwd_after_cd(plain):
+        return "JARVIS can't follow cd -, popd, ~-, ~+, $OLDPWD or $PWD; name the folder plainly"
+    if re.search(r"\b(?:python3?|perl|ruby|node|php|awk|gawk|deno|bun)\b", command, re.I) and \
+            any(n.casefold() in command.casefold() for n in (*PROTECTED_NAMES, "jarvis/", "obsidian", *_vault_paths(config))):
+        return "inline code can't touch JARVIS's own files or the vault"
+
+    def judge(step, here, unknown):
+        """Why this one command (cwd `here`) is refused, or None."""
         words = terminal._words(step) or [(w, w) for w in step.split()]
         if not words:
-            continue
+            return None
         values = [v for v, _ in words]
-        name = values[0].lower()
-        if name == "sudo" and len(values) > 1:
-            name = values[1].lower()
+        at, name = _command_name(values)
+        values = values[at:] or values
+        if name in SHELLS or name == "eval":  # `bash -c "rm -rf ~"`: judge the inner command
+            # From the raw text: the parsed words have lost PowerShell/cmd backslashes.
+            raw = step.split()
+            inner = next((" ".join(raw[k + 1:]).strip().strip("'\"") for k in range(len(raw) - 1)
+                          if raw[k].lower() in ("-c", "-command", "/c", "/k")), None) \
+                if name != "eval" else " ".join(raw[raw.index(next(w for w in raw if w.lower() == "eval")) + 1:])
+            if inner is None and name != "eval" and name not in ("pwsh", "powershell"):
+                # bash -lc 'x', sh -ec 'x': the -c may share its dash with other flags
+                inner = next((" ".join(raw[k + 1:]).strip().strip("'\"") for k in range(len(raw) - 1)
+                              if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", raw[k])), None)
+            if inner is None and name != "eval" and any(re.fullmatch(r"-e(?:c|n\w*)?", v, re.I)
+                                                        for v in values[1:]):
+                return "JARVIS doesn't run encoded shell commands"
+            if inner:
+                found = _terminal_denial({**(args or {}), "command": inner}, config, base, depth + 1)
+                if found:
+                    return found
         targets = []
         for value in values[1:]:
             # option=path forms (--out=~/x), and quoted/spaced pieces
             for piece in {value, value.split("=", 1)[-1]}:
                 if piece and not (piece.startswith("-") and "=" not in piece):
                     targets.append(piece)
+        protected = own + vaults
+        windows = [m.replace("\\", "/") for m in re.findall(r"[A-Za-z]:\\[^\s'\"(),;|]*", step)]
+        for t in targets + windows:
+            fixed = t.replace("\\", "/")
+            if EXPANDS.search(fixed) and not fixed.startswith("-") and ("/" in fixed or fixed.startswith("~")):
+                head = EXPANDS.split(fixed, 1)[0]
+                if not head:  # "$HOME/x", "$PATH": the base is unknown here; deletes check it below
+                    continue
+                start = _abs(head, here)
+                if len(start) > 1 and any(g.casefold().startswith(start.casefold()) or _under(start, g)
+                                          for g in protected):
+                    return "a wildcard there could reach JARVIS's own files or the vault"
+        if name in ("python", "python3", "perl", "ruby", "node", "php", "awk", "gawk", "deno", "bun") and \
+                any(n.casefold() in step.casefold() for n in (*PROTECTED_NAMES, "jarvis/", "obsidian", *vaults)):
+            return "inline code can't touch JARVIS's own files or the vault"
         paths = [_abs(t, here) for t in targets] + [here]
+        # Windows paths as PowerShell sees them (the parsed words lost their backslashes), found
+        # anywhere: -Path:C:\x, [IO.File]::WriteAllText("C:\x"), and > redirect targets.
+        paths += [_abs(w, here) for w in windows]
+        paths += [_abs(m, here) for m in re.findall(r">>?\s*([^\s'\";&|>]+)", step)]
         for path in paths:
             if any(_under(path, v) for v in vaults):
                 return "the Obsidian vault is read-only"
             if any(_under(path, o) for o in own) or \
-                    re.search(r"(?:^|/)(?:\.jarvis|jarvis\.config\.json|JARVIS\.md|\.ssh)(?:/|$)",
-                              path, re.I):
+                    re.search(r"(?:^|/)(?:\.jarvis|jarvis\.config\.json|JARVIS\.md|\.ssh|\.codex|\.claude|"
+                              r"\.gnupg)(?:/|$)|/JARVIS/jarvis(?:/|$)", path, re.I):
                 return "JARVIS's own config, state and keys are off limits"
-        if name in terminal.CD and values[1:]:
-            here = paths[-2] if len(paths) > 1 else here
+        if name == "git" and "clean" in values and any(re.fullmatch(r"-\w*f\w*|--force", v) for v in values):
+            if _under(here, repo_s) or here == home or any(_under(here, v) for v in vaults):
+                return "git clean would delete JARVIS's or the vault's untracked files"
+        if name == "find" and any(v in ("-delete", "-exec", "-execdir", "-ok") for v in values[1:]):
+            start = [v for v in values[1:] if not v.startswith("-")][:1] or ["."]
+            name, values = "rm", ["rm", "-r", *start]
+            targets = values[2:]
+        if name == "rsync" and any(v.startswith("--del") for v in values[1:]):
+            name, values = "rm", ["rm", "-r", *[t for t in targets if not t.startswith("-")][-1:]]
+            targets = values[2:]
+        if name in ("mv", "move", "move-item", "mi", "rename-item", "ren") and targets:
+            sources = [t for t in targets if not t.startswith("-")][:-1] or targets[:1]
+            for t in sources:  # moving home, the repo or the vault away destroys them as surely
+                if any(_under(g, _abs(t, here)) for g in [repo_s, home] + vaults) or TOP_FOLDERS.match(_abs(t, here)):
+                    return "that move would take away JARVIS, its vault or the home folder"
+        if name in ("chmod", "chown", "chgrp", "setfacl"):
+            recursive = any(re.fullmatch(r"-[a-zA-Z]*R[a-zA-Z]*|--recursive", v) for v in values[1:])
+            spec = name != "setfacl" and \
+                not any(v.startswith("--reference") or re.fullmatch(r"-[rwxXst]+", v) for v in values[1:])
+            for t in [v for v in values[1:] if not v.startswith("-")][1 if spec else 0:]:
+                if EXPANDS.search(t):
+                    if recursive:
+                        return "recursive chmod/chown must name its target plainly"
+                    continue
+                path = _abs(t, here)
+                # Home, the repo, the vault or a folder above them: even one level locks it out.
+                if any(_under(g, path) for g in [repo_s, home, "/"] + vaults) or TOP_FOLDERS.match(path):
+                    return "chmod/chown/setfacl can't cover JARVIS's repo, its vault or the home folder"
+                if recursive and _under(path, repo_s):
+                    return "recursive chmod/chown can't cover JARVIS's repo, its vault or the home folder"
         if name in RM_NAMES:
-            recursive = any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--recursive|-recurse|/s", v, re.I)
+            # -Path:C:\x / -LiteralPath:x carry their target inside the option.
+            targets += [v.split(":", 1)[1] for v in values[1:] if re.match(r"-\w+:.", v)]
+            targets += [w.strip("'\"").split(":", 1)[1] for w in step.split()[1:]
+                        if re.match(r"-\w+:.", w.strip("'\""))]  # -Path:C:\x keeps its backslashes raw
+            recursive = any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--r\w*|-recurse\w*|/s", v, re.I)
                             or v == "--no-preserve-root" for v in values[1:])
             if recursive or name in ("rmdir", "rd"):
                 guarded = [repo_s, home, "/"] + vaults
-                for t in targets[:]:
-                    path = _abs(re.sub(r"/\*+$", "", t.replace("\\", "/")) or "/", here)
-                    if any(_under(g, path) for g in guarded):
+                if unknown and any(not t.startswith(("/", "~")) and not re.match(r"[A-Za-z]:", t) for t in targets):
+                    return "a recursive delete after cd into an unresolved place isn't allowed"
+                # Unquoted Windows paths too: _words drops their backslashes as bash escapes.
+                raw = [w.strip("'\"") for w in step.split()[1:] if "\\" in w and not w.startswith("-")]
+                for t in targets[:] + raw:
+                    fixed = t.replace("\\", "/")
+                    if EXPANDS.search(fixed):
+                        # A variable, substitution, ~user or glob: judge the fixed part before it.
+                        head = EXPANDS.split(fixed, 1)[0]
+                        if "$" in fixed or "`" in fixed or fixed.startswith("~") and not fixed.startswith("~/"):
+                            return "recursive deletes must name their target plainly (no variables or ~user)"
+                        start = _abs(head, here) if head else here
+                        if any(g.casefold().startswith(start.casefold()) for g in guarded):
+                            return "that delete's wildcard could cover JARVIS, its vault or the home folder"
+                        fixed = head.rsplit("/", 1)[0] if "/" in head else ""
+                        if not fixed:
+                            return "that recursive delete's target is a wildcard JARVIS can't check"
+                    path = _abs(re.sub(r"/\*+$", "", fixed) or "/", here)
+                    if any(_under(g, path) for g in guarded) or TOP_FOLDERS.match(path):
                         return "that delete would wipe JARVIS, its vault or the home folder"
+                    if _under(path, repo_s) and _repo_keeps(path, repo_s):
+                        return "JARVIS doesn't delete folders inside its own repo"
+        return None
+
+    unknown = False  # a cd/pushd into a place this check can't resolve (glob, variable)
+    pieces, seps, at = [], [], 0
+    for m in SEPARATORS.finditer(command):
+        pieces.append(command[at:m.start()])
+        seps.append(m.group(0))
+        at = m.end()
+    pieces.append(command[at:])
+    seps.append("")
+    # Folders the shell may be in. A cd that fails (`cd /nonexistent; rm -rf x`), runs in a
+    # pipeline or subshell, or is backgrounded leaves it where it was, so every cd adds a
+    # possibility; only `cd d && ...` (not after ||) is sure to be in d for what follows.
+    # Each command is judged in every one of them (audit 2026-11-04).
+    grouped = bool(re.search(r"[(){}`]", command))
+    heres = [here]
+    chain = list(heres)  # where the current &&-chain began
+    prev = ";"
+    for step, sep in zip(pieces, seps):
+        for h in heres:
+            found = judge(step, h, unknown)
+            if found:
+                return found
+        words = terminal._words(step) or [(w, w) for w in step.split()]
+        values = [v for v, _ in words]
+        if values:
+            at, name = _command_name(values)
+            values = values[at:] or values
+            if name in terminal.CD | {"pushd"}:
+                args_ = [v for v in values[1:] if not v.startswith("-")] if values[1:] else []
+                if any(EXPANDS.search(v) for v in values[1:]):
+                    unknown = True
+                news = [home if not args_ else _abs(args_[-1], h) for h in heres]
+                if prev in (";", "\n", "&&") and sep == "&&" and not grouped:
+                    heres = news
+                else:
+                    heres = heres + [n for n in news if n not in heres]
+                if len(heres) > 64:
+                    return "JARVIS can't follow that many folder changes in one command"
+        if sep != "&&":  # the chain ended: it may have stopped before its cd
+            heres = chain + [h for h in heres if h not in chain]
+            chain = list(heres)
+        prev = sep
     return None
 
 
@@ -325,9 +645,25 @@ def check(command, devices, origin_class="owner", reachable=None, ready=None,
     return {"pass": True, "risk": risk, "checks": checks, "why": ""}
 
 
+# Plurals and the other names for the same secrets (audit 2026-11-03: "my passwords", "my OTP",
+# "the verification code" and "my CVV" all passed). "pin" only as a code, not "pin this tab".
+CREDENTIAL_WORDS = re.compile(
+    r"\b(?:pass(?:word|code|phrase)s?|2fa(?:\s+codes?)?|mfa\s+codes?|otps?|one[- ]time\s+(?:code|"
+    r"password|passcode)s?|verification\s+codes?|security\s+codes?|auth(?:entication)?\s+codes?|"
+    r"card\s+numbers?|credit\s+card\s+(?:number|details|info)|cvv2?|cvc2?|(?:my|the|a)\s+pin(?:\s+(?:code|number))?|"
+    r"pin\s+(?:code|number)s?|social\s+security\s+number|ssn)\b", re.I)
+
+
+def always_asks_text(text, config):
+    """A task that spends money or messages people as David: asked even under confirm never."""
+    from .browser_gate import ALWAYS_ASK
+    kinds = ((config or {}).get("rules") or {}).get("always_ask", ["money", "messages"])
+    return any(ALWAYS_ASK[k].search(text or "") for k in kinds if k in ALWAYS_ASK)
+
+
 def agent_risk(text, preflight=None):
     """Risk can only rise; credentials are refused before any model is contacted."""
-    if re.search(r"\b(password|passcode|2fa\s+code|card\s+number)\b", text, re.I):
+    if CREDENTIAL_WORDS.search(text):
         return "deny"
     risky = (r"\b(buy|pay|order|book|send|message|reply|text|email|post|tweet|comment|"
              r"delete|remove|unsubscribe|submit|apply|sign|accept|transfer|install|uninstall)\b|"

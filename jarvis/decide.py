@@ -98,7 +98,12 @@ STATEMENT_MARGIN = 0.05  # notes must beat "none" by this much for a plain state
 
 def wants_notes(text):
     """False only when a request is clearly not about David's own notes (small talk, general
-    knowledge, commands); True when it is, or it's close, or the model is unavailable."""
+    knowledge, commands); True when it is, or it's close, or the model is unavailable.
+    While another thread is still building the recall vectors, True at once (keep the
+    notes) rather than wait on the request path."""
+    with _lock:
+        if "recall" not in _cache and _building.get("recall"):
+            return True
     found = choose("recall", text)
     if found is None:
         return True
@@ -160,19 +165,35 @@ _cache = {}  # job -> {option: matrix of prototype vectors}
 _generation = 0  # bumped by learn(): a model fitted on older examples must not be stored
 
 
+_building = {}  # job -> how many threads are embedding its prototypes right now
+
+
 def _vectors(job):
+    """The job's prototype embeddings, built once. Embedding runs outside _lock (the mode
+    job is hundreds of phrases plus the model load), so other jobs never wait on it."""
     from .embed import embed
     with _lock:
-        if job not in _cache:
-            options = PROTOTYPES[job]
-            built = {}
-            for option, phrases in options.items():
-                vectors = embed(phrases)
-                if vectors is None:
-                    return None
-                built[option] = vectors
-            _cache[job] = built
-        return _cache[job]
+        if job in _cache:
+            return _cache[job]
+        generation = _generation
+        options = {o: list(p) for o, p in PROTOTYPES[job].items()}
+        _building[job] = _building.get(job, 0) + 1
+    try:
+        built = {}
+        for option, phrases in options.items():
+            vectors = embed(phrases)
+            if vectors is None:
+                return None
+            built[option] = vectors
+    finally:
+        with _lock:
+            _building[job] -= 1
+            if not _building[job]:
+                _building.pop(job)
+    with _lock:
+        if generation == _generation:  # learn() since the snapshot: don't keep stale vectors
+            return _cache.setdefault(job, built)
+    return built
 
 
 def learn(job, option, phrase):
@@ -324,7 +345,7 @@ def warm(job):
     """Build the job's model once in the background (about 2 s): never on a request.
     A failed build is logged and retried after WARM_RETRY_S, not on every request."""
     with _lock:
-        if job in _warming or job in _models:
+        if job in _warming or job in _models or (job not in CUES and job in _cache):
             return
         failed = _warm_failed.get(job)
         if failed is not None and time.monotonic() - failed < WARM_RETRY_S:
@@ -335,7 +356,9 @@ def warm(job):
         try:
             choose(job, "warm up")
             # choose() returns None, not an error, when the embedding model is missing.
-            why = None if job in _models else "no embedding model or no cues for the job"
+            # A job without cues (recall) has no classifier: its vectors are the model.
+            built = job in _models or (job not in CUES and job in _cache)
+            why = None if built else "no embedding model or no cues for the job"
         except Exception as exc:
             why = repr(exc)
         with _lock:
@@ -379,9 +402,14 @@ def _db(state):
                 id TEXT PRIMARY KEY, at REAL NOT NULL, job TEXT NOT NULL, text TEXT NOT NULL,
                 winner TEXT, probs TEXT, confidence REAL, label TEXT, source TEXT)""")
             db.execute("CREATE INDEX IF NOT EXISTS decisions_job ON decisions(job, at)")
+            db.execute("CREATE INDEX IF NOT EXISTS decisions_at ON decisions(at)")
             yield db
     finally:
         db.close()
+
+
+PRUNE_EVERY_S = 3600
+_pruned = {}  # history.sqlite3 path -> time.time() of its last prune
 
 
 def record(state, job, text, decision, label=None, source=None):
@@ -393,9 +421,16 @@ def record(state, job, text, decision, label=None, source=None):
                     (decision or {}).get("winner"),
                     json.dumps({"probs": (decision or {}).get("probs"), "sims": (decision or {}).get("sims")}),
                     (decision or {}).get("confidence"), label, source))
-        # Calibration needs recent behaviour, not all of it: drop rows past the history's age.
-        from .history import KEEP_DAYS
-        db.execute("DELETE FROM decisions WHERE at<?", (time.time() - KEEP_DAYS * 86400,))
+        # Calibration needs recent behaviour, not all of it: drop rows past the history's age,
+        # at most once an hour (not on every shadow-logged request).
+        key, now = str(Path(state).resolve()), time.time()
+        with _lock:
+            due = now - _pruned.get(key, 0.0) >= PRUNE_EVERY_S
+            if due:
+                _pruned[key] = now
+        if due:
+            from .history import KEEP_DAYS
+            db.execute("DELETE FROM decisions WHERE at<?", (now - KEEP_DAYS * 86400,))
     return did
 
 

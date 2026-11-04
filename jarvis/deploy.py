@@ -21,6 +21,7 @@ packages) and a node installs only what verifies against the key its invite pinn
 """
 
 import base64
+import fnmatch
 import hashlib
 import io
 import os
@@ -38,6 +39,9 @@ from .platforms import NO_WINDOW
 
 PACKAGE = Path(__file__).resolve().parent
 SKIP = {"__pycache__"}
+# Editor and hand-made backup files never count as code (the node's fingerprint and the
+# release.GUARD walk use the same list).
+EXCLUDE = ("*.pre-*", "*~", "*.swp", ".#*", "*.tmp")
 REMOTE_DIR = "~/projects/JARVIS"
 SERVICE = "jarvis-cluster.service"
 WAIT = 40  # seconds for the restarted node to check in with the new code
@@ -48,11 +52,12 @@ FLAGS = NO_WINDOW
 
 # Runs on the node: the same fingerprint as code_fingerprint(), for a folder (CRLF-blind).
 REMOTE_FINGERPRINT = r"""
-import hashlib, os, sys
+import fnmatch, hashlib, os, sys
+EXCLUDE = ("*.pre-*", "*~", "*.swp", ".#*", "*.tmp")
 root = sys.argv[1]; h = hashlib.sha256(); found = []
 for base, dirs, files in os.walk(root):
     dirs[:] = [d for d in dirs if d != "__pycache__"]
-    found += [os.path.join(base, n) for n in files if not n.endswith(".pyc")]
+    found += [os.path.join(base, n) for n in files if not n.endswith(".pyc") and not any(fnmatch.fnmatchcase(n, x) for x in EXCLUDE)]
 for rel, path in sorted((os.path.relpath(p, root).replace(os.sep, "/"), p) for p in found):
     h.update(rel.encode() + b"\0")
     with open(path, "rb") as f:
@@ -66,22 +71,36 @@ _CACHE = {"stamp": None, "value": None}
 def _files(root):
     """Package files in one canonical order (relative POSIX path), the node's order too."""
     found = [p for p in root.rglob("*")
-             if p.is_file() and not SKIP.intersection(p.parts) and p.suffix != ".pyc"]
+             if p.is_file() and not SKIP.intersection(p.parts) and p.suffix != ".pyc"
+             and not any(fnmatch.fnmatchcase(p.name, x) for x in EXCLUDE)]
     return sorted(found, key=lambda p: p.relative_to(root).as_posix())
 
 
 def code_fingerprint(root=PACKAGE):
     """16 hex chars identifying this exact code. Cached until a file changes."""
     root = Path(root)
-    files = list(_files(root))
-    stamp = (len(files), max((f.stat().st_mtime_ns for f in files), default=0))
+    files, stats = [], []
+    for path in _files(root):
+        try:
+            info = path.stat()
+        except OSError:
+            continue  # saved-and-gone between the listing and now (editor temp file)
+        files.append(path)
+        stats.append((info.st_size, info.st_mtime_ns, info.st_ino))
+    # Size and inode too: a content change that keeps its old mtime (cp -p, rsync -a) still shows.
+    stamp = (len(files), max((s[1] for s in stats), default=0), sum(s[0] for s in stats),
+             sum(s[2] for s in stats))
     if root == PACKAGE and _CACHE["stamp"] == stamp:
         return _CACHE["value"]
     digest = hashlib.sha256()
     for path in files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
         digest.update(path.relative_to(root).as_posix().encode() + b"\0")
         # CRLF -> LF so a Windows checkout with core.autocrlf matches the same commit.
-        digest.update(path.read_bytes().replace(b"\r\n", b"\n") + b"\0")
+        digest.update(data.replace(b"\r\n", b"\n") + b"\0")
     value = digest.hexdigest()[:16]
     if root == PACKAGE:
         _CACHE.update(stamp=stamp, value=value)
@@ -162,6 +181,37 @@ def verify(data, signature, key):
         except subprocess.SubprocessError:
             return False
     return out.returncode == 0
+
+
+JOB_SKEW = 600  # seconds a signed job's `issued` may differ from the node's clock
+JOB_DOMAIN = b"jarvis-job-v1\n"  # never the bytes of a code bundle: a job signature can't pass as one
+
+
+def _job_bytes(job, node):
+    import json
+    return JOB_DOMAIN + json.dumps({"id": job.get("id"), "node": node, "kind": job.get("kind"),
+                                    "payload": job.get("payload"), "issued": job.get("issued")},
+                                   sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def sign_job(job, node, state):
+    """The job as the main hands it to `node`, signed with the code-signing key the node
+    pinned at join: a program squatting the node's loopback port while the tunnel is down
+    can't hand it commands (audit 2026-11-03)."""
+    import time
+    job = {**job, "issued": round(time.time())}
+    return {**job, "sig": sign(_job_bytes(job, node), state)}
+
+
+def verify_job(job, node, key, now=None):
+    """None when the job is the main's, for this node and fresh; else why it is refused."""
+    import time
+    if not isinstance(job, dict) or not verify(_job_bytes(job, node), job.get("sig"), key):
+        return "not signed by the main"
+    issued = job.get("issued")
+    if not isinstance(issued, (int, float)) or abs((now or time.time()) - issued) > JOB_SKEW:
+        return "too old (or the clocks differ by more than 10 minutes)"
+    return None
 
 
 def code_bundle(state):

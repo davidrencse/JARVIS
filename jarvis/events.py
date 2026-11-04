@@ -215,6 +215,8 @@ class Watcher:
             identity = (stat.st_dev, stat.st_ino)
             size = stat.st_size
             if identity != self.feed_identity or size < self.offset:
+                if identity != self.feed_identity and self.feed_identity is not None:
+                    self._drain_rolled()
                 self.offset = 0
             self.feed_identity = identity
             if size == self.offset:
@@ -223,7 +225,24 @@ class Watcher:
             chunk = feed.read(size - self.offset)
         complete = chunk.rfind(b"\n") + 1  # leave a half-written last line for next time
         self.offset += complete
-        for raw in chunk[:complete].splitlines():
+        self._relay(chunk[:complete])
+
+    def _drain_rolled(self):
+        """Another process rolled the feed over to events.1.jsonl: read what it appended
+        to that file after our last poll before switching to the new one."""
+        try:
+            with self.feed.with_name("events.1.jsonl").open("rb") as old:
+                stat = os.fstat(old.fileno())
+                if (stat.st_dev, stat.st_ino) != self.feed_identity or stat.st_size <= self.offset:
+                    return
+                old.seek(self.offset)
+                chunk = old.read(stat.st_size - self.offset)
+        except OSError:
+            return
+        self._relay(chunk[:chunk.rfind(b"\n") + 1])
+
+    def _relay(self, data):
+        for raw in data.splitlines():
             try:
                 event = json.loads(raw.decode("utf-8"))
             except ValueError:

@@ -53,8 +53,12 @@ def now_line():
     return f"Now: {local:%A %Y-%m-%d %H:%M} {local.tzname()} (UTC{local:%z})."
 
 
-def close_process(proc, reader):
-    """Reap a lane's child and let its reader close stdout, including after EOF."""
+def close_process(proc, reader, grace=1.0):
+    """Reap a lane's child and let its reader close stdout, including after EOF.
+
+    An idle CLI exits on stdin EOF within `grace`; one mid-turn (an abort or timeout) won't,
+    and its answer is abandoned anyway, so it gets SIGTERM, then SIGKILL. Waiting 5 s for a
+    graceful exit used to add 5 s to every aborted or timed-out turn."""
     if proc is None:
         return
     try:
@@ -62,11 +66,16 @@ def close_process(proc, reader):
             proc.stdin.close()
     except OSError:
         pass
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+    for stop, wait in ((None, grace), (proc.terminate, 3), (proc.kill, 5)):
+        try:
+            if stop:
+                stop()
+            proc.wait(timeout=wait)
+            break
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:  # already reaped
+            break
     if reader is not None:
         reader.join(timeout=1)
 
@@ -92,6 +101,7 @@ class FastLane:
         self.base, self.max_turns, self.timeout = str(base), max_turns, timeout
         self.proc, self.lines, self.turns = None, None, 0
         self._reader = None
+        self._cost_seen = 0.0
         self.held = ThreadRecall()  # what this CLI session already holds; reset on respawn
         self.lock = threading.Lock()
         self.command = command  # tests substitute a fake CLI
@@ -127,6 +137,7 @@ class FastLane:
             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1,
             creationflags=NO_WINDOW, env=subscription_env())
         self.lines, self.turns = queue.Queue(), 0
+        self._cost_seen = 0.0  # total_cost_usd is cumulative over this process's session
         self.held.reset()
         self._reader = threading.Thread(target=self._pump, args=(self.proc, self.lines),
                                         daemon=True)
@@ -238,7 +249,11 @@ class FastLane:
                 if event.get("is_error") or not isinstance(event.get("result"), str):
                     raise RuntimeError(f"Fast lane error: {event.get('subtype')}")
                 from .usage import record
-                record("claude", self.model, event.get("usage"), event.get("total_cost_usd"))
+                cost = event.get("total_cost_usd")
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+                    # Cumulative for the session: charge this turn only its own share.
+                    cost, self._cost_seen = max(0.0, cost - self._cost_seen), max(cost, self._cost_seen)
+                record("claude", self.model, event.get("usage"), cost)
                 if on_sentence:
                     # Remainder of the stream, or the whole answer if nothing streamed.
                     rest = pending.strip() if spoke else event["result"].strip()
