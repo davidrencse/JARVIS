@@ -12,3 +12,4 @@ jarvis.egg-info/
 .playwright-mcp/
 jarvis.config.json.pre-*
 jarvis.prev/
+*.sqlite3

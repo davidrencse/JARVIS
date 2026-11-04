@@ -149,6 +149,14 @@
       "model": "gpt-6.1-sol",
       "effort": "low",
       "fallback_model": "gpt-6-sol"
+    },
+    "chatgpt_l2": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    },
+    "chatgpt_l3": {
+      "model": "gpt-6.1-sol",
+      "effort": "high"
     }
   },
   "routing": {
@@ -181,6 +189,7 @@
     "enabled": true,
     "browser": true,
     "browser_engines": [
+      "chrome",
       "playwright",
       "agent-browser"
     ]
@@ -233,5 +242,9 @@
   },
   "decisions": {
     "shadow": true
+  },
+  "orchestrator": {
+    "enabled": true,
+    "l3_per_5h": 20
   }
 }
