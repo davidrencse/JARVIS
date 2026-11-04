@@ -167,8 +167,11 @@ class FullPermissionTests(unittest.TestCase):
         with patched:
             self.assertEqual(gate.call("close_app", {"name": "Word"}), (True, "Closed 1 Word window."))
         self.assertEqual(seen, [("close_app", "brain", "dell")])  # gates + history, as "brain"
-        self.assertEqual(gate.call("grok_agent", {"task": "post my photo"}), (True, "ran"))
+        self.assertEqual(gate.call("grok_agent", {"task": "find my photos"}), (True, "ran"))
         self.assertEqual(ConfirmQueue(self.state).pending(), [])
+        ok, said = gate.call("grok_agent", {"task": "post my photo"})  # messages still ask
+        self.assertFalse(ok)
+        self.assertIn("needs David's OK", said)
 
     def test_credentials_are_still_refused(self):
         tools = FakeTools()

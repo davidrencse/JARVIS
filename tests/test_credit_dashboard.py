@@ -44,3 +44,12 @@ console.log('quota windows correctly identified');
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UsageLockTests(unittest.TestCase):
+    def test_each_provider_has_its_own_usage_lock(self):
+        import tempfile
+        from jarvis.credits import Credits
+        with tempfile.TemporaryDirectory() as state:
+            locks = Credits(state)._usage_locks
+        self.assertIsNot(locks["claude"], locks["codex"])

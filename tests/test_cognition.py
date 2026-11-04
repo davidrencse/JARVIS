@@ -350,7 +350,29 @@ for line in sys.stdin:
 '''
 
 
+COST_CLAUDE = r'''
+import json, sys
+total = 0.0
+for line in sys.stdin:
+    total += 0.25
+    print(json.dumps({"type": "result", "result": "ok", "total_cost_usd": total,
+                      "usage": {"input_tokens": 1, "output_tokens": 1}}), flush=True)
+'''
+
+
 class FastLaneTests(Temp):
+    def test_cumulative_cost_recorded_per_turn(self):
+        from jarvis.fastlane import FastLane
+        from jarvis.usage import meter
+        script = self.base / "cost_claude.py"
+        script.write_text(COST_CLAUDE, encoding="utf-8")
+        lane = FastLane({}, self.base, timeout=20, command=[sys.executable, str(script)])
+        self.addCleanup(lane.close)
+        with meter() as m:
+            for _ in range(3):
+                lane.ask("hi")
+        self.assertEqual([c["usd"] for c in m.calls], [0.25, 0.25, 0.25])
+
     def test_sends_only_recall_the_session_lacks(self):
         from jarvis.fastlane import FastLane
         from jarvis.memory import CONVERSATION, exchange_line
@@ -438,7 +460,7 @@ class FastLaneTests(Temp):
         store, mem = Store(self.base / "s"), Memory(self.base / "s")
         with patch("jarvis.assistant.run_task", return_value={
                 "task_id": "t", "state": "finished", "answer": "slow path"}):
-            result = ask("hi there", store, mem, {}, self.base, lane=Broken())
+            result = ask("tell me a joke", store, mem, {}, self.base, lane=Broken())
         self.assertEqual(result["reply"], "slow path")
         self.assertEqual(result["lane_error"], "down")
 

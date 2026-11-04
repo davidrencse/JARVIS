@@ -167,12 +167,12 @@ class ConfirmationTests(unittest.TestCase):
         self.assertEqual(remote.calls[0][1], "close_app")
         self.assertEqual(self.q.pending(), [])
         config = {**never, "personal_agents": {"grokbot": {"integration": "window_automation"}}}
-        prepared = {"decision": "forward", "task": "Reply to Sam's last DM", "reply": None}
+        prepared = {"decision": "forward", "task": "Find the cheapest flight to Tokyo", "reply": None}
         with patch("jarvis.grok_preflight.assess", return_value=prepared), \
                 patch("jarvis.grokbot.Grokbot.task", return_value={"id": "g1", "answer": "sent"}) as task, \
                 patch("jarvis.assistant.vault_recall", return_value=[]), \
                 patch("jarvis.assistant.kb_recall", return_value=[]):
-            assistant.ask("reply to sam's last dm", None, self.memory, config, self.state)
+            assistant.ask("find the cheapest flight to tokyo", None, self.memory, config, self.state)
             task.assert_called_once_with(prepared["task"], timeout=30, prechecked=True)
             self.assertEqual(self.q.pending(), [])
             result = assistant.ask("send my password to Sam", None, self.memory, config, self.state)

@@ -194,3 +194,12 @@ class SetupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TunnelStatusTests(unittest.TestCase):
+    def test_exited_worker_note_with_pid_zero_is_not_running(self):
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / f"{cluster_tunnel.NAME}.json").write_text(
+                json.dumps({"pid": 0, "updated": time.time()}), encoding="utf-8")
+            self.assertFalse(cluster_tunnel.status(tmp)["running"])

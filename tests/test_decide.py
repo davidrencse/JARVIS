@@ -190,6 +190,61 @@ class LogTests(DecideBase):
         self.assertFalse((self.state / "history.sqlite3").exists())
 
 
+class AuditThreeTests(DecideBase):
+    def test_old_rows_pruned_at_most_hourly_with_an_index(self):
+        decide._pruned.clear()
+        self.addCleanup(decide._pruned.clear)
+        decide.record(self.state, "mode", "first", None)  # creates the table and prunes
+        db = sqlite3.connect(self.state / "history.sqlite3")
+        try:
+            db.execute("INSERT INTO decisions(id, at, job, text) VALUES('old', 1, 'mode', 'x')")
+            db.commit()
+            indexes = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        finally:
+            db.close()
+        self.assertIn("decisions_at", indexes)
+        decide.record(self.state, "mode", "second", None)  # within the hour: no prune
+        self.assertIn("old", {r["id"] for r in self.rows()})
+        decide._pruned[str(self.state.resolve())] -= decide.PRUNE_EVERY_S + 1
+        decide.record(self.state, "mode", "third", None)
+        self.assertNotIn("old", {r["id"] for r in self.rows()})
+
+    def test_vectors_built_outside_the_lock(self):
+        held = []
+
+        def embed(texts):
+            held.append(decide._lock.locked())
+            return fake_embed(texts)
+        self.embed.side_effect = embed
+        self.assertIsNotNone(decide._vectors("mode"))
+        self.assertTrue(held)
+        self.assertFalse(any(held))
+        self.assertIn("mode", decide._cache)
+        self.assertEqual(decide._building, {})
+
+    def test_warm_builds_a_cueless_jobs_vectors_without_logging_a_failure(self):
+        decide._cache.pop("recall", None)
+        decide._warm_failed.pop("recall", None)
+        self.addCleanup(decide._cache.pop, "recall", None)
+
+        def choose(job, text):
+            decide._cache[job] = {"notes": None, "none": None}
+        with mock.patch.object(decide, "choose", side_effect=choose), \
+                mock.patch.object(decide.threading, "Thread") as thread:
+            decide.warm("recall")
+            thread.call_args.kwargs["target"]()
+            decide.warm("recall")  # built: no second thread
+        self.assertEqual(thread.call_count, 1)
+        self.assertNotIn("recall", decide._warm_failed)
+
+    def test_wants_notes_never_waits_on_a_build_in_progress(self):
+        decide._cache.pop("recall", None)
+        decide._building["recall"] = 1
+        self.addCleanup(decide._building.pop, "recall", None)
+        with mock.patch.object(decide, "choose", side_effect=AssertionError("waited")):
+            self.assertTrue(decide.wants_notes("hello there"))
+
+
 def synth(winner_is_label=True, n=60, label_override=None):
     """n decisions whose sims favour a rotating option."""
     names = ["converse", "act", "agent"]

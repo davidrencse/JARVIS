@@ -185,7 +185,7 @@ class CorrectionTest(Base):
 
     def test_lesson_links_the_corrected_exchange(self):
         asked = self.memory.add("message", "open chrome on the laptop")["id"]
-        answered = self.memory.add("reply", "Opened Chrome on the ASUS.")["id"]
+        answered = self.memory.add("reply", "Opened Chrome on the ASUS.", links=[("answers", asked)])["id"]
         lesson = self.memory.note_correction("no, I meant the Dell")
         item = self.memory.get(lesson)
         self.assertEqual(item["kind"], "lesson")
@@ -196,6 +196,28 @@ class CorrectionTest(Base):
     def test_no_recent_exchange_no_lesson(self):
         self.said("David", "open chrome", days=1)
         self.assertIsNone(self.memory.note_correction("no, I meant the Dell"))
+
+
+class AuditTwoTest(Base):
+    def test_replaced_fact_is_not_merge_target(self):
+        old, _ = self.memory.absorb("fact", "David lives in Boston with his wife Anna and their dog.", [])
+        new, state = self.memory.absorb(
+            "fact", "David lives in Seattle with his wife Anna and their dog.", [], replaces=[old])
+        self.assertEqual(state, "added")
+        self.assertNotEqual(new, old)
+        self.assertEqual(self.memory.get(old)["kind"], "replaced")
+
+    def test_correction_links_the_reply_that_answered_it(self):
+        asked = self.memory.add("message", "close the browser on the laptop")["id"]
+        self.memory.add("reply", "Closed it.", links=[("answers", asked)])
+        newest = self.memory.add("message", "open spotify on the laptop")["id"]
+        self.memory.add("reply", "Opened Spotify on the ASUS.", links=[("answers", newest)])
+        self.memory.add("message", "close the browser on the laptop again")  # unanswered, newest
+        lesson = self.memory.note_correction("no, I meant the Dell")
+        item = self.memory.get(lesson)
+        self.assertIn("close the browser on the laptop again", item["body"])
+        self.assertNotIn("Opened Spotify", item["body"])
+        self.assertEqual(len(item["links"]), 1)
 
 
 class PackTest(Base):
