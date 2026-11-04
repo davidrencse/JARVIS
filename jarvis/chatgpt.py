@@ -163,6 +163,30 @@ def note_usage_limit(exc, now=None):
     _LIMIT.update(until=until.timestamp(), text=f"until {shown}")
 
 
+LIMIT_ENV = "JARVIS_CHATGPT_LIMIT_UNTIL"  # the main process hands its limit to brain-tools
+
+
+def seed_usage_limit(value, now=None):
+    """Adopt a limit another process already hit (epoch seconds), so this one doesn't cold-start
+    a Codex app-server just to be refused."""
+    import datetime as dt
+    import time as _time
+    try:
+        stamp = float(value)
+    except (TypeError, ValueError):
+        return
+    if stamp <= (now or _time.time()):
+        return
+    until = dt.datetime.fromtimestamp(stamp)
+    shown = f"{until:%I:%M %p}".lstrip("0")
+    if stamp - (now or _time.time()) >= 86400:
+        shown = f"{until:%a %b} {until.day}, {shown}"
+    _LIMIT.update(until=stamp, text=f"until {shown}")
+
+
+seed_usage_limit(os.environ.get(LIMIT_ENV))
+
+
 def usage_limit(now=None):
     """'until 8:00 PM' while ChatGPT's plan is out of quota, else ''."""
     import time as _time
@@ -201,6 +225,7 @@ class ChatGPTLane:
         quiet = () if tools or mcp_servers or not lean else ("features.code_mode_host=false",)
         self.overrides = (*(lean_prompt() if lean else ()), *quiet, *overrides)
         self.tool_log = []  # (tool, success, text) of the current turn
+        self._mine = threading.local()  # the finished turn's log, per calling thread
         self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
         self.proc = self.lines = self.thread = None
         self.held = ThreadRecall()  # recall and exchanges the current thread already holds
@@ -272,10 +297,16 @@ class ChatGPTLane:
             params = message.get("params") or {}
             key = f"jarvis:{message['id']}"
             self._tool(key, params.get("tool"), None, "")
-            ok, text = self.tools.call(params.get("tool", ""), params.get("arguments") or {})
+            try:
+                ok, text = self.tools.call(params.get("tool", ""), params.get("arguments") or {})
+            except Exception as exc:  # a tool crash is that call's failure, not the turn's
+                ok, text = False, f"{type(exc).__name__}: {exc}"
             self._tool(key, params.get("tool"), ok, text)
+            items = [{"type": "inputText", "text": str(text)}]
+            if getattr(text, "b64", None):  # control.ToolImage: a screenshot the model looks at
+                items.append({"type": "inputImage", "imageUrl": f"data:{text.mime};base64,{text.b64}"})
             self._send({"jsonrpc": "2.0", "id": message["id"], "result": {
-                "success": ok, "contentItems": [{"type": "inputText", "text": text}]}})
+                "success": ok, "contentItems": items}})
             return {}
         if message.get("method") == "mcpServer/elicitation/request" and "id" in message:
             # Codex asks before an MCP tool changes something (navigate, click, type...).
@@ -302,7 +333,7 @@ class ChatGPTLane:
         self.next_id += 1
         rid = self.next_id
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + min(60, self.timeout)
         while True:
             message = self._next(deadline)
             if message.get("id") == rid:
@@ -328,7 +359,7 @@ class ChatGPTLane:
             self.held.reset()
             # Tool servers (the browser) start alongside the thread; a turn sent before
             # they're ready has no browser tools, and the model says it can't browse.
-            deadline = time.monotonic() + 45
+            deadline = time.monotonic() + min(45, self.timeout)
             while any(self.mcp_status.get(n) not in ("ready", "failed") for n in self.mcp_servers):
                 if time.monotonic() > deadline:
                     break
@@ -361,11 +392,19 @@ class ChatGPTLane:
         self.proc = self.thread = self.lines = self._reader = None
         close_process(proc, reader)
 
+    def turn_log(self):
+        """The tool calls of this thread's last finished turn, copied while the lane lock was
+        held: tool_log itself is replaced by the next turn, which may be another thread's."""
+        return getattr(self._mine, "log", None)
+
     def ask(self, text, recall=(), on_sentence=None):
+        self._mine.log = None
         limited = usage_limit()
         if limited:  # don't spend ~2 s asking a plan that already said no
-            self.tool_log = []  # nothing ran this turn: never report the previous turn's tools
-            raise RuntimeError(f"ChatGPT usage limit: {limited}")
+            # Not self.tool_log: another turn on this lane may be mid-flight and own it.
+            exc = RuntimeError(f"ChatGPT usage limit: {limited}")
+            exc.tool_log = []  # nothing ran this turn
+            raise exc
         with self.lock:
             self.tool_log = []  # a stale log from an earlier turn must not block the retry
             theirs = []  # an error raised by the caller's own on_sentence is theirs, not the lane's
@@ -380,7 +419,9 @@ class ChatGPTLane:
                         raise
             for attempt in (1, 2):
                 try:
-                    return self._ask(text, recall, on_sentence)
+                    result = self._ask(text, recall, on_sentence)
+                    self._mine.log = list(self.tool_log)
+                    return result
                 except BaseException as exc:
                     note_usage_limit(exc)
                     # A turn abandoned mid-flight would leave its remaining events in the pipe,
@@ -432,7 +473,14 @@ class ChatGPTLane:
             method, params = message.get("method"), message.get("params") or {}
             if method and "tokenusage" in method.lower().replace("_", ""):
                 found = params.get("tokenUsage") or params.get("token_usage") or params
-                spent = found.get("last") or found.get("lastTokenUsage") or found.get("last_token_usage") or spent
+                last = found.get("last") or found.get("lastTokenUsage") or found.get("last_token_usage")
+                if isinstance(last, dict):  # one model request: a turn with tool calls has several
+                    spent = spent or {}
+                    for key, value in last.items():
+                        if isinstance(value, (int, float)) and not isinstance(value, bool):
+                            spent[key] = spent.get(key, 0) + value
+                        else:
+                            spent.setdefault(key, value)
             if message.get("id") == rid and "error" in message:
                 raise RuntimeError(f"ChatGPT turn/start failed: {message['error']}")
             if method == "item/agentMessage/delta":
@@ -488,11 +536,15 @@ class Brain:
             from . import _under_tests
             decider = not _under_tests()
         self.decider = decider
+        self._failed_log = None  # the latest failed turn's own tool log (see ask)
+        self._picked = None  # (text, lane) of the latest pick(): the decider is not free
 
     @property
     def tool_log(self):
         # assistant reads this after a failed turn to say what already ran; only the action
         # lane has tools.
+        if self._failed_log is not None:
+            return self._failed_log
         return getattr(self.last, "tool_log", [])
 
     @property
@@ -506,6 +558,9 @@ class Brain:
     def pick(self, text):
         """'act' (tools) or 'chat': which conversation ask(text) will use."""
         if self.wants is None:
+            last = self._picked  # lane_label() and ask() pick for the same text, back to back
+            if last and last[0] == (text, self.decider):
+                return last[1]
             from .actions import is_action
             from .memory import is_memory_request
             from .vault import is_vault_request
@@ -514,8 +569,10 @@ class Brain:
                 from .decide import wants_tools
                 wants = wants_tools(text)
         else:
-            wants = self.wants(text)
-        return "act" if wants else "chat"
+            return "act" if self.wants(text) else "chat"
+        picked = "act" if wants else "chat"
+        self._picked = ((text, self.decider), picked)
+        return picked
 
     def _act(self, text, recall, on_sentence, said=()):
         """The tools lane, held to its tools: an excuse it has no grounds for ("the tool is
@@ -533,13 +590,16 @@ class Brain:
                 on_sentence(sentence)
         ask = (HEARD.format(heard=" ".join(said)) + str(text)) if said else text
         reply = self.act.ask(ask, recall, on_sentence=speak if on_sentence else None)
-        nudge = ungrounded(reply, getattr(self.act, "tool_log", None))
+        mine = self.act.turn_log() if hasattr(self.act, "turn_log") else None
+        if mine is None:  # a lane without per-turn logs (a stand-in)
+            mine = getattr(self.act, "tool_log", None)
+        nudge = ungrounded(reply, mine)
         if nudge is None:
             if doubted and on_sentence:  # held back, but it stands: say it after all
                 for sentence in doubted:
                     on_sentence(sentence)
             return reply
-        earlier = list(getattr(self.act, "tool_log", None) or ())
+        earlier = list(mine or ())
         if spoken:
             nudge = HEARD.format(heard=" ".join(spoken)) + nudge
         try:
@@ -552,6 +612,7 @@ class Brain:
                 self.act.tool_log = earlier
 
     def ask(self, text, recall=(), on_sentence=None):
+        self._failed_log = None
         try:
             return self._ask_lanes(text, recall, on_sentence)
         except Exception as exc:
@@ -563,6 +624,7 @@ class Brain:
                     exc.tool_log = list(getattr(self.last, "tool_log", None) or ())
                 except Exception:
                     pass
+            self._failed_log = getattr(exc, "tool_log", None)
             raise
 
     def _ask_lanes(self, text, recall=(), on_sentence=None):
@@ -803,8 +865,10 @@ class ConfirmGate:
             return False, f"Not run: {errors[0]}"
         if command["intent"] == "agent_task" and agent_risk(command["args"]["text"]) == "deny":
             return False, "Refused: JARVIS never handles passwords, 2FA codes or card numbers."
-        from .gates import asks_now
-        if not asks_now(self.config, self.state):  # rules.confirm: never (read live)
+        from .gates import always_asks_text, asks_now
+        money_or_message = command["intent"] == "agent_task" and \
+            always_asks_text(command["args"].get("text", ""), self.config)
+        if not asks_now(self.config, self.state) and not money_or_message:  # confirm: never
             from .pipeline import DIRECT
             if command["intent"] not in DIRECT:  # agent_task: Grok has its own checks
                 return self.tools.call(name, args)
@@ -860,14 +924,16 @@ def brain_parts(config, base, state):
     if actions:
         from .actions import (BROWSER_ENGINES, INSTRUCTIONS as ACT, DesktopTools,
                               approve_browser, browser_mcp)
+        from .pipeline import _local_tools  # the process-wide cached app list
         from .remote import Remote
-        tools.append(DesktopTools(remote=Remote(config, state)))
+        tools.append(DesktopTools(remote=Remote(config, state, tools=_local_tools()),
+                                  config=config, state=state))
         instructions += [ACT, CONFIRM_INSTRUCTIONS]
         browser = config.get("actions", {})
         from .browser_gate import gate
         # Commit-like clicks and keys in the signed-in browsers wait for David's OK.
         extra = {"approve": gate(approve_browser, config, state),
-                 "mcp_servers": browser_mcp(state, browser.get("browser_engines", BROWSER_ENGINES))
+                 "mcp_servers": browser_mcp(state, browser.get("browser_engines", BROWSER_ENGINES), browser)
                  if browser.get("browser", True) else None}
     else:
         instructions.append(VAULT_ONLY)

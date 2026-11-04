@@ -34,7 +34,7 @@ def servers(config, state):
     actions = (config or {}).get("actions", {})
     if not actions.get("enabled", True) or not actions.get("browser", True):
         return {}
-    return browser_mcp(state, actions.get("browser_engines", BROWSER_ENGINES))
+    return browser_mcp(state, actions.get("browser_engines", BROWSER_ENGINES), actions)
 
 
 def mcp_entries(config, config_path, state, python=None):
