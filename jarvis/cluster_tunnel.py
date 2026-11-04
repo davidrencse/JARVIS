@@ -126,7 +126,7 @@ def status(state):
     state = Path(state)
     try:
         note = json.loads((state / f"{NAME}.json").read_text(encoding="utf-8"))
-        running = bool(_alive(int(note["pid"])) and time.time() - note["updated"] < 15)
+        running = bool(int(note["pid"]) > 0 and _alive(int(note["pid"])) and time.time() - note["updated"] < 15)
     except (OSError, ValueError, KeyError, TypeError):
         note, running = {}, False
     return {**note, "running": running, "ssh_alive": running and note.get("ssh_alive", False),

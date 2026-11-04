@@ -224,12 +224,14 @@ class Credits:
         self._cache, self._lock = {}, threading.Lock()
         self._claude_files = {}  # path -> (mtime, size, [(ts, tokens_in, tokens_out)])
         self._claude_log_lock = threading.RLock()
-        self._usage_cache, self._usage_lock = {}, threading.Lock()
+        self._usage_cache = {}
+        # One lock per provider: a slow Claude renewal must not hold up a Codex read.
+        self._usage_locks = {"claude": threading.Lock(), "codex": threading.Lock()}
         self._usage_checked = {}
 
     def _subscription(self, provider):
         """Read quota; let Claude's CLI renew its own login, never rewrite credentials here."""
-        with self._usage_lock:
+        with self._usage_locks.setdefault(provider, threading.Lock()):
             signature = _credential_signature(provider)
             hit = self._usage_cache.get(provider)
             if (hit and hit[3] == signature and time.monotonic() - hit[0] < 60

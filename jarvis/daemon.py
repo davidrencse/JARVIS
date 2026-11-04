@@ -214,9 +214,12 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 return parse_for(text, config, here)["commands"] is not None
             except Exception:
                 return False
+        live = [None]  # the open mic, for the console's level wave (post_levels)
+        start_level_poster(state, lambda: live[0])
         while True:
             try:
                 mic = mic or LiveMic(tuning=mic_settings(state))  # device + cutoffs from setup
+                live[0] = mic
                 audio = record_utterance(mic=mic)
                 if audio is None:  # silence or a short noise: keep the brain warm
                     warm_quietly(lane)
@@ -240,13 +243,12 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 # accepted only when it also starts with "Jarvis"; strangers score far lower.
                 settings = config.get("voice", {})
                 near = not is_owner and score >= settings.get("near_miss", BORDERLINE)
-                heard = None
+                heard, stats_of = None, audio  # stats_of: the array Whisper heard
                 if not is_owner and not near:
-                    head = None
+                    head, clip = None, audio[:int(HEAD_SECONDS * RATE)]
                     if score >= settings.get("stranger_floor", STRANGER_FLOOR):
                         try:  # its words stay unread unless they open with the wake word
-                            head = text.result() if text is not None else \
-                                stt(audio[:int(HEAD_SECONDS * RATE)])
+                            head = text.result() if text is not None else stt(clip)
                         except Exception:
                             head = None
                     if head is None or wake_word(head) is None:
@@ -258,6 +260,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     near = True
                     if text is not None or len(audio) <= HEAD_SECONDS * RATE:
                         heard = head  # already the whole clip
+                        if text is None:
+                            stats_of = clip  # its confidence was stored under the clip it heard
                 if heard is None:
                     heard = text.result() if text is not None else stt(audio)
                 request = wake_word(heard)
@@ -291,7 +295,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     elif heard:  # David's own voice without the wake word: say so, never what
                         log(f"no wake word ({score}): {len(heard.split())} words, not kept")
                     continue
-                if unsure(stt.stats(audio) if hasattr(stt, "stats") else None):
+                if unsure(stt.stats(stats_of) if hasattr(stt, "stats") else None):
                     # Probably misheard: ask again rather than answer a guess, and keep the
                     # follow-up window open so the repeat needs no "Jarvis".
                     log(f"unclear ({score}): asked to repeat")
@@ -318,15 +322,23 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     continue
                 if not near:
                     ears.learn()  # passed the voice check AND said "Jarvis": adapt to live audio
-                log(f"you ({score}): {request}")
+                # Seconds from the end of David's speech to these words: the silence wait,
+                # the voice check and Whisper. The reply line adds the brain's own time.
+                words_in = time.monotonic() - (began + len(audio) / RATE)
+                via = getattr(stt, "last_engine", None)
+                log(f"you ({score}, words in {words_in:.1f}s{' via ' + via if via else ''}): {request}")
                 emit(state, "voice.heard", text=request, score=score)
                 if not instant_answer(request):  # instant answers need no "On it."
                     voice.say(ACK, wait=False)  # cached, free; plays while ChatGPT thinks
                 budget = [voice.limit]
                 turn = Turn(feed_sender(state), "voice", request)
 
-                def speak_sentence(sentence, turn=turn, budget=budget):
+                first = []  # when the first streamed sentence arrived, for the timing line
+
+                def speak_sentence(sentence, turn=turn, budget=budget, first=first):
                     # Queue streamed sentences as they land, up to the spoken-length cap.
+                    if not first:
+                        first.append(time.time())
                     turn.sentence(sentence)
                     if budget[0] > 0:
                         budget[0] -= len(sentence)
@@ -347,7 +359,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     turn.error(exc)
                     raise
                 turn.done(result)
-                log(f"jarvis [{result['tier']}, {time.time() - started:.1f}s]: {result['reply']}")
+                lead = f", first words {first[0] - started:.1f}s" if first else ""
+                log(f"jarvis [{result['tier']}, {time.time() - started:.1f}s{lead}]: {result['reply']}")
                 if not result.get("streamed"):
                     speaker.put(spoken(result["reply"], voice.limit))
                 speaker.drain()  # finish talking before listening again
@@ -434,6 +447,65 @@ def _is_listener(pid):
     if stat.rpartition(")")[2].split()[:1] == ["Z"]:
         return False
     return b"jarvis" in cmdline and b"listen" in cmdline
+
+
+LEVEL_EVERY = 0.1   # seconds between posts of the mic level
+LEVEL_STALE = 1.5   # older than this, the console shows the listener as not hearing
+
+
+def level_file(state):
+    """Where the listener posts its live mic level for the console's wave. A tmpfs
+    ($XDG_RUNTIME_DIR) when there is one, so ten writes a second never touch the disk."""
+    import hashlib
+    state = Path(state).resolve()
+    run = os.environ.get("XDG_RUNTIME_DIR")
+    if run and os.path.isdir(run):
+        tag = hashlib.sha1(str(state).encode()).hexdigest()[:10]
+        return Path(run) / f"jarvis-voice-level-{tag}.json"
+    return state / "voice" / "level.json"
+
+
+def post_level(path, peak, now=None):
+    """Write one reading atomically (the console must never read half a file)."""
+    import json
+    tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"at": now or time.time(), "pid": os.getpid(),
+                               "peak": round(float(peak), 5)}), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def start_level_poster(state, current_mic, every=LEVEL_EVERY):
+    """A daemon thread posting the mic's peak level every `every` seconds. Display only:
+    any failure is swallowed so it can never cost the listener a request."""
+    import threading
+    path = level_file(state)
+
+    def run():
+        while True:
+            time.sleep(every)
+            mic = current_mic()
+            if mic is None:
+                continue
+            try:
+                post_level(path, mic.take_peak())
+            except Exception:
+                pass
+    atexit.register(lambda: path.unlink(missing_ok=True))
+    threading.Thread(target=run, name="voice-level", daemon=True).start()
+
+
+def level(state, now=None):
+    """The listener's latest mic level for the console: {"live": False} when the
+    listener is off or hasn't posted lately."""
+    import json
+    try:
+        data = json.loads(level_file(state).read_text(encoding="utf-8"))
+        at, peak = float(data["at"]), float(data["peak"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"live": False}
+    if (now or time.time()) - at > LEVEL_STALE:
+        return {"live": False}
+    return {"live": True, "peak": peak, "at": at}
 
 
 def status(state):
