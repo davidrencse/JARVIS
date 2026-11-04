@@ -49,6 +49,39 @@ class ParserTests(unittest.TestCase):
         got = parse_for("open spotify on my main pc", config, origin="dell")
         self.assertEqual(got["commands"][0]["device"], "zenbook")
 
+    def test_close_needs_an_exact_app_name(self):
+        for text in ("close the stream", "close sword", "close explore"):
+            self.assertIsNone(parse(text, DEVICES, "dell")["commands"], text)
+        got = parse("close steam", DEVICES, "dell")["commands"]
+        self.assertEqual(got[0]["args"], {"name": "Steam"})
+
+    def test_then_orders_commands_and_plain_and_does_not(self):
+        got = parse("close spotify and then open spotify", DEVICES, "dell")["commands"]
+        self.assertEqual([c["depends_on"] for c in got], [[], ["c1"]])
+        got = parse("close spotify then open chrome", DEVICES, "dell")["commands"]
+        self.assertEqual(got[1]["depends_on"], ["c1"])
+        got = parse("open chrome and open discord", DEVICES, "dell")["commands"]
+        self.assertEqual([c["depends_on"] for c in got], [[], []])
+        got = parse("close spotify and open spotify", DEVICES, "dell")["commands"]
+        self.assertEqual(got[1]["depends_on"], ["c1"])
+
+    def test_filler_inside_a_url_path_is_kept(self):
+        for text, url in (("go to reddit.com/r/again", "https://reddit.com/r/again"),
+                          ("go to example.com/please", "https://example.com/please")):
+            got = parse(text, DEVICES, "dell")["commands"]
+            self.assertEqual(got[0]["args"], {"url": url}, text)
+
+    def test_scroll_is_never_inherited(self):
+        for text in ("scroll down and then chrome", "start scrolling, youtube"):
+            got = parse(text, DEVICES, "dell")
+            self.assertIsNone(got["commands"], text)
+
+    def test_an_explicit_http_scheme_is_kept(self):
+        got = parse("open http://neverssl.com", DEVICES, "dell")["commands"]
+        self.assertEqual(got[0]["args"], {"url": "http://neverssl.com"})
+        got = parse("open neverssl.com", DEVICES, "dell")["commands"]
+        self.assertEqual(got[0]["args"], {"url": "https://neverssl.com"})
+
     def test_device_apps_extend_the_catalog(self):
         self.assertIsNone(parse("open blender", DEVICES, "dell")["commands"])
         got = parse("open blender", DEVICES, "dell", apps={"dell": ["Blender"]})

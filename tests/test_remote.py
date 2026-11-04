@@ -111,7 +111,8 @@ class RemoteTests(unittest.TestCase):
         folder.mkdir()
         (folder / "grokbot-dell.json").write_text(json.dumps({"port": port, "token": token}))
         with patch.object(grokbot, "TUNNEL_DIR", folder), \
-                patch("jarvis.actions.DesktopTools", return_value=fake):
+                patch("jarvis.actions.DesktopTools", return_value=fake), \
+                patch("jarvis.pipeline._local_tools", return_value=fake):  # run_here uses the cached one
             ok, text = self.remote("zenbook").call("dell", "open_app", "Google Chrome")
         self.assertTrue(ok, text)
         self.assertEqual(fake.calls, [("open_app", {"name": "Google Chrome"})])
@@ -194,6 +195,17 @@ class ClusterFallbackTests(unittest.TestCase):
                 patch.object(self.remote, "_ssh") as ssh:
             self.assertEqual(self.remote.call("zenbook", "open_app", "Chrome"), (True, "opened"))
             ssh.assert_not_called()
+
+
+class RunHereToolsTests(unittest.TestCase):
+    def test_run_here_reuses_the_process_wide_tools(self):
+        from jarvis import pipeline
+        fake = FakeTools()
+        with patch.object(pipeline, "_TOOLS", fake), \
+                patch.dict("os.environ", {"WAYLAND_DISPLAY": "w", "DISPLAY": ":0"}):
+            remote.run_here("list_apps", "spot")
+            remote.run_here("open_app", "Spotify")
+        self.assertEqual(fake.calls, [("list_apps", {"query": "spot"}), ("open_app", {"name": "Spotify"})])
 
 
 class LocalTargetWithClusterTests(unittest.TestCase):

@@ -102,10 +102,21 @@ class LaneIsolationTests(Temp):
 
     def test_force_killed_child_is_waited_for(self):
         child, reader = Mock(), Mock()
-        child.wait.side_effect = [subprocess.TimeoutExpired("fake", 5), 0]
+        child.wait.side_effect = [subprocess.TimeoutExpired("fake", 1), 0]
         close_process(child, reader)
-        child.kill.assert_called_once()
+        child.terminate.assert_called_once()  # a mid-turn child gets SIGTERM after the grace
+        child.kill.assert_not_called()
         self.assertEqual(child.wait.call_count, 2)
+        reader.join.assert_called_once()
+
+    def test_child_ignoring_sigterm_is_killed_and_waited_for(self):
+        child, reader = Mock(), Mock()
+        child.wait.side_effect = [subprocess.TimeoutExpired("fake", 1),
+                                  subprocess.TimeoutExpired("fake", 3), 0]
+        close_process(child, reader)
+        child.terminate.assert_called_once()
+        child.kill.assert_called_once()
+        self.assertEqual(child.wait.call_count, 3)
         reader.join.assert_called_once()
 
     def test_busy_claude_stream_cannot_bypass_deadline(self):

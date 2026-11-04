@@ -141,3 +141,40 @@ class GuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FingerprintTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name, "jarvis")
+        tree(self.root, {"a.py": "x = 1\n"})
+
+    def test_backups_and_editor_files_do_not_change_the_fingerprint(self):
+        before = deploy.code_fingerprint(self.root)
+        tree(self.root, {"a.py.pre-fix": "old", "a.py~": "", ".a.py.swp": "", ".#a.py": "", "t.tmp": ""})
+        self.assertEqual(deploy.code_fingerprint(self.root), before)
+        self.assertEqual([p.name for p in deploy._files(self.root)], ["a.py"])
+
+    def test_remote_fingerprint_uses_the_same_rule(self):
+        tree(self.root, {"a.py.pre-fix": "old", "a.py~": ""})
+        out = subprocess.run([sys.executable, "-c", deploy.REMOTE_FINGERPRINT, str(self.root)],
+                             capture_output=True, text=True).stdout.strip()
+        self.assertEqual(out, deploy.code_fingerprint(self.root))
+
+    def test_same_size_edit_with_old_mtime_changes_the_main_fingerprint(self):
+        import os
+        with patch.object(deploy, "PACKAGE", self.root):
+            deploy._CACHE.update(stamp=None, value=None)
+            first = deploy.code_fingerprint(self.root)
+            path = self.root / "a.py"
+            stat = path.stat()
+            path.write_text("x = 22\n", encoding="utf-8")  # longer, mtime restored below
+            os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            self.assertNotEqual(deploy.code_fingerprint(self.root), first)
+            deploy._CACHE.update(stamp=None, value=None)
+
+    def test_settled_ignores_a_file_that_vanishes(self):
+        gone = self.root / "gone.py"
+        with patch.object(release, "_files", return_value=[gone, self.root / "a.py"]):
+            self.assertTrue(release.settled(self.root, quiet=0))

@@ -157,6 +157,16 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class EmptyPartTests(unittest.TestCase):
+    def test_a_part_with_no_rows_renders_without_a_score(self):
+        empty = scorecard._part([])
+        self.assertIsNone(empty["score"])
+        report = {"cases": 0, "rev": None, "seconds": 0, "notes": {}, "drops": [], "parts": {"parser": empty},
+                  "previous": {"parser": {"score": 0.9, "at": "then", "same_cases": True}}}
+        text = scorecard.render(report)
+        self.assertIn("parser", text)
+
+
 class DeciderFoldTests(unittest.TestCase):
     def test_wake_word_variants_share_a_fold(self):
         for n in (3, 5):

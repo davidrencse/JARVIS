@@ -279,6 +279,12 @@ class BlockedTests(Base):
         self.assertIn("OK", got["reply"])
         self.assertEqual(got["outcomes"][0]["state"], "not_sent")
 
+    def test_held_dependent_tells_you_to_ask_again(self):
+        got, remote = self.run_fast("close notepad and then open chrome")
+        self.assertEqual(remote.calls, [])
+        self.assertIn("ask me again", got["reply"])
+        self.assertNotIn("until that's confirmed", got["reply"])
+
     def test_one_blocked_command_blocks_all(self):
         got, remote = self.run_fast("open chrome on arch and spotify on the dell",
                                     app_exists=lambda d, n: d != "dell")
@@ -486,6 +492,17 @@ class NeedsAgentTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(pipeline.needs_agent(text, CONFIG, "dell"))
         self.assertFalse(pipeline.needs_agent("reply to sam", CONFIG, "phone"))
+
+    def test_named_music_is_for_the_brain_not_grok(self):
+        # Grok Bot has no Spotify and only declined "open up spotify and play drake".
+        for text in ["open up Spotify and play Drake", "play hotline bling by drake",
+                     "put on some drake"]:
+            with self.subTest(text=text):
+                self.assertTrue(pipeline.plays_named(text, CONFIG, "dell"))
+        for text in ["play music", "play my liked songs", "open spotify", "check my email"]:
+            with self.subTest(text=text):
+                self.assertFalse(pipeline.plays_named(text, CONFIG, "dell"))
+        self.assertFalse(pipeline.plays_named("play drake", CONFIG, "phone"))
 
     def test_lead_word_skips_wake_word_and_politeness(self):
         self.assertEqual(pipeline.lead_word("Jarvis, could you please buy milk"), "buy")
