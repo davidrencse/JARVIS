@@ -29,8 +29,10 @@ TRAILER_UNSAFE = re.compile(r"\b(?:don'?t|do not|no|wait|actually|cancel|never ?
 FILLER = re.compile(r"\b(?:(?:can|could|would|will) you|please|for me|go ahead and|"
                     r"i want you to|i'?d like you to|just|quickly|real quick|right now|"
                     r"again|agian|agan)\b")
-SPLIT = re.compile(r"\s*,\s*(?:and\s+)?(?:then\s+)?|\s+and\s+then\s+|\s+then\s+|"
-                   r"\s+and\s+|\s+also\s+|\s+plus\s+")
+SPLIT = re.compile(r"(\s*,\s*(?:and\s+)?(?:then\s+)?|\s+and\s+then\s+|\s+then\s+|"
+                   r"\s+(?:and\s+)?after that\s+|\s+and\s+|\s+also\s+|\s+plus\s+)")
+# A URL or path ("reddit.com/r/again") is data: filler and joiner words inside it stay.
+URL_TOKEN = re.compile(r"[^\s,;]*/[^\s,;]*")
 
 # Verb phrase -> verb class; the longest phrase at the start of a clause wins.
 VERBS = {
@@ -226,6 +228,13 @@ def _parse(text, devices, origin, main, apps):
     text = _lower(LEAD.sub("", text.replace("’", "'").replace("‘", "'")))
     text = GREETING.sub("", text.strip())
     text = re.sub(r"[?!.]+$", "", text.strip())
+    urls = []
+
+    def stash(match):
+        urls.append(match.group(0))
+        return f"zurlz{len(urls) - 1}z"
+
+    text = URL_TOKEN.sub(stash, text)
     if (trailer := TRAILER.search(text)) and TRAILER_UNSAFE.search(trailer.group(1)):
         raise Unsure("a correction or command follows \"that's it\"")
     text = TRAILER.sub("", text)
@@ -251,13 +260,20 @@ def _parse(text, devices, origin, main, apps):
         for name in names or ():
             catalog.setdefault(_norm(name), name)
 
+    parts = SPLIT.split(text)  # piece, separator, piece, ...
+    todo = []
+    for i in range(0, len(parts), 2):
+        piece = re.sub(r"zurlz(\d+)z", lambda m: urls[int(m.group(1))], parts[i])
+        then = bool(i) and re.search(r"then|after that", parts[i - 1]) is not None
+        todo += [(raw, then and n == 0) for n, raw in enumerate(_unglue(piece, aliases, catalog))]
     clauses, verb = [], None
-    for raw in (part for piece in SPLIT.split(text) for part in _unglue(piece, aliases, catalog)):
+    for raw, then in todo:
         if not raw.strip(" ,;"):  # "open chrome, please, and spotify" leaves a hollow clause
             continue
         clause = _clause(raw.strip(" ,;"), aliases, catalog, verb)
+        clause["then"] = then
         if clause["verb"] is None:  # "open spotify ... and chrome on my other pc"
-            if verb is None:
+            if verb is None or verb == "scroll":  # a scroll has no object to carry over
                 raise Unsure("no action verb")
             clause["verb"], clause["inherited"] = verb, True
         verb = clause["verb"]
@@ -273,7 +289,8 @@ def _parse(text, devices, origin, main, apps):
                     break
     commands = []
     for clause in clauses:
-        commands.append({**_command(clause, catalog), "device": clause["device"]})
+        commands.append({**_command(clause, catalog), "device": clause["device"],
+                         "then": clause["then"]})
     for prev, (clause, command) in zip(commands, list(zip(clauses, commands))[1:]):
         # "go to youtube on firefox and chrome": YouTube in both, or open Chrome too?
         if prev["intent"] == "open_url" and prev["args"].get("browser") and clause.get("inherited") \
@@ -283,13 +300,21 @@ def _parse(text, devices, origin, main, apps):
     if agent:
         commands = [_in_agent_browser(c) for c in commands]
     _assign_devices(commands, origin)
+    for prev, command in zip(commands, commands[1:]):
+        # "close spotify then open spotify" must run in order; plain "and" only when both
+        # act on the same app. Either way only on one device: PCs run independently.
+        name = command["args"].get("name")
+        if command["device"] == prev["device"] \
+                and (command.get("then") or (name and name == prev["args"].get("name"))) \
+                and prev not in command.get("after", []):
+            command["after"] = [*command.get("after", []), prev]
     for n, command in enumerate(commands, 1):
         command["id"] = f"c{n}"
     ids = {id(c): c["id"] for c in commands}
     for command in commands:
         command["depends_on"] = [ids[id(d)] for d in command.pop("after", [])]
     return [{k: c[k] for k in ("id", "intent", "device", "args", "depends_on")}
-            for c in commands]
+            for c in commands]  # "then" and "after" are working fields only
 
 
 def _in_agent_browser(command):
@@ -478,6 +503,8 @@ def _app(obj, catalog, typo=True):
     name = OBJECT_TAIL.sub("", OBJECT_LEAD.sub("", obj))
     if name in catalog:
         return catalog[name]
+    if not typo:  # closing or focusing: an exact catalog hit only, never a near miss
+        return None
     close = difflib.get_close_matches(name, list(catalog), n=2, cutoff=0.86)
     if len(close) == 1:
         return catalog[close[0]]
@@ -486,13 +513,13 @@ def _app(obj, catalog, typo=True):
     if close:
         return catalog[close[0]]
     # "psotify": letters swapped. Fine for opening; never for closing the wrong app.
-    return _typo(name, catalog, 6) if typo else None
+    return _typo(name, catalog, 6)
 
 
 def _site(obj):
     name = SITE_TAIL.sub("", OBJECT_LEAD.sub("", obj))
     name = re.sub(r"^(?:https?://)?(?:www\.)?([a-z0-9-]+)\.com/?$", r"\1", name)
-    if name in SITES:
+    if name in SITES and not obj.startswith("http://"):
         return SITES[name]
     match = DOMAIN.match(obj)
     if not match:
@@ -502,7 +529,8 @@ def _site(obj):
     tld = match.group(1).rsplit(".", 1)[-1]
     if tld in FILE_EXTENSIONS and not match.group(2) and not re.match(r"(?:https?://|www\.)", obj):
         raise Unsure(f"is {match.group(1)} a file or a website?")
-    return f"https://{match.group(1)}{match.group(2) or ''}"
+    scheme = "http://" if obj.startswith("http://") else "https://"  # keep what was said
+    return f"{scheme}{match.group(1)}{match.group(2) or ''}"
 
 
 def _command(clause, catalog):
@@ -592,11 +620,11 @@ def _merge(commands):
             device = prev["device"] or command["device"]
             if command["intent"] == "open_url" and prev["args"]["name"] in BROWSERS \
                     and "browser" not in command["args"]:
-                out[-1] = {**command, "device": device,
+                out[-1] = {**command, "device": device, "then": prev["then"],
                            "args": {**command["args"], "browser": prev["args"]["name"]}}
                 continue
             if command["intent"] == "spotify_play" and prev["args"]["name"] == "Spotify":
-                out[-1] = {**command, "device": device}
+                out[-1] = {**command, "device": device, "then": prev["then"]}
                 continue
             if command["intent"] == "media" and command["args"]["command"] == "play":
                 command = {**command, "after": [prev]}

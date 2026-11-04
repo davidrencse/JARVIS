@@ -129,3 +129,25 @@ def private_dir(path):
     if _os() != "windows" and path.stat().st_mode & 0o077:
         path.chmod(0o700)
     return path
+
+
+def boot_time():
+    """When this computer last booted (Unix seconds), or None if it can't be read. Windows
+    derives it from the uptime counter, so expect a second or two of jitter between calls."""
+    import time
+    try:
+        system = _os()
+        if system == "windows":
+            import ctypes
+            tick = ctypes.windll.kernel32.GetTickCount64
+            tick.restype = ctypes.c_ulonglong  # the default c_int wraps after 24.9 days of uptime
+            return time.time() - tick() / 1000
+        if system == "macos":  # "{ sec = 1730000000, usec = 0 } Mon Nov ..."
+            out = run_quiet(["sysctl", "-n", "kern.boottime"]).stdout
+            return float(out.split("sec =", 1)[1].split(",", 1)[0])
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError, IndexError, AttributeError, subprocess.SubprocessError):
+        pass
+    return None

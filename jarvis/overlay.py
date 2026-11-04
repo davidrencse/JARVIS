@@ -302,8 +302,10 @@ def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=Fal
         raise RuntimeError("The overlay is Windows-only; on Arch, bind a Hyprland key to "
                            "`jarvis app` instead.")
     from .ui import Console, ConsoleServer, Handler
-    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\JARVIS-Overlay")
-    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)  # keeps GetLastError() from being clobbered
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    mutex = kernel.CreateMutexW(None, False, "Local\\JARVIS-Overlay")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
         raise RuntimeError("The JARVIS overlay is already running; press its hotkey.")
     label = parse_hotkey(hotkey)[2]  # validates the hotkey and names it for the page
     # The overlay hosts its own console so the page's "hide" button can reach it, on a

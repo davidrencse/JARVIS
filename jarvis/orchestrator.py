@@ -1,6 +1,8 @@
 """Complex work: a lead planner splits a goal into specialist subtasks, then JARVIS
 runs them in dependency order. Each subtask agent may spawn its own subagents
 (third level) when its power tier allows. Plans need an explicit `run` to execute.
+
+Not brain.py: that one splits everyday conversational requests across model levels.
 """
 
 import json

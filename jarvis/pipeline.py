@@ -54,6 +54,16 @@ def _local_tools():
 CHAT_REASONS = ("no action verb", "empty or too long", "nothing left after the wake word")
 
 
+def plays_named(text, config, origin):
+    """True for "play <a song, artist or album>" ("open spotify and play drake"): the
+    parser can't pick the track, and Grok Bot has no Spotify, so it only declines (seen
+    live 2026-11-04). The brain's spotify tool searches and plays it."""
+    if origin not in config.get("devices", {}):
+        return False
+    reason = parse_for(text, config, origin)["reason"] or ""
+    return reason.startswith("play what:")
+
+
 def needs_agent(text, config, origin):
     """True when the request is an action the fast path can't run itself: the parser saw
     an action but wasn't certain of it ("play that song kevin sent me", "reply to sam"),
@@ -270,7 +280,8 @@ def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
                     outcomes[command["id"]] = {"id": command["id"], "state": "not_sent", "ok": False,
                                                "text": "Held: it follows a step that needs your OK."}
                     notes.append(f"I held {command['intent'].replace('_', ' ')} "
-                                 f"{next(iter(command['args'].values()))} until that's confirmed.")
+                                 f"{next(iter(command['args'].values()))}; ask me again for it "
+                                 f"once you've confirmed the step it follows.")
         runnable = [c for c in commands if c["id"] not in held]
         outcomes.update(_execute(runnable, remote, step, request, skip))
         done = _reply(runnable, outcomes, origin) if runnable else ""

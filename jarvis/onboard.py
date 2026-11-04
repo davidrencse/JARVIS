@@ -142,9 +142,9 @@ class VoiceSetup:
     def _run(self, device, mic_only=False):
         daemon = self._daemon_mod()
         was_listening = daemon._pid(self.state) is not None
-        finished, mic = False, None
-        kept = self._keep()
+        finished, mic, kept = False, None, None
         try:
+            kept = self._keep()
             if was_listening:
                 self._set(message="Pausing the always-on listener")
                 daemon.stop(self.state)
@@ -181,7 +181,8 @@ class VoiceSetup:
                     pass
             shutil.rmtree(self.state / "voice" / "enroll.new", ignore_errors=True)
             try:  # before the listener restarts, so it never loads a half-made setup
-                self._put_back(kept, restore=not finished)
+                if kept is not None:
+                    self._put_back(kept, restore=not finished)
             except Exception as exc:
                 self._set(warning=f"Couldn't put the old voice setup back: {exc}")
             if finished:
