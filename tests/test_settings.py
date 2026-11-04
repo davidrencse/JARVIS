@@ -39,6 +39,33 @@ class MachineStatusTests(unittest.TestCase):
         self.assertFalse((self.state / "cluster.sqlite3").exists())  # never creates a hub database
 
 
+class SavedClusterTests(unittest.TestCase):
+    def test_a_saved_main_shows_before_the_restart_and_no_broker_is_built(self):
+        import json
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state, ignore_errors=True)
+        settings._SAVED_CLUSTER.pop(str(state), None)
+        self.addCleanup(settings._SAVED_CLUSTER.pop, str(state), None)
+        path = state / "jarvis.config.json"
+        path.write_text(json.dumps(CONFIG))
+        config = json.loads(json.dumps(CONFIG))
+        with mock.patch("jarvis.cluster_store.Broker", side_effect=AssertionError("DDL on every read")):
+            settings.write(config, path, state, {"cluster.main_device": "dell"})
+            view = settings.read(config, state)
+        self.assertEqual(config["cluster"]["main_device"], "zenbook")  # running config unchanged
+        row = {f["path"]: f for f in view["fields"]}["cluster.main_device"]
+        self.assertEqual(row["value"], "dell")
+        self.assertEqual({m["id"]: m["role"] for m in view["machines"]}["dell"], "main")
+
+    def test_node_rows_read_the_file_without_creating_it(self):
+        state = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, state, ignore_errors=True)
+        broker = Broker(state)
+        broker.enroll("dell")
+        with mock.patch("jarvis.cluster_store.Broker", side_effect=AssertionError("no Broker")):
+            self.assertEqual([n["id"] for n in settings._node_rows(state)], ["dell"])
+
+
 class RestartMarkerTests(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp())

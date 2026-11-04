@@ -155,6 +155,25 @@ class WriteTests(TaskCase):
             with self.assertRaises(ValueError, msg=bad):
                 self.tasks.add(**bad, when=NOW)
 
+    def test_priority_change_keeps_indent_and_inner_spacing(self):
+        path = self.root / "courses/os.md"
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text + "\n- [ ] parent\n    - [ ] sub task  with \u23eb \U0001F4C5 2026-11-05\n", encoding="utf-8")
+        self.tasks = Tasks(self.vault)
+        self.tasks.update("sub task", "priority", "", when=NOW)
+        self.assertIn("\n    - [ ] sub task  with \U0001F4C5 2026-11-05\n", self.read("courses/os.md"))
+
+    def test_tasks_reader_dies_with_its_vault(self):
+        import gc
+        import weakref
+        from jarvis.tasks import tasks_for
+        vault = Vault(self.root, Path(self.root.parent, "state2"), {"write": True})
+        self.assertIs(tasks_for(vault), tasks_for(vault))
+        ref = weakref.ref(vault)
+        del vault
+        gc.collect()
+        self.assertIsNone(ref())
+
     def test_updates_edit_one_verified_line(self):
         self.tasks.update("decide what it is for", "done", when=NOW)
         self.tasks.update("sketch the frame", "due", "next week", when=NOW)

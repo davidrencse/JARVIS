@@ -31,6 +31,49 @@ class TimeoutTests(unittest.TestCase):
         self.assertFalse(marker.exists())  # the backgrounded grandchild died too
 
 
+@unittest.skipIf(os.name == "nt", "POSIX shell")
+class OutputBoundTests(unittest.TestCase):
+    """audit 2026-11-04: communicate() held all output in memory (`yes`, `cat big.mkv`)."""
+
+    def test_endless_output_is_bounded_and_only_the_timeout_kills(self):
+        import time
+        tmp = tempfile.mkdtemp()
+        with mock.patch.object(terminal, "OUTPUT_CAP", 200_000), mock.patch.object(terminal, "TIMEOUT", 2):
+            start = time.time()
+            code, out, err, timed_out = terminal._run_shell(terminal._argv("yes", tmp), tmp)
+        self.assertLess(time.time() - start, 10)
+        self.assertTrue(timed_out)
+        self.assertLess(len(out), 3 * terminal.MAX_OUTPUT + terminal.KEEP_TAIL)
+
+    def test_output_past_the_cap_does_not_kill_the_command(self):
+        tmp = tempfile.mkdtemp()
+        with mock.patch.object(terminal, "OUTPUT_CAP", 200_000):
+            code, out, err, timed_out = terminal._run_shell(
+                terminal._argv("seq 1 200000; touch done.txt", tmp), tmp)
+        self.assertFalse(timed_out)
+        self.assertEqual(code, 0)
+        self.assertTrue((Path(tmp) / "done.txt").exists())  # it ran to its end
+        self.assertIn("characters dropped", out)
+        self.assertIn("discarded", err)
+        self.assertIn(terminal.MARK, out)  # final folder still reported
+
+    def test_long_output_keeps_head_and_final_folder(self):
+        tmp = tempfile.mkdtemp()
+        ok, text = terminal.run(json.dumps({"command": "seq 1 100000 > /dev/null; seq 1 50000", "cwd": tmp}))
+        self.assertTrue(ok)
+        self.assertTrue(text.startswith("1\n2\n"))
+        self.assertIn("more characters cut", text)
+        self.assertIn(f"cwd {Path(tmp).resolve()}", text)  # MARK survived in the kept tail
+
+    def test_short_output_is_whole(self):
+        tmp = tempfile.mkdtemp()
+        code, out, err, timed_out = terminal._run_shell(terminal._argv("echo hi; echo oops >&2", tmp), tmp)
+        self.assertEqual((code, timed_out), (0, False))
+        self.assertTrue(out.startswith("hi\n"))
+        self.assertIn(terminal.MARK, out)
+        self.assertEqual(err.strip(), "oops")
+
+
 class AuditBypassTests(unittest.TestCase):
     """Bypasses found in the 2026-11-01 audit."""
 

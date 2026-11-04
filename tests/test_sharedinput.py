@@ -243,3 +243,65 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StatusCostTests(unittest.TestCase):
+    def test_stop_reads_the_status_once(self):
+        with mock.patch.object(si, "os") as fake_os, \
+                mock.patch.object(si, "_run") as run, \
+                mock.patch.object(si, "lan_mouse_status", return_value={"running": False, "build": None}) as st:
+            fake_os.name = "nt"
+            self.assertTrue(si.stop()["stopped"])
+        st.assert_called_once()
+        run.assert_called_once()  # taskkill only
+
+    def test_start_polls_cheaply_on_windows(self):
+        calls = []
+
+        def run(*args, timeout=5):
+            calls.append(args[0])
+            return SimpleNamespace(stdout="lan-mouse.exe,1\n" if args[0] == "tasklist" else "", returncode=0)
+        with mock.patch.object(si, "os") as fake_os, mock.patch.object(si, "_run", side_effect=run), \
+                mock.patch.object(si, "_desktop", return_value="windows"), \
+                mock.patch.object(si, "_units", return_value=[]), \
+                mock.patch.object(si, "_windows_launcher", return_value=Path("/nonexistent")), \
+                mock.patch.object(si, "_windows_once_launcher", return_value=Path("/nonexistent")), \
+                mock.patch.object(si, "_binary", return_value="lan-mouse.exe"), \
+                mock.patch.object(si.subprocess, "Popen") as popen, \
+                mock.patch("builtins.open", mock.mock_open()), \
+                mock.patch.object(Path, "mkdir"), \
+                mock.patch("time.sleep"), \
+                mock.patch.object(si, "lan_mouse_status", side_effect=[
+                    {"running": False, "build": None}, {"running": True, "build": "patched"}]) as st:
+            fake_os.name = "nt"
+            fake_os.environ = {}
+            out = si.start()
+        popen.assert_called_once()
+        self.assertTrue(out["started"])
+        self.assertEqual(st.call_count, 2)  # before launching, and once for the build type
+        self.assertIn("tasklist", calls)
+
+
+class LocalNetworkFamilyTests(unittest.TestCase):
+    IP_ADDR = ("2: wlan0    inet 172.1.0.23/16 brd 172.1.255.255 scope global wlan0\n"
+               "2: wlan0    inet6 2601:1::5/64 scope global\n"
+               "3: tailscale0    inet 100.84.1.2/32 scope global tailscale0\n")
+
+    def nets(self, **kw):
+        with mock.patch.object(si.os, "name", "posix"), \
+                mock.patch.object(si.shutil, "which", return_value="/usr/bin/ip"), \
+                mock.patch.object(si, "_run", return_value=SimpleNamespace(stdout=self.IP_ADDR)):
+            return [str(n) for n in si.local_networks(**kw)]
+
+    def test_guard_reads_ipv4_only_and_address_checks_get_ipv6_too(self):
+        self.assertEqual(self.nets(), ["172.1.0.0/16"])
+        self.assertEqual(self.nets(families=(4, 6)), ["172.1.0.0/16", "2601:1::/64"])
+
+    def test_macos_ifconfig(self):
+        text = ("en0: flags=8863<UP> mtu 1500\n\tinet6 fe80::1c%en0 prefixlen 64 scopeid 0x4\n"
+                "\tinet 172.1.0.23 netmask 0xffffff00 broadcast 172.1.0.255\n"
+                "lo0: flags=8049<UP>\n\tinet 127.0.0.1 netmask 0xff000000\n")
+        with mock.patch.object(si.os, "name", "posix"), \
+                mock.patch.object(si.shutil, "which", side_effect=lambda b: None if b == "ip" else "/sbin/ifconfig"), \
+                mock.patch.object(si, "_run", return_value=SimpleNamespace(stdout=text)):
+            self.assertEqual([str(n) for n in si.local_networks(families=(4, 6))], ["fe80::/64", "172.1.0.0/24"])

@@ -56,6 +56,22 @@ class SystemDesignTests(unittest.TestCase):
         self.assertTrue(all(c["fix"] for c in self.data["checks"] if c["state"] == "fail"))
         self.assertTrue(all(not c["fix"] for c in self.data["checks"] if c["state"] == "ok"))
 
+    def test_config_check_catches_a_bad_edit(self):
+        from jarvis.sysview import config_check
+        base = Path(self.tmp.name)
+        self.assertEqual(config_check(base)["state"], "fail")                     # missing
+        (base / "jarvis.config.json").write_text('{"rules": {', encoding="utf-8")
+        broken = config_check(base)
+        self.assertEqual(broken["state"], "fail")
+        self.assertIn("pre-*", broken["fix"])
+        (base / "jarvis.config.json").write_text("[1, 2]", encoding="utf-8")
+        self.assertEqual(config_check(base)["state"], "fail")                     # not an object
+        (base / "jarvis.config.json").write_text('{"rules": {}, "vault": {}}', encoding="utf-8")
+        ok = config_check(base)
+        self.assertEqual(ok["state"], "ok")
+        self.assertEqual(ok["fix"], "")
+        self.assertIn("Config file reads cleanly", {c["label"] for c in self.data["checks"]})
+
     def test_vault_off_by_choice_is_not_a_failure(self):
         config = dict(self.console.config, vault={"enabled": False, "path": str(Path(self.tmp.name, "no-vault"))})
         checks = {c["label"]: c for c in design(Console(config, ROOT, self.tmp.name))["checks"]}
@@ -72,3 +88,34 @@ class SystemDesignTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScheduleCheckTests(unittest.TestCase):
+    def test_a_schtasks_kind_alone_is_not_proof_it_is_scheduled(self):
+        from unittest import mock
+        from jarvis import sysview
+        for sched, expect in (({"kind": "schtasks", "at": "02:00", "installed": False}, False),
+                              ({"kind": "systemd", "at": "03:30", "installed": True}, True)):
+            with tempfile.TemporaryDirectory() as tmp:
+                config = {"vault": {"path": str(Path(tmp, "none"))}, "knowledge": {"path": str(Path(tmp, "kb"))}}
+                console = Console(config, ROOT, tmp)
+                snap = console.kb().snapshot()
+                snap["checker"]["schedule"] = sched
+                with mock.patch.object(type(console.kb()), "snapshot", return_value=snap):
+                    row = next(c for c in sysview.checks(console) if c["label"] == "Nightly wiki check scheduled")
+                self.assertEqual(row["state"] == "ok", expect, row)
+
+
+class ComponentCardsTest(unittest.TestCase):
+    def test_every_card_has_the_grammar_and_never_raises(self):
+        import tempfile
+        from types import SimpleNamespace
+        from jarvis import sysview
+        with tempfile.TemporaryDirectory() as state:
+            cards = sysview.components(SimpleNamespace(config={}, state=state))
+        self.assertGreaterEqual(len(cards), 8)
+        for card in cards:
+            self.assertIn(card["state"], ("ok", "warn", "off", "fail"), card)
+            self.assertTrue(card["title"] and 1 <= len(card["rows"]) <= 5, card)
+            self.assertTrue(all(len(row) == 2 for row in card["rows"]), card)
+        self.assertNotIn("fail", [c["state"] for c in cards])  # an empty state folder is not an error
