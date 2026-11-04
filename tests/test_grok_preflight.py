@@ -59,7 +59,7 @@ class PreflightTests(unittest.TestCase):
             answer = infer_with_chatgpt("request", {}, ".")
         self.assertEqual(answer, result())
         self.assertEqual(lane.call_args.kwargs["max_turns"], 1)
-        self.assertEqual(lane.call_args.kwargs["timeout"], 20)
+        self.assertEqual(lane.call_args.kwargs["timeout"], 30)  # the grok_check role default
         self.assertNotIn("tools", lane.call_args.kwargs)
         lane.return_value.close.assert_called_once()
 
@@ -157,3 +157,11 @@ class UsageLimitFallbackTests(unittest.TestCase):
         chatgpt.assert_not_called()
         self.assertEqual(len(asked), 2)  # draft and review, each a fresh Claude session
         self.assertTrue(all(p.startswith(grok_preflight.INSTRUCTIONS) for p in asked))
+
+
+class RoleTimeoutTests(unittest.TestCase):
+    def test_chatgpt_pass_uses_the_grok_check_role_timeout(self):
+        from jarvis.grok_preflight import chatgpt_lane
+        lane = chatgpt_lane({"inference": {"roles": {"grok_check": {"timeout": 77}}}}, Path("."))
+        self.assertEqual(lane.timeout, 77)
+        self.assertEqual(chatgpt_lane({}, Path(".")).timeout, 30)

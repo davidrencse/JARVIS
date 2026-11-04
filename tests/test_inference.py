@@ -252,3 +252,17 @@ class ToolsServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrainToolsLimitTests(unittest.TestCase):
+    def test_mcp_config_hands_the_chatgpt_limit_to_the_subprocess(self):
+        import time
+        from jarvis import chatgpt, tools_mcp
+        saved = dict(chatgpt._LIMIT)
+        self.addCleanup(chatgpt._LIMIT.update, saved)
+        chatgpt._LIMIT.update(until=0.0, text="")
+        env = tools_mcp.mcp_config("c.json", "state")["mcpServers"]["jarvis"]["env"]
+        self.assertNotIn(chatgpt.LIMIT_ENV, env)
+        chatgpt._LIMIT.update(until=time.time() + 600, text="until soon")
+        env = tools_mcp.mcp_config("c.json", "state")["mcpServers"]["jarvis"]["env"]
+        self.assertGreater(float(env[chatgpt.LIMIT_ENV]), time.time())

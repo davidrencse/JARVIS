@@ -220,12 +220,12 @@ class SendTests(unittest.TestCase):
         route = {"local": True, "os": "windows", "device": "dell"}
         with patch.object(self.bot, "route", return_value=route), \
                 patch.object(self.bot, "can_type", return_value=(True, "")), \
-                patch.object(grokbot.time, "monotonic", side_effect=[100.0, 100.025]), \
+                patch.object(grokbot.time, "monotonic", side_effect=[100.0, 100.01, 100.025]), \
                 patch.object(self.bot, "_windows", side_effect=grokbot.subprocess.TimeoutExpired(
                     "powershell.exe", 0.1)) as send:
             with self.assertRaisesRegex(TimeoutError, "timed out while sending"):
                 self.bot.send("hello", timeout=0.1)
-        # Setup consumed 25 ms; tolerate floating-point deadline subtraction.
+        # Setup (and the paste-lock budget read) consumed 25 ms; tolerate float subtraction.
         self.assertAlmostEqual(send.call_args.args[1], 0.075)
         send.assert_called_once()
 
@@ -477,8 +477,17 @@ class HandoffTests(unittest.TestCase):
         wait.assert_not_called()
 
     def test_busy_sender_times_out_without_submitting(self):
-        grokbot.SENDING.acquire()
-        self.addCleanup(grokbot.SENDING.release)
+        held, free = threading.Event(), threading.Event()  # SENDING is reentrant: hold it elsewhere
+
+        def other_sender():
+            with grokbot.SENDING:
+                held.set()
+                free.wait(5)
+        holder = threading.Thread(target=other_sender)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(free.set)
+        held.wait(5)
         with self.assertRaisesRegex(TimeoutError, "waiting to send"):
             self.bot.handoff("x", timeout=0.02)
         self.assertEqual(self.sent, [])
@@ -547,5 +556,57 @@ class StatusTests(unittest.TestCase):
         self.assertNotIn("local-exec-daemon-credential.json", opened)
 
 
+class PasteLockTests(unittest.TestCase):
+    """Voice, ui, cluster and the CLI share one clipboard and focus: one paste at a time."""
+
+    def test_second_process_waits_then_times_out(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = Path(tmp, "grok-send.lock")
+            code = ("import sys, time\nfrom jarvis.locking import exclusive_lock\n"
+                    f"with exclusive_lock({str(lock)!r}):\n print('held', flush=True); time.sleep(1.5)")
+            child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+            self.addCleanup(child.wait)
+            self.assertEqual(child.stdout.readline().strip(), "held")
+            child.stdout.close()
+            bot = Grokbot.__new__(Grokbot)
+            bot.state = Path(tmp)
+            with self.assertRaises(TimeoutError):
+                with bot._paste_lock(time.monotonic() + 0.2):
+                    pass
+            child.wait()
+            with bot._paste_lock(time.monotonic() + 1):
+                pass  # free again once the other process is done
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SendLockTests(unittest.TestCase):
+    def test_send_waits_for_a_paste_already_in_flight(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bot = Grokbot(CONFIG, tmp.name)
+        route = {"device": "here", "local": True, "os": "linux"}
+        held, free = threading.Event(), threading.Event()
+
+        def other_sender():
+            with grokbot.SENDING:
+                held.set()
+                free.wait(5)
+        holder = threading.Thread(target=other_sender)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(free.set)
+        held.wait(5)
+        with patch.object(Grokbot, "route", return_value=route), \
+                patch.object(Grokbot, "can_type", return_value=(True, "")), \
+                patch.object(Grokbot, "_linux", return_value="ok=1\n") as typed:
+            with self.assertRaisesRegex(TimeoutError, "waiting to send"):
+                bot.send("hello", timeout=0.2)
+            typed.assert_not_called()
+            free.set()
+            holder.join()
+            bot.send("hello", timeout=2)
+            typed.assert_called_once()

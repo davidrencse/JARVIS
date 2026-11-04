@@ -17,6 +17,14 @@ class GrokRoutingTest(unittest.TestCase):
             self.assertTrue(grok_first(text, GROK), text)
             self.assertEqual(decide(text, GROK, conversational=True)["tier"], "medium", text)
 
+    def test_my_chrome_goes_to_the_brain_when_its_browser_is_on(self):
+        mine = {**GROK, "actions": {"browser_engines": ["chrome", "playwright"]}}
+        for text in ("using my Chrome, check my gmail", "open my browser and read my email",
+                     "in my own chrome check my gmail"):
+            self.assertFalse(grok_first(text, mine), text)
+            self.assertTrue(grok_first(text, GROK), text)  # no chrome server: Grok as before
+        self.assertTrue(grok_first("check my gmail", mine))  # not asked for: Grok as before
+
     def test_plain_talk_and_the_clock_stay_local(self):
         for text in ("tell me a joke", "what time is it", "open spotify"):
             self.assertNotEqual(decide(text, GROK, conversational=True)["tier"], "medium", text)
