@@ -33,6 +33,11 @@ def vault_answer(text, config, state):
         return None
 
 
+# "Jarvis, stop controlling my computer", "hands off", "stop using my mouse": halt control.py.
+STOP_CONTROL = re.compile(
+    r"\b(?:stop|quit|halt)\s+(?:controlling|using|touching|moving)\s+(?:my\s+|the\s+)?"
+    r"(?:computer|pc|laptop|mouse|keyboard|desktop|screen)\b|"
+    r"^\W*(?:(?:hey\s+)?jarvis\W+)?hands\s+off(?:\s+my\s+\w+)?\W*$", re.I)
 CONVERSATIONAL = ("Reply as JARVIS to the owner, David. Lead with the answer in plain "
                   "sentences; it may be read aloud, so keep it short unless detail is asked "
                   "for. Put code or long output after the spoken part.")
@@ -109,6 +114,13 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
     if not isinstance(text, str) or not text.strip():
         raise ValueError("Say or type something for JARVIS to do.")
     text = text.strip()
+    if STOP_CONTROL.search(text):  # the desktop control fail-safe: no model, no routing
+        from .control import stop_everywhere
+        ok, said = stop_everywhere(config, memory.path.parent if memory is not None else None)
+        if on_sentence:
+            on_sentence(said)
+        return {"tier": "simple", "reasons": ["instant: stop desktop control"], "reply": said,
+                "streamed": on_sentence is not None}  # spoken already: callers mustn't say it again
     from .topology import is_node
     if is_node(config):
         from .cluster import Client
@@ -139,6 +151,8 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
     quick = (instant_answer(text) or vault_answer(text, config, memory.path.parent)
              if tier in (None, "simple") and not write else None)
     agent = tier is None and not write and not quick and _needs_agent(text, config)
+    if agent and lane is not None and _plays_named(text, config):
+        agent = False   # a named song/artist: the brain's spotify tool, not Grok (no Spotify)
     build = False
     if agent and routing.get("interpreter"):
         # The parser saw an action it couldn't resolve: ask the interpreter before Grok.
@@ -204,6 +218,9 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
         step("instant", "route", "Instant", "clock or vault, no model")
         if on_sentence:
             on_sentence(quick)
+
+    if route["tier"] == "simple" and reply is None and lane is not None and not write:
+        reply = _orchestrated(text, config, base, memory, lane, step, recalled, on_sentence, detail)
 
     if route["tier"] == "simple" and reply is None:
         if lane is not None and not write:
@@ -289,11 +306,13 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                 risk = agent_risk(text, prepared)
                 if risk == "deny":
                     raise ValueError("That task is refused by the risk checks.")
-                if prepared["decision"] in ("forward", "confirm") and not gates_ask(config):
+                from .gates import always_asks_text
+                asks = gates_ask(config) or (risk == "confirm" and
+                                             always_asks_text(prepared.get("task") or text, config))
+                if prepared["decision"] in ("forward", "confirm") and not asks:
                     prepared = {**prepared, "decision": "forward",
                                 "task": prepared.get("task") or text}
-                if prepared["decision"] in ("forward", "confirm") and risk == "confirm" \
-                        and gates_ask(config):
+                if prepared["decision"] in ("forward", "confirm") and risk == "confirm" and asks:
                     from .confirm import ConfirmQueue, prompt
                     from .remote import Remote
                     from .topology import ORIGIN
@@ -548,6 +567,16 @@ def _needs_agent(text, config):
         return False
 
 
+def _plays_named(text, config):
+    try:
+        from .pipeline import plays_named
+        from .remote import Remote
+        from .topology import ORIGIN
+        return plays_named(text, config, ORIGIN.get() or Remote(config, ".").here())
+    except Exception:
+        return False
+
+
 def _fast_path(text, memory, config, channel, on_start, on_sentence, on_step):
     """Certain direct actions (open, play, volume...) run without a model; None sends
     the request on to the router and the brain as before (jarvis/pipeline.py)."""
@@ -733,6 +762,30 @@ def _confirmation_turn(text, memory, config, base, channel, on_start, on_sentenc
             "memory": [inbound["id"], outbound["id"]]}
 
 
+def _orchestrated(text, config, base, memory, lane, step, recalled, on_sentence, detail):
+    """brain.orchestrate for requests judge() marks as several jobs or hard thinking; None
+    (the brain lane answers as before) for the rest, or if the orchestrator itself fails."""
+    from .brain import judge, orchestrate
+    verdict = judge(text, config)
+    if not verdict["plan"]:
+        return None
+    step("judge", "route", "Judge · orchestrate", "; ".join(verdict["reasons"]))
+
+    def run_tools(instruction):
+        return _with_tools(lane, step, lambda: lane.ask(instruction, recalled()))
+    try:
+        out = orchestrate(text, config, base, memory.path.parent, run_tools=run_tools, step=step,
+                          recall=recalled())
+    except Exception as exc:  # e.g. both providers limited: let the brain lane try
+        step("judge", "route", "Judge · orchestrate", f"orchestrator failed: {exc}"[:160], "fail")
+        return None
+    detail.update(lane="orchestrator", steps=out["steps"], levels=out["levels"], l3_left=out["l3_left"],
+                  streamed=on_sentence is not None)
+    if on_sentence and out["reply"]:
+        on_sentence(out["reply"])
+    return out["reply"]
+
+
 def _stepper(on_step):
     def step(id, parent, label, detail="", state="done"):
         if on_step:
@@ -816,7 +869,10 @@ def wake_word(text, words=WAKE_WORDS):
     if not word:
         return None
     tail = re.compile(r"(?:\s*,\s*(?:" + names + r")\W*|\s+(?:" + names + r")\s*\?\W*)$", re.I | re.S)
-    match = tail.search(text, lead + word.end())
+    # Only the last few hundred characters can hold the closing name: searching a long
+    # whitespace run from every start was quadratic (1.2 s on 20k spaces, audit 2026-11-04).
+    end = text.rstrip()
+    match = tail.search(end, max(lead + word.end(), len(end) - 300))
     if not match:
         return None
     head = text[lead:match.start()]

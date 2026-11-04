@@ -42,9 +42,6 @@ OTP_STRONG = re.compile(r"\b(otp|2fa|mfa|two[- ]?factor|verification|one[- ]time
                         re.I)
 CHANGE_PASSWORD = re.compile(r"\b(change|update|reset|set)\b[^.]{0,25}\bpass(?:word|code)\b|"
                              r"\bpass(?:word|code)\b[^.]{0,15}\b(change|update|reset)\b", re.I)
-# Arguments that say how to act, not what is being acted on.
-NOT_LABEL = {"button", "modifiers", "type", "direction", "state", "timeout", "accept",
-             "promptText", "slowly", "submit", "doubleClick"}
 REFERENCE = re.compile(r"^@?[a-z]{0,3}\d+(?:[a-z]\d+)*$", re.I)  # @e12, e12, f1e3
 _TYPED = {}  # server -> was the last field typed into a search box (Enter is then harmless)
 _LOCK = threading.Lock()
@@ -397,9 +394,13 @@ def judge(params):
         for text in _strings(args):
             if re.search(r"[\r\n]", text):
                 final = "enter"
+            elif text == " ":
+                final = "space"
             else:
                 final = text.lower().split("+")[-1].strip()
-            if final in ("enter", "return", "numpadenter") and not searching:
+            # Space presses a focused button just like Enter (audit 2026-11-03: type, Tab, Space
+            # posted on x.com unasked).
+            if final in ("enter", "return", "numpadenter", "space", "spacebar") and not searching:
                 key = text.strip().lower() or "enter"
                 key = "enter" if re.search(r"[\r\n]", text) else key
                 return out(f"press {key} after typing", "high", f"press {key} after typing")
@@ -443,8 +444,8 @@ def gate(policy, config, state, wait=None, queue=None):
         if not info:
             return ok, why
         from .gates import asks_now
-        if not asks_now(config, state):  # rules.confirm: never (read live)
-            return ok, why
+        if not asks_now(config, state) and not always_asks(info, config):
+            return ok, why  # rules.confirm: never (read live); money and messages still ask
         try:
             from .confirm import ConfirmQueue
             here = queue or ConfirmQueue(state)
@@ -458,7 +459,23 @@ def gate(policy, config, state, wait=None, queue=None):
     return approve
 
 
-def ask(action, config, state, wait=WAIT, queue=None, info=None):
+# Even in full-auto mode (rules.confirm: never) these wait for David: spending money and speaking
+# for him to other people (agreed 2026-11-03). rules.always_ask lists the kinds; [] turns it off.
+ALWAYS_ASK = {
+    "money": re.compile(r"\b(buy|purchase|pay|payment|checkout|check out|place (?:your )?order|order now|"
+                        r"donate|subscribe|transfer|withdraw|send money|tip|bid|book now|reserve|rent)\b", re.I),
+    "messages": re.compile(r"\b(send|sent|post|posting|publish|tweet|retweet|repost|reply|comment|share|"
+                           r"message|dm|email|invite)\b", re.I),
+}
+
+
+def always_asks(info, config):
+    kinds = ((config or {}).get("rules") or {}).get("always_ask", ["money", "messages"])
+    text = " ".join(str(info.get(k) or "") for k in ("question", "target", "reason"))
+    return info.get("stakes") == "high" and any(ALWAYS_ASK[k].search(text) for k in kinds if k in ALWAYS_ASK)
+
+
+def ask(action, config, state, wait=WAIT, queue=None, info=None, subject="the browser"):
     from .assistant import confirmation_origin
     from .confirm import ConfirmQueue, notify
     queue = queue or ConfirmQueue(state)
@@ -468,9 +485,9 @@ def ask(action, config, state, wait=WAIT, queue=None, info=None):
                "target": info.get("target"), "stakes": info.get("stakes") or "high",
                "named": bool(info.get("named")), "expires_at": round(time.time() + wait, 1)}
     item = queue.park({"intent": "browser_action", "device": origin,
-                       "args": {"text": f"let the browser {action}", "browser": browser}},
+                       "args": {"text": f"let {subject} {action}", "browser": browser}},
                       origin, "console")
-    notify(f"let the browser {action}")
+    notify(f"let {subject} {action}")
     number, deadline = int(item["id"][1:]), time.monotonic() + wait
     timed_out = f"David didn't answer in {wait:g} s (timed out): {action}"
     answered = False
@@ -489,6 +506,22 @@ def ask(action, config, state, wait=WAIT, queue=None, info=None):
             if hasattr(queue, "expire_safely"):
                 queue.expire_safely()
             time.sleep(0.5)
+        # Expire first, then look once more: an approval that landed after the last poll
+        # (expire_item is then a no-op) is honoured, not reported as a timeout (audit 2026-11-04).
+        answered = True
+        try:
+            if hasattr(queue, "expire_item"):
+                queue.expire_item(item["id"])
+            else:
+                queue.reject(item["id"])
+        except Exception:
+            answered = False  # the finally tries once more
+        try:
+            if queue.status(number) == "approved":
+                answered = True
+                return True, f"David approved: {action}"
+        except Exception:
+            pass
         return False, timed_out
     finally:
         if not answered:  # timed out, or the poll itself failed: never leave it approvable
