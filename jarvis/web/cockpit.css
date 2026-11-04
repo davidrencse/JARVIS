@@ -39,7 +39,7 @@
 #view-console.ck[hidden] { display: none; }
 .ck-head { grid-area: head; }
 .ck-rail { grid-area: rail; }
-.ck-center { grid-area: center; display: grid; grid-template-rows: minmax(0, 1.5fr) minmax(0, 1fr); gap: var(--ck-gap); min-height: 0; }
+.ck-center { grid-area: center; display: grid; grid-template-rows: minmax(0, 2.3fr) minmax(0, 1fr); gap: var(--ck-gap); min-height: 0; }
 .ck-side { grid-area: side; }
 
 .ck-box {
@@ -233,10 +233,15 @@
   #view-console.ck { padding-bottom: var(--gate-h, 64px);
     grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
     grid-template-areas: "head head" "center side" "rail rail";
-    /* A fixed height: the assistant column scrolls inside it instead of growing with the thread. */
-    grid-template-rows: auto clamp(560px, 78dvh, 880px) minmax(360px, auto);
+    /* A fixed height: the assistant column scrolls inside it instead of growing with the thread.
+       It ends above the gate bar (window minus the console's top, its head row and the gate),
+       so the prompt at its foot is never under the bar; 78dvh put it there at 1180 wide. */
+    grid-template-rows: auto clamp(380px, calc(100dvh - var(--ck-top, 120px) - var(--gate-h, 64px) - 100px), 880px) minmax(360px, auto);
     height: auto;
   }
+  /* The row sets the assistant's height: porcelain's 560px floor and console.css's
+     70dvh !important (at 1080 and below) both overran it and hid the prompt under the gate. */
+  #view-console.ck .assistant { min-height: 0; height: auto !important; }
 }
 @media (max-width: 760px) {
   #view-console.ck { grid-template-columns: minmax(0, 1fr); grid-template-areas: "head" "side" "center" "rail"; grid-template-rows: auto 70dvh 80dvh auto; }
@@ -281,3 +286,67 @@
    and keep toasts (including "couldn't send your answer") above it. */
 .stage { padding-bottom: calc(20px + var(--gate-pad, 0px)); }
 .toast { z-index: 45; bottom: max(140px, calc(var(--gate-h, 0px) + var(--gate-bottom, 10px) + 12px)); }
+
+
+/* ---------- JARVIS hardware: the 3D board (board3d.js) under the pipeline wheel ---------- */
+.lab-stage .board3d { position: absolute; inset: 0; z-index: 0; background: #060606; overflow: hidden; }  /* engine3d.js places the engine in the wheel's world */
+.lab-stage .engine-strands { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+.lab-stage { background: #060606; }
+/* the engine stage is black in both themes: its overlays (tip, gauges, tags) keep dark-theme ink */
+.lab-stage .board3d { --ink: #eceef0; --ink-2: #a9aeb4; --ink-3: #9ea3a9; --line: rgba(255, 255, 255, .085); --line-2: rgba(255, 255, 255, .17);
+  --ok: #e8e8e8; --bad: #ef7a6c; --bg: #060708; }
+.lab-stage .board3d canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.lab-stage #lab-wheel { z-index: 1; }
+.lab-stage .lab-tag, .lab-stage .lab-state { z-index: 3; }
+.lab-stage .board-tip { position: absolute; z-index: 4; min-width: 170px; max-width: 230px; padding: 7px 9px; pointer-events: none;
+  background: rgba(0, 0, 0, .88); border: 1px solid var(--line); font: 500 10.5px/1.5 var(--mono, ui-monospace, monospace); }
+.lab-stage .board-tip div { display: flex; justify-content: space-between; gap: 10px; }
+.lab-stage .board-tip span { color: var(--ink-3); white-space: nowrap; }
+.lab-stage .board-tip b { color: var(--ink); font-weight: 600; text-align: right; overflow-wrap: anywhere; }
+.lab-stage .board-fallback { position: absolute; left: 12px; top: 10px; margin: 0; color: var(--ink-3); font-size: 11px; }
+
+/* engine gauges: a crisp strip under the engine, scaled with it (engine3d.js) */
+.lab-stage .engine-gauges { position: absolute; left: 0; top: 0; width: 360px; z-index: 2; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; will-change: transform;
+  font: 500 9.5px/1 var(--mono, ui-monospace, monospace); letter-spacing: .06em; text-transform: uppercase; pointer-events: none; }
+.lab-stage .engine-gauges span { min-width: 0; display: flex; justify-content: space-between; gap: 6px; padding: 5px 7px;
+  background: rgba(0, 0, 0, .72); border-top: 1px solid var(--line); }
+.lab-stage .engine-gauges i { font-style: normal; color: var(--ink-3); }
+.lab-stage .engine-gauges b { color: var(--ink); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lab-stage .engine-gauges .warn b { color: var(--warn, #f0b429); } .lab-stage .engine-gauges .fail b { color: var(--down, #ff4d5e); }
+/* engine module callouts: numbered nameplates on leader lines (engine3d.js draws the leaders) */
+.lab-stage .engine-tags { position: absolute; inset: 0; z-index: 2; pointer-events: none; overflow: hidden; }
+.lab-stage .engine-tags[data-mode="off"] { display: none; }
+.lab-stage .engine-tags .et { position: absolute; left: 0; top: 0; display: flex; align-items: baseline; gap: 5px; padding: 3px 6px; white-space: nowrap;
+  font: 500 9.5px/1.1 var(--mono, ui-monospace, monospace); letter-spacing: .06em; text-transform: uppercase;
+  background: rgba(6, 6, 6, .82); border: 1px solid rgba(184, 190, 198, .28); color: var(--ink); will-change: transform; }
+.lab-stage .engine-tags .et b { color: var(--ink-3); font-weight: 600; }
+.lab-stage .engine-tags .et em { font-style: normal; font-weight: 600; }
+.lab-stage .engine-tags .et i { font-style: normal; color: var(--ink-3); text-transform: none; letter-spacing: 0; }
+.lab-stage .engine-tags[data-mode="num"] .et:not(.on) em, .lab-stage .engine-tags[data-mode="num"] .et:not(.on) i { display: none; }
+.lab-stage .engine-tags .et { z-index: 0; } .lab-stage .engine-tags .et.on { z-index: 1; }
+/* status light per module: colour means state only */
+.lab-stage .engine-tags .et::before { content: ""; align-self: center; width: 5px; height: 5px; flex: none; background: var(--ink-3); opacity: .55; }
+.lab-stage .engine-tags .et[data-st="ok"]::before { background: var(--ok, #e8e8e8); opacity: .8; }
+.lab-stage .engine-tags .et[data-st="active"]::before { background: #f0b429; opacity: 1; box-shadow: 0 0 6px #f0b429; }  /* the engine's activity amber */
+.lab-stage .engine-tags .et[data-st="warn"]::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--bad, #ef7a6c); opacity: 1; }
+.lab-stage .engine-tags .et[data-st="fail"]::before { background: var(--bad, #ef7a6c); opacity: 1; }
+/* engine view controls: top-left of the stage, over the wheel (same look as .lab-zoom) */
+.lab-stage .engine-ctl { position: absolute; left: 10px; top: 10px; z-index: 3; display: flex; border: 1px solid var(--line-2);
+  background: color-mix(in srgb, var(--bg) 85%, transparent); }
+.lab-stage .engine-ctl button { all: unset; cursor: pointer; height: 26px; padding: 0 9px; font: 400 10px/26px var(--mono); letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-2); }
+.lab-stage .engine-ctl button + button { border-left: 1px solid var(--line); }
+.lab-stage .engine-ctl button:hover, .lab-stage .engine-ctl button:focus-visible { color: var(--ink); background: var(--hover); }
+.lab-stage .engine-ctl button:focus-visible { outline: 2px solid var(--ink); outline-offset: -2px; }
+.lab-stage .engine-ctl button[aria-pressed="true"] { color: #f0b429; }
+.lab-stage .engine-tags .et.on { border-color: var(--warn, #f0b429); }
+.lab-stage .engine-tags .et.on b { color: var(--warn, #f0b429); }
+.lab-stage .board-tip .tt { display: flex; justify-content: space-between; gap: 10px; margin: 0 0 4px; padding: 0 0 4px; border-bottom: 1px solid var(--line); }
+
+/* The always-on listener's ear (ear.js): live mic wave beside the mic button.
+   Grey = listening to a quiet room, ink = a voice reaches the mic, faint flat = listener off. */
+.ear { --ear-ink: var(--ink); --ear-quiet: var(--ink-3); flex: none; width: 64px; height: 44px;
+       display: grid; border: 1px solid var(--line-ctl, var(--line)); border-radius: var(--r-sm, 6px); overflow: hidden; }
+.ear[data-state="off"] { --ear-quiet: var(--line); }
+.ear-wave { width: 100%; height: 100%; display: block; }
+.ck-side .ear, .cx-side .ear { height: 30px; width: 56px; border-radius: 2px; border-color: var(--line-2, var(--line)); }
