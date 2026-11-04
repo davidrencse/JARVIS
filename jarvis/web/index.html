@@ -42,9 +42,8 @@
       <a href="design.html" data-page="design" title="System design: how JARVIS works and what needs fixing (3)"><svg class="i"><use href="icons.svg?v=2#i-blocks"/></svg><span>System</span></a>
       <a href="#credits" data-view="credits" title="Credits (4)"><svg class="i"><use href="icons.svg?v=2#i-gauge"/></svg><span>Credits</span></a>
       <a href="#memory" data-view="memory" title="Memory (5)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
-      <a href="#run" data-view="run" title="Run: a plan on one screen (6)"><svg class="i"><use href="icons.svg?v=2#i-activity"/></svg><span>Run</span></a>
-      <a href="#files" data-view="files" title="Files across both laptops (7)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
-      <a href="#devices" data-view="devices" title="Connections: computers and peripherals (8)"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Connections</span></a>
+      <a href="#files" data-view="files" title="Files across both laptops (6)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
+      <a href="#devices" data-view="devices" title="Connections: computers and peripherals (7)"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Connections</span></a>
       <a href="#settings" data-view="settings" title="Voice and input settings"><svg class="i"><use href="icons.svg?v=2#i-audio-lines"/></svg><span>Settings</span></a>
     </nav>
     <div class="profile">
@@ -200,6 +199,12 @@
       <!-- Centre: what JARVIS is doing right now -->
       <section class="ck-center" aria-label="Current request">
         <section class="ck-box lab-stage" id="lab-stage" aria-label="Pipeline: every stage of the current request, live">
+          <div class="board3d" id="board3d" role="img"
+               aria-label="JARVIS drawn as a circuit board: the CPU is the brain, the RAM sticks are memory by kind, the M.2 drive is the vault, the graphics card is the action tools, the chipset is the gates. Lights run along the traces as a request moves through JARVIS. Hover a part for its live numbers.">
+            <canvas></canvas>
+            <div class="board-tip" hidden></div>
+            <p class="board-fallback" hidden>The 3D board needs WebGL, which this browser has switched off.</p>
+          </div>
           <canvas id="lab-wheel" aria-hidden="true"></canvas>
           <div class="lab-tag" id="lab-tag" hidden><b></b><span></span></div>
           <p class="lab-state" id="lab-state" role="status" aria-live="polite">Idle · waiting for “Jarvis, …”</p>
@@ -476,6 +481,9 @@
         <svg class="i"><use href="icons.svg?v=2#i-mic"/></svg>
         <canvas class="mic-wave" id="mic-wave" aria-hidden="true"></canvas>
       </button>
+      <div class="ear" id="ear" role="img" aria-label="Always-on listener: off" title="Always-on listener: off" data-state="off">
+        <canvas class="ear-wave" id="ear-wave" aria-hidden="true"></canvas>
+      </div>
       <button class="mic agent-call" id="agent-call" type="button" aria-label="Live call with JARVIS" aria-pressed="false" data-state="idle" hidden>
         <svg class="i"><use href="icons.svg?v=2#i-radio"/></svg>
       </button>
@@ -512,6 +520,7 @@
 <script src="voicesetup.js"></script>
 <script src="agent.js"></script>
 <script src="app.js"></script>
+<script src="ear.js"></script>
 <script src="agentscreen.js"></script>
 <script src="dashboard.js"></script>
 <script src="signals.js"></script>
@@ -522,11 +531,12 @@
 <script src="sharedinput.js"></script>
 <script src="peripherals.js"></script>
 <script src="laptops.js"></script>
-<script src="field.js"></script>
+<script src="boardfield.js"></script>
 <script src="wheel.js"></script>
 <script src="layout.js"></script>
 <script src="gate.js"></script>
 <script src="cockpit.js"></script>
 <script src="settings.js"></script>
+<script type="module" src="engine3d.js"></script>
 </body>
 </html>
