@@ -93,7 +93,7 @@ BOILERPLATE = re.compile(r"cookie|subscribe|sign up|all rights reserved|click he
 
 CLAIM_LINE = re.compile(
     r"^- (?:\[!(?P<flag>conflict|unconfirmed|superseded)(?: (?P<with>[^\]]*))?\] )?(?P<text>.+?) "
-    r"\^(?P<id>c[0-9a-f]{6}) — source: (?P<src>.*?) · confirmed: (?P<date>\d{4}-\d{2}-\d{2})\s*$")
+    r"\^(?P<id>c[0-9a-f]{6,16}) — source: (?P<src>.*?) · confirmed: (?P<date>\d{4}-\d{2}-\d{2})\s*$")
 LINK = re.compile(r"\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]")
 
 
@@ -260,8 +260,18 @@ def slugify(text):
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9]+", "-", text.lower())).strip("-")[:60]
 
 
-def claim_id(text):
-    return "c" + hashlib.sha1(" ".join(words(text)).encode()).hexdigest()[:6]
+def claim_id(text, size=12):
+    """12 hex digits for new ids (6 collided across a big vault); pages written with the old
+    6-digit ids still parse, and `claim_ids` lists both spellings of a text's id."""
+    return "c" + hashlib.sha1(" ".join(words(text)).encode()).hexdigest()[:size]
+
+
+def claim_ids(text):
+    return (claim_id(text), claim_id(text, 6))
+
+
+def same_claim(text, other):
+    return words(text) == words(other)
 
 
 # -- facets and the contradiction test -----------------------------------------------------
@@ -386,9 +396,9 @@ def extract_claims(text, idf=None, limit=MAX_CLAIMS_PER_SOURCE):
     best = sorted(picked, reverse=True)[:limit]
     seen, out = set(), []
     for _, _, s in sorted(best, key=lambda x: x[1]):
-        cid = claim_id(s)
-        if cid not in seen:
-            seen.add(cid)
+        key = tuple(words(s))
+        if key not in seen:
+            seen.add(key)
             out.append(s)
     return out
 
@@ -643,7 +653,7 @@ class KnowledgeBase:
 
     # ---- reader ------------------------------------------------------------------------
     def ingest(self, item=None, text=None, title=None, digest=True, fetch=None, transcribe=None,
-               page=None):
+               page=None, relink=True):
         """Reader: keep a source untouched in raw/, then hand it to the librarian. Fetching,
         PDF extraction and transcription happen before the lock, so a slow source never
         blocks a ruling or the nightly check. `page` files the whole source on one page of
@@ -710,7 +720,7 @@ class KnowledgeBase:
                        source=sid, title=meta["title"], bytes=len(data))
             result = {"source": meta, "duplicate": False}
             if digest:
-                result["librarian"] = self.digest(sid)
+                result["librarian"] = self.digest(sid, relink=relink)
             return result
 
     VAULT_SKIP = ("daily/", "templates/", "archive/", "attachments/")
@@ -735,13 +745,15 @@ class KnowledgeBase:
                 continue
             try:
                 result = self.ingest(path, title=note.get("title") or None, page=Path(rel).stem if stems[Path(rel).stem] == 1
-                                  else Path(rel).with_suffix("").as_posix())
+                                  else Path(rel).with_suffix("").as_posix(), relink=False)
             except (ValueError, OSError) as exc:
                 failed.append({"path": rel, "error": str(exc)})
                 continue
             seen[rel] = digest_hex
             if not result["duplicate"]:
                 added.append(rel)
+        if added:
+            self._relink_all()  # once, not after every note
         # Merged into what is on disk now, not a copy read at the start: another sync that
         # ran meanwhile keeps the notes it recorded.
         self.bot("reader", lambda m: m.update(vault={**m.get("vault", {}), **seen},
@@ -750,6 +762,14 @@ class KnowledgeBase:
                    f"{len(added)} notes read · {unchanged} unchanged · raw/ untouched",
                    added=len(added), unchanged=unchanged, failed=failed[:20])
         return {"added": added, "unchanged": unchanged, "failed": failed}
+
+    def _relink_all(self):
+        with self.lock():
+            pages = self.pages()
+            before = {s: (self.wiki / f"{s}.md").read_text(encoding="utf-8") for s in pages}
+            self._relink(pages)
+            self._save(pages, before, "librarian", "--relink")
+            self._index(pages)
 
     def _by_hash(self, digest_hex):
         """The source with these bytes, or None. Reading every meta file per ingest cost
@@ -925,8 +945,9 @@ class KnowledgeBase:
             page["related"] = [s for _, s in sorted(scores, reverse=True)[:4]]
 
     # ---- librarian ---------------------------------------------------------------------
-    def digest(self, sid):
-        """Librarian: file a source's claims into the wiki, rewriting every page it touches."""
+    def digest(self, sid, relink=True):
+        """Librarian: file a source's claims into the wiki, rewriting every page it touches.
+        relink=False skips the all-pairs related-pages pass (sync_vault runs it once at the end)."""
         with self.lock():
             meta, text = self.source(sid), self.source_text(sid)
             pages = self.pages()
@@ -944,9 +965,10 @@ class KnowledgeBase:
                 pages[whole] = {"slug": whole, "title": meta["title"], "type": "page", "claims": [],
                                 "related": [], "answer": "", "extra": "", "question": ""}
             for claim in claims:
-                cid = claim_id(claim)
-                if cid in existing:
-                    homes[claim] = existing[cid][0]
+                hit = next((existing[i] for i in claim_ids(claim)
+                            if i in existing and same_claim(existing[i][1]["text"], claim)), None)
+                if hit:
+                    homes[claim] = hit[0]
                     continue
                 if whole:
                     homes[claim] = whole
@@ -994,7 +1016,8 @@ class KnowledgeBase:
             for claim, slug in homes.items():
                 page, cid = pages[slug], claim_id(claim)
                 touched.add(slug)
-                same = next((c for c in page["claims"] if c["id"] == cid), None)
+                same = next((c for c in page["claims"] if c["id"] in claim_ids(claim)
+                             and same_claim(c["text"], claim)), None)
                 if same is None:
                     same = next((c for c in page["claims"] if relation(claim, c["text"]) == ("duplicate", None)), None)
                 if same is not None:
@@ -1005,6 +1028,10 @@ class KnowledgeBase:
                         same["flag"] = None
                     reconfirmed += 1
                     continue
+                size = 12
+                while cid in existing and not same_claim(existing[cid][1]["text"], claim) and size < 16:
+                    size += 2  # a different claim already owns this id
+                    cid = claim_id(claim, size)
                 new = {"id": cid, "text": claim, "date": today, "sources": [sid], "flag": None, "with": []}
                 for other_slug, other in self._candidates(index, claim):
                     rel = relation(claim, other["text"])
@@ -1020,9 +1047,11 @@ class KnowledgeBase:
                                           "other_page": other_slug, "why": rel[1],
                                           "text": claim, "other_text": other["text"]})
                 page["claims"].append(new)
+                existing[cid] = (slug, new)
                 index_add(index, slug, new)
                 added += 1
-            self._relink(pages)
+            if relink:
+                self._relink(pages)
             writes = self._save(pages, before, "librarian", f"--source {sid}")
             self._index(pages)
             for c in conflicts:
@@ -1251,21 +1280,32 @@ class KnowledgeBase:
 
     # ---- questions ---------------------------------------------------------------------
     def retrieve(self, question, limit=6, pages=None):
-        """BM25 over every claim (page title included), best first."""
-        pages = pages if pages is not None else self.pages()
-        docs = [(slug, c, _terms(c["text"]) + _terms(p["title"]))
-                for slug, p in pages.items() if p["type"] == "page" for c in p["claims"]
-                if c.get("flag") != "superseded"]
+        """BM25 over every claim (page title included), best first. With no `pages` the index
+        (documents, document frequencies, term -> documents) is kept between calls and rebuilt
+        only when a wiki page changed, so a talk turn scores just the claims that share a term."""
+        stamp = None
+        if pages is None:
+            with self._page_cache_lock:
+                pages = self._pages_locked(self._page_cache, True)
+                stamp = tuple((slug, hit[0]) for slug, hit in self._page_cache.items())
+            cached = getattr(self, "_bm25", None)
+            index = cached[1] if cached and cached[0] == stamp else None
+        else:
+            index = None
+        if index is None:
+            index = self._bm25_index(pages)
+            if stamp is not None:
+                self._bm25 = (stamp, index)
+        docs, n, avg, df, where = index
         if not docs:
             return []
         query = set(content(question))
-        n, avg = len(docs), sum(len(d) for *_, d in docs) / len(docs)
-        df = Counter(t for *_, d in docs for t in set(d))
+        candidates = sorted({i for t in query for i in where.get(t, ())})
         scored = []
-        for slug, claim, terms in docs:
-            tf = Counter(terms)
+        for i in candidates:
+            slug, claim, terms, tf, tfkeys = docs[i]
             score = 0.0
-            for t in query & set(tf):
+            for t in query & tfkeys:
                 idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
                 score += idf * tf[t] * 2.2 / (tf[t] + 1.2 * (0.25 + 0.75 * len(terms) / avg))
             if score > 0:
@@ -1274,7 +1314,29 @@ class KnowledgeBase:
         if not scored:
             return []
         top = scored[0][0]
-        return [{"page": s, "score": round(sc, 3), **c} for sc, s, c in scored[:limit] if sc >= 0.45 * top]
+        return [{"page": s, "score": round(sc, 3), **copy.deepcopy(c)}
+                for sc, s, c in scored[:limit] if sc >= 0.45 * top]
+
+    @staticmethod
+    def _bm25_index(pages):
+        docs = []
+        for slug, p in pages.items():
+            if p["type"] != "page":
+                continue
+            for c in p["claims"]:
+                if c.get("flag") != "superseded":
+                    terms = _terms(c["text"]) + _terms(p["title"])
+                    tf = Counter(terms)
+                    docs.append((slug, c, terms, tf, frozenset(tf)))
+        if not docs:
+            return docs, 0, 0.0, Counter(), {}
+        avg = sum(len(d[2]) for d in docs) / len(docs)
+        df, where = Counter(), {}
+        for i, d in enumerate(docs):
+            for t in d[4]:
+                df[t] += 1
+                where.setdefault(t, []).append(i)
+        return docs, len(docs), avg, df, where
 
     def ask(self, question, file=True, llm=None):
         """Answer from claims; a good answer (two or more claims) is filed back as a page."""
@@ -1283,7 +1345,7 @@ class KnowledgeBase:
             raise ValueError("Ask something.")
         self.event("you", "ask", "", question)
         with self.lock():
-            hits = self.retrieve(question, pages=self.pages())
+            hits = self.retrieve(question)
         if not hits:
             answer = "Nothing in the wiki covers that yet. Give the reader a source about it."
             self.event("librarian", "answer", "", answer, cited=[])
@@ -1328,7 +1390,7 @@ class KnowledgeBase:
                                  creationflags=NO_WINDOW).stdout.strip()
         except (OSError, subprocess.TimeoutExpired):
             return None
-        cited = set(re.findall(r"\[(c[0-9a-f]{6})\]", out))
+        cited = set(re.findall(r"\[(c[0-9a-f]{6,16})\]", out))
         return out if out and cited and cited <= {h["id"] for h in hits} else None
 
     def _file_answer(self, question, answer, hits, pages):
@@ -1464,7 +1526,7 @@ class KnowledgeBase:
 
     def recall(self, text, limit=4):
         lines = []
-        for hit in self.retrieve(text, limit=limit, pages=self.pages(shared=True)):
+        for hit in self.retrieve(text, limit=limit):
             mark = " DISPUTED" if hit.get("flag") == "conflict" else (
                 " UNCONFIRMED" if hit.get("flag") == "unconfirmed" else "")
             lines.append(f"[wiki {hit['page']}] {hit['text']} ({', '.join(hit['sources'])}, "

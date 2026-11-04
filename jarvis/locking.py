@@ -2,12 +2,14 @@
 
 import errno
 import os
+import time
 from contextlib import contextmanager
 
 
 @contextmanager
-def exclusive_lock(path):
-    """Nonblocking lock; keep the file so waiters always lock the same inode.
+def exclusive_lock(path, timeout=0.0, poll=0.05):
+    """Nonblocking lock (or, with `timeout`, retried until then); keep the file so waiters
+    always lock the same inode.
 
     Intended for state on a local filesystem, not distributed network storage.
     The open handle owns the lock; a leftover file does not mean a stale owner.
@@ -16,19 +18,26 @@ def exclusive_lock(path):
         if handle.tell() == 0:
             handle.write(b"\0")
             handle.flush()
-        try:
-            if os.name == "nt":
-                import msvcrt
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
-                raise
-            raise ValueError("Plan is busy in another run or recovery. Try again after "
-                             "that operation finishes.") from exc
+        deadline = None  # the clock is read only when someone else holds the lock
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if deadline is None:
+                    deadline = time.monotonic() + timeout
+                if time.monotonic() >= deadline:
+                    raise ValueError("Plan is busy in another run or recovery. Try again after "
+                                     "that operation finishes.") from exc
+                time.sleep(poll)
         try:
             yield
         finally:

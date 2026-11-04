@@ -318,6 +318,7 @@ class LiveMic:
         self._queue = queue
         self.tuning = tuning or {}
         self.level = 0.0  # RMS of the newest block, for the setup screen's meter
+        self.peak = 0.0   # loudest block since take_peak(), for the console's wave
         self.block = VAD_CHUNK if _vad_model() else FRAME
         self.blocks = queue.Queue(maxsize=max(1, int(backlog * RATE / self.block)))
         if stream is None:
@@ -335,6 +336,8 @@ class LiveMic:
     def _callback(self, data, frames, time_info, status):
         chunk = data[:, 0].copy()
         self.level = float((chunk ** 2).mean()) ** 0.5
+        if self.level > self.peak:
+            self.peak = self.level
         while True:
             try:
                 self.blocks.put_nowait(chunk)
@@ -350,6 +353,11 @@ class LiveMic:
             return self.blocks.get(timeout=5)
         except self._queue.Empty:
             raise RuntimeError("The microphone stopped sending audio.") from None
+
+    def take_peak(self):
+        """The loudest block since the last call (0 when none arrived), then reset."""
+        peak, self.peak = self.peak, 0.0
+        return peak
 
     def flush(self):
         """Drop queued audio, e.g. what the mic heard while JARVIS was talking."""
@@ -449,7 +457,7 @@ class VoicePrint:
         learned = (profile[len(pinned):] + [embedding.tolist()])[-room:]
         data["profile"] = pinned + learned
         data["embedding"] = self._unit(np.mean(data["profile"], axis=0)).tolist()
-        self._save(data)
+        self._save(data, keep_threshold=True)
 
     def learn(self):
         """Add the last verified clip: called once the transcript also starts with 'Jarvis',
@@ -458,9 +466,15 @@ class VoicePrint:
             self._add(self._load(), self.last_embedding)
             self.last_embedding = None
 
-    def _save(self, data):
+    def _save(self, data, keep_threshold=False):
         # voice service and console transcribe both read and write this file
         from .fsio import atomic_write
+        try:  # learning: the threshold is Settings' to change, so keep what the file holds now
+            current = json.loads(self.path.read_text(encoding="utf-8")) if keep_threshold else {}
+            if "threshold" in current:
+                data = {**data, "threshold": current["threshold"]}
+        except (OSError, ValueError):
+            pass
         atomic_write(self.path, json.dumps(data))
 
     def _load(self):
@@ -547,15 +561,84 @@ def _expose_cuda_dlls():
             os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
 
 
+class Moonshine:
+    """Moonshine ONNX (pip: useful-moonshine-onnx), English only. Whisper pads every clip
+    to 30 s, so on this CPU a 2 s command cost ~2.5 s with small.en; Moonshine encodes
+    only the audio it gets (~0.2-0.8 s here, measured 2026-11-04). Loaded on first use."""
+
+    def __init__(self, name="base"):
+        self.name, self._model, self._tok = name, None, None
+
+    def __call__(self, audio):
+        if self._model is None:
+            from moonshine_onnx import MoonshineOnnxModel, load_tokenizer
+            self._model, self._tok = MoonshineOnnxModel(model_name=self.name), load_tokenizer()
+        import numpy as np
+        audio = np.asarray(audio, dtype="float32")
+        if len(audio) < RATE // 10:  # the model takes 0.1-64 s
+            return ""
+        return self._tok.decode_batch(self._model.generate(audio[:64 * RATE][None]))[0].strip()
+
+
+def plausible(text, seconds):
+    """False for what a small model emits on noise: too many words for the time spoken,
+    or one word looping ("the the the the the")."""
+    words = text.split()
+    if not words or len(words) > seconds * 6 + 3:
+        return False
+    run = 1
+    for a, b in zip(words, words[1:]):
+        run = run + 1 if a.lower() == b.lower() else 1
+        if run > 4:
+            return False
+    return True
+
+
 class Transcriber:
     def __init__(self, config=None):
         cfg = (config or {}).get("voice", {})
         self.model_name = cfg.get("stt_model", "large-v3-turbo")
         self.language = cfg.get("language", "en")
+        # voice.stt_engine "moonshine": try Moonshine first and keep its words only when
+        # they carry the wake word; anything else (no "Jarvis", noise, a failure) is
+        # transcribed by Whisper as before, so a misheard wake word is never lost.
+        self.engine = cfg.get("stt_engine", "whisper")
+        self.fast = Moonshine(cfg.get("moonshine_model", "base")) \
+            if self.engine == "moonshine" and self.language.startswith("en") else None
         self._model, self.device = None, None
         self._stats = {}
+        self.last_engine = None
 
     def __call__(self, audio):
+        if self.fast is not None and self.device != "cuda":  # Whisper on a GPU is fast already
+            text = self._try_fast(audio)
+            if text is not None:
+                return text
+        self.last_engine = "whisper"
+        return self._whisper(audio)
+
+    def _try_fast(self, audio):
+        """Moonshine's words when they hold the wake word, else None (Whisper decides)."""
+        from .assistant import wake_word
+        try:
+            text = self.fast(audio)
+        except Exception:
+            self.fast = None  # missing package or model: Whisper only from now on
+            return None
+        if not plausible(text, len(audio) / RATE) or wake_word(text) is None:
+            return None
+        # No log probabilities from Moonshine: unsure() sees None and lets it through.
+        self.last = {"logprob": None, "no_speech": None, "engine": "moonshine"}
+        self._remember(audio, self.last)
+        self.last_engine = "moonshine"
+        return text
+
+    def _remember(self, audio, stats):
+        self._stats[id(audio)] = stats
+        while len(self._stats) > 8:
+            self._stats.pop(next(iter(self._stats)))
+
+    def _whisper(self, audio):
         if self._model is None:
             _expose_cuda_dlls()
             try:
@@ -592,9 +675,7 @@ class Transcriber:
         self.last = {"logprob": (sum(s.avg_logprob * len(s.tokens) for s in segments) / tokens
                                  if tokens else None),
                      "no_speech": max((s.no_speech_prob for s in segments), default=None)}
-        self._stats[id(audio)] = self.last
-        while len(self._stats) > 8:
-            self._stats.pop(next(iter(self._stats)))
+        self._remember(audio, self.last)
         return " ".join(s.text.strip() for s in segments).strip()
 
     def stats(self, audio):

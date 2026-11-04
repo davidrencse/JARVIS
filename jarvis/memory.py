@@ -217,19 +217,31 @@ class Memory:
             raise ValueError("importance must be between 0 and 1.")
         title = (title or body.strip().splitlines()[0])[:200]
         created = _now()
-        item_id = f"{kind}:{created:%Y%m%d}:{secrets.token_hex(3)}"
-        salt = item_id if kind in EVENT_KINDS else ""
-        digest = hashlib.sha256((body + salt).encode("utf-8")).hexdigest()
         with self.connect() as db:
-            existing = db.execute("SELECT id FROM items WHERE kind=? AND digest=?",
-                                  (kind, digest)).fetchone()
-            if existing:
-                item_id = existing["id"]
+            # INSERT OR IGNORE: another process (the voice daemon and the console share this
+            # file) may add the same fact between our look-up and insert, or draw the same id.
+            for _ in range(8):
+                item_id = f"{kind}:{created:%Y%m%d}:{secrets.token_hex(3)}"
+                salt = item_id if kind in EVENT_KINDS else ""
+                digest = hashlib.sha256((body + salt).encode("utf-8")).hexdigest()
+                existing = db.execute("SELECT id FROM items WHERE kind=? AND digest=?",
+                                      (kind, digest)).fetchone()
+                if existing:
+                    item_id = existing["id"]
+                    break
+                made = db.execute("INSERT OR IGNORE INTO items VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                  (item_id, kind, title, body, " ".join(tags), source,
+                                   float(importance), json.dumps(meta or {}), digest,
+                                   created.isoformat()))
+                if made.rowcount:
+                    break
+                existing = db.execute("SELECT id FROM items WHERE kind=? AND digest=?",
+                                      (kind, digest)).fetchone()
+                if existing:  # lost the race to an identical item
+                    item_id = existing["id"]
+                    break
             else:
-                db.execute("INSERT INTO items VALUES(?,?,?,?,?,?,?,?,?,?)",
-                           (item_id, kind, title, body, " ".join(tags), source,
-                            float(importance), json.dumps(meta or {}), digest,
-                            created.isoformat()))
+                raise RuntimeError("Could not store the memory item (id clash).")
             for rel, dst in links:
                 self._link(db, item_id, dst, rel)
         return self.get(item_id)
@@ -332,6 +344,8 @@ class Memory:
         terms = set(_terms(text))
         target = None
         for known in self.knowledge((kind,), limit=500):
+            if known["id"] in replaces:  # being replaced, never merged into
+                continue
             if known["id"] == same_as or _jaccard(terms, set(_terms(known["text"]))) >= RECALL_DUPLICATE:
                 target = known["id"]
                 break
@@ -363,12 +377,16 @@ class Memory:
             return None
         since = (_now() - timedelta(minutes=minutes)).isoformat()
         with self.connect() as db:
-            rows = {r["kind"]: r for r in db.execute(
-                "SELECT id, kind, body FROM items WHERE kind IN ('message','reply') AND created_at >= ? "
-                "ORDER BY created_at DESC, rowid DESC LIMIT 2", (since,))}
-        asked, answered = rows.get("message"), rows.get("reply")
-        if asked is None:
-            return None  # nothing recent to correct
+            asked = db.execute(
+                "SELECT id, kind, body FROM items WHERE kind='message' AND created_at >= ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1", (since,)).fetchone()
+            if asked is None:
+                return None  # nothing recent to correct
+            # Its own reply, by the answers link: not whichever reply happens to be newest.
+            answered = db.execute(
+                "SELECT i.id, i.kind, i.body FROM links l JOIN items i ON i.id=l.src "
+                "WHERE l.dst=? AND l.rel='answers' AND i.kind='reply' "
+                "ORDER BY i.created_at DESC, i.rowid DESC LIMIT 1", (asked["id"],)).fetchone()
         body = (f'David corrected JARVIS. He had asked: "{_clip(asked["body"], 200)}"'
                 + (f'; JARVIS answered: "{_clip(answered["body"], 200)}"' if answered else "")
                 + f'. His correction: "{_clip(text, 200)}".')
@@ -471,6 +489,8 @@ class Memory:
         request ever waits for the first full index. No-op when semantic recall is off."""
         if self.semantic:
             self._index_in_background()
+            from .decide import warm
+            warm("recall")  # the vault recall gate's vectors: ~2.6 s on the first recall otherwise
 
     def _index_in_background(self):
         """Embed unindexed items off the request path. One worker per database file; a call
@@ -551,9 +571,14 @@ class Memory:
         waits on embedding (except the very first one, while nothing is indexed). Items not embedded yet simply rank by keyword alone."""
         from .embed import MODEL, embed
         import numpy as np
-        query = embed([text])
-        if query is None:
-            return None
+        last = getattr(self, "_last_query", None)
+        if last and last[0] == (text, MODEL):  # one request is searched up to three times
+            query = last[1]
+        else:
+            query = embed([text])
+            if query is None:
+                return None
+            self._last_query = ((text, MODEL), query)
         if index:
             self.index_vectors(limit=25)  # warm_vectors() does the bulk in the background
         cache = self._vectors(MODEL)
@@ -785,6 +810,9 @@ class MemoryTools:
                 text = " ".join(str(args.get("text") or "").split())
                 if not text:
                     return False, "Nothing to remember."
+                if PROFILE_ORDER.search(text):
+                    return False, ("Not saved: a memory describes David or what happened; links, "
+                                   "commands and standing orders to act don't belong here.")
                 item = self.memory.add("fact", text, title=text[:80], tags=["remembered"],
                                        source=self.channel, importance=0.8)
                 return True, f"Remembered ({item['id']})."

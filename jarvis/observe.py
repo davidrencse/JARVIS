@@ -598,8 +598,12 @@ def app_match(window, query, words=()):
     if any(part in names for part in parts):
         return 3
     said = names[0]
-    if (len(said) >= 4 and said not in CLASS_NOISE and any(said in part for part in parts)) or \
-            any(len(part) >= 3 and part in words for part in parts):
+    # A multi-word name ("visual studio code") needs all its words among the class parts,
+    # or "vs code" would match Android Studio's "jetbrains-studio".
+    needed = {w for w in words if len(w) >= 3}
+    word_hit = any(len(part) >= 3 and part in words for part in parts) and (
+        len(words) < 2 or needed <= set(parts))
+    if (len(said) >= 4 and said not in CLASS_NOISE and any(said in part for part in parts)) or word_hit:
         return 2
     return 1 if said and said in _flat(window.get("title") or "") else 0
 
@@ -642,9 +646,12 @@ def matches(predicate, listed):
             hit = next((w for w, t in titles if query in _flat(t)), None)
         return bool(hit), hit["app"].split()[0] if hit and hit["app"] else None
     query = _flat(predicate["app"])
-    hits = [w for w in listed if _is_app(w, query)]
-    if kind == "gone":
-        return not hits, None
+    hits = [w for w in listed if app_match(w, query) >= 2]
+    if kind == "gone":  # close_app never closes a browser tab titled with the name, so it
+        return not hits, None  # doesn't count as the app still being open
+    if not hits:  # no app/class match: a browser window titled with the name still counts,
+        # but a terminal titled "nvim discord_bot.py" does not
+        hits = [w for w in listed if is_browser(w["app"]) and app_match(w, query) == 1]
     if kind == "focused":
         hits = [w for w in hits if w["focused"]]
     return bool(hits), hits[0]["app"].split()[0] if hits and hits[0]["app"] else None
