@@ -47,8 +47,14 @@ def handle(tools, message):
         result = {"tools": [{"name": s["name"], "description": s["description"],
                              "inputSchema": s["inputSchema"]} for s in tools.specs()]}
     elif method == "tools/call":
-        ok, text = tools.call(str(params.get("name", "")), params.get("arguments") or {})
-        result = {"content": [{"type": "text", "text": text}], "isError": not ok}
+        try:
+            ok, text = tools.call(str(params.get("name", "")), params.get("arguments") or {})
+        except Exception as exc:  # one failing tool must not end the MCP session
+            ok, text = False, f"{type(exc).__name__}: {exc}"
+        content = [{"type": "text", "text": str(text)}]
+        if getattr(text, "b64", None):  # control.ToolImage: a screenshot for the model
+            content.append({"type": "image", "data": text.b64, "mimeType": text.mime})
+        result = {"content": content, "isError": not ok}
     else:
         return {"jsonrpc": "2.0", "id": rid,
                 "error": {"code": -32601, "message": f"Method not found: {method}"}}
