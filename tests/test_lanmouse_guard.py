@@ -122,6 +122,43 @@ class GuardTests(unittest.TestCase):
         stopped = [c.args for c in run.call_args_list if "stop" in c.args]
         self.assertEqual(stopped, [("systemctl", "--user", "stop", "lan-mouse.service")])
 
+    def boot_step(self, near, boot):
+        return sharedinput.guard(self.state, nearby=lambda: {"near": near, "peer": "Dell", "why": "test."},
+                                 status_fn=lambda: {"running": self.running},
+                                 start_fn=lambda: (self.calls.append("start"), setattr(self, "running", True)),
+                                 stop_fn=lambda: (self.calls.append("stop"), setattr(self, "running", False)),
+                                 autostart=True, boot=boot)
+
+    def test_autostart_after_boot_when_together(self):
+        self.running = False
+        self.assertIsNone(self.boot_step(True, 1000.0)["action"])
+        self.assertEqual(self.boot_step(True, 1001.5)["action"], "started")  # jitter: same boot
+        self.assertEqual(self.calls, ["start"])
+
+    def test_autostart_waits_while_apart(self):
+        self.running = False
+        for _ in range(3):
+            self.boot_step(False, 1000.0)
+        self.assertEqual(self.calls, [])
+        self.boot_step(True, 1000.0); self.boot_step(True, 1000.0)
+        self.assertEqual(self.calls, ["start"])
+
+    def test_stop_by_hand_sticks_until_next_boot(self):
+        self.running = False
+        self.boot_step(True, 1000.0); self.boot_step(True, 1000.0)
+        self.running = False                          # David stops it
+        for _ in range(3):
+            self.boot_step(True, 1000.0)
+        self.assertEqual(self.calls, ["start"])
+        self.boot_step(True, 9000.0); self.boot_step(True, 9000.0)  # rebooted
+        self.assertEqual(self.calls, ["start", "start"])
+
+    def test_autostart_off_never_starts(self):
+        self.running = False
+        for _ in range(3):
+            self.step(True)
+        self.assertEqual(self.calls, [])
+
     def test_memo_survives_between_runs(self):
         self.step(False)
         self.assertEqual(json.loads((self.state / sharedinput.GUARD_FILE).read_text())["apart"], 1)

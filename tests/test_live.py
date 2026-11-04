@@ -199,7 +199,7 @@ class ConsoleLiveTests(Temp):
         console = Console(CONFIG, ROOT, self.base)
         console._lane = Brain()
         sub, _ = console.bus.subscribe()
-        self.assertEqual(console.route("hello there")["handler"], "ChatGPT brain")
+        self.assertEqual(console.route("tell me a joke")["handler"], "ChatGPT brain")
         job = console.submit("what is the capital of Mongolia")  # not a local-clock question
         for _ in range(500):
             if job["state"] != "running":

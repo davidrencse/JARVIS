@@ -65,6 +65,23 @@ class PredicateTests(unittest.TestCase):
         self.assertIsNone(observe.predicate_for(self.cmd("volume", level="")))
 
 
+class AppOnlyPredicateTests(unittest.TestCase):
+    kitty = win("kitty", "nvim discord_bot.py")
+
+    def test_terminal_title_is_not_the_app(self):
+        self.assertFalse(observe.matches({"kind": "window", "app": "discord"}, [self.kitty])[0])
+        self.assertTrue(observe.matches({"kind": "gone", "app": "discord"}, [self.kitty])[0])
+        listed = [self.kitty, win("discord", "General")]
+        self.assertEqual(observe.matches({"kind": "window", "app": "discord"}, listed),
+                         (True, "discord"))
+
+    def test_multi_word_name_needs_every_word(self):
+        studio = win("jetbrains-studio", "MyApp")
+        self.assertEqual(observe.app_match(studio, "visual studio code", {"visual", "studio", "code"}), 0)
+        self.assertEqual(observe.app_match(win("code-oss", "x"), "visual studio code",
+                                           {"visual", "studio", "code"}), 3)
+
+
 class ValidateTests(unittest.TestCase):
     def test_good(self):
         p = {"kind": "title", "text": "youtube"}
@@ -109,6 +126,11 @@ class MatchTests(unittest.TestCase):
     def test_gone(self):
         self.assertTrue(observe.matches({"kind": "gone", "app": "notepad"}, self.listed)[0])
         self.assertFalse(observe.matches({"kind": "gone", "app": "spotify"}, self.listed)[0])
+
+    def test_gone_ignores_browser_tab_named_like_the_app(self):
+        listed = [win("google-chrome", "Spotify - Web Player: Music for everyone - Google Chrome")]
+        self.assertEqual(observe.matches({"kind": "gone", "app": "Spotify"}, listed), (True, None))
+        self.assertTrue(observe.matches({"kind": "window", "app": "Spotify"}, listed)[0])
 
 
 class CheckTests(unittest.TestCase):

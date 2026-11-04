@@ -219,5 +219,29 @@ class ClipTests(Case):
                 _public(url)
 
 
+
+class LanRefusalTests(unittest.TestCase):
+    def test_refuses_an_address_on_this_computers_lan(self):
+        import ipaddress
+        from unittest import mock
+        infos = [(2, 1, 6, "", ("172.1.1.5", 80))]  # global to Python, but David's home LAN
+        net = ipaddress.ip_network("172.1.0.0/16")
+        with mock.patch("jarvis.vault.socket.getaddrinfo", return_value=infos), \
+             mock.patch("jarvis.sharedinput.local_networks", return_value=[net]):
+            with self.assertRaises(ValueError):
+                _public("http://router.lan/admin")
+        with mock.patch("jarvis.vault.socket.getaddrinfo", return_value=infos), \
+             mock.patch("jarvis.sharedinput.local_networks", return_value=[]):
+            self.assertEqual(_public("http://router.lan/admin"), tuple(infos))
+
+    def test_refuses_nat64_wrapped_addresses(self):
+        from unittest import mock
+        infos = [(10, 1, 6, "", ("64:ff9b::ac01:105", 80, 0, 0))]
+        with mock.patch("jarvis.vault.socket.getaddrinfo", return_value=infos), \
+             mock.patch("jarvis.sharedinput.local_networks", return_value=[]):
+            with self.assertRaises(ValueError):
+                _public("http://x.example/")
+
+
 if __name__ == "__main__":
     unittest.main()

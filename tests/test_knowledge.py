@@ -453,5 +453,80 @@ class IntegrationTests(Temp):
         self.assertIn("kb.audit", seen)
 
 
+
+class ClaimIdTests(Temp):
+    def test_new_ids_are_12_hex_and_old_ids_still_parse(self):
+        from jarvis.knowledge import claim_id, CLAIM_LINE
+        self.assertRegex(claim_id("The review routine runs daily."), r"^c[0-9a-f]{12}$")
+        for cid in ("c1a2b3c", "c1a2b3c4d5e6f"):
+            line = f"- Some text. ^{cid} \u2014 source: source-001 \u00b7 confirmed: 2026-09-01"
+            self.assertEqual(CLAIM_LINE.match(line)["id"], cid)
+
+    def test_colliding_id_of_a_different_claim_is_not_reconfirmed(self):
+        from jarvis.knowledge import claim_id
+        real = claim_id
+        first = "The review routine runs daily at 02:00."
+        second = "The vault backup keeps thirty copies on the NAS."
+        with patch("jarvis.knowledge.claim_id", side_effect=lambda t, size=12: real(first, size)):
+            self.kb.ingest(text=first)
+            self.kb.ingest(text=second)
+        texts = [c["text"] for p in self.kb.pages().values() for c in p["claims"]]
+        self.assertEqual(len(texts), 2)
+
+    def test_legacy_six_digit_claim_is_recognised_as_same(self):
+        from jarvis.knowledge import claim_id
+        self.kb.ingest(text=ROUTINES)
+        pages = self.kb.pages()
+        before = sum(len(p["claims"]) for p in pages.values())
+        slug, page = next((s, p) for s, p in pages.items() if p["claims"])
+        for c in page["claims"]:
+            c["id"] = claim_id(c["text"], 6)
+        self.kb._save(pages, {}, "librarian", "legacy ids")
+        self.kb.ingest(text=ROUTINES + "\n\nOne more line about the router.")
+        after = sum(len(p["claims"]) for p in self.kb.pages().values())
+        self.assertLessEqual(after, before + 1)
+
+
+class RelinkOnceTests(Temp):
+    def test_sync_relinks_once_and_single_ingest_relinks_each_time(self):
+        calls = []
+        real = KnowledgeBase._relink
+        with patch.object(KnowledgeBase, "_relink", lambda self, pages: (calls.append(1), real(self, pages))[1]):
+            self.kb.ingest(text=ROUTINES)
+            self.assertEqual(len(calls), 1)
+            self.kb.ingest(text=WEEKLY)
+            self.assertEqual(len(calls), 2)
+            self.kb.ingest(text="# Extra\n\nThe router restarts at night.", relink=False)
+            self.assertEqual(len(calls), 2)
+
+
+class SyncRelinkTests(Temp):
+    def test_vault_sync_relinks_once(self):
+        from jarvis.vault import Vault
+        root = Path(self.tmp.name, "vault3")
+        root.mkdir()
+        for i in range(3):
+            (root / f"note{i}.md").write_text(f"---\ntitle: Note {i}\n---\n# Note {i}\n\n"
+                                              f"Note {i} describes the router number {i}.\n")
+        calls = []
+        real = KnowledgeBase._relink
+        with patch.object(KnowledgeBase, "_relink", lambda self, pages: (calls.append(1), real(self, pages))[1]):
+            result = self.kb.sync_vault(Vault(root, Path(self.tmp.name, "vstate3")))
+        self.assertEqual(len(result["added"]), 3)
+        self.assertEqual(len(calls), 1)
+
+
+class RetrieveCacheTests(Temp):
+    def test_cached_retrieve_matches_uncached_and_follows_changes(self):
+        self.kb.ingest(text=ROUTINES)
+        self.kb.ingest(text=WEEKLY)
+        for q in ("review routine", "NAS drive backups", "weekly summary Monday", "nothing relevant zebra"):
+            cached = self.kb.retrieve(q)
+            self.assertEqual(cached, self.kb.retrieve(q, pages=self.kb.pages()))
+            self.assertEqual(cached, self.kb.retrieve(q))  # second call hits the cache
+        self.kb.ingest(text="# Zebras\n\nThe zebra enclosure opens at nine.")
+        self.assertTrue(self.kb.retrieve("zebra enclosure"))
+
+
 if __name__ == "__main__":
     unittest.main()

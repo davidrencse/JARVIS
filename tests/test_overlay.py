@@ -18,3 +18,17 @@ class HotkeyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleInstanceTests(unittest.TestCase):
+    def test_second_overlay_is_refused_using_the_thread_safe_last_error(self):
+        from unittest import mock
+        from jarvis import overlay
+        kernel = mock.MagicMock()
+        with mock.patch.object(overlay.os, "name", "nt"), \
+                mock.patch.object(overlay.ctypes, "WinDLL", create=True, return_value=kernel) as windll, \
+                mock.patch.object(overlay.ctypes, "get_last_error", create=True, return_value=183):
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                overlay.run({}, "", "")
+        windll.assert_called_once_with("kernel32", use_last_error=True)
+        kernel.CreateMutexW.assert_called_once()

@@ -210,6 +210,21 @@ class VoiceSetupTest(unittest.TestCase):
 
 
 @unittest.skipIf(np is None, "numpy not installed")
+class KeepFailureTest(VoiceSetupTest):
+    def test_a_failure_while_setting_aside_the_old_setup_does_not_wedge_it(self):
+        from jarvis.onboard import VoiceSetup
+        with tempfile.TemporaryDirectory() as d:
+            setup = VoiceSetup(Path(d), {}, say=lambda line: None, open_mic=lambda t: FakeMic(),
+                               daemon=FakeDaemon(False, Path(d)))
+            with mock.patch.object(setup, "_keep", side_effect=OSError("disk full")):
+                setup.start()
+                setup._thread.join(10)
+            self.assertFalse(setup.view["running"])
+            setup.start()  # a later run is not refused as "already running"
+            setup.cancel()
+            setup._thread.join(10)
+
+
 class SpeechGateTest(unittest.TestCase):
     def gate(self, scores, **kw):
         from jarvis.listen import _SpeechGate
