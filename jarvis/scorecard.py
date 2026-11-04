@@ -37,7 +37,8 @@ DECIDER_MODE = {"act": "act", "agent": "agent", "converse": "converse", "build":
                 "instant": "converse", "vault": "converse"}
 BRAIN_MODE = {**DECIDER_MODE, "clarify": "clarify"}
 RANK = {"allow": 0, "confirm": 1, "ratchet": 1, "deny": 2}
-PARTS = ("parser", "registry", "decider", "vault", "grounding", "brain")
+PARTS = ("parser", "registry", "decider", "vault", "grounding", "judge", "brain")
+JUDGE = Path(__file__).resolve().parent.parent / "tests" / "eval" / "judge.jsonl"
 SHOW = 5  # failures listed per part
 FOLDS = 5  # cross-validation folds for the decider
 
@@ -264,6 +265,24 @@ def score_grounding(path=GROUNDING):
     return _part(rows)
 
 
+def score_judge(cases, path=JUDGE):
+    """brain.judge: does a request get planned? Labelled rows in tests/eval/judge.jsonl, plus
+    every act/instant/vault case as "no plan" (the fast path must never be slowed down)."""
+    from .brain import judge
+    rows = [(c["text"], bool(c["plan"])) for c in _jsonl(path)] if Path(path).is_file() else []
+    rows += [(c["text"], False) for c in cases if c.get("type") in ("act", "instant", "vault")]
+    out = []
+    for text, want in rows:
+        got = judge(text)["plan"]
+        out.append((got == want, None if got == want else {"text": text, "want": want, "got": got}))
+    return _part(out)
+
+
+def _jsonl(path):
+    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("{\"_meta\"")]
+
+
 def sample(cases, size, seed=0):
     """A fixed sample spread over the types, so brain runs compare with each other."""
     rng = random.Random(seed)
@@ -343,6 +362,7 @@ def run(config, base, state, path=CASES, brain=False, size=8, seed=0, save=True)
         notes["grounding"] = "no tests/eval/grounding.jsonl"
     else:
         parts["grounding"] = grounded
+    parts["judge"] = score_judge(cases)
     if brain:
         picked = sample(cases, size, seed)
         scored = score_brain(picked, config, base, origin)
@@ -418,7 +438,7 @@ def render(report, show=SHOW):
             continue
         old = report["previous"].get(name)
         trend = ""
-        if old:
+        if old and part["score"] is not None and old.get("score") is not None:
             delta = part["score"] - old["score"]
             mark = "DROP" if name in report["drops"] else "up" if delta > 1e-9 else "same"
             trend = f"  {mark} {delta:+.3f} vs {old['at']}" + ("" if old["same_cases"] else " (cases changed)")
@@ -428,7 +448,8 @@ def render(report, show=SHOW):
             extra += (f"  at {decide_target():.0%} precision: coverage {part['coverage']:.0%}"
                       + (f" (confidence >= {part['threshold']})" if part["threshold"] else "")
                       + ("  READY" if part["ready"] else "  stays in shadow"))
-        lines.append(f"  {name:<9} {part['score']:.3f}  {part['correct']}/{part['n']}{extra}{trend}")
+        score = "-    " if part["score"] is None else f"{part['score']:.3f}"
+        lines.append(f"  {name:<9} {score}  {part['correct']}/{part['n']}{extra}{trend}")
     for name in PARTS:
         fails = (report["parts"].get(name) or {}).get("fails") or []
         if fails and show:

@@ -9,6 +9,7 @@ Three parts, all read-only:
 """
 
 import importlib.util
+import json
 import os
 import shutil
 import sys
@@ -30,12 +31,12 @@ STATIONS = [
     {"id": "think", "title": "Think", "verb": "answers",
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",
-     "modules": ["chatgpt", "fastlane", "inference", "tools_mcp", "runner", "orchestrator", "prompts", "adapters",
+     "modules": ["chatgpt", "fastlane", "inference", "brain", "tools_mcp", "runner", "orchestrator", "prompts", "adapters",
                  "claude_auth", "grok_preflight", "usage"]},
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput", "peripherals", "connections", "screen"]},
+     "modules": ["actions", "control", "app_ui", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput", "peripherals", "connections", "screen"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by ElevenLabs, falling back to Kokoro, a voice that "
               "runs on this laptop. ElevenLabs' agent also runs live calls from the console.",
@@ -106,6 +107,21 @@ def _has(module):
         return False
 
 
+def config_check(base):
+    """jarvis.config.json is read once at start: a bad edit since then breaks the next start."""
+    path = Path(base) / "jarvis.config.json"
+    fix = "fix the JSON by hand, or restore one of the jarvis.config.json.pre-* backups"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _check("decide", "Config file reads cleanly", False, f"{path.name} is missing", fix)
+    except (OSError, ValueError) as e:
+        return _check("decide", "Config file reads cleanly", False, f"won't parse: {e}"[:160], fix)
+    if not isinstance(data, dict):
+        return _check("decide", "Config file reads cleanly", False, "the top level isn't an object", fix)
+    return _check("decide", "Config file reads cleanly", True, f"{len(data)} sections; the next start will read it")
+
+
 def checks(console):
     from . import daemon
     state, config, out = console.state, console.config, []
@@ -162,7 +178,7 @@ def checks(console):
                       "nothing to rule on" if not open_conflicts else f"{open_conflicts} to rule on",
                       f"{py} kb conflicts   (or the Wiki page)", warn=True))
     sched = snap["checker"]["schedule"]
-    scheduled = sched.get("installed") or sched.get("kind") == "schtasks"
+    scheduled = bool(sched.get("installed"))
     out.append(_check("remember", "Nightly wiki check scheduled", scheduled,
                       f"runs at {sched['at']}" if scheduled else "only runs when you ask",
                       f"{py} kb schedule on", warn=True))
@@ -191,6 +207,7 @@ def checks(console):
     player = os.name == "nt" or any(shutil.which(p) for p in ("pw-play", "paplay", "aplay"))
     out.append(_check("speak", "Speaker output", player, "audio player found" if player else
                       "no audio player", "sudo pacman -S pipewire"))
+    out.append(config_check(console.base))
     usage = console.store.overview(limit=1)
     out.append(_check("log", "Task ledger readable", True, f"{sum(usage['states'].values()) if isinstance(usage.get('states'), dict) else 0} agent runs recorded"))
     return out
@@ -253,3 +270,167 @@ def setup(console):
             "voice": voice.get("engine"), "kokoro_voice": voice.get("kokoro_voice"),
             "stt": voice.get("stt_model"), "platform": sys.platform,
             "python": sys.version.split()[0], "state": str(console.state)}
+
+
+# -- components: the live parts, one card each (ARGONA-style: title, 3-5 key -> value rows) --------
+def _card(cid, title, station, state, rows, note=""):
+    """state: ok (working), warn (needs a look), off (switched off on purpose), fail."""
+    return {"id": cid, "title": title, "station": station, "state": state,
+            "rows": [[str(k), str(v)] for k, v in rows], "note": note}
+
+
+def _safe(build):
+    try:
+        return build()
+    except Exception as exc:  # one broken card never hides the others
+        return _card(getattr(build, "__name__", "card").lstrip("_"), getattr(build, "__name__", "?").strip("_"),
+                     "other", "fail", [["error", type(exc).__name__]], str(exc)[:160])
+
+
+def components(console):
+    """Read-only, quick (no network, no models): what each part is doing right now."""
+    import json as _json
+    import shutil as _shutil
+    config, state = console.config, Path(console.state)
+
+    def last_eval():
+        try:
+            lines = (state / "eval" / "runs.jsonl").read_text(encoding="utf-8").splitlines()
+            runs = [_json.loads(line) for line in lines if line.strip()]
+        except (OSError, ValueError):
+            return {}, {}
+        latest = runs[-1].get("parts", {}) if runs else {}
+        brain = next((r["parts"]["brain"] for r in reversed(runs) if "brain" in r.get("parts", {})), {})
+        return latest, brain
+
+    def _brain():
+        from .inference import LEVELS
+        from .brain import Budget, settings
+        models = config.get("models") or {}
+        name = lambda level: (models.get(LEVELS[level]["chatgpt"]) or LEVELS[level]["default"])
+        orch = settings(config)
+        left = Budget(state, orch["l3_per_5h"]).left()
+        rows = [[f"L{n}", f"{name(n).get('model')} {name(n).get('effort')} / {(models.get('claude') or {}).get(LEVELS[n]['claude'], {}).get('model', LEVELS[n]['claude'])}"]
+                for n in (1, 2, 3)]
+        rows.append(["L3 left / 5h", f"{left} / {orch['l3_per_5h']}"])
+        return _card("brain", "Brain levels", "think", "ok" if orch["enabled"] else "off", rows,
+                     "Hard requests are planned at L3, steps run on L1-L3, checked at L1.")
+
+    def _judge():
+        latest, brain = last_eval()
+        judge = latest.get("judge") or {}
+        parser = latest.get("parser") or {}
+        rows = [["judge", f"{judge.get('correct', '?')} / {judge.get('n', '?')}"],
+                ["parser", f"{parser.get('correct', '?')} / {parser.get('n', '?')}"],
+                ["brain sample", f"{brain.get('correct', '?')} / {brain.get('n', '?')}" if brain else "not run"]]
+        ok = judge.get("score") == 1.0 and parser.get("wrong", 1) == 0
+        return _card("scorecard", "Scorecard", "decide", "ok" if ok else "warn", rows, "jarvis eval (free); --brain uses quota.")
+
+    def _control():
+        from . import control
+        try:
+            backend = type(control.backend()).__name__.lower()
+        except LookupError as exc:
+            backend = f"none ({str(exc)[:40]})"
+        stopped = control._stopped(state)
+        recent = 0
+        try:
+            import time as _t
+            for line in (state / "logs" / "control.jsonl").read_text(encoding="utf-8").splitlines()[-400:]:
+                at = _json.loads(line).get("at", "")
+                if at and _t.mktime(_t.strptime(at, "%Y-%m-%dT%H:%M:%S")) > _t.time() - 600:
+                    recent += 1
+        except (OSError, ValueError):
+            pass
+        return _card("control", "Desktop control", "act", "warn" if stopped else "ok",
+                     [["backend", backend], ["state", "stopped" if stopped else "ready"],
+                      ["actions / 10 min", f"{recent} / {control.MAX_ACTIONS}"], ["stop", "Super+Shift+Esc"]],
+                     "Screenshots, mouse and keyboard. Pauses when you move the mouse.")
+
+    def _chrome():
+        from .actions import MY_CHROME_OFF_LIMITS
+        actions = config.get("actions") or {}
+        on = "chrome" in (actions.get("browser_engines") or [])
+        token = (state / "chrome-extension-token").is_file()
+        return _card("chrome", "Your Chrome", "act", ("ok" if token else "warn") if on else "off",
+                     [["engine", "on" if on else "off"], ["extension token", "saved" if token else "missing"],
+                      ["off-limits sites", len(MY_CHROME_OFF_LIMITS) + len(actions.get("my_chrome_off_limits") or [])],
+                      ["fallback", "JARVIS profile"]], "Playwright MCP through the Bridge extension, with your sign-ins.")
+
+    def _sandbox():
+        from . import terminal
+        args = terminal.sandbox("/tmp")
+        hidden = args.count("--tmpfs") + sum(1 for i, a in enumerate(args) if a == "--ro-bind" and args[i + 1] == "/dev/null")
+        readonly = sum(1 for i, a in enumerate(args) if a == "--ro-bind" and args[i + 1] != "/dev/null")
+        if args:
+            return _card("sandbox", "Terminal sandbox", "act", "ok",
+                         [["engine", "bubblewrap"], ["hidden", f"{hidden} paths"], ["read-only", f"{readonly} paths"],
+                          ["network", "internet, no localhost" if args[0].endswith("pasta")
+                           else "none (install passt)"]],
+                         "Secrets hidden; JARVIS's code, config and the vault read-only.")
+        why = "switched off" if (config.get("terminal") or {}).get("sandbox") is False else \
+            "no bwrap" if not _shutil.which("bwrap") else "not on this OS"
+        return _card("sandbox", "Terminal sandbox", "act", "off" if why == "switched off" else "warn",
+                     [["engine", "none"], ["why", why]], "Only the pattern refusals protect this computer.")
+
+    def _gates():
+        from .gates import asks_now
+        rules = config.get("rules") or {}
+        always = rules.get("always_ask", ["money", "messages"])
+        return _card("gates", "Gates", "decide", "ok",
+                     [["confirm", rules.get("confirm", "ask")], ["always ask", ", ".join(always) or "nothing"],
+                      ["asks now", "yes" if asks_now(config, state) else "no (full auto)"],
+                      ["hard refusals", "credentials, wipes, own files"]],
+                     "What runs unasked, and what never runs.")
+
+    def _cluster():
+        from .release import served_code, current
+        main = (config.get("cluster") or {}).get("main_device", "?")
+        from .cluster import _HUBS
+        hub = _HUBS.get(str(state))
+        nodes = hub.broker.nodes() if hub is not None and getattr(hub, "broker", None) else []
+        want = served_code(state)
+        online = [n for n in nodes if n.get("online")]
+        same = [n for n in online if n.get("code") == want]
+        failed = {}
+        try:
+            failed = _json.loads((state / "code-release-failed.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        rows = [["main", main], ["nodes online", f"{len(online)} / {len(nodes)}" if nodes else "hub not here"],
+                ["same code", f"{len(same)} / {len(online)}" if online else "-"], ["release", (want or "?")[:12]]]
+        bad = failed.get("code") and failed.get("code") != want and failed.get("at", 0) > (current(state).get("at") or 0)
+        return _card("cluster", "Cluster", "machines", "warn" if bad else "ok", rows,
+                     "Jobs to nodes are signed; nodes only get code that passed the tests.")
+
+    def _lanmouse():
+        try:
+            memo = _json.loads((state / "lanmouse-guard.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            memo = {}
+        lm = config.get("lan_mouse") or {}
+        reading = "together" if memo.get("together") else "apart" if memo.get("apart") else "unknown"
+        return _card("lanmouse", "Lan Mouse guard", "machines", "ok" if memo else "off",
+                     [["laptops", reading], ["stopped by guard", "yes" if memo.get("stopped_by_guard") else "no"],
+                      ["autostart", "on" if lm.get("autostart", True) else "off"],
+                      ["off when apart", "on" if lm.get("off_when_apart", True) else "off"]],
+                     "Sharing on when both PCs are together, off when apart.")
+
+    def _memory():
+        vault = config.get("vault") or {}
+        size = lambda p: (state / p).stat().st_size if (state / p).is_file() else 0
+        return _card("memory", "Memory & vault", "remember", "ok",
+                     [["memory db", f"{size('memory.sqlite3') / 1e6:.1f} MB"],
+                      ["vault", "on" if vault.get("enabled", True) and vault.get("path") else "off"],
+                      ["vault writes", "on" if vault.get("write") is True else "off"],
+                      ["recall", "BM25 + vectors"]], "Daily consolidation turns talk into facts, lessons and open loops.")
+
+    def _spotify():
+        players = _shutil.which("playerctl") is not None
+        return _card("spotify", "Spotify", "act", "ok" if players else "warn",
+                     [["play", "track / album / playlist / liked"], ["search", "open.spotify.com in your Chrome"],
+                      ["driver", "MPRIS (playerctl)" if players else "playerctl missing"]],
+                     "Plays exactly what was asked and reports what started.")
+
+    return [_safe(b) for b in (_brain, _judge, _gates, _control, _chrome, _sandbox, _spotify,
+                               _memory, _cluster, _lanmouse)]

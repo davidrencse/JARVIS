@@ -50,6 +50,7 @@ class Store:
                 DROP INDEX IF EXISTS single_running_task;
                 CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state);
                 CREATE INDEX IF NOT EXISTS tasks_created_at ON tasks(created_at);
+                CREATE INDEX IF NOT EXISTS events_task ON events(task_id, seq);
             """)
 
     @contextmanager

@@ -65,6 +65,9 @@ def _get(config, path):
 _SEEN = {}  # config file -> mtime refresh() last copied from
 
 
+_WRITE_LOCK = __import__("threading").Lock()
+
+
 def refresh(config, path):
     """Pick up the console's saves in another process (the voice listener keeps its own
     config): every field that needs no restart is copied from disk into `config` in place,
@@ -97,9 +100,15 @@ def _voiceprint(state):
     return Path(state) / "voice" / "voiceprint.json"
 
 
+_SAVED_CLUSTER = {}  # state dir -> cluster.* values saved to disk that apply at restart
+
+
 def read(config, state):
     """Every editable field with its current value and limits, grouped by section."""
     from .daemon import BORDERLINE
+    saved = _SAVED_CLUSTER.get(str(state))
+    if saved:  # show what was saved, not the running value, or a save looks like it failed
+        config = {**config, "cluster": {**(config.get("cluster") or {}), **saved}}
     defaults = {"voice.near_miss": BORDERLINE, "cluster.tunnel": "reverse"}
     fields = []
     for path, (section, label, help_, kind, extra) in FIELDS.items():
@@ -123,6 +132,29 @@ def read(config, state):
     return {"fields": fields, "machines": machines(config, state), "this_os": label()}
 
 
+def _node_rows(state):
+    """The paired nodes without Broker(state): its constructor runs schema DDL (a write lock
+    on a database the hub is using). Use the running hub's broker, else read the file."""
+    import sqlite3
+    import time
+    from .cluster import _HUBS
+    hub = _HUBS.get(str(state)) or _HUBS.get(str(Path(state).resolve()))
+    if hub is not None and getattr(hub, "broker", None) is not None:
+        return hub.broker.nodes()
+    from .cluster_store import ONLINE
+    db = sqlite3.connect(Path(Path(state) / "cluster.sqlite3").resolve().as_uri() + "?mode=ro",
+                         uri=True, timeout=2)
+    try:
+        rows = db.execute("SELECT id,capabilities,seen,info FROM nodes ORDER BY id").fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        db.close()
+    return [{"id": r[0], "capabilities": json.loads(r[1]), "seen": r[2],
+             "online": bool(r[2] and time.time() - r[2] < ONLINE), **json.loads(r[3] or "{}")}
+            for r in rows]
+
+
 def machines(config, state):
     """Every configured computer with its role, plus live link status when this PC is the
     main: whether the node is paired, online, when it last checked in, and if it runs our code."""
@@ -134,9 +166,8 @@ def machines(config, state):
         local = None
     nodes, code = {}, None
     if local and local == main and (Path(state) / "cluster.sqlite3").is_file():
-        from .cluster_store import Broker
         from .release import served_code
-        nodes, code = {n["id"]: n for n in Broker(state).nodes()}, served_code(state)
+        nodes, code = {n["id"]: n for n in _node_rows(state)}, served_code(state)
     out = []
     for key, d in (config.get("devices") or {}).items():
         item = {"id": key, "label": (d or {}).get("label") or key,
@@ -190,15 +221,21 @@ def write(config, path, state, changes):
     # Saving a value it already has (a slider dropped back) changes nothing to restart for.
     changed = [k for k in clean if current(k) != clean[k]]
     if clean:
-        disk = json.loads(Path(path).read_text(encoding="utf-8"))
-        for target in (disk, config):
-            for key, value in clean.items():
-                *parents, leaf = key.split(".")
-                node = target
-                for part in parents:
-                    node = node.setdefault(part, {})
-                node[leaf] = value
-        save_json(path, disk)
+        with _WRITE_LOCK:  # two rows saved at once must not overwrite each other on disk
+            disk = json.loads(Path(path).read_text(encoding="utf-8"))
+            for target in (disk, config):
+                for key, value in clean.items():
+                    if target is config and key.startswith("cluster."):
+                        continue  # a new main or tunnel applies at restart, not mid-request
+                    *parents, leaf = key.split(".")
+                    node = target
+                    for part in parents:
+                        node = node.setdefault(part, {})
+                    node[leaf] = value
+            save_json(path, disk)
+            moved = {k.split(".", 1)[1]: v for k, v in clean.items() if k.startswith("cluster.")}
+            if moved:
+                _SAVED_CLUSTER.setdefault(str(state), {}).update(moved)
     if threshold is not None:
         print_path = _voiceprint(state)
         data = json.loads(print_path.read_text(encoding="utf-8"))

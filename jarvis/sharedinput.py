@@ -314,6 +314,11 @@ def _windows_launcher():
             / "Programs" / "Startup" / STARTUP_NAME)
 
 
+def _windows_once_launcher():
+    """start-now.vbs: runs bin\\lan-mouse.exe once, no watchdog (login autostart stays off)."""
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "lan-mouse" / "start-now.vbs"
+
+
 def _binary():
     if os.name == "nt":
         patched = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "lan-mouse" / "bin" / "lan-mouse.exe"
@@ -322,9 +327,19 @@ def _binary():
     return str(patched) if patched.is_file() else shutil.which("lan-mouse")
 
 
+def _quick_status():
+    """lan_mouse_status() for polling: Windows swaps the slow PowerShell/CIM query for tasklist
+    (no build type, which the callers of this don't need)."""
+    if os.name == "nt":
+        out = _run("tasklist", "/FI", "IMAGENAME eq lan-mouse.exe", "/FO", "CSV", "/NH", timeout=10)
+        return {"running": "lan-mouse.exe" in out.stdout.lower(), "build": None}
+    return lan_mouse_status()
+
+
 def start():
-    if lan_mouse_status()["running"]:
-        return {"started": False, "note": "Lan Mouse is already running.", **lan_mouse_status()}
+    first = lan_mouse_status()
+    if first["running"]:
+        return {"started": False, "note": "Lan Mouse is already running.", **first}
     if _desktop() == "macos":
         raise ValueError("Start Lan Mouse from its app on macOS.")
     units = _units()
@@ -336,6 +351,10 @@ def start():
     elif os.name == "nt" and _windows_launcher().is_file():
         # The startup launcher also raises its priority and keeps its log, as at login.
         subprocess.Popen(["wscript.exe", str(_windows_launcher())], creationflags=FLAGS, close_fds=True)
+    elif os.name == "nt" and _windows_once_launcher().is_file():
+        # Through Explorer, so the daemon runs outside the calling shell's job (a remote
+        # `lanmouse start` otherwise dies when the node's command shell exits).
+        subprocess.Popen(["explorer.exe", str(_windows_once_launcher())], creationflags=FLAGS, close_fds=True)
     else:
         binary = _binary()
         if not binary:
@@ -350,9 +369,9 @@ def start():
     import time
     for _ in range(20):
         time.sleep(0.25)
-        status = lan_mouse_status()
+        status = _quick_status()
         if status["running"]:
-            return {"started": True, **status}
+            return {"started": True, **(lan_mouse_status() if os.name == "nt" else status)}
     return {"started": False, "note": "Lan Mouse didn't come up; check its log.", **lan_mouse_status()}
 
 
@@ -369,7 +388,8 @@ def stop(sharing_only=False):
         if shutil.which("pkill"):
             _run("pkill", "-x", "lan-mouse")
             _run("pkill", "-x", "lan-mouse-jarvi")
-    return {"stopped": not lan_mouse_status()["running"], **lan_mouse_status()}
+    status = lan_mouse_status()
+    return {"stopped": not status["running"], **status}
 
 
 # -- off while the laptops are apart -----------------------------------------------------------
@@ -382,6 +402,7 @@ def stop(sharing_only=False):
 # This only stops the sharing daemon: each laptop's own keyboard and mouse are untouched.
 GUARD_FILE = "lanmouse-guard.json"
 GUARD_STREAK = 2  # readings in a row before acting (30-60 s apart): a brief relay doesn't flap it
+BOOT_JITTER = 120  # seconds: boot times closer than this are the same boot (Windows derives it from uptime)
 
 
 def _tailscale_status():
@@ -414,33 +435,61 @@ def _private(ip):
 VIRTUAL_IF = re.compile(r"^(lo|tailscale|docker|br-|veth|virbr|vEthernet|Loopback|zt|wg)", re.I)
 
 
-def local_networks():
+def local_networks(families=(4,)):
     """This computer's real LAN subnets (Wi-Fi/Ethernet), virtual and VPN interfaces left out.
     A home LAN can use any range (David's uses 172.1.x, which isn't RFC1918), so "same subnet
-    as me" is the test, not "private address"."""
+    as me" is the test, not "private address". families: IP versions to list; the Lan Mouse
+    guard reads IPv4 only, address checks ask for (4, 6)."""
     import ipaddress
     pairs = []  # (interface, "ip/prefix")
     if os.name == "nt":
+        fam = "" if 6 in families else " -AddressFamily IPv4"
         out = _run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-                   "Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { $_.InterfaceAlias + '|' + "
+                   f"Get-NetIPAddress{fam} | ForEach-Object {{ $_.InterfaceAlias + '|' + "
                    "$_.IPAddress + '/' + $_.PrefixLength }", timeout=10)
         pairs = [tuple(line.strip().rsplit("|", 1)) for line in out.stdout.splitlines() if "|" in line]
     elif shutil.which("ip"):
-        for line in _run("ip", "-4", "-o", "addr").stdout.splitlines():
+        for line in _run("ip", "-o", "addr").stdout.splitlines():
             parts = line.split()
-            if len(parts) >= 4 and parts[2] == "inet":
+            if len(parts) >= 4 and parts[2] in ("inet", "inet6"):
                 pairs.append((parts[1], parts[3]))
+    elif shutil.which("ifconfig"):  # macOS/BSD: no iproute2
+        pairs = _ifconfig_pairs(_run("ifconfig").stdout)
     nets = []
     for name, cidr in pairs:
         if VIRTUAL_IF.match(name or ""):
             continue
         try:
-            net = ipaddress.ip_interface(cidr).network
+            net = ipaddress.ip_interface(re.sub(r"%[^/]*", "", cidr)).network  # drop fe80::1%12 zone
         except ValueError:
             continue
-        if net.prefixlen >= 8 and not net.is_loopback and net.prefixlen < 32:
+        if net.version not in families or net.is_loopback:
+            continue
+        if 8 <= net.prefixlen < net.max_prefixlen:
             nets.append(net)
     return nets
+
+
+def _ifconfig_pairs(text):
+    """(interface, "ip/prefix") from BSD ifconfig: `inet 10.0.0.5 netmask 0xffffff00` and
+    `inet6 fe80::1%en0 prefixlen 64`."""
+    pairs, name = [], ""
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            name = line.split(":", 1)[0]
+            continue
+        parts = line.split()
+        try:
+            if parts[:1] == ["inet"] and "netmask" in parts:
+                mask = parts[parts.index("netmask") + 1]
+                bits = bin(int(mask, 16)).count("1") if mask.startswith("0x") else \
+                    sum(bin(int(o)).count("1") for o in mask.split("."))
+                pairs.append((name, f"{parts[1]}/{bits}"))
+            elif parts[:1] == ["inet6"] and "prefixlen" in parts:
+                pairs.append((name, f"{parts[1].split('%')[0]}/{parts[parts.index('prefixlen') + 1]}"))
+        except (ValueError, IndexError):
+            continue
+    return pairs
 
 
 def _in(ip, nets):
@@ -505,10 +554,15 @@ def _save_memo(path, memo):
         pass
 
 
-def guard(state, nearby=None, status_fn=None, start_fn=None, stop_fn=None):
+def guard(state, nearby=None, status_fn=None, start_fn=None, stop_fn=None, autostart=False, boot=None):
     """One reading: stop Lan Mouse when the laptops are apart, start it again when they're
     back together (only if this guard stopped it). A start by hand while apart is an override:
-    left alone until the laptops have been together again. Returns what it saw and did."""
+    left alone until the laptops have been together again. Returns what it saw and did.
+
+    autostart: on the first reading after each boot (boot = platforms.boot_time()), a stopped
+    Lan Mouse counts as stopped by the guard, so it comes on once the laptops read together
+    and stays off while they're apart. Same on every OS: whatever runs the guard at login
+    (the IP watcher on Linux, the node agent on Windows) is the autostart."""
     nearby = nearby or peer_nearby
     status_fn, start_fn = status_fn or lan_mouse_status, start_fn or start
     stop_fn = stop_fn or (lambda: stop(sharing_only=True))  # never the IP watcher that runs us
@@ -522,6 +576,10 @@ def guard(state, nearby=None, status_fn=None, start_fn=None, stop_fn=None):
     memo["apart"] = memo.get("apart", 0) + 1 if near is False else 0
     memo["together"] = memo.get("together", 0) + 1 if near is True else 0
     running = status_fn()["running"]
+    if autostart and boot is not None and abs(boot - float(memo.get("boot") or 0)) > BOOT_JITTER:
+        memo["boot"] = round(boot)  # once per boot, so a stop by hand later in the session sticks
+        if not running:
+            memo["stopped_by_guard"], memo["override"] = True, False
     if running and memo.get("stopped_by_guard"):
         memo["stopped_by_guard"], memo["override"] = False, True  # David started it by hand
     if near is True:
@@ -542,6 +600,14 @@ def guard(state, nearby=None, status_fn=None, start_fn=None, stop_fn=None):
         _notify(f"Sharing is back on: {reading['why']}")
     return {**reading, "running": status_fn()["running"] if action else running, "action": action,
             "stopped_by_guard": bool(memo.get("stopped_by_guard")), "override": bool(memo.get("override"))}
+
+
+def guard_for(config, state):
+    """guard() with this machine's settings: lan_mouse.autostart (default on) brings sharing
+    up after each boot once the laptops read together."""
+    from .platforms import boot_time
+    on = (config.get("lan_mouse") or {}).get("autostart", True)
+    return guard(state, autostart=bool(on), boot=boot_time() if on else None)
 
 
 def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None):
@@ -566,7 +632,12 @@ def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None):
     restarted = False
     if lan_mouse_status()["running"]:  # it reads the config only at startup
         stop()
-        restarted = bool(start().get("running"))
+        import time as _time
+        for _ in range(20):  # stop() only signals; start() would see the dying daemon and skip
+            if not lan_mouse_status()["running"]:
+                break
+            _time.sleep(0.25)
+        restarted = bool(start().get("started"))
     return {"written": str(path), "backup": str(backup) if backup else None, "restarted": restarted}
 
 
