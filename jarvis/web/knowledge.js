@@ -28,7 +28,11 @@ const view = {
   selected: null, hover: null, pulses: [], snap: null, started: performance.now(), last: "reader :: idle",
   scn: "all", activeUntil: 0, dirty: true,
 };
-const cam = { az: -0.55, el: 0.26, zoom: 1, zoomTo: 1, spin: 0, drag: null };
+const cam = { az: -0.55, el: 0.26, zoom: 1, zoomTo: 1, spin: 0, drag: null,
+  px: 0, py: 0, panTo: null, anchor: null, pan: null };  // px/py: screen-space pan in CSS px
+const ZOOM_MIN = 0.35, ZOOM_MAX = 60;
+// adaptive quality: glow and resolution step down when frames get slow, back up when fast
+const quality = { scale: 1, bloom: true, ema: 16, slowSince: 0, fastSince: 0 };
 let scene = { clusters: [], nodes: [], mesh: new Float32Array(0), meshN: 0, strands: new Float32Array(0), strandN: 0,
   bundles: [], extent: 1, stats: {} };
 
@@ -450,7 +454,7 @@ function project(x, y, z, o) {  // same maths as the shader
   const x1 = x * c.ca - z * c.sa, z1 = x * c.sa + z * c.ca;
   const y2 = y * c.ce - z1 * c.se, z2 = y * c.se + z1 * c.ce;
   const f = c.D / Math.max(c.D - z2, 0.15 * c.D);
-  o.sx = W / 2 + x1 * c.S * f; o.sy = H / 2 + y2 * c.S * f; o.depth = z2; o.f = f;
+  o.sx = W / 2 + cam.px + x1 * c.S * f; o.sy = H / 2 + cam.py + y2 * c.S * f; o.depth = z2; o.f = f;
   return o;
 }
 let timeNow = 0;
@@ -471,7 +475,7 @@ function projectAll() {
 const canvas = $("graph"), labels = $("graph-labels"), octx = labels.getContext("2d");
 const COMMON = `#version 300 es
 precision highp float;
-uniform mat3 u_rot; uniform vec2 u_res; uniform float u_S, u_D, u_time, u_breath, u_zoom;
+uniform mat3 u_rot; uniform vec2 u_res, u_pan; uniform float u_S, u_D, u_time, u_breath, u_zoom;
 uniform vec4 u_cc[${MAXC}]; uniform vec4 u_st[${MAXC}]; uniform vec3 u_tc[${MAXC}]; uniform vec3 u_base[${MAXC}];
 vec3 wob(vec3 p, float seed, float R) {
   float k = R * .035 * u_breath;
@@ -480,7 +484,7 @@ vec3 wob(vec3 p, float seed, float R) {
 vec4 proj(vec3 p) {
   vec3 r = u_rot * p;
   float f = u_D / max(u_D - r.z, .15 * u_D);
-  return vec4(u_res * .5 + r.xy * u_S * f, r.z, f);
+  return vec4(u_res * .5 + u_pan + r.xy * u_S * f, r.z, f);
 }
 vec3 bez3(vec3 a, vec3 c, vec3 b, float t) { float u = 1. - t; return u * u * a + 2. * u * t * c + t * t * b; }
 `;
@@ -549,7 +553,7 @@ void main() {
   vec4 P = proj(wob(a_n.xyz, a_n.w, u_cc[cl].w));
   float id = float(gl_InstanceID);
   float hot = (id == u_hover || id == u_sel) ? 1. : 0.;
-  float r = a_nm.y * clamp(P.w * pow(u_zoom, .35), .6, 2.4) * (1. + hot * 1.4) * (1. + .12 * sin(u_time * 1.7 + a_n.w * 30.));
+  float r = a_nm.y * clamp(P.w * pow(u_zoom, .35), .6, 3.2) * (1. + hot * 1.4) * (1. + .12 * sin(u_time * 1.7 + a_n.w * 30.));
   vec2 s = P.xy + q * r * 2.2;
   gl_Position = vec4(s / u_res * 2. - 1., 0., 1.); gl_Position.y = -gl_Position.y;
   float code = a_nm.w;
@@ -580,8 +584,55 @@ void main() {
   o = vec4(v_col.rgb * a, a);
 }`;
 
+const FULL_VS = `#version 300 es
+out vec2 v; void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); v = p; gl_Position = vec4(p * 2. - 1., 0., 1.); }`;
+const BRIGHT_FS = `#version 300 es
+precision highp float; in vec2 v; uniform sampler2D u_tex; uniform vec2 u_px; out vec4 o;
+void main() {  // 4-tap downsample, keep only what is bright enough to glow
+  vec3 c = .25 * (texture(u_tex, v + u_px * vec2(-1, -1)).rgb + texture(u_tex, v + u_px * vec2(1, -1)).rgb
+                + texture(u_tex, v + u_px * vec2(-1, 1)).rgb + texture(u_tex, v + u_px * vec2(1, 1)).rgb);
+  float l = max(c.r, max(c.g, c.b));
+  o = vec4(c * smoothstep(.18, .9, l), 1.);
+}`;
+const BLUR_FS = `#version 300 es
+precision highp float; in vec2 v; uniform sampler2D u_tex; uniform vec2 u_dir; out vec4 o;
+void main() {
+  vec3 c = texture(u_tex, v).rgb * .227;
+  c += (texture(u_tex, v + u_dir * 1.385).rgb + texture(u_tex, v - u_dir * 1.385).rgb) * .316;
+  c += (texture(u_tex, v + u_dir * 3.231).rgb + texture(u_tex, v - u_dir * 3.231).rgb) * .070;
+  o = vec4(c, 1.);
+}`;
+const COMP_FS = `#version 300 es
+precision highp float; in vec2 v; uniform sampler2D u_scene, u_bloom; uniform float u_amt; out vec4 o;
+void main() { o = vec4(texture(u_scene, v).rgb + texture(u_bloom, v).rgb * u_amt, 1.); }`;
+
 const renderer = (() => {
   let gl = null, progs = null, bufs = [], mesh = null, strand = null, nodesVao = null, dynBuf = null, ok = false;
+  let post = null;  // {ms, msRb, scene, sceneTex, a, aTex, b, bTex, w, h, hw, hh}
+  const tex = (w, h) => {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  };
+  const fbo = (t) => { const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); return f; };
+  function setupPost(w, h) {
+    if (!ok) return;
+    if (post) {
+      for (const k of ["sceneTex", "aTex", "bTex"]) gl.deleteTexture(post[k]);
+      for (const k of ["ms", "scene", "a", "b"]) gl.deleteFramebuffer(post[k]);
+      gl.deleteRenderbuffer(post.msRb);
+    }
+    const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1);
+    const msRb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, msRb);
+    gl.renderbufferStorageMultisample(gl.RENDERBUFFER, Math.min(4, gl.getParameter(gl.MAX_SAMPLES)), gl.RGBA8, w, h);
+    const ms = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, ms);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, msRb);
+    const sceneTex = tex(w, h), scene = fbo(sceneTex), aTex = tex(hw, hh), a = fbo(aTex), bTex = tex(hw, hh), b = fbo(bTex);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    post = { ms, msRb, scene, sceneTex, a, aTex, b, bTex, w, h, hw, hh };
+  }
   const program = (vs, fs) => {
     const p = gl.createProgram();
     for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
@@ -604,7 +655,11 @@ const renderer = (() => {
 
   try {
     gl = canvas.getContext("webgl2", { alpha: false, antialias: true, premultipliedAlpha: true });
-    if (gl) { progs = { edge: program(EDGE_VS, EDGE_FS), node: program(NODE_VS, NODE_FS) }; ok = true; }
+    if (gl) {
+      progs = { edge: program(EDGE_VS, EDGE_FS), node: program(NODE_VS, NODE_FS),
+                bright: program(FULL_VS, BRIGHT_FS), blur: program(FULL_VS, BLUR_FS), comp: program(FULL_VS, COMP_FS) };
+      ok = true;
+    }
   } catch (err) { console.error("knowledge graph: WebGL2 unavailable, using 2D", err); gl = null; ok = false; }
   const ctx2 = ok ? null : canvas.getContext("2d");
 
@@ -646,15 +701,17 @@ const renderer = (() => {
     const u = p.u;
     gl.useProgram(p.p);
     gl.uniformMatrix3fv(u.u_rot, false, camS.rot);
-    gl.uniform2f(u.u_res, W, H); gl.uniform1f(u.u_S, camS.S); gl.uniform1f(u.u_D, camS.D);
+    gl.uniform2f(u.u_res, W, H); gl.uniform2f(u.u_pan, cam.px, cam.py); gl.uniform1f(u.u_S, camS.S); gl.uniform1f(u.u_D, camS.D);
     gl.uniform1f(u.u_time, t); gl.uniform1f(u.u_breath, reduced ? 0 : 1); gl.uniform1f(u.u_zoom, cam.zoom);
     gl.uniform4fv(u["u_cc[0]"], ST.cc); gl.uniform4fv(u["u_st[0]"], ST.cur);
     gl.uniform3fv(u["u_tc[0]"], ST.tc); gl.uniform3fv(u["u_base[0]"], ST.base);
   }
   function draw(t) {
+    const glow = quality.bloom && post && post.w === canvas.width && post.h === canvas.height;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, glow ? post.ms : null);
     gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
-    if (!scene.nodes.length) return;
+    if (!scene.nodes.length) { if (glow) present(false); return; }
     gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
     const hov = view.hover ? view.hover.gi : -1, sel = view.selected && view.selected.gi !== undefined ? view.selected.gi : -1;
     const e = progs.edge; setCommon(e, t);
@@ -666,6 +723,29 @@ const renderer = (() => {
     gl.uniform1f(n.u.u_hover, hov); gl.uniform1f(n.u.u_sel, sel);
     gl.bindVertexArray(nodesVao); gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, scene.nodes.length);
     gl.bindVertexArray(null);
+    if (glow) present(true);
+  }
+  // multisampled scene -> texture -> bright pass (half res) -> blur H, V -> scene + glow on screen
+  function present(withGlow) {
+    gl.disable(gl.BLEND);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, post.ms); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, post.scene);
+    gl.blitFramebuffer(0, 0, post.w, post.h, 0, 0, post.w, post.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    const pass = (prog, target, w, h, bind) => {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target); gl.viewport(0, 0, w, h); gl.useProgram(prog.p); bind(prog.u);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    };
+    const unit = (i, t, loc) => { gl.activeTexture(gl.TEXTURE0 + i); gl.bindTexture(gl.TEXTURE_2D, t); gl.uniform1i(loc, i); };
+    if (withGlow) {
+      pass(progs.bright, post.a, post.hw, post.hh, (u) => { unit(0, post.sceneTex, u.u_tex); gl.uniform2f(u.u_px, 1 / post.w, 1 / post.h); });
+      for (let i = 0; i < 2; i++) {  // two blur rounds: a wide soft halo
+        pass(progs.blur, post.b, post.hw, post.hh, (u) => { unit(0, post.aTex, u.u_tex); gl.uniform2f(u.u_dir, (1.6 + i) / post.hw, 0); });
+        pass(progs.blur, post.a, post.hw, post.hh, (u) => { unit(0, post.bTex, u.u_tex); gl.uniform2f(u.u_dir, 0, (1.6 + i) / post.hh); });
+      }
+    }
+    pass(progs.comp, null, post.w, post.h, (u) => {
+      unit(0, post.sceneTex, u.u_scene); unit(1, post.aTex, u.u_bloom);
+      gl.uniform1f(u.u_amt, withGlow ? clamp(0.85 - 0.12 * Math.log2(Math.max(1, cam.zoom)), 0.35, 0.85) : 0);
+    });
   }
 
   // the fallback: the same scene on a plain 2D canvas
@@ -701,14 +781,19 @@ const renderer = (() => {
 
   return {
     ok, upload, uploadDyn,
-    resize(w, h, ratio) { canvas.width = Math.round(w * ratio); canvas.height = Math.round(h * ratio); },
+    resize(w, h, ratio) {
+      canvas.width = Math.round(w * ratio); canvas.height = Math.round(h * ratio);
+      try { setupPost(canvas.width, canvas.height); } catch (err) { quality.bloom = false; console.warn("knowledge graph: no glow pass", err); }
+    },
     draw(t) { if (ok) draw(t); else draw2D(t); },
   };
 })();
 
 /* ---------- overlay: labels, tags, pulses, tooltip ---------- */
 function resize() {
-  DPR = Math.min(2, window.devicePixelRatio || 1);
+  const device = window.devicePixelRatio || 1;
+  // sharp at any zoom: up to 3x on high-DPI screens, 1.5x supersampling on ordinary ones
+  DPR = Math.min(3, device < 1.5 ? device * 1.5 : device) * quality.scale;
   const box = canvas.getBoundingClientRect();
   W = Math.max(1, box.width); H = Math.max(1, box.height);
   renderer.resize(W, H, DPR);
@@ -766,6 +851,9 @@ function drawOverlay(now) {
   // cluster labels
   for (const cl of scene.clusters.slice().sort((p, q) => p.depth - q.depth)) {
     const dim = ST.cur[cl.i * 4], a = 0.3 + 0.7 * dim, rpx = cl.R * camS.S * cl.f;
+    // zoomed in: a cluster far off screen keeps its label off screen too (no pile-up at the edges)
+    if (cam.zoom > 1.4 && (cl.sx < -rpx - 40 || cl.sx > W + rpx + 40 || cl.sy < -rpx - 40 || cl.sy > H + rpx + 40)) continue;
+    if (cam.zoom > 1.4 && (cl.sx < 0 || cl.sx > W || cl.sy < 0 || cl.sy > H)) continue;
     const name = cl.label, sub = `${cl.n.toLocaleString()} ${cl.group === "mem" || cl.n !== 1 ? "items" : "item"} · ${cl.running > 0 ? "running" : "live"}`;
     c.font = `600 11px ${MONO}`; const w = Math.max(c.measureText(name).width, 80);
     const x = clamp(cl.sx - w / 2, 6, W - w - 6);
@@ -776,6 +864,21 @@ function drawOverlay(now) {
     }
     c.textAlign = "left"; c.fillStyle = `rgba(237,237,237,${a})`; halo(name, x, y);
     c.font = `400 9.5px ${MONO}`; c.fillStyle = `rgba(138,138,138,${a})`; halo(sub, x, y + 12);
+  }
+  // up close: label individual records, biggest first, never overlapping (at most 48)
+  const near = clamp((cam.zoom - 2.2) / 1.6, 0, 1);
+  if (near > 0) {
+    c.font = `500 10px ${MONO}`; c.textAlign = "left";
+    const seen = scene.nodes.filter((n) => n.sx > -20 && n.sx < W + 20 && n.sy > -20 && n.sy < H + 20
+      && ST.cur[n.ci * 4] * (ST.nodeDim[n.gi] ?? 1) > 0.3 && n.label && !(n.kind === "mem" && n.mkind === "kind"))
+      .sort((a, b) => (b.size || 1) * b.f - (a.size || 1) * a.f);
+    let shown = 0;
+    for (const n of seen) {
+      if (shown >= 48) break;
+      const text = clip(n.label, 30), w = c.measureText(text).width, x = n.sx + 6, y = n.sy + 3;
+      if (x + w > W - 4 || !free(x, y - 10, w + 4, 13)) continue;
+      c.fillStyle = `rgba(237,237,237,${(0.35 + 0.5 * near) * clamp(n.f, 0.6, 1)})`; halo(text, x, y); shown++;
+    }
   }
   // pulses from the knowledge bots
   for (const p of view.pulses) {
@@ -847,17 +950,29 @@ function tooltip(n) {
 let frames = 0, fpsAt = performance.now(), lastDraw = 0, lastT = performance.now();
 function frame(now) {
   requestAnimationFrame(frame);
-  const active = cam.drag || now < view.activeUntil || ST.busy || Math.abs(cam.spin) > 1e-5 || Math.abs(cam.zoomTo - cam.zoom) > 0.002 || view.pulses.length;
+  const active = cam.drag || cam.pan || cam.panTo || cam.anchor || now < view.activeUntil || ST.busy || Math.abs(cam.spin) > 1e-5 || Math.abs(cam.zoomTo - cam.zoom) > 0.002 || view.pulses.length;
   $("clock").textContent = new Date().toTimeString().slice(0, 8);
   $("ticker").textContent = `${((now - view.started) / 1000).toFixed(2)}   ${view.last}`;
   if (reduced) { if (!view.dirty && !active) return; }
   else if (!active && !view.dirty && now - lastDraw < 32) return;
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now; lastDraw = now;
   if (!cam.drag) {
-    cam.az += (reduced ? 0 : 0.045 * dt) + cam.spin;
+    const exploring = cam.zoom > 1.6 || Math.hypot(cam.px, cam.py) > 4;  // hold still while you look closely
+    cam.az += (reduced || exploring ? 0 : 0.045 * dt) + cam.spin;
     cam.spin *= 0.94; if (Math.abs(cam.spin) < 1e-5) cam.spin = 0;
   }
+  const z0 = cam.zoom;
   cam.zoom += (cam.zoomTo - cam.zoom) * (reduced ? 1 : 0.18);
+  if (cam.anchor && z0 > 0) {  // the point under the cursor stays under the cursor
+    const k = cam.zoom / z0, ax = cam.anchor.x - W / 2, ay = cam.anchor.y - H / 2;
+    cam.px = ax - (ax - cam.px) * k; cam.py = ay - (ay - cam.py) * k;
+    if (Math.abs(cam.zoomTo - cam.zoom) < 0.002) cam.anchor = null;
+  }
+  if (cam.panTo) {
+    cam.px += (cam.panTo.x - cam.px) * (reduced ? 1 : 0.16); cam.py += (cam.panTo.y - cam.py) * (reduced ? 1 : 0.16);
+    if (Math.hypot(cam.panTo.x - cam.px, cam.panTo.y - cam.py) < 0.5) { cam.px = cam.panTo.x; cam.py = cam.panTo.y; cam.panTo = null; }
+  }
+  tuneQuality(now, dt);
   timeNow = reduced ? 0 : (now - view.started) / 1000;
   const nodesChanged = easeState(dt);
   if (nodesChanged) renderer.uploadDyn();
@@ -868,7 +983,28 @@ function frame(now) {
   frames++;
   if (now - fpsAt > 1000) { $("fps").textContent = `${frames}FPS`; frames = 0; fpsAt = now; }
   const deg = (((cam.az * 180) / Math.PI + 180) % 360) - 180;
-  $("graph-angle").textContent = `AZ ${deg.toFixed(1)}° Z ${Math.round(cam.zoom * 100)}`;
+  $("graph-angle").textContent = `AZ ${deg.toFixed(1)}° · ZOOM ${cam.zoom < 10 ? cam.zoom.toFixed(1) : Math.round(cam.zoom)}× · ${quality.bloom ? "GLOW" : "FAST"} ${Math.round(DPR * 10) / 10}x`;
+}
+function tuneQuality(now, dt) {
+  // Only frames that really animate count (the loop idles otherwise).
+  quality.ema = quality.ema * 0.9 + dt * 1000 * 0.1;
+  if (quality.ema > 26) {           // under ~38 fps: give up glow first, then resolution
+    quality.fastSince = 0;
+    if (!quality.slowSince) quality.slowSince = now;
+    if (now - quality.slowSince > 1500) {
+      quality.slowSince = now;
+      if (quality.bloom) quality.bloom = false;
+      else if (quality.scale > 0.6) { quality.scale = Math.max(0.6, quality.scale * 0.8); resize(); }
+    }
+  } else if (quality.ema < 17) {    // ~60 fps with room to spare: earn it back slowly
+    quality.slowSince = 0;
+    if (!quality.fastSince) quality.fastSince = now;
+    if (now - quality.fastSince > 5000) {
+      quality.fastSince = now;
+      if (quality.scale < 1) { quality.scale = Math.min(1, quality.scale / 0.8); resize(); }
+      else if (!quality.bloom) quality.bloom = true;
+    }
+  } else { quality.slowSince = 0; quality.fastSince = 0; }
 }
 
 /* ---------- interaction ---------- */
@@ -887,16 +1023,31 @@ const poke = () => { view.activeUntil = performance.now() + 700; view.dirty = tr
 canvas.addEventListener("pointerdown", (e) => {
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   canvas.setPointerCapture(e.pointerId);
-  if (pointers.size === 2) { const [p, q] = [...pointers.values()]; pinch = Math.hypot(p.x - q.x, p.y - q.y); cam.drag = null; return; }
-  cam.spin = 0; cam.drag = { x: e.clientX, y: e.clientY, az: cam.az, el: cam.el, moved: false, vx: 0, t: e.timeStamp };
+  if (pointers.size === 2) {
+    const [p, q] = [...pointers.values()]; pinch = Math.hypot(p.x - q.x, p.y - q.y);
+    cam.drag = null; cam.pan = { x: (p.x + q.x) / 2, y: (p.y + q.y) / 2, px: cam.px, py: cam.py }; return;
+  }
+  cam.spin = 0; cam.panTo = null;
+  if (e.button === 1 || e.button === 2 || e.shiftKey) {  // shift, right or middle drag: pan
+    cam.pan = { x: e.clientX, y: e.clientY, px: cam.px, py: cam.py, moved: false };
+    canvas.style.cursor = "move"; poke(); return;
+  }
+  cam.drag = { x: e.clientX, y: e.clientY, az: cam.az, el: cam.el, moved: false, vx: 0, t: e.timeStamp };
   poke();
 });
 canvas.addEventListener("pointermove", (e) => {
   const box = canvas.getBoundingClientRect();
   if (pointers.has(e.pointerId)) pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   if (pointers.size === 2) {
-    const [p, q] = [...pointers.values()], d = Math.hypot(p.x - q.x, p.y - q.y);
-    if (pinch) zoomBy(d / pinch); pinch = d; poke(); return;
+    const [p, q] = [...pointers.values()], d = Math.hypot(p.x - q.x, p.y - q.y), mx = (p.x + q.x) / 2, my = (p.y + q.y) / 2;
+    if (cam.pan) { cam.px = cam.pan.px + (mx - cam.pan.x); cam.py = cam.pan.py + (my - cam.pan.y); }
+    if (pinch) zoomBy(d / pinch, mx - box.left, my - box.top);
+    pinch = d; if (cam.pan) { cam.pan.x = mx; cam.pan.y = my; cam.pan.px = cam.px; cam.pan.py = cam.py; }
+    poke(); return;
+  }
+  if (cam.pan) {
+    cam.px = cam.pan.px + (e.clientX - cam.pan.x); cam.py = cam.pan.py + (e.clientY - cam.pan.y);
+    view.hover = null; poke(); return;
   }
   if (cam.drag) {
     const dx = e.clientX - cam.drag.x, dy = e.clientY - cam.drag.y;
@@ -914,18 +1065,44 @@ canvas.addEventListener("pointermove", (e) => {
 canvas.addEventListener("pointerup", (e) => {
   const box = canvas.getBoundingClientRect();
   pointers.delete(e.pointerId); pinch = 0;
+  if (cam.pan) { cam.pan = null; canvas.style.cursor = ""; poke(); return; }
   if (cam.drag && !cam.drag.moved) select(nearest(e.clientX - box.left, e.clientY - box.top));
   else if (cam.drag && !reduced && e.timeStamp - cam.drag.t < 80) cam.spin = clamp(cam.drag.vx, -0.08, 0.08);
   cam.drag = null; poke();
 });
-canvas.addEventListener("pointercancel", (e) => { pointers.delete(e.pointerId); pinch = 0; cam.drag = null; });
+canvas.addEventListener("pointercancel", (e) => { pointers.delete(e.pointerId); pinch = 0; cam.drag = null; cam.pan = null; });
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());  // right-drag pans
 canvas.addEventListener("pointerleave", () => { view.hover = null; poke(); });
-const zoomBy = (f) => { cam.zoomTo = clamp(cam.zoomTo * f, 0.45, 5); poke(); };
-canvas.addEventListener("wheel", (e) => { e.preventDefault(); zoomBy(Math.exp(-e.deltaY * 0.0012)); }, { passive: false });
-canvas.addEventListener("dblclick", () => { cam.az = -0.55; cam.el = 0.26; cam.zoomTo = 1; cam.spin = 0; poke(); });
+// Zoom toward a screen point (the cursor, the fingers); no point: toward the centre.
+const zoomBy = (f, x, y) => {
+  cam.zoomTo = clamp(cam.zoomTo * f, ZOOM_MIN, ZOOM_MAX);
+  cam.anchor = x === undefined ? { x: W / 2, y: H / 2 } : { x, y }; cam.panTo = null; poke();
+};
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const box = canvas.getBoundingClientRect(), speed = e.ctrlKey ? 0.01 : 0.0015;  // ctrlKey: a trackpad pinch
+  zoomBy(Math.exp(-e.deltaY * speed), e.clientX - box.left, e.clientY - box.top);
+}, { passive: false });
+function home() { cam.az = -0.55; cam.el = 0.26; cam.zoomTo = 1; cam.spin = 0; cam.anchor = null; cam.panTo = { x: 0, y: 0 }; poke(); }
+function flyTo(n) {  // double-click a record: bring it to the centre and lean in
+  const z = Math.max(cam.zoomTo, Math.min(ZOOM_MAX, cam.zoomTo * 2.6, 8));
+  const k = z / cam.zoom;
+  cam.anchor = null; cam.zoomTo = z;
+  // the node's offset from the centre scales with zoom: aim the pan so it ends at the centre
+  cam.panTo = { x: (cam.px - (n.sx - W / 2)) * k, y: (cam.py - (n.sy - H / 2)) * k }; poke();
+}
+canvas.addEventListener("dblclick", (e) => {
+  const box = canvas.getBoundingClientRect(), n = nearest(e.clientX - box.left, e.clientY - box.top);
+  if (n) { select(n); flyTo(n); } else home();
+});
 canvas.addEventListener("keydown", (e) => {
   const k = { ArrowLeft: () => (cam.az -= 0.1), ArrowRight: () => (cam.az += 0.1), ArrowUp: () => (cam.el = clamp(cam.el - 0.08, -1.25, 1.25)),
-    ArrowDown: () => (cam.el = clamp(cam.el + 0.08, -1.25, 1.25)), "+": () => zoomBy(1.15), "=": () => zoomBy(1.15), "-": () => zoomBy(1 / 1.15) }[e.key];
+    ArrowDown: () => (cam.el = clamp(cam.el + 0.08, -1.25, 1.25)), "+": () => zoomBy(1.25), "=": () => zoomBy(1.25), "-": () => zoomBy(1 / 1.25),
+    "0": () => home() }[e.key];
+  if (e.shiftKey && e.key.startsWith("Arrow")) {  // shift+arrows pan
+    e.preventDefault(); cam.panTo = null;
+    cam.px += { ArrowLeft: 40, ArrowRight: -40 }[e.key] || 0; cam.py += { ArrowUp: 40, ArrowDown: -40 }[e.key] || 0; poke(); return;
+  }
   if (k) { e.preventDefault(); k(); poke(); }
 });
 addEventListener("keydown", (e) => {  // Esc: back to ALL, nothing selected
@@ -972,8 +1149,17 @@ function renderChat() {
     if (prev && ["patch", "create"].includes(e.action) && prev.e.bot === e.bot && prev.e.action === e.action && prev.e.message === e.message) prev.n++;
     else rows.push({ e, n: 0 });
   }
-  if (rows.length) {
-    $("chat").innerHTML = rows.slice(-14).map(({ e, n }) => `<li class="who-${esc(e.bot)}"><time>${esc(String(e.at || "").slice(11, 19))}</time><b class="verb v-${esc(e.action)}">${esc(String(e.action || who(e.bot)).toLowerCase())}</b><span title="${esc(e.message)}">${esc(e.target ? e.target + (n ? ` +${n} more` : "") + " · " : "")}${esc(e.message)}</span></li>`).join("");
+  // The same line again (the nightly "start / audit" pair, every night): one row, newest time, ×N.
+  const seen = new Map();
+  for (const row of rows) {
+    const key = [row.e.bot, row.e.action, row.e.target, row.e.message].join("|");
+    const had = seen.get(key);
+    if (had) { had.times++; had.e = row.e; seen.delete(key); seen.set(key, had); }
+    else seen.set(key, { ...row, times: 1 });
+  }
+  const shown = [...seen.values()];
+  if (shown.length) {
+    $("chat").innerHTML = shown.slice(-14).map(({ e, n, times }) => `<li class="who-${esc(e.bot)}"><time>${esc(String(e.at || "").slice(11, 19))}</time><b class="verb v-${esc(e.action)}">${esc(String(e.action || who(e.bot)).toLowerCase())}</b><span title="${esc(e.message)}">${esc(e.target ? e.target + (n ? ` +${n} more` : "") + " · " : "")}${esc(e.message)}${times > 1 ? `<em class="times">×${times}</em>` : ""}</span></li>`).join("");
     const last = view.snap.log[view.snap.log.length - 1];
     $("chat-foot").textContent = last ? `${last.at.slice(11)} · ${last.bot} :: ${last.action}` : "quiet";
     return;
@@ -1303,6 +1489,9 @@ resize();
 renderTabs();
 refresh(true);
 connect();
-setInterval(() => refresh(true), 60000);  // the nightly checker may run in another process
-setInterval(refreshMemory, 15000);
+setInterval(() => { if (!document.hidden) refresh(true); }, 60000);  // the nightly checker may run in another process
+setInterval(() => { if (!document.hidden) refreshMemory(); }, 15000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { refresh(true); refreshMemory(); }  // catch up once on return
+});
 requestAnimationFrame(frame);

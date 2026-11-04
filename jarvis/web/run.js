@@ -242,13 +242,18 @@
     });
   }
 
+  let openSeq = 0, openTimer = 0;
   async function open(id) {
     const host = $("#rv");
     if (!host) return false;
+    const seq = ++openSeq;  // only the newest request may draw
     try {
-      data = await load(id);
+      const loaded = await load(id);
+      if (seq !== openSeq) return false;
+      data = loaded;
       planId = data.plan?.id || null;
     } catch (e) {
+      if (seq !== openSeq) return false;
       host.innerHTML = `<div class="rv-card"><div class="rv-empty"><b>Couldn't read the run.</b>${esc(e.message)}</div></div>`;
       return false;
     }
@@ -260,7 +265,10 @@
   addEventListener("jarvis:live", (e) => {
     const kind = e.detail?.kind;
     if (!$("#view-run") || $("#view-run").hidden) return;
-    if (kind === "plan.updated" || kind === "task.event") open(planId);
+    if (kind === "plan.updated" || kind === "task.event") {  // a burst of step events becomes one reload
+      clearTimeout(openTimer);
+      openTimer = setTimeout(() => open(planId), 300);
+    }
   });
 
   window.JarvisRun = { open };

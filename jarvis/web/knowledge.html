@@ -61,6 +61,7 @@
   </span>
 </div>
 
+<div class="workbench">
 <main class="stage">
   <div class="graph-head">
     <span id="graph-count">GRAPH / 0 RECORDS &middot; 0 LINKS</span>
@@ -72,6 +73,18 @@
   <div class="scn-note" id="scn-note" aria-live="polite"></div>
   <div class="ticker" id="ticker">00.00 &nbsp; reader :: idle</div>
 </main>
+<aside class="side" aria-label="Selection and mix">
+  <article class="panel" id="p-inspect">
+    <header><h2>Inspector</h2><span id="inspect-tag">TRACE</span></header>
+    <div class="inspect" id="inspect"><p class="dim">Click a node.</p></div>
+  </article>
+  <article class="panel" id="p-mix">
+    <header><h2>Knowledge mix</h2><span id="mix-tag">0 ITEMS</span></header>
+    <ul class="mix" id="mix"></ul>
+    <footer id="mix-foot">&mdash;</footer>
+  </article>
+</aside>
+</div>
 
 <form class="command" id="command" autocomplete="off">
   <label for="command-input">&gt;</label>
@@ -82,20 +95,42 @@
   <span class="who" id="command-who">READER</span>
 </form>
 
-<section class="panels" aria-label="Engine instruments">
+<section class="panels pipeline" aria-label="Write pipeline: raw sources to checked pages">
+  <article class="panel" id="p-raw">
+    <header><h2>Raw sources</h2><span>READ ONLY</span></header>
+    <table class="raw"><thead><tr><th>PATH</th><th>SHA-256</th><th></th></tr></thead><tbody id="raw"></tbody></table>
+    <footer><span id="raw-mut">0 MUTATIONS</span><span id="raw-verify">VERIFY &mdash;</span></footer>
+  </article>
+  <article class="panel" id="p-queue">
+    <header><h2>Write queue</h2><span id="queue-count">0 DOC</span></header>
+    <ol class="queue" id="queue"></ol>
+    <footer><span id="queue-foot">0/0 ATOMIC WRITES</span><span>NO RAW EDITS</span></footer>
+  </article>
+  <article class="panel" id="p-diff">
+    <header><h2>Latest change</h2><span id="diff-tag">PATCH</span></header>
+    <pre class="diff" id="diff"></pre>
+    <footer id="diff-foot">&mdash;</footer>
+  </article>
+  <article class="panel" id="p-matrix">
+    <header><h2>Citations</h2><span id="matrix-size">0&times;0</span></header>
+    <div class="matrix" id="matrix" role="table" aria-label="Pages by sources"></div>
+    <footer><span id="matrix-foot">0 PAGES + 0 RAW SOURCES</span><span><i class="key-cited"></i>cited<i class="key-conflict"></i>conflict</span></footer>
+  </article>
+  <article class="panel" id="p-checker">
+    <header><h2>Nightly checker</h2><span id="check-state">WAIT</span></header>
+    <div class="check-body">
+      <p id="check-when">NIGHTLY 02:00</p>
+      <p id="check-scan">SCANNED 000 / 000</p>
+      <div class="bars" id="bars" aria-label="Claim age, newest left"></div>
+    </div>
+    <footer><span id="check-foot">0 CHECKS · 0 FLAGS</span><span>READ · WRITE · CHECK</span></footer>
+  </article>
+</section>
+<section class="panels lower" aria-label="Activity">
   <article class="panel" id="p-chat">
     <header><h2>Run log</h2><span id="chat-bots">3 BOTS</span></header>
     <ol class="chat" id="chat"></ol>
     <footer id="chat-foot">&mdash;</footer>
-  </article>
-  <article class="panel" id="p-mix">
-    <header><h2>Knowledge mix</h2><span id="mix-tag">0 ITEMS</span></header>
-    <ul class="mix" id="mix"></ul>
-    <footer id="mix-foot">&mdash;</footer>
-  </article>
-  <article class="panel" id="p-inspect">
-    <header><h2>Inspector</h2><span id="inspect-tag">TRACE</span></header>
-    <div class="inspect" id="inspect"><p class="dim">Click a node.</p></div>
   </article>
   <article class="panel" id="p-age">
     <header><h2>Age</h2><span id="age-tag">24 BUCKETS</span></header>
@@ -109,35 +144,6 @@
       <dl><dt>PAGES</dt><dd id="idx-pages">0</dd><dt>LINKS</dt><dd id="idx-links">0</dd></dl>
     </div>
     <footer id="idx-foot">SELECT 00/00</footer>
-  </article>
-  <article class="panel" id="p-queue">
-    <header><h2>Write queue</h2><span id="queue-count">0 DOC</span></header>
-    <ol class="queue" id="queue"></ol>
-    <footer><span id="queue-foot">0/0 ATOMIC WRITES</span><span>NO RAW EDITS</span></footer>
-  </article>
-  <article class="panel" id="p-raw">
-    <header><h2>Raw sources</h2><span>READ ONLY</span></header>
-    <table class="raw"><thead><tr><th>PATH</th><th>SHA-256</th><th></th></tr></thead><tbody id="raw"></tbody></table>
-    <footer><span id="raw-mut">0 MUTATIONS</span><span id="raw-verify">VERIFY &mdash;</span></footer>
-  </article>
-  <article class="panel" id="p-matrix">
-    <header><h2>Citations</h2><span id="matrix-size">0&times;0</span></header>
-    <div class="matrix" id="matrix" role="table" aria-label="Pages by sources"></div>
-    <footer><span id="matrix-foot">0 PAGES + 0 RAW SOURCES</span><span><i class="key-cited"></i>cited<i class="key-conflict"></i>conflict</span></footer>
-  </article>
-  <article class="panel" id="p-diff">
-    <header><h2>Latest change</h2><span id="diff-tag">PATCH</span></header>
-    <pre class="diff" id="diff"></pre>
-    <footer id="diff-foot">&mdash;</footer>
-  </article>
-  <article class="panel" id="p-checker">
-    <header><h2>Nightly checker</h2><span id="check-state">WAIT</span></header>
-    <div class="check-body">
-      <p id="check-when">NIGHTLY 02:00</p>
-      <p id="check-scan">SCANNED 000 / 000</p>
-      <div class="bars" id="bars" aria-label="Claim age, newest left"></div>
-    </div>
-    <footer><span id="check-foot">0 CHECKS · 0 FLAGS</span><span>READ · WRITE · CHECK</span></footer>
   </article>
 </section>
 </div>

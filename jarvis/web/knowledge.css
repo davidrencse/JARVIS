@@ -222,26 +222,12 @@ body.dropping::after { content: "Drop into raw/ — read only"; position: fixed;
 .age-stats dt { color: var(--muted); font: 500 8.5px var(--mono); letter-spacing: .08em; }
 .age-stats dd { margin: 0; font: 600 13px var(--mono); }
 
-/* wide screens use 12 columns above; narrower ones regroup into 6, then 2, then 1 */
-@media (max-width: 1500px) {
-  .panels { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-  .panel, #p-chat, #p-index, #p-raw, #p-matrix { grid-column: span 2; }
-  #p-chat { order: 1; grid-column: span 3; } #p-inspect { order: 2; grid-column: span 3; }
-  #p-mix { order: 3; } #p-age { order: 4; } #p-index { order: 5; }
-  #p-queue { order: 6; } #p-raw { order: 7; } #p-matrix { order: 8; }
-  #p-diff { order: 9; grid-column: span 3; } #p-checker { order: 10; grid-column: span 3; }
-}
-@media (max-width: 1180px) { .kmain { padding-left: 0; } .stage { height: clamp(420px, calc(100dvh - 420px), 760px); } }
-@media (max-width: 960px) {
-  .panels { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .panel, #p-chat, #p-inspect, #p-mix, #p-age, #p-index, #p-queue, #p-raw, #p-matrix, #p-diff, #p-checker { grid-column: span 1; order: 0; }
-  #p-chat, #p-matrix { grid-column: span 2; }
-}
+/* narrow screens: the old 12/6/2-column panel regrouping is replaced by the layout at the end */
+@media (max-width: 1180px) { .kmain { padding-left: 0; } }
 @media (max-width: 640px) {
   .kmain { padding: 10px 12px 24px; gap: 8px; }
   .stage { height: 60dvh; min-height: 380px; }
   .panels { grid-template-columns: minmax(0, 1fr); }
-  .panel, #p-chat, #p-matrix { grid-column: auto; height: auto; min-height: 190px; max-height: 300px; }
   .command .who { display: none; }
   .command { padding-left: 12px; }
   .statusbar { flex-wrap: wrap; overflow: visible; }
@@ -257,3 +243,55 @@ body.dropping::after { content: "Drop into raw/ — read only"; position: fixed;
   .ticker { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+
+
+/* ======================= layout (2026-11-03 redo) ======================= */
+/* status bar wraps instead of hiding counts off the right edge */
+.statusbar { flex-wrap: wrap; overflow: visible; white-space: normal; row-gap: 0; }
+.statusbar > * { min-height: 34px; }
+.counts { flex-wrap: wrap; }
+.role.cmd { width: auto; flex: 1 1 120px; max-width: 280px; padding-top: 0; display: inline-flex; align-items: center; }
+
+/* graph and its side column: the inspector and the mix sit beside what they describe */
+.workbench { display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, 340px); gap: 8px; min-width: 0; }
+.workbench .stage { height: clamp(420px, calc(100dvh - 300px), 880px); }
+.side { display: grid; grid-template-rows: minmax(0, 1fr) minmax(0, 1.25fr); gap: 8px; min-height: 0; min-width: 0; }
+.side .panel { height: auto; min-height: 0; }
+#p-inspect .inspect { overflow: auto; flex: 1; }
+#p-mix .mix { overflow: auto; }
+
+/* panels: same card grammar as the System page; height follows content, empty stays short */
+.panels.pipeline { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.panels.lower { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.panels .panel, .panels #p-chat, .panels #p-raw, .panels #p-matrix, .panels #p-index,
+.side .panel, .side #p-inspect, .side #p-mix { grid-column: auto; }  /* the old 12-column spans */
+.panels .panel { height: auto; min-height: 112px; max-height: 260px; }
+.role span { white-space: nowrap; }
+.panel ol, .panel ul, .panel table, .panel .diff, .panel .matrix, .panel .inspect { overflow: auto; }
+.panel li.empty, .panel .empty { color: var(--muted); }
+#p-chat { max-height: 300px; }
+#p-index { display: none; }  /* duplicated the graph; its counts are in the graph header */
+.chat .times { color: var(--muted); margin-left: 6px; }
+
+@media (max-width: 1180px) {
+  .workbench { grid-template-columns: minmax(0, 1fr); }
+  .side { grid-template-rows: none; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .side .panel { max-height: 280px; }
+  .panels.pipeline { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .side, .panels.pipeline, .panels.lower { grid-template-columns: minmax(0, 1fr); }
+  .workbench .stage { height: clamp(300px, 60dvh, 520px); }
+}
+
+/* narrow: the bot roles wrap; the scenario tabs scroll inside their own bar */
+.roles { flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.tabs { min-width: 0; max-width: 100%; }
+.scn { min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.scn::-webkit-scrollbar { display: none; }
+@media (max-width: 720px) {
+  .tabs { flex-wrap: wrap; }
+  .scn { flex: 1 1 100%; }
+  .role { flex: 1 1 auto; min-height: 30px; }
+  .role.cmd { flex-basis: 100%; }
+}
