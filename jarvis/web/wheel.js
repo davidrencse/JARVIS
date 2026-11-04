@@ -37,7 +37,7 @@
     ["brain", "Brain", ["chatgpt lane", "claude failover", "tools"]],
     ["adapter", "Agents", ["adapters", "browser agents", "muse"]],
     ["grok", "Grok", ["grok preflight", "ten checks", "grok bot"]],
-    ["plan", "Plan", ["orchestrator.py", "specialists", "subtasks"]],
+    ["plan", "Plan", ["brain.py · L1-L3 steps", "orchestrator.py", "check · combine"]],
     ["task", "Task", ["runner.py", "codex / claude cli", "ledger"]],
     ["memory", "Remember", ["memory.sqlite3", "history.sqlite3", "events.jsonl"]],
     ["speak", "Speak", ["kokoro", "sentence stream", "on it."]],
@@ -50,7 +50,7 @@
     if (head === "hist") return byId.hist;
     if (byId[head]) return byId[head];
     if (parent === "brain") return byId.brain; // tool calls inside a brain turn
-    if (head.startsWith("plan")) return byId.plan;
+    if (head.startsWith("plan") || parent === "plan") return byId.plan; // brain.py steps, combine
     return byId.route;
   }
 
@@ -279,10 +279,11 @@
   const toScreen = (wx, wy) => [view.x + wx * view.k, view.y + wy * view.k];
   function home() {  // a little zoomed in, the ring's inner edge just left of centre
     view.k = W < 640 ? 1.15 : 1.35;
-    view.x = W * 0.42 - view.k * (G.cx + G.r);
+    view.x = W * 0.58 - view.k * (G.cx + G.r);  // engine3d.js HOME_EDGE: the engine fills the space left of it
     view.y = H / 2 - view.k * G.cy;
   }
   function zoomAt(sx, sy, factor) {
+    tweenStop();
     const k = Math.min(K_MAX, Math.max(K_MIN, view.k * factor)), f = k / view.k;
     view.x = sx - (sx - view.x) * f; view.y = sy - (sy - view.y) * f; view.k = k;
     view.touched = true; zoomLabel(); wake();
@@ -296,7 +297,8 @@
   }, { passive: false });
   const pointers = new Map(); let drag = null;
   stage.addEventListener("pointerdown", (e) => {
-    if (e.target.closest(".lab-zoom")) return;
+    if (e.target.closest(".lab-zoom, .engine-ctl")) return;
+    tweenStop();
     stage.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, local(e));
     drag = { at: local(e), moved: 0, pinch: pointers.size === 2 ? dist() : 0 };
@@ -306,7 +308,29 @@
   stage.addEventListener("pointerup", end); stage.addEventListener("pointercancel", end);
   function end(e) { pointers.delete(e.pointerId); if (!pointers.size) { drag = null; stage.classList.remove("dragging"); } }
   stage.addEventListener("dblclick", (e) => { if (!e.target.closest(".lab-zoom")) reset(); });
-  function reset() { view.touched = false; home(); zoomLabel(); wake(); }
+  function reset() { tweenStop(); view.touched = false; home(); zoomLabel(); wake(); }
+  // zoom/pan so a screen rect fills the stage, eased (the engine's "Fit engine" button)
+  let tw = 0;
+  const tweenStop = () => { if (tw) cancelAnimationFrame(tw); tw = 0; };
+  function fitRect(x0, y0, x1, y1) {
+    if (!(x1 > x0 && y1 > y0)) return;
+    const f = Math.max(1, Math.min((W * 0.94) / (x1 - x0), (H * 0.9) / (y1 - y0)));  // never zooms out, only in and centred
+    const k = Math.min(K_MAX, Math.max(K_MIN, view.k * f)), g = k / view.k, cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    const from = { k: view.k, x: view.x, y: view.y }, to = { k, x: W / 2 - (cx - view.x) * g, y: H / 2 - (cy - view.y) * g };
+    view.touched = true; tweenStop();
+    if (reduce.matches) { Object.assign(view, to); zoomLabel(); wake(); return; }
+    const t0 = performance.now();
+    const stepT = (now) => {
+      const t = Math.min(1, (now - t0) / 420), e = 1 - Math.pow(1 - t, 3);
+      // interpolate in screen space so the rect centre glides straight to the middle
+      view.k = from.k + (to.k - from.k) * e;
+      const gg = view.k / from.k, ccx = cx + (W / 2 - cx) * e, ccy = cy + (H / 2 - cy) * e;
+      view.x = ccx - (cx - from.x) * gg; view.y = ccy - (cy - from.y) * gg;
+      zoomLabel(); wake();
+      tw = t < 1 ? requestAnimationFrame(stepT) : 0;
+    };
+    tw = requestAnimationFrame(stepT);
+  }
   stage.tabIndex = 0;
   stage.addEventListener("keydown", (e) => {
     const step = 40, c = [W / 2, H / 2];
@@ -434,5 +458,5 @@
   }
   on("overview", (o) => { if (Math.abs((o.memory?.items ?? 0) - graphItems) >= 5) loadGraph(); });
   layout(); header(); wake(); loadGraph();
-  window.JarvisWheel = { fire: (id, text, state) => byId[id] && fire(byId[id], text, state), stages: STAGES };
+  window.JarvisWheel = { fire: (id, text, state) => byId[id] && fire(byId[id], text, state), stages: STAGES, fitRect, reset };
 })();
