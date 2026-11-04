@@ -388,3 +388,17 @@ class ServeLoopTests(McpCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrashingToolTests(unittest.TestCase):
+    def test_a_tool_that_raises_is_an_error_result_not_a_dead_server(self):
+        class Boom:
+            def specs(self):
+                return []
+
+            def call(self, name, args):
+                raise RuntimeError("database is locked")
+        reply = handle(Boom(), {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                "params": {"name": "terminal", "arguments": {}}})
+        self.assertTrue(reply["result"]["isError"])
+        self.assertIn("database is locked", reply["result"]["content"][0]["text"])

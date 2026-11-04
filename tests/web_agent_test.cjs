@@ -8,7 +8,7 @@ const tick = () => new Promise((r) => setImmediate(r));
 
 function harness({ failMic = false, missingDevice = false, failDeviceId = null, failEnumeration = false, audioPrefs = null,
   microphoneLevels = [[0.02], [0.02]] } = {}) {
-  const state = { sockets: [], sources: [], tracks: [], contexts: [], calls: [], states: [], tools: [], mediaConstraints: [], errors: [], connectedMics: 0, selectedMics: [], analyserCount: 0 };
+  const state = { longTimers: [], sockets: [], sources: [], tracks: [], contexts: [], calls: [], states: [], tools: [], mediaConstraints: [], errors: [], connectedMics: 0, selectedMics: [], analyserCount: 0 };
   class FakeSocket {
     constructor(url) { this.url = url; this.sent = []; this.readyState = 0; state.sockets.push(this); setImmediate(() => { this.readyState = 1; this.onopen?.(); }); }
     send(data) { this.sent.push(JSON.parse(data)); }
@@ -17,7 +17,8 @@ function harness({ failMic = false, missingDevice = false, failDeviceId = null, 
   }
   FakeSocket.OPEN = 1;
   const context = {
-    window: {}, localStorage: { getItem: () => audioPrefs ? JSON.stringify(audioPrefs) : null }, setTimeout: (fn) => setImmediate(fn), setImmediate, btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+    window: {}, localStorage: { getItem: () => audioPrefs ? JSON.stringify(audioPrefs) : null }, setTimeout: (fn, ms) => { if (ms >= 10000) { state.longTimers.push(fn); return fn; } return setImmediate(fn); },
+    clearTimeout: (h) => { const i = state.longTimers.indexOf(h); if (i >= 0) state.longTimers.splice(i, 1); }, setImmediate, btoa: (s) => Buffer.from(s, "binary").toString("base64"),
     atob: (s) => Buffer.from(s, "base64").toString("binary"), WebSocket: FakeSocket,
     navigator: { mediaDevices: { async getUserMedia(constraints) {
       state.mediaConstraints.push(JSON.parse(JSON.stringify(constraints)));
@@ -78,6 +79,19 @@ async function connect(env) {
 }
 
 const scenarios = {
+  async handshake_that_never_answers_gives_up() {
+    const env = harness();
+    const started = env.agent.start().then(() => "connected", (e) => e.message);
+    await tick(); await tick();
+    assert.equal(env.state.longTimers.length, 1, "a handshake timeout is armed");
+    env.state.longTimers[0]();  // 15 s pass with no metadata
+    assert.match(await started, /didn't answer/);
+    assert.equal(env.state.sockets[0].readyState, 3, "the half-open socket is closed");
+    const ok = harness();  // answering in time disarms the timer
+    await connect(ok);
+    assert.equal(ok.state.longTimers.length, 0);
+    await ok.agent.stop();
+  },
   async protocol() {
     const env = harness(), { state, agent } = env;
     const ws = await connect(env);

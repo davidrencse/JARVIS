@@ -119,7 +119,7 @@ class TextWorkflowTests(Temp):
             return {"task_id": task_id, "state": "finished", "artifacts": "", "answer": "backup"}
 
         with patch("jarvis.assistant.run_task", side_effect=one_shot):
-            result = ask("hello there", store, mem, CONFIG, ROOT, lane=Down())
+            result = ask("tell me a joke", store, mem, CONFIG, ROOT, lane=Down())
         self.assertEqual(result["reply"], "backup")
         self.assertIn("app-server gone", result["lane_error"])
         self.assertEqual(store.get(result["task"])["state"], "finished")
@@ -135,7 +135,7 @@ class TextWorkflowTests(Temp):
         store, mem = Store(self.base), Memory(self.base)
         with patch("jarvis.assistant.run_task", return_value={
                 "task_id": "t", "state": "failed", "answer": None}):
-            result = ask("hello", store, mem, CONFIG, ROOT, tier="simple")
+            result = ask("tell me a joke", store, mem, CONFIG, ROOT, tier="simple")
         self.assertIn("didn't produce an answer", result["reply"])
         self.assertIn("failed", result["reply"])
 
@@ -299,7 +299,7 @@ class ConsoleWorkflowTests(Temp):
 
         self.console._lane = Broken()
         with patch("jarvis.assistant.run_task", side_effect=RuntimeError("cli also down")):
-            job = self.console.submit("hello")
+            job = self.console.submit("tell me a joke")
             wait_for(lambda: self.console.job(job["id"])["state"] != "running")
         self.assertEqual(self.console.job(job["id"])["state"], "error")
         self.assertIn("cli also down", self.console.job(job["id"])["error"])
@@ -769,7 +769,7 @@ class VoiceWorkflowTests(Temp):
 
         ears = MagicMock()
         ears.verify.return_value = (True, 0.9)
-        stt = MagicMock(side_effect=lambda audio: "Jarvis, hello" if isinstance(audio, str) else "")
+        stt = MagicMock(side_effect=lambda audio: "Jarvis, tell me a joke" if isinstance(audio, str) else "")
         stt.device = "cpu"
         voice = MagicMock(limit=350)
         brain = Brain()
@@ -794,7 +794,7 @@ class VoiceWorkflowTests(Temp):
                 patch.object(daemon.time, "sleep"):
             with self.assertRaises(KeyboardInterrupt):
                 daemon.listen_loop(str(self.base), CONFIG, ROOT)
-        self.assertEqual(calls, ["hello", "hello"])  # the second clip was still handled
+        self.assertEqual(calls, ["tell me a joke", "tell me a joke"])  # the second clip was still handled
 
     def test_second_listener_cannot_take_the_microphone(self):
         from jarvis.daemon import InstanceLock

@@ -18,6 +18,12 @@ class BrowserMicrophoneTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS " + name, result.stdout)
 
+    def test_elevenlabs_handshake_that_never_answers_gives_up(self):
+        result = subprocess.run([NODE, str(Path(__file__).with_name("web_agent_test.cjs")),
+                                 "handshake_that_never_answers_gives_up"], capture_output=True,
+                                text=True, encoding="utf-8", timeout=20)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_startup_failures_release_resources_and_allow_retry(self):
         self.check_scenario("failures_and_retry")
 

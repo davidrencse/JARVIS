@@ -122,6 +122,13 @@ class TransferTests(Homes):
                 transfer.send_file(cluster(), self.state, src)
 
 
+class SafeNameTests(unittest.TestCase):
+    def test_every_safe_name_is_a_valid_inbox_name(self):
+        for raw in ("(draft).txt", "+1 notes.md", "@home.png", ",x", "-rf", ".hidden", "a b", "", "CON"):
+            with self.subTest(raw=raw):
+                self.assertTrue(transfer.NAME.fullmatch(transfer.safe_name(raw)), transfer.safe_name(raw))
+
+
 class ValidateTests(unittest.TestCase):
     def test_refuses_anything_off_the_fixed_operations(self):
         good = {"action": "put", "upload": "b" * 32, "offset": 0, "data": "", "name": "n"}
@@ -237,6 +244,28 @@ class LanMouseTests(unittest.TestCase):
                           written["capture_backend"]), (4300, 1.5, ["KeyLeftAlt"], "layer-shell"))
         self.assertEqual(written["clients"][0]["ips"], ["10.0.0.2"])
         self.assertIn("motion_scale = 1.5", Path(out["backup"]).read_text(encoding="utf-8"))
+
+    def test_pairing_waits_for_the_old_daemon_to_exit_before_starting(self):
+        self.path.write_text("port = 4300\n", encoding="utf-8")
+        states = iter([True, True, True, False, False])  # running, then still dying, then gone
+        with mock.patch.object(sharedinput, "lan_mouse_status",
+                               side_effect=lambda: {"running": next(states, False)}), \
+                mock.patch.object(sharedinput, "stop") as stop, \
+                mock.patch.object(sharedinput, "start", return_value={"started": True, "running": True}) as start, \
+                mock.patch("time.sleep"):
+            out = sharedinput.write_pairing("WinLaptop", ["10.0.0.2"], "right", self.fp, self.path)
+        stop.assert_called_once()
+        start.assert_called_once()
+        self.assertTrue(out["restarted"])
+
+    def test_pairing_does_not_claim_a_restart_that_did_not_happen(self):
+        self.path.write_text("port = 4300\n", encoding="utf-8")
+        with mock.patch.object(sharedinput, "lan_mouse_status", return_value={"running": True}), \
+                mock.patch.object(sharedinput, "stop"), \
+                mock.patch.object(sharedinput, "start", return_value={"started": False, "running": True}), \
+                mock.patch("time.sleep"):
+            out = sharedinput.write_pairing("WinLaptop", ["10.0.0.2"], "right", self.fp, self.path)
+        self.assertFalse(out["restarted"])
 
     def test_control_refuses_anything_but_its_commands(self):
         for arg in ("rm -rf", '{"pair": {"peer_name": "x"}}', "[]"):
