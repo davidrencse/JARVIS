@@ -19,6 +19,7 @@ heuristic over the command text; it narrows what runs unasked, it isn't a sandbo
 """
 
 import json
+import sys
 import os
 import posixpath
 import re
@@ -67,6 +68,7 @@ PROC = re.compile(r"(?:^|[/\\])proc(?:[/\\]|$)|environ\b|\benv\b|"
 # App and browser state where tokens sit under ordinary names (github-copilot/apps.json,
 # VS Code's state.vscdb...): reading inside it, or cd-ing into it, needs David's OK.
 APP_STATE = re.compile(r"\.config\b|\.local[/\\]share\b|AppData\b|Application Support\b|"
+                       r"Local Settings\b|Application Data\b|"
                        r"\.mozilla\b|\.thunderbird\b|\.var[/\\]app\b|Library[/\\](?:Keychains|Cookies)\b", re.I)
 # Commands that print what they read, and the only ones a pipe may feed: in PowerShell any
 # other name after | (cat, gc, type, sls...) may read each file object it is handed.
@@ -129,6 +131,9 @@ def _outside_quotes(text, sep):
     parts, start, quote, i = [], 0, None, 0
     while i < len(text):
         ch = text[i]
+        if ch == "\\" and quote != "'":  # \' or \" is a literal quote, not one that opens
+            i += 2  # (audit 2026-11-03: `echo \' && rm -rf x` hid the rm inside a "quote")
+            continue
         if quote:
             if ch == quote:
                 quote = None
@@ -256,10 +261,14 @@ def _looks(segment):
         return False
     if (name in PS_ALIASES or "-" in name) and any(PS_REMOTE.match(value) for value in args):
         return False
-    if name in READERS and any(APP_STATE.search(value) for value in spelled):
+    # PowerShell doesn't treat \ as an escape: AppData\Local and \\host\x reach it whole, so
+    # check the raw words too, split on its array commas and with a -Path: style prefix off.
+    raw = [piece for word in segment.split()[1:]
+           for piece in re.sub(r"^-\w+:", "", word.strip("'\"")).split(",") if piece]
+    if name in READERS and any(APP_STATE.search(value)
+                               for value in spelled + [r.replace("\\", "/") for r in raw]):
         return False
-    # PowerShell doesn't treat \ as an escape: \\host\x reaches it whole, so check raw words too.
-    if any(ELSEWHERE.search(word.strip("'\"")) for word in segment.split()[1:]):
+    if any(ELSEWHERE.search(piece) for piece in raw):
         return False
     if not _no_wildcards(name, words[1:]):
         return False
@@ -354,7 +363,90 @@ def _argv(command, folder):
         return [shell, "-NoProfile", "-NonInteractive", "-Command", script]
     shell = shutil.which("bash") or "/bin/sh"
     script = f"{command}\n__code=$?\nprintf '\\n{MARK}%s' \"$PWD\"\nexit $__code"
-    return [shell, "-c", script]
+    return [*sandbox(folder), shell, "-c", script]
+
+
+# Enforced by the OS, not by reading the command (audit 2026-11-03: quoting, //paths, variables
+# and globs got past the text checks). Hidden: secrets, browser profiles and JARVIS's state.
+# Read-only: JARVIS's own code and config, and the Obsidian vault. Everything else as normal.
+HIDDEN = ("~/.ssh", "~/.codex", "~/.claude", "~/.gnupg", "~/.password-store", "~/.local/share/keyrings",
+          "~/.config/google-chrome", "~/.config/chromium", "~/.mozilla", "~/.zen", "~/.config/zen",
+          "~/.config/BraveSoftware", "~/.config/gh", "~/.config/github-copilot", "~/.docker", "~/.aws",
+          "~/.kube", "~/.azure", "~/.config/gcloud", "~/.android", "~/.vnc", "~/.pki", "~/.cache/huggingface",
+          "~/.cache/google-chrome", "~/.cache/chromium", "~/.cache/mozilla", "~/.cargo/registry/credentials",
+          "~/.local/share/fish", "~/.config/Code/User/globalStorage", "~/.config/discord", "~/snap",
+          "~/.var/app", "~/.local/share/TelegramDesktop", "~/.config/Signal",
+          "~/.config/jarvis",  # relay tokens (grokbot-<device>.json) reach other laptops' desktops
+          "/dev/input", "/dev/snd/by-id")  # input devices: no keylogging from a terminal command
+HIDDEN_FILES = ("~/.git-credentials", "~/.netrc", "~/.pgpass", "~/.claude.json", "~/.my.cnf", "~/.s3cfg",
+                "~/.authinfo", "~/.wakatime.cfg", "~/.cargo/credentials.toml", "~/.cargo/credentials",
+                "~/.npmrc", "~/.pypirc", "~/.bash_history", "~/.zsh_history", "~/.python_history",
+                "~/.mysql_history", "~/.psql_history", "~/.lesshst", "~/.viminfo", "~/.Xauthority")
+# Read-only: places that run code later outside the sandbox (audit 2026-11-03: a .pth in the
+# venv or a systemd/autostart/shell-rc entry would run at the next login or JARVIS start).
+PERSIST = ("~/.config/systemd", "~/.config/autostart", "~/.config/hypr", "~/.config/uwsm",
+           "~/.config/fish", "~/.bashrc", "~/.bash_profile", "~/.profile", "~/.zshrc", "~/.zprofile",
+           "~/.config/environment.d", "~/.pam_environment")
+# $XDG_RUNTIME_DIR is replaced by an empty tmpfs: its sockets (D-Bus -> systemd-run, Hyprland IPC
+# -> dispatch exec, gpg/ssh agents, keyrings, agent-browser, Lan Mouse) run things outside bwrap.
+# Only display and audio come back.
+RUNTIME_KEEP = ("wayland-*", "pipewire-0", "pulse")
+RUNTIME_ENV = ("DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "HYPRLAND_INSTANCE_SIGNATURE")
+
+
+def sandbox(folder=None, repo=None, config=None):
+    """The bwrap prefix for a terminal command on Linux, or [] where it can't run (Windows,
+    macOS, no bwrap, or terminal.sandbox: false in jarvis.config.json)."""
+    if os.name == "nt" or sys.platform == "darwin" or not shutil.which("bwrap"):
+        return []
+    repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
+    if config is None:
+        try:
+            config = json.loads((repo / "jarvis.config.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+    if (config.get("terminal") or {}).get("sandbox", True) is False:
+        return []
+    home = str(Path.home())
+    expand = lambda p: Path(home + str(p)[1:]) if str(p).startswith("~") else Path(p)
+    args = ["bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
+            "--die-with-parent"]
+    for path in (*HIDDEN, str(repo / ".jarvis")):
+        if expand(path).is_dir():
+            args += ["--tmpfs", str(expand(path))]
+    for path in HIDDEN_FILES:
+        if expand(path).is_file():
+            args += ["--ro-bind", "/dev/null", str(expand(path))]
+    for raw in sorted(Path("/dev").glob("hidraw*")) + [Path("/dev/uinput")]:
+        if raw.exists():  # raw keyboard/mouse devices and synthetic input
+            args += ["--ro-bind", "/dev/null", str(raw)]
+    vault = (config.get("vault") or {}).get("path")
+    vaults = list(vault.values()) if isinstance(vault, dict) else [vault]
+    for path in (repo / "jarvis", repo / ".git", repo / "jarvis.config.json", repo / "JARVIS.md",
+                 repo / "pyproject.toml", repo / "jarvis-memory", repo / ".venv",
+                 *[expand(p) for p in PERSIST], *[expand(v) for v in vaults if v]):
+        if Path(path).exists():
+            args += ["--ro-bind", str(path), str(path)]
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    if runtime.is_dir():
+        keep = [p for pattern in RUNTIME_KEEP for p in sorted(runtime.glob(pattern))
+                if not p.name.endswith(".lock")]
+        args += ["--tmpfs", str(runtime)]
+        for path in keep:
+            args += ["--bind", str(path), str(path)]
+    for name in RUNTIME_ENV:
+        args += ["--unsetenv", name]
+    if folder:
+        args += ["--chdir", str(folder)]
+    # No host loopback (audit 2026-11-03): the console on 7777, the hub, the relay and browser
+    # debug ports trust any local caller. pasta gives the command its own network namespace with
+    # internet but no route to the host's 127.0.0.1 (-T/-U none: no namespace->host port
+    # forwards; --no-map-gw: the gateway isn't the host). Without pasta: no network at all.
+    pasta = shutil.which("pasta")
+    if pasta:
+        return [pasta, "--quiet", "--config-net", "-t", "none", "-u", "none", "-T", "none",
+                "-U", "none", "--no-map-gw", "--", *args, "--"]
+    return [*args, "--unshare-net", "--"]
 
 
 def _kill_tree(proc):
@@ -374,24 +466,81 @@ def _kill_tree(proc):
         pass
 
 
+OUTPUT_CAP = 1_000_000  # characters kept from a command; the rest is read and thrown away (audit 2026-11-04)
+KEEP_TAIL = 4096        # characters kept from the end: the MARK line with the final folder
+
+
+def _drain(pipe, keep, total, proc):
+    """Read `pipe` to its end keeping only the head (2*MAX_OUTPUT) and a short tail, so
+    `cat big.mkv` or `yes` can't fill memory. Past OUTPUT_CAP nothing more is kept but the tail;
+    the pipe is still drained to its end so the command can finish (only the timeout kills)."""
+    head, tail, dropped = "", "", 0
+    try:
+        while True:
+            chunk = pipe.read(8192)
+            if not chunk:
+                break
+            with total[2]:
+                total[0] += len(chunk)
+                if total[0] > OUTPUT_CAP:
+                    total[1] = True
+                over = total[1]
+            room = 2 * MAX_OUTPUT - len(head)
+            if room > 0 and not over:
+                head, chunk = head + chunk[:room], chunk[room:]
+            if chunk:
+                tail += chunk
+                if len(tail) > KEEP_TAIL:
+                    dropped += len(tail) - KEEP_TAIL
+                    tail = tail[-KEEP_TAIL:]
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            pipe.close()
+        except OSError:
+            pass
+    keep.append(head + (f"\n... ({dropped} characters dropped)\n" if dropped else "") + tail)
+
+
 def _run_shell(argv, folder):
     """(returncode, stdout, stderr, timed_out). On timeout the whole process tree dies and
-    the pipes are drained with a bounded wait, so a grandchild holding them can't hang us."""
+    the pipes are drained with a bounded wait, so a grandchild holding them can't hang us.
+    Output is read in bounded pieces (_drain); past OUTPUT_CAP the rest is drained and discarded."""
+    import threading
     extra = ({"creationflags": NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
              else {"start_new_session": True})
     proc = subprocess.Popen(argv, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace",
                             stdin=subprocess.DEVNULL, **extra)
+    total, out, err = [0, False, threading.Lock()], [], []
+    readers = [threading.Thread(target=_drain, args=(pipe, keep, total, proc), daemon=True)
+               for pipe, keep in ((proc.stdout, out), (proc.stderr, err))]
+    for reader in readers:
+        reader.start()
+    import time
+    deadline, timed_out = time.monotonic() + TIMEOUT, False
     try:
-        out, err = proc.communicate(timeout=TIMEOUT)
-        return proc.returncode, out, err, False
+        proc.wait(timeout=TIMEOUT)
+        for reader in readers:  # like communicate(): wait for whatever still holds the pipes
+            reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        timed_out = any(reader.is_alive() for reader in readers)
     except subprocess.TimeoutExpired:
+        timed_out = True
+    if timed_out:
         _kill_tree(proc)
+        for reader in readers:
+            reader.join(timeout=5)  # a grandchild still holding a pipe can't hang us
         try:
-            out, err = proc.communicate(timeout=5)
+            proc.wait(timeout=5)  # reap the killed shell
         except subprocess.TimeoutExpired:
-            out = err = ""
-        return None, out or "", err or "", True
+            pass
+    stdout, stderr = "".join(out), "".join(err)
+    if total[1]:
+        stderr += f"\n[the command printed over {OUTPUT_CAP} characters; the rest was discarded]"
+    if timed_out:
+        return None, stdout, stderr, True
+    return proc.returncode, stdout, stderr, False
 
 
 def run(spec):

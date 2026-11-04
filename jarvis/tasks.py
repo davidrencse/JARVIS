@@ -449,8 +449,11 @@ class Tasks:
             level = (value or "").strip().lower() or None
             if level and level not in EMOJI:
                 raise ValueError("priority must be highest, high, medium, low, lowest or empty.")
-            line = PRIO_FIELD.sub("", line)
-            line = re.sub(r"  +", " ", line).rstrip()
+            start = LINE.match(line).start("body")  # never touch the indent or the text itself
+            head, body = line[:start], line[start:]
+            body = re.sub(" ?" + PRIO_FIELD.pattern, "", body).lstrip(" ") if PRIO_FIELD.match(body) \
+                else re.sub(" ?" + PRIO_FIELD.pattern, "", body)
+            line = (head + body).rstrip()
             if level:
                 match = LINE.match(line)
                 body = match.group("body")
@@ -570,7 +573,11 @@ def tasks_for(vault):
     if vault is None:
         return None
     with _OPEN_LOCK:
-        reader = _OPEN_TASKS.get(vault)
-        if reader is None:
-            reader = _OPEN_TASKS[vault] = Tasks(vault)
+        reader = getattr(vault, "_jarvis_tasks", None)
+        if reader is None or reader.vault is not vault:
+            reader = Tasks(vault)
+            try:
+                vault._jarvis_tasks = reader  # lives and dies with the vault (no strong ref from a global)
+            except AttributeError:  # a vault that refuses attributes: keep the old weak map
+                reader = _OPEN_TASKS.get(vault) or _OPEN_TASKS.setdefault(vault, reader)
         return reader
