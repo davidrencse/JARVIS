@@ -1,0 +1,25 @@
+{"_meta": {"note": "brain.judge scorecard: plan = should the orchestrator split this into steps. Synthetic, written 2026-11-03; add real misses here."}}
+{"text": "research the best 27 inch 4k monitors under 400 dollars, compare the top three and recommend one for coding", "plan": true}
+{"text": "check my gmail and then summarize the newest three emails and draft a reply to the first", "plan": true}
+{"text": "look up flights from new york to tokyo in december, compare prices on two sites and tell me the cheapest", "plan": true}
+{"text": "compare the pros and cons of moving my backend from flask to fastapi", "plan": true}
+{"text": "figure out why the lan mouse keeps disconnecting and recommend a fix", "plan": true}
+{"text": "come up with a plan for studying for my algorithms final in two weeks", "plan": true}
+{"text": "go to my github, list my repos updated this month, then write a short summary of what changed in each", "plan": true}
+{"text": "write me a report on the trade-offs between tailscale and wireguard for my two laptops", "plan": true}
+{"text": "find three good ramen places near campus, check their hours, and tell me which is open latest", "plan": true}
+{"text": "analyze my spending emails from this month and tell me where most of my money went", "plan": true}
+{"text": "open spotify", "plan": false}
+{"text": "tell me a joke", "plan": false}
+{"text": "what time is it", "plan": false}
+{"text": "what's the weather today", "plan": false}
+{"text": "how are you doing jarvis", "plan": false}
+{"text": "turn the volume down", "plan": false}
+{"text": "what's my newest email", "plan": false}
+{"text": "using my chrome open youtube", "plan": false}
+{"text": "remind me what we talked about yesterday", "plan": false}
+{"text": "who won the game last night", "plan": false}
+{"text": "close discord on the dell", "plan": false}
+{"text": "what is a hash map", "plan": false}
+{"text": "summarize this page", "plan": false}
+{"text": "thanks that worked", "plan": false}
