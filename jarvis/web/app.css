@@ -282,6 +282,7 @@ select.field { width: auto; }
 .step.fail { color: var(--ink); }
 .step.fail .dot { border-style: dashed; }
 .step.preview { color: var(--ink-3); }
+a.step { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
 .step.preview .dot { border-style: dotted; }
 /* A reply still streaming in from the brain (any channel). */
 .msg.streaming .msg-body::after { content: ""; display: inline-block; width: 7px; height: 1em; margin-left: 3px; vertical-align: -2px; background: var(--ink-2); animation: breathe 1s var(--ease) infinite; }

@@ -81,8 +81,10 @@
                   case: store.get("jarvis.case", "") };
 
   // ---------- views ----------
-  // Order is the rail's own order, so the number keys read top to bottom.
+  // Order is the rail's own order, so the number keys read top to bottom. "run" has no rail
+  // link or number key: the console trace links to it when a plan exists.
   const VIEWS = ["console", "graph", "system", "credits", "memory", "run", "files", "devices", "settings"];
+  const KEYED = VIEWS.filter((v) => v !== "run");
   const loaded = {};
   async function show() {
     // The graph view gave way to the knowledge engine page; old links and key 2 go there.
@@ -926,7 +928,9 @@
 
   // ---------- trace ----------
   function trace(steps) {
-    $("#trace").innerHTML = steps.map(([label, s]) => `<span class="step ${s}"><span class="dot"></span>${esc(label)}</span>`).join("");
+    $("#trace").innerHTML = steps.map(([label, s, href]) => href
+      ? `<a class="step ${s}" href="${esc(href)}"><span class="dot"></span>${esc(label)}</a>`
+      : `<span class="step ${s}"><span class="dot"></span>${esc(label)}</span>`).join("");
   }
 
   // ---------- dock ----------
@@ -1032,7 +1036,7 @@
       const done = await waitForJob(job.id, 15 * 60e3);
       const routed = routeLabel(current.route);
       if (done.state === "stopped") { trace([...pre, [routed, "done"], ["stopped waiting · JARVIS may still finish; the reply will appear here", "fail"]]); announce("Stopped waiting."); return; }
-      if (done.state === "timeout") { trace([...pre, [routed, "done"], ["still running after 15 min · check the Run view", "fail"]]); return; }
+      if (done.state === "timeout") { trace([...pre, [routed, "done"], ["still running after 15 min · open the plan", "fail", "#run"]]); return; }
       if (done.state === "lost") { trace([...pre, [routed, "done"], ["lost contact with the console server · the job may still be running", "fail"]]); return; }
       if (current.message) local = local.filter((m) => m !== pending); // memory has it now
       const secs = Math.round((done.finished - done.started) * 10) / 10;
@@ -1041,7 +1045,7 @@
         (res.memory || []).slice(0, 1).forEach((id) => mine.add(id)); store.set("jarvis.mine", [...mine].slice(-300));
         local = local.filter((m) => m !== pending);
         await loadHistory();
-        trace([...pre, [routed, "done"], [`answered in ${secs}s${res.voice?.source ? " · spoke via " + res.voice.source : ""}${res.plan ? " · plan ready in the Run view" : ""}`, "done"]]);
+        trace([...pre, [routed, "done"], [`answered in ${secs}s${res.voice?.source ? " · spoke via " + res.voice.source : ""}${res.plan ? " · plan ready, open it" : ""}`, "done", res.plan ? "#run" : ""]]);
         announce("JARVIS answered: " + String(res.reply).slice(0, 240));
         if (state.case) loadCases();
       } else {
@@ -1173,7 +1177,7 @@
     if (typing() || e.metaKey || e.altKey) return;
     if (e.code === "Space" && !e.repeat && !e.ctrlKey && pageFocused()) { e.preventDefault(); spaceAt = Date.now(); startMic(false, true); }
     else if (e.key === "Enter" && (mic.active || mic.starting) && pageFocused()) { e.preventDefault(); stopMic(); }
-    else if (!e.ctrlKey && /^[1-9]$/.test(e.key) && pageFocused()) location.hash = VIEWS[+e.key - 1];
+    else if (!e.ctrlKey && /^[1-9]$/.test(e.key) && pageFocused()) location.hash = KEYED[+e.key - 1];
     else if (e.key === "/" || (e.key.toLowerCase() === "k" && e.ctrlKey)) { e.preventDefault(); prompt.focus(); }
   });
   // Hold Space to talk; a quick tap leaves it listening until you pause.

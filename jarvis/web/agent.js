@@ -124,6 +124,11 @@
         const ws = new WebSocket(session.signed_url);
         this.ws = ws;
         let ready = false;
+        const giveUp = setTimeout(() => {  // accepted but never answered: don't sit "connecting" forever
+          if (ready) return;
+          try { ws.close(); } catch (_) { /* already closed */ }
+          reject(new Error("The ElevenLabs agent didn't answer."));
+        }, 15000);
         ws.onopen = () => {
           const init = { type: "conversation_initiation_client_data" }, tts = {};
           if (session.voice_id) tts.voice_id = session.voice_id;
@@ -142,13 +147,14 @@
             this.outRate = rateOf(meta.agent_output_audio_format, 16000);
             this.conversation = meta.conversation_id;
             if (session.context) this.send({ type: "contextual_update", text: session.context });
-            if (!ready) { ready = true; resolve(); }
+            if (!ready) { ready = true; clearTimeout(giveUp); resolve(); }
             return;
           }
           this.receive(msg);
         };
-        ws.onerror = () => { if (!ready) reject(new Error("Couldn't reach the ElevenLabs agent.")); };
+        ws.onerror = () => { if (!ready) { clearTimeout(giveUp); reject(new Error("Couldn't reach the ElevenLabs agent.")); } };
         ws.onclose = (ev) => {
+          clearTimeout(giveUp);
           if (!ready) return reject(new Error(ev.reason || "The ElevenLabs agent closed the call."));
           if (this.ws === ws && this.live) {
             if (ev.code !== 1000 && ev.reason) this.h.onError?.(ev.reason);
