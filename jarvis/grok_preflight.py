@@ -46,7 +46,8 @@ def chatgpt_lane(config, base):
     max_turns=1 starts a new thread for every ask, so the review never sees the draft's
     reasoning, while both passes share one Codex process (a cold start is ~4 s)."""
     from .chatgpt import ChatGPTLane
-    return ChatGPTLane(config, base, max_turns=1, timeout=20,
+    from .inference import role
+    return ChatGPTLane(config, base, max_turns=1, timeout=role(config, "grok_check")["timeout"],
                        instructions=INSTRUCTIONS, overrides=['web_search="disabled"'])
 
 

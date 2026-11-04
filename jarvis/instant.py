@@ -1,4 +1,5 @@
-"""Answers JARVIS knows without asking anyone: the local clock and calendar.
+"""Answers JARVIS knows without asking anyone: the local clock and calendar, and bare
+greetings or thanks.
 
 A cold ChatGPT turn took 5.3 s to say what day it was. These answers come from the
 laptop's clock in microseconds, so "what day is it" is spoken as soon as Kokoro can
@@ -18,6 +19,15 @@ TIME = re.compile(_LEAD + r"(?:what(?:'s|s|\s+is)\s+the\s+time|what\s+time\s+is\
                   r"(?:do\s+you\s+(?:know|have)\s+)?the\s+time)" + _TAIL, re.I)
 
 
+# Bare greetings and thanks: a ChatGPT turn took 3.9 s to say "Hi, David." (2026-11-04).
+# Only the whole utterance counts; "hey, open chrome" or "thanks, now play music" go on.
+# "Good morning" is not here: the vault answers it with the day's briefing.
+GREET = re.compile(_LEAD + r"(?:hello|hi|hey|yo|hiya|howdy|what'?s\s+up|sup)"
+                   r"(?:\s+(?:there|jarvis|buddy|man))?\W*$", re.I)
+THANKS = re.compile(_LEAD + r"(?:thanks|thank\s+you|thank\s+u|thx|cheers|appreciate\s+it)"
+                    r"(?:\s+(?:so\s+much|a\s+lot|jarvis|buddy|man))*\W*$", re.I)
+
+
 def _ordinal(n):
     return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
@@ -29,4 +39,8 @@ def answer(text, now=None):
         return f"It's {now:%A}, {now:%B} {_ordinal(now.day)}, {now.year}."
     if TIME.match(text):
         return f"It's {now.strftime('%I:%M %p').lstrip('0')}."
+    if GREET.match(text):
+        return "Hi, David."
+    if THANKS.match(text):
+        return "Any time."
     return None

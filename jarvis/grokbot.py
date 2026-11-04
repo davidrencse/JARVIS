@@ -49,6 +49,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -68,7 +69,7 @@ TUNNEL_DIR = HOME / ".config" / "jarvis"   # where a reverse tunnel leaves its p
 INBOX = TUNNEL_DIR / "grok-inbox"             # where Grok writes handoff answers
 REQUEST_TIMEOUT = 30.0
 MAX_ANSWER = 20000
-SENDING = threading.Lock()  # one paste at a time: focus and the clipboard are shared
+SENDING = threading.RLock()  # one paste at a time: focus and the clipboard are shared (send() and handoff() both take it)
 RELAY_PORT, TUNNEL_PORT = 7779, 7778          # relay on the Windows side; its forward here
 URL = re.compile(r"https?://[^\s\"'<>]+")
 BARE_URL = re.compile(r"[\w-]+(\.[\w-]+)+(/[^\s\"'<>]*)?")
@@ -441,19 +442,43 @@ class Grokbot:
             ok, why = self.can_type()
             if not ok:
                 raise ValueError(why)
-        if "tunnel" in route:
-            return {**self._via_tunnel(prompt, route, _remaining(deadline)), "sent": prompt}
+        if not (SENDING.acquire(blocking=False) or SENDING.acquire(timeout=_remaining(deadline))):
+            raise TimeoutError("Grok request timed out waiting to send; stopped.")
         try:
-            out = (self._windows(prompt, _remaining(deadline)) if route["os"] == "windows"
-                   else self._linux(prompt, route, _remaining(deadline)))
-        except subprocess.TimeoutExpired as exc:
-            raise TimeoutError("Grok request timed out while sending; stopped.") from exc
+            if "tunnel" in route:
+                return {**self._via_tunnel(prompt, route, _remaining(deadline)), "sent": prompt}
+            try:
+                # SENDING covers this process; the file lock covers the others (voice, ui,
+                # cluster, CLI), which share the same clipboard and focus.
+                with self._paste_lock(deadline):
+                    out = (self._windows(prompt, _remaining(deadline)) if route["os"] == "windows"
+                           else self._linux(prompt, route, _remaining(deadline)))
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError("Grok request timed out while sending; stopped.") from exc
+        finally:
+            SENDING.release()
         res = _kv(out)
         if res.get("ok") != "1":
             raise RuntimeError(res.get("error") or (out or "").strip()[-200:]
                                or f"Grokbot on {route['device']} didn't confirm.")
         return {"sent": prompt, "to": "grokbot", "device": route["device"],
                 "workspace": res.get("workspace") or None}
+
+    @contextmanager
+    def _paste_lock(self, deadline):
+        from .locking import exclusive_lock
+        path = Path(self.state) / "grok-send.lock"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock = exclusive_lock(path, timeout=_remaining(deadline))
+            lock.__enter__()
+        except ValueError:
+            raise TimeoutError("Grok request timed out waiting for another JARVIS process "
+                               "to finish sending; stopped.") from None
+        try:
+            yield
+        finally:
+            lock.__exit__(None, None, None)
 
     # -- handoffs: a task for Grok, and its answer back ------------------------------------
     def handoff(self, task, browser=True, device=None, timeout=REQUEST_TIMEOUT):
