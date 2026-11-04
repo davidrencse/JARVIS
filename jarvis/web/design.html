@@ -44,10 +44,10 @@
 </header>
 
 <main>
-  <section class="block" aria-labelledby="flow-h">
+  <section class="block board-block" aria-labelledby="flow-h">
     <header class="block-head">
       <h2 id="flow-h"><span>01</span> What happens when you say “Jarvis, …”</h2>
-      <p>Seven stations, left to right. Click one to see the code behind it and what it needs.</p>
+      <p>JARVIS drawn as one circuit board, live, beside the seven stations a request passes through. Point at a part or a station to see what it does; click either to open the code behind it. Trace a request and watch it travel the board.</p>
     </header>
     <form class="tester" id="tester" autocomplete="off">
       <label for="try">Try a request</label>
@@ -55,8 +55,38 @@
       <button type="submit">TRACE</button>
     </form>
     <p class="verdict" id="verdict" aria-live="polite">Type something above to light up the path it would take.</p>
-    <ol class="flow" id="flow"></ol>
-    <div class="side" id="side"></div>
+    <div class="rig">
+      <div class="board3d" id="design-board" data-mode="full" role="group"
+           aria-label="JARVIS drawn as a circuit board: the CPU is the brain, the RAM sticks are memory by kind, the M.2 drive is the vault, the graphics card is the action tools, the chipset is the gates. Point at a part for what it does and its live numbers.">
+        <canvas></canvas>
+        <div class="board-tip" hidden></div>
+        <p class="board-fallback" hidden>The 3D board needs WebGL, which this browser has switched off.</p>
+        <div class="board-zoom" hidden>
+          <button type="button" data-z="out" aria-label="Back to the whole board (Esc)">◂ Whole board</button>
+          <b></b>
+          <button type="button" data-z="more">Details ↓</button>
+        </div>
+        <button type="button" class="board-diag" id="diag-run" title="Re-run every health check and scan the board">Run diagnostics</button>
+        <p class="board-key" aria-hidden="true"><i></i>request path<i class="k-hi"></i>selected part · click a part to zoom in<i class="k-ok"></i>ok<i class="k-warn"></i>to improve<i class="k-fail"></i>broken</p>
+      </div>
+      <div class="rail">
+        <h3 class="rail-h">The request path</h3>
+        <ol class="flow" id="flow"></ol>
+        <div class="side" id="side"></div>
+        <h3 class="rail-h">Under the hood</h3>
+        <ul class="parts-rail" id="hood-rail">
+          <li><button type="button" data-part="power"><b>Power</b><span>daemon + autostart</span><i>VRM</i></button></li>
+          <li><button type="button" data-part="config"><b>Config</b><span>rules, roles, lanes</span><i>VRM</i></button></li>
+          <li><button type="button" data-part="local"><b>Local models</b><span>decider + embedder, free</span><i>small chips</i></button></li>
+          <li><button type="button" data-part="stores"><b>Data stores</b><span>sqlite, vault index, logs</span><i>SATA</i></button></li>
+          <li><button type="button" data-part="sandbox"><b>Sandbox</b><span>bubblewrap for commands</span><i>security chip</i></button></li>
+        </ul>
+        <h3 class="rail-h">Skills <em>coming soon</em></h3>
+        <ul class="parts-rail" id="skills-rail">
+          <li><button type="button" data-part="skills" class="ghost"><b>Empty slot</b><span>add a skill to JARVIS</span><i>slot 2</i></button></li>
+        </ul>
+      </div>
+    </div>
     <div class="drawer" id="drawer" hidden></div>
   </section>
 
@@ -76,11 +106,29 @@
     <div class="stores" id="stores"></div>
   </section>
 
+  <section class="block" aria-labelledby="skills-h">
+    <header class="block-head">
+      <h2 id="skills-h"><span>04</span> Skills <em class="soon">coming soon</em></h2>
+      <p>The empty slot on the board. A skill will be one thing you add to JARVIS, made of three parts it already uses for everything else:</p>
+    </header>
+    <ol class="skill-anatomy">
+      <li><b>Words it answers to</b><span>an intent in the registry, so the free parser can route to it without the brain</span></li>
+      <li><b>What it does</b><span>an executor the direct path calls, checked on screen afterwards</span></li>
+      <li><b>What it must ask first</b><span>its gates: anything that buys, sends or posts as you still waits for your OK</span></li>
+    </ol>
+    <div class="skill-slots" aria-label="Skill slots">
+      <div class="skill-slot"><span>SLOT 01</span><b>empty</b></div>
+      <div class="skill-slot"><span>SLOT 02</span><b>empty</b></div>
+      <div class="skill-slot"><span>SLOT 03</span><b>empty</b></div>
+    </div>
+  </section>
+
   <section class="block" aria-labelledby="code-h">
     <header class="block-head">
-      <h2 id="code-h"><span>04</span> Under the hood</h2>
-      <p>The real Python modules, grouped by station. Lines show who imports whom. Hover or focus a module.</p>
+      <h2 id="code-h"><span>05</span> Under the hood</h2>
+      <p>The live components first, then the real Python modules grouped by station. Hover or focus a module (or Tab, then the arrow keys) to draw who it imports and who imports it.</p>
     </header>
+    <div class="parts" id="parts" aria-live="polite"></div>
     <div class="setup" id="setup"></div>
     <div class="codemap"><svg id="codemap" role="img" aria-label="Modules by station with their imports"></svg></div>
     <p class="module-note" id="module-note" aria-live="polite"></p>
@@ -91,5 +139,6 @@
 </div>
 <script src="esc.js"></script>
 <script src="design.js"></script>
+<script type="module" src="board3d.js"></script>
 </body>
 </html>

@@ -21,6 +21,10 @@ const REASONS = {  // the router's reasons, said plainly
   "owner override": "you picked the tier yourself",
 };
 let data = null, open = null, lastPath = null;
+// which part of the 3D board (board3d.js) does each station's job
+const HW = { hear: "I/O shield", decide: "chipset", remember: "RAM + M.2 drive", think: "CPU + cooler", act: "graphics card",
+  speak: "audio chip", log: "log chip", machines: "network chip" };
+const boardSay = (name, detail) => dispatchEvent(new CustomEvent("jarvis:" + name, { detail }));
 
 async function api(path) {
   const res = await fetch(path);
@@ -45,19 +49,61 @@ function renderFlow() {
       <h3>${esc(s.title)}</h3>
       <p class="plain">${esc(s.plain)}</p>
       ${problem ? `<p class="issue ${problem.state}">${MARK[problem.state]} ${esc(problem.label)}</p>` : ""}
-      <p class="meta">${s.modules.length} modules · ${s.lines.toLocaleString()} lines</p>
+      <p class="meta">${s.modules.length} modules · ${s.lines.toLocaleString()} lines${HW[s.id] ? `<span class="hw">▣ ${esc(HW[s.id])}</span>` : ""}</p>
     </li>`;
   };
   $("flow").innerHTML = main.map(card).join("") + `<span class="packet" id="packet" aria-hidden="true"></span>`;
   $("side").innerHTML = side.map((s) => card(s, 0).replace("<li", "<div").replace("</li>", "</div>")).join("");
   document.querySelectorAll(".station").forEach((el) => {
-    const go = () => toggle(el.dataset.id);
+    // a click zooms the board in on the station's parts and opens its code below
+    const go = () => { boardSay("zoom-station", { id: el.dataset.id }); toggle(el.dataset.id, false); };
     el.addEventListener("click", go);
     el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+    // pointing at a station points at its parts on the board, with the station's own words
+    const show = () => {
+      const s = data.stations.find((x) => x.id === el.dataset.id), mine = data.checks.filter((c) => c.station === s.id);
+      const bad = mine.filter((c) => c.state !== "ok");
+      boardSay("station", { id: s.id, title: s.title, hw: HW[s.id], plain: s.plain, rows: [
+        ["modules", `${s.modules.length} · ${s.lines.toLocaleString()} lines`],
+        ["health", bad.length ? `${bad.length} to look at` : mine.length ? "all working" : "nothing to check"],
+        ...bad.slice(0, 2).map((c) => [c.state, c.label])] });
+    };
+    el.addEventListener("mouseenter", show); el.addEventListener("focus", show);
+    el.addEventListener("mouseleave", () => boardSay("station", { id: null }));
+    el.addEventListener("blur", () => boardSay("station", { id: null }));
   });
 }
+// the board talks back: the part under the pointer lights its station; a click opens it
+// remembered so the 30 s refresh (which redraws the stations) keeps them
+const marks = {};
+const mark = (cls, id) => { marks[cls] = id; document.querySelectorAll(".station").forEach((el) => el.classList.toggle(cls, !!id && el.dataset.id === id)); };
+addEventListener("jarvis:board-part", (e) => mark("hot", e.detail && e.detail.station));
+addEventListener("jarvis:board-stop", (e) => mark("now", e.detail && e.detail.station));
+addEventListener("jarvis:open-station", (e) => {
+  const id = e.detail && e.detail.station;
+  if (!data || !data.stations.some((s) => s.id === id)) return;
+  if (open !== id) toggle(id); else $("drawer").scrollIntoView({ behavior: "smooth", block: "nearest" });
+});
+addEventListener("jarvis:board-zoom", (e) => {
+  const d = e.detail || {};
+  mark("zoomed", d.station);
+  document.querySelectorAll(".parts-rail button").forEach((b) => b.classList.toggle("zoomed", b.dataset.part === d.name));
+});
+// the rail's under-the-hood and skills rows point at and zoom to their parts
+document.querySelectorAll(".parts-rail button").forEach((b) => {
+  const name = b.dataset.part;
+  b.addEventListener("mouseenter", () => boardSay("part", { name }));
+  b.addEventListener("focus", () => boardSay("part", { name }));
+  b.addEventListener("mouseleave", () => boardSay("part", { name: null }));
+  b.addEventListener("blur", () => boardSay("part", { name: null }));
+  b.addEventListener("click", () => boardSay("part", { name, zoom: true }));
+});
+addEventListener("jarvis:board-part", (e) => {
+  const st = e.detail && e.detail.name;
+  document.querySelectorAll(".parts-rail button").forEach((b) => b.classList.toggle("hot", !!st && b.dataset.part === st));
+});
 
-function toggle(id) {
+function toggle(id, scroll = true) {
   open = open === id ? null : id;
   document.querySelectorAll(".station").forEach((el) => el.setAttribute("aria-expanded", String(el.dataset.id === open)));
   const drawer = $("drawer");
@@ -72,7 +118,7 @@ function toggle(id) {
     </div>`;
   drawer.hidden = false;
   wireCopy(drawer);
-  drawer.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "nearest" });
+  if (scroll) drawer.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "nearest" });
 }
 
 /* the route tester lights up the stations a request would pass through */
@@ -85,6 +131,7 @@ async function trace(text) {
       <span class="dim">· because ${esc((r.reasons || []).map((x) => REASONS[x] || x).join(", "))}.</span>`;
     light(path);
     runPacket(path);
+    boardSay("route", { path, tier: r.tier });
   } catch (err) {
     $("verdict").textContent = "Couldn't trace that: " + err.message;
   }
@@ -150,6 +197,23 @@ function renderSetup() {
     ["speech-to-text", s.stt], ["python", s.python], ["platform", s.platform]]
     .map(([k, v]) => `<span>${esc(k)} <b>${esc(v)}</b></span>`).join("");
 }
+/* ---------- 04a: the live components, one card each ---------- */
+const STATE_WORD = { ok: "running", warn: "check", off: "off", fail: "broken" };
+async function renderParts() {
+  let cards;
+  try {
+    cards = await api("/api/system/components");
+  } catch (err) {
+    $("parts").innerHTML = `<p class="parts-err">Couldn't read the components: ${esc(err.message)}</p>`;
+    return;
+  }
+  $("parts").innerHTML = cards.map((c) => `<article class="part ${esc(c.state)}" aria-label="${esc(c.title)}: ${esc(STATE_WORD[c.state] || c.state)}">
+      <header><h3>${esc(c.title)}</h3><span class="state"><span class="dot ${esc(c.state)}"></span>${esc(STATE_WORD[c.state] || c.state)}</span></header>
+      <dl>${c.rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
+      ${c.note ? `<p class="part-note">${esc(c.note)}</p>` : ""}
+    </article>`).join("");
+}
+
 function renderCodemap() {
   const cols = data.stations, BW = 132, BH = 34, GX = 22, GY = 10, TOP = 30;
   const pos = new Map();
@@ -172,7 +236,8 @@ function renderCodemap() {
     const back = x2 <= a.x;  // an import pointing left loops around the bottom
     const d = back ? `M${a.x + BW / 2},${a.y + BH} C${a.x + BW / 2},${H + 6} ${b.x + BW / 2},${H + 6} ${b.x + BW / 2},${b.y + BH}`
       : `M${x1},${y1} C${x1 + 40},${y1} ${x2 - 40},${y2} ${x2},${y2}`;
-    edges.push(`<path class="edge" data-s="${esc(m.name)}" data-t="${esc(t)}" d="${d}"/>`);
+    const same = a.x === b.x;  // same station: drawn only while one of them is focused
+    edges.push(`<path class="edge${same ? " same" : ""}" data-s="${esc(m.name)}" data-t="${esc(t)}" d="${d}"/>`);
   }
   const boxes = [...pos.values()].map(({ x, y, m }, i) => `<g class="mod" data-id="${esc(m.name)}" transform="translate(${x},${y})" tabindex="${i ? -1 : 0}"
       aria-label="${esc(m.name)}.py, ${m.lines} lines">
@@ -208,6 +273,54 @@ function renderCodemap() {
   });
 }
 
+/* ---------- diagnostics: re-run every check, then scan the board part by part ---------- */
+// which board part each station's checks and each live component belong to
+const DIAG_STATION = { hear: ["io"], decide: ["gates"], remember: ["vault", "ram0", "ram1", "ram2", "ram3"], think: ["brain"],
+  act: ["act"], speak: ["voice"], log: ["log"] };
+const DIAG_COMPONENT = { brain: "brain", gates: "gates", control: "act", chrome: "chrome", sandbox: "sandbox", memory: "stores",
+  cluster: "cluster", lanmouse: "lanmouse", scorecard: "local" };
+let diagnosing = false;
+async function diagnose() {
+  if (diagnosing) return;
+  diagnosing = true;
+  const btn = $("diag-run");
+  btn.disabled = true; btn.textContent = "Running…"; btn.removeAttribute("data-state");
+  try {
+    const [d, comps] = await Promise.all([api("/api/system/design"), api("/api/system/components")]);
+    data = d; render();
+    const parts = new Map();
+    const add = (name, state, problem) => {
+      const p = parts.get(name) || { name, state: "ok", problems: [], checks: 0 };
+      p.checks++; if (RANK[state] > RANK[p.state]) p.state = state;
+      if (problem) p.problems.push(problem);
+      parts.set(name, p);
+    };
+    for (const c of data.checks) {
+      const names = [...(DIAG_STATION[c.station] || []), ...(c.label === "Listener running" ? ["power"] : []), ...(c.label === "Config file reads cleanly" ? ["config"] : [])];
+      for (const name of names) add(name, c.state, c.state === "ok" ? null : { label: c.label, fix: c.fix || c.detail });
+    }
+    for (const c of comps) if (DIAG_COMPONENT[c.id])
+      add(DIAG_COMPONENT[c.id], c.state, c.state === "ok" ? null : { label: `${c.id}: ${c.state}`, fix: (c.rows || []).map((r) => r.join(" ")).slice(0, 2).join(" · ") });
+    const n = (s) => data.checks.filter((c) => c.state === s).length;
+    $("verdict").innerHTML = `<span class="tier">DIAGNOSTICS</span><b>${n("ok")}</b> working · <b>${n("warn")}</b> to improve · <b>${n("fail")}</b> broken
+      <span class="dim">· ${data.checks.length} checks and ${comps.length} components read live at ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}. Fixes are in 02 below.</span>`;
+    boardSay("diagnose", { results: [...parts.values()], total: data.checks.length + comps.length });
+    const worstState = [...parts.values()].reduce((w, p) => (RANK[p.state] > RANK[w] ? p.state : w), "ok");
+    btn.dataset.state = worstState;
+  } catch (err) {
+    $("verdict").textContent = "Diagnostics couldn't run: " + err.message;
+    btn.dataset.state = "fail";
+  }
+  setTimeout(() => { diagnosing = false; btn.disabled = false; btn.textContent = "Run diagnostics"; }, 3200);  // after the scan
+}
+$("diag-run").addEventListener("click", diagnose);
+
+function render() {
+  renderFlow(); Object.entries(marks).forEach(([cls, id]) => mark(cls, id)); renderChecks(); renderStores(); renderSetup(); renderCodemap(); renderParts();
+  if (lastPath) light(lastPath);
+  if (open) { const was = open; open = null; toggle(was, false); }
+}
+
 async function load() {
   try {
     data = await api("/api/system/design");
@@ -215,9 +328,7 @@ async function load() {
     $("score").textContent = "Couldn't read the system: " + err.message;
     return;
   }
-  renderFlow(); renderChecks(); renderStores(); renderSetup(); renderCodemap();
-  if (lastPath) light(lastPath);
-  if (open) { const was = open; open = null; toggle(was); }
+  render();
 }
 
 $("tester").addEventListener("submit", (e) => {
