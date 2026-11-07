@@ -483,15 +483,31 @@ def serve():
 APPLIED = "clipboard-applied.json"
 
 
+def _paused(state):
+    """Why the shared clipboard is off right now (apart, remote control on), or None."""
+    try:
+        from .sharedinput import sharing_paused
+    except ImportError:  # the bare-script remote half has no package
+        return None
+    try:
+        return sharing_paused(state)
+    except Exception:
+        return None
+
+
 def apply(state, kind, data):
-    """Paste a copy that came from the other laptop (the transfer job's last chunk)."""
+    """Paste a copy that came from the other laptop (the transfer job's last chunk).
+    Returns False (not pasted) while sharing is paused here."""
     if kind not in ("text", "png") or not data or len(data) > MAX_BYTES:
         raise ValueError("Not a clipboard copy.")
+    if _paused(state):
+        return False
     if state:  # first, so this machine's watcher sees it as ours, not a new copy
         path = os.path.join(os.path.abspath(state), APPLIED)
         with open(path, "w", encoding="utf-8") as out:
             json.dump({"digest": digest(kind, data), "at": time.time()}, out)
     local_clipboard().write(kind, data)
+    return True
 
 
 APPLIED_TTL = 5.0  # seconds a pasted-in copy is recognised as the peer's
@@ -521,6 +537,7 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
     log = log or _log_line(os.path.join(state, "logs", "clipboard.log"))
     last = [None]
     busy = [None]
+    paused = [None]
     try:
         current = board.read()
         if current:  # don't push whatever happened to be copied before starting
@@ -543,6 +560,13 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
         last[0] = key
         if key == _applied(state, busy[0]):  # the other laptop's copy, just pasted in here
             return
+        why = _paused(state)
+        if why:  # apart or remote control on: this copy stays here
+            if why != paused[0]:
+                log(f"sharing paused ({why}); copies stay on this laptop")
+            paused[0] = why
+            return
+        paused[0] = None
         began = time.time()
         for target in targets:
             try:
@@ -677,12 +701,33 @@ def refresh(state, log=print):
     return bool(result.get("started"))
 
 
+LOCK = "clipboard.lock"
+
+
 def run(config, state, device_name=None):
+    """One watcher per state folder, for its whole life. The hub's keep-alive, the node
+    agent's and `jarvis clipboard start` can race (audit cluster-05): a second watcher would
+    push every copy twice and nothing would ever stop it. A later one leaves quietly."""
+    from .locking import exclusive_lock
+    state = os.path.abspath(state)
+    os.makedirs(os.path.join(state, "logs"), exist_ok=True)
+    try:
+        lock = exclusive_lock(os.path.join(state, LOCK))
+        lock.__enter__()
+    except ValueError:
+        _log_line(os.path.join(state, "logs", "clipboard.log"))(
+            "another clipboard watcher already runs here; this one exits")
+        return None
+    try:
+        return _run_watcher(config, state, device_name)
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _run_watcher(config, state, device_name=None):
     """Keep the link up: reconnect with backoff (sleep, Wi-Fi changes, the peer rebooting)."""
     from .topology import enabled
     from .transfer import ssh_device
-    state = os.path.abspath(state)
-    os.makedirs(os.path.join(state, "logs"), exist_ok=True)
     _record_code(state)
     log = _log_line(os.path.join(state, "logs", "clipboard.log"))
     _own_pid_file(state)
@@ -806,7 +851,45 @@ def status(state):
             "autostart": _startup_file().is_file(), "log": path, "recent": recent}
 
 
+STOPPED = "clipboard.stopped"  # a stop by hand: {"boot": boot_time()} at that stop
+STOP_JITTER = 120  # seconds: boot times closer than this are the same boot
+
+
+def _boot():
+    try:
+        from .platforms import boot_time
+        return boot_time()
+    except Exception:
+        return None
+
+
+def stopped_by_hand(state):
+    """True while a `clipboard stop` from this boot stands: the keep-alives leave it off.
+    Like Lan Mouse, a stop by hand sticks until the next boot (audit cluster-02). An
+    unreadable boot time never keeps it off."""
+    try:
+        with open(os.path.join(state, STOPPED), encoding="utf-8") as f:
+            then = json.load(f).get("boot")
+    except (OSError, ValueError, AttributeError):
+        return False
+    now = _boot()
+    if then is None or now is None:
+        return False
+    try:
+        return abs(float(then) - float(now)) <= STOP_JITTER
+    except (TypeError, ValueError):
+        return False
+
+
+def _clear_stopped(state):
+    try:
+        os.remove(os.path.join(state, STOPPED))
+    except OSError:
+        pass
+
+
 def start(state, device_name=None):
+    _clear_stopped(state)  # asked to run: a hand stop earlier no longer holds
     if _pid(state):
         return {"started": False, **status(state)}
     state = os.path.abspath(state)
@@ -843,6 +926,11 @@ def start(state, device_name=None):
 
 
 def stop(state):
+    try:  # even when it's already down, so a keep-alive doesn't bring it back this boot
+        with open(os.path.join(state, STOPPED), "w", encoding="utf-8") as f:
+            json.dump({"boot": _boot()}, f)
+    except OSError:
+        pass
     pid = _pid(state)
     if not pid:
         return {"stopped": False, "note": "Not running."}

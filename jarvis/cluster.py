@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 from . import __version__
 from .deploy import code_fingerprint
 from .release import served_code
@@ -56,16 +56,39 @@ def _label(action):
     return str(action).replace("_", " ")
 
 
-def _refresh_clipboard(state):
-    """Restart the clipboard watcher if it runs older code, in the background (never delays
-    the hub or the node starting)."""
+CLIP_CHECK = 60  # seconds between "is the clipboard watcher up?" checks
+
+
+def _refresh_clipboard(state, config=None, stop=None):
+    """Restart the clipboard watcher if it runs older code, then keep it running: a reboot
+    or a crash used to leave copy/paste between the laptops dead until someone typed
+    `jarvis clipboard start` (2026-11-04: down from a 10:44 reboot until evening). Runs
+    in the background (never delays the hub or the node starting). The watcher pushes
+    over the hub, so an offline peer just skips copies until it's back.
+    clipboard.autostart: false in jarvis.config.json turns the keep-alive off."""
+    from . import _under_tests
+    keep = ((config or {}).get("clipboard") or {}).get("autostart", True) and not _under_tests()
+
     def run():
+        from . import clipsync
         try:
-            from .clipsync import refresh
-            refresh(str(state))
+            clipsync.refresh(str(state))
         except Exception as exc:
             print(f"JARVIS: clipboard watcher not refreshed: {exc}", flush=True)
-    threading.Thread(target=run, name="jarvis-clip-refresh", daemon=True).start()
+        while keep:
+            try:
+                # A `clipboard stop` by hand sticks until the next boot (audit cluster-02).
+                if not clipsync._pid(str(state)) and not clipsync.stopped_by_hand(str(state)):
+                    result = clipsync.start(str(state))
+                    print(f"JARVIS: clipboard watcher was down; started: {result.get('started')}",
+                          flush=True)
+            except Exception as exc:  # never let the keep-alive take the hub or node down
+                print(f"JARVIS: clipboard watcher not started: {exc}", flush=True)
+            if stop is not None and stop.wait(CLIP_CHECK):
+                return
+            if stop is None:
+                time.sleep(CLIP_CHECK)
+    threading.Thread(target=run, name="jarvis-clip-keepalive", daemon=True).start()
 
 
 class NodeOffline(ConnectionError):
@@ -328,6 +351,9 @@ def validate_action(kind, payload):
     elif kind == "transfer":
         from .transfer import validate
         validate(payload)
+    elif kind == "remote":  # David's remote-control session (remote_view.py)
+        from .remote_view import validate
+        validate(payload)
     elif kind != "inventory":
         raise ValueError("Nodes execute only desktop, inventory, or Grokbot operations, and file transfers.")
 
@@ -347,6 +373,9 @@ def execute_local(kind, payload, config, state):
     if kind == "transfer":
         from .transfer import run_here
         return run_here(payload, state)
+    if kind == "remote":
+        from .remote_view import run
+        return run(payload, config, state)
     from .grokbot import Grokbot
     return Grokbot(config, state).send(payload["text"], device=identity(config)[0])
 
@@ -365,6 +394,15 @@ class Hub:
         self._polling = {}  # node -> sockets of polls held open now (guarded by _condition)
         self.server = self.thread = self.worker = self._lock = None
         self.started = False
+        from .remote_view import Sessions
+        from . import _under_tests
+        pause = None
+        if not _under_tests():  # tests never touch the real Lan Mouse
+            from .sharedinput import ControllerPause
+            pause = ControllerPause(state).set  # David's input stays here while he drives a node
+        self.remote = Sessions(on_busy=pause)  # David's remote-control sessions, in memory only
+        if pause is not None:
+            pause(False)  # a pause the last hub left behind (crash, restart) ends now
 
     def redeem(self, node, public_key=None, token=None):
         """A newly joined node trades its invite for its own credential: a fresh hub token
@@ -484,9 +522,12 @@ class Hub:
         if node not in self.config.get("devices", {}):
             raise ValueError("Unknown node.")
         if node == self.main:
+            if kind == "remote":
+                raise ValueError("Remote control is for another computer, not the main itself.")
             return execute_local(kind, payload, self.config, self.state)
         status = next((n for n in self.broker.nodes() if n["id"] == node), None)
-        capability = "files" if kind in ("storage", "transfer") else kind
+        capability = ("files" if kind in ("storage", "transfer") else
+                      "desktop" if kind == "remote" else kind)
         if not status or capability not in status["capabilities"]:
             raise ValueError(f"Node {node} is not enrolled for {kind} actions.")
         if not self.alive(node, status) and not self._await_poll(node, status):
@@ -526,6 +567,39 @@ class Hub:
                                        f"(job {job_id}).")
                 self._condition.wait(remaining)
         raise RuntimeError(f"Main stopped while waiting for {job_id}; action outcome is uncertain.")
+
+    def remote_open(self, node, quality="medium"):
+        """Open a remote-control session on `node` for the console: register it, then hand
+        the node its signed start job. The node answers at once and streams on its own."""
+        if node == self.main or node not in self.config.get("devices", {}):
+            raise ValueError("Pick one of your other computers.")
+        session = self.remote.open(node, quality, pending=True)
+        # key: the session's secret, only ever in this signed job; the node checks every reply's MAC
+        payload = {"op": "start", "session": session["id"], "quality": quality,
+                   "key": self.remote.key(session["id"])}
+        try:
+            result = self.dispatch(node, "remote", payload, timeout=20)
+        except TimeoutError:  # dispatch's own text is about jobs; the session is closed, so retry is right
+            why = (f"{_name(node, self.config)} didn't answer within 20 s. "
+                   "Check it's awake, then press Connect again.")
+            self.remote.close(session["id"], why)
+            raise TimeoutError(why) from None
+        except Exception as exc:
+            self.remote.close(session["id"], str(exc))
+            raise
+        try:
+            self.remote.touch(session["id"])  # the console waited on this request: it's watching
+        except LookupError:
+            pass
+        if not (result or {}).get("ok"):
+            why = (result or {}).get("text") or "The computer didn't start the session."
+            self.remote.close(session["id"], why)
+            raise RuntimeError(why)
+        return self.remote.get(session["id"])
+
+    def remote_close(self, session_id):
+        """End a session here at once; the node hears it on its next frame or input poll."""
+        return self.remote.close(session_id, "Disconnected.")
 
     def _asks(self):
         while not self.stop_event.is_set():
@@ -596,7 +670,7 @@ class Hub:
         except BaseException:
             self._lock = None
             raise RuntimeError("The main runtime is already running for this state directory.") from None
-        _refresh_clipboard(self.state)  # the hub restarts with every code change here
+        _refresh_clipboard(self.state, self.config)  # the hub restarts with every code change here
         try:
             self.server = make_server(self, host, port)
             if cert or key:
@@ -629,6 +703,7 @@ class Hub:
 
     def close(self):
         self.stop_event.set()
+        self.remote.close_all("JARVIS on the main stopped.")  # nodes let go on their next poll
         with self._condition:
             self._condition.notify_all()
         if self.server and self.thread:
@@ -701,7 +776,7 @@ def make_server(hub, host, port):
                     return self._send(404, {"error": "Unknown cluster endpoint."})
                 length = int(self.headers.get("Content-Length", "0"))
                 # Results, and file chunks on their way to a node (BULK jobs), may be large.
-                bulk = ("/v1/result", "/v1/action", "/v1/control")
+                bulk = ("/v1/result", "/v1/action", "/v1/control", "/v1/remote/frame")
                 if not 0 < length <= (MAX_RESULT if self.path in bulk else MAX_PROTOCOL):
                     raise ValueError("Invalid cluster request length.")
                 self.connection.settimeout(15)
@@ -713,6 +788,8 @@ def make_server(hub, host, port):
                 if self.path == "/v1/poll" and "owner" not in caps:
                     hub.broker.heartbeat(node, data)
                     kinds = caps & {"desktop", "inventory", "grokbot"}
+                    if "desktop" in caps:
+                        kinds |= {"remote"}
                     if "files" in caps:
                         kinds |= {"storage", "transfer"}
                     deadline = time.monotonic() + POLL_WAIT
@@ -745,6 +822,23 @@ def make_server(hub, host, port):
                             raise
                     return self._send(200, {"job": job, "main_device": hub.main,
                                              "code": served_code(hub.state)})
+                if self.path in ("/v1/remote/frame", "/v1/remote/input") and "owner" not in caps:
+                    if "desktop" not in caps:
+                        raise PermissionError("This node isn't enrolled for desktop actions.")
+                    sid = data.get("session")
+                    if self.path == "/v1/remote/frame" and data.get("end") is not None:
+                        return self._send(200, hub.remote.node_end(node, sid, data["end"]))
+                    if self.path == "/v1/remote/input":
+                        return self._send(200, hub.remote.seal(sid, "input", hub.remote.take_input(
+                            node, sid, data.get("after", 0), stop_event=hub.stop_event)))
+                    jpeg = None
+                    if data.get("jpeg") is not None:
+                        import base64
+                        if not isinstance(data["jpeg"], str):
+                            raise ValueError("Frame must be base64 text.")
+                        jpeg = base64.b64decode(data["jpeg"], validate=True)
+                    return self._send(200, hub.remote.seal(sid, "frame", hub.remote.frame(
+                        node, sid, jpeg, data.get("width"), data.get("height"))))
                 if self.path == "/v1/result" and "owner" not in caps:
                     with hub._condition:
                         hub.broker.finish(data.get("id"), node, data.get("result"), bool(data.get("failed")))
@@ -766,6 +860,8 @@ def make_server(hub, host, port):
                         if (data.get("kind") == "desktop" and isinstance(payload, dict)
                                 and payload.get("action") == "terminal"):
                             raise PermissionError("Nodes can't run terminal commands.")
+                        if data.get("kind") == "remote":
+                            raise PermissionError("Only the main's console can start remote control.")
                     timeout = data.get("timeout", 45)
                     if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 1800:
                         raise ValueError("Action timeout must be 1-1800 seconds.")
@@ -909,7 +1005,7 @@ class NodeWorker:
             return False  # apply_bundle would refuse an unpinned bundle; don't fetch and back up for it
         bundle = self.client.request("/v1/code", timeout=60)
         backup(self.state)  # what the watchdog restores if the new code won't start
-        count = apply_bundle(bundle, key)  # installs changed requirements before its start check
+        count = apply_bundle(bundle, key, state=self.state)  # installs changed requirements before its start check
         self.installed = bundle.get("code")
         print(f"JARVIS node: installed main's code {bundle.get('code')} ({count} files); restarting.", flush=True)
         return True
@@ -1019,16 +1115,20 @@ class NodeWorker:
         return True
 
     def _untrusted(self, job):
-        """Why a polled job must not run, or None. With a pinned code key (every node paired
-        since code signing) each job must carry the main's signature for this node, be fresh,
-        and not have run before (a captured job replayed by a port squatter)."""
+        """Why a polled job must not run, or None. Each job must carry the main's signature for
+        this node (made with the code key the node pinned at join), be fresh, and not have run
+        before (a captured job replayed by a port squatter). A node with no pinned key refuses."""
         try:
             pinned = json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pinned = {}
         key, me = pinned.get("code_key"), pinned.get("node_id")
         if not key:
-            return None  # paired before signing existed: nothing to check against
+            # Paired before code signing existed: nothing to check a job against, so it can't
+            # be told from one a port squatter made up. Fail closed.
+            return ("this node never pinned the main's signing key (paired before job signing); "
+                    "re-pair it: `jarvis cluster invite <node>` on the main, then `jarvis cluster join "
+                    "<code>` on the node")
         from .deploy import verify_job
         why = verify_job(job, me, key)
         if why:
@@ -1056,33 +1156,56 @@ class NodeWorker:
             except Exception as exc:  # never let the guard take the node down
                 print(f"JARVIS node: Lan Mouse guard: {exc}", flush=True)
 
+    def _poll_loop(self):
+        # Only the agent holding the lock guards Lan Mouse (a console's in-process
+        # worker that loses the lock must not start a second guard).
+        if self._acts_locally and (self.config.get("lan_mouse") or {}).get("off_when_apart", True):
+            threading.Thread(target=self._input_guard, name="lanmouse-guard", daemon=True).start()
+        delay = 1
+        while not self.stop_event.is_set() and not self.restarting:
+            if self._rejoined():  # before redeem_invite, which would use the stale client
+                print("JARVIS node: paired again (new credential); restarting to use it.", flush=True)
+                self.restarting = True
+                break
+            try:
+                redeem_invite(self.config, self.state, self.client)
+                worked = self.once()
+                delay = 1
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                print(f"JARVIS node: {exc}", flush=True)
+                worked = False
+                delay = min(delay * 2, 15)
+            if not worked:
+                self.stop_event.wait(delay)
+
     def run(self):
         from .locking import exclusive_lock
-        _refresh_clipboard(self.state)  # a node restarts after each code update: bring the watcher along
-        try:
-            with exclusive_lock(self.state / "cluster-node.lock"):
-                # Only the agent holding the lock guards Lan Mouse (a console's in-process
-                # worker that loses the lock must not start a second guard).
-                if self._acts_locally and (self.config.get("lan_mouse") or {}).get("off_when_apart", True):
-                    threading.Thread(target=self._input_guard, name="lanmouse-guard", daemon=True).start()
-                delay = 1
-                while not self.stop_event.is_set() and not self.restarting:
-                    if self._rejoined():  # before redeem_invite, which would use the stale client
-                        print("JARVIS node: paired again (new credential); restarting to use it.", flush=True)
-                        self.restarting = True
-                        break
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            try:  # only a busy lock means "already running"; the loop's own errors are its own
+                stack.enter_context(exclusive_lock(self.state / "cluster-node.lock"))
+            except ValueError:
+                print("A JARVIS node agent is already running for this state directory.", flush=True)
+            else:
+                # A node restarts after each code update: bring the watcher along, and keep it
+                # up. Only the agent holding the lock does (audit cluster-05: a console's
+                # worker that lost the lock ran a second keep-alive beside the agent's).
+                if getattr(self, "_acts_locally", False):
+                    _refresh_clipboard(self.state, getattr(self, "config", None),
+                                       getattr(self, "stop_event", None))
+                else:
+                    _refresh_clipboard(self.state)
+                if getattr(self, "_acts_locally", False):  # the last agent died mid-session: let go of its keys
+                    from .remote_view import recover
                     try:
-                        redeem_invite(self.config, self.state, self.client)
-                        worked = self.once()
-                        delay = 1
-                    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                        print(f"JARVIS node: {exc}", flush=True)
-                        worked = False
-                        delay = min(delay * 2, 15)
-                    if not worked:
-                        self.stop_event.wait(delay)
-        except ValueError:
-            print("A JARVIS node agent is already running for this state directory.", flush=True)
+                        recover(self.state)
+                    except Exception as exc:
+                        print(f"JARVIS node: remote-control recovery: {exc}", flush=True)
+                try:
+                    self._poll_loop()
+                finally:
+                    from .remote_view import end_all
+                    end_all()  # a restart or stop never leaves David's keys held down
         if self.restarting:
             self.respawn()
 
@@ -1114,7 +1237,7 @@ class NodeWorker:
         flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                  | NO_WINDOW)
         subprocess.Popen([sys.executable, "-c", wrapper, *argv], close_fds=True,
-                         **({"creationflags": flags} if os.name == "nt" else {"start_new_session": True}))
+                         **({"creationflags": flags} if on_windows() else {"start_new_session": True}))
         os._exit(0)
 
     def start(self):

@@ -141,7 +141,8 @@ def proxy_handler(client, overlay=None, setup=None, local=None):
                             response = again
                 self.send_response(response.status)
                 for name in ("Content-Type", "Content-Length", "Cache-Control",
-                             "Content-Disposition", "X-Content-Type-Options"):
+                             "Content-Disposition", "X-Content-Type-Options",
+                             "X-Frame-Seq", "X-Frame-Width", "X-Frame-Height", "X-Node-Ago"):
                     if response.headers.get(name):
                         self.send_header(name, response.headers[name])
                 self.send_header("Referrer-Policy", "no-referrer")
