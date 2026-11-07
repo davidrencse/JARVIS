@@ -19,15 +19,15 @@ heuristic over the command text; it narrows what runs unasked, it isn't a sandbo
 """
 
 import json
-import sys
 import os
 import posixpath
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows, on_macos
 from . import platforms
 
 TIMEOUT = 30          # seconds a command may run
@@ -367,8 +367,10 @@ def _argv(command, folder):
 
 
 # Enforced by the OS, not by reading the command (audit 2026-11-03: quoting, //paths, variables
-# and globs got past the text checks). Hidden: secrets, browser profiles and JARVIS's state.
-# Read-only: JARVIS's own code and config, and the Obsidian vault. Everything else as normal.
+# and globs got past the text checks). Audit 2026-11-04 (#4) inverted it to an allowlist: the whole
+# filesystem is read-only and only WRITABLE below can change. A writable home let a command plant
+# ~/.local/bin/claude, a systemd unit, ~/.gitconfig hooks or a json.py in the repo root, all run
+# later outside the sandbox. Hidden: secrets, browser profiles, app sign-ins and JARVIS's state.
 HIDDEN = ("~/.ssh", "~/.codex", "~/.claude", "~/.gnupg", "~/.password-store", "~/.local/share/keyrings",
           "~/.config/google-chrome", "~/.config/chromium", "~/.mozilla", "~/.zen", "~/.config/zen",
           "~/.config/BraveSoftware", "~/.config/gh", "~/.config/github-copilot", "~/.docker", "~/.aws",
@@ -377,27 +379,77 @@ HIDDEN = ("~/.ssh", "~/.codex", "~/.claude", "~/.gnupg", "~/.password-store", "~
           "~/.local/share/fish", "~/.config/Code/User/globalStorage", "~/.config/discord", "~/snap",
           "~/.var/app", "~/.local/share/TelegramDesktop", "~/.config/Signal",
           "~/.config/jarvis",  # relay tokens (grokbot-<device>.json) reach other laptops' desktops
+          # audit 2026-11-04 (#4): agent and app sign-ins, wallets, clipboard history, CA keys
+          "~/.grok", "~/.grokbot", "~/.hermes", "~/.openclaw", "~/.gemini", "~/.copilot", "~/.cursor",
+          "~/.ollama", "~/.camoufox", "~/.agent-desktop", "~/.zoom", "~/csaw-certs",
+          "~/.config/openclaw", "~/.config/Grok Bot", "~/.config/Codex", "~/.config/Cursor",
+          "~/.config/cursor", "~/.config/gogcli", "~/.config/google-chrome-for-testing",
+          "~/.config/microsoft-edge", "~/.config/opera", "~/.config/vivaldi", "~/.config/Slack",
+          "~/.config/Notion", "~/.config/Electron", "~/.config/Vencord", "~/.config/Mullvad VPN",
+          "~/.config/Windscribe", "~/.config/TradingView", "~/.config/browser-harness", "~/.config/opencode",
+          "~/.config/eve", "~/.config/lan-mouse", "~/.config/lanshare", "~/.config/instabox-listener",
+          "~/.config/figma-linux-next", "~/.local/share/kwalletd", "~/.local/share/com.vercel.cli",
+          "~/.local/share/gogcli", "~/.local/share/opencode", "~/.local/share/wifidoc-chrome",
+          "~/.local/share/undetected_chromedriver", "~/.local/share/Windscribe", "~/.local/share/mkcert",
+          "~/.local/share/klipper", "~/.local/share/instabox-listener", "~/.local/share/tgfs",
+          "~/.cache/Codex", "~/.cache/codex-runtimes", "~/.cache/claude", "~/.cache/claude-cli-nodejs",
+          "~/.cache/opencode", "~/.cache/com.vercel.cli", "~/.cache/google-chrome-headless",
+          "~/.cache/cliphist", "~/.cache/gh",
           "/dev/input", "/dev/snd/by-id")  # input devices: no keylogging from a terminal command
 HIDDEN_FILES = ("~/.git-credentials", "~/.netrc", "~/.pgpass", "~/.claude.json", "~/.my.cnf", "~/.s3cfg",
                 "~/.authinfo", "~/.wakatime.cfg", "~/.cargo/credentials.toml", "~/.cargo/credentials",
                 "~/.npmrc", "~/.pypirc", "~/.bash_history", "~/.zsh_history", "~/.python_history",
                 "~/.mysql_history", "~/.psql_history", "~/.lesshst", "~/.viminfo", "~/.Xauthority")
-# Read-only: places that run code later outside the sandbox (audit 2026-11-03: a .pth in the
-# venv or a systemd/autostart/shell-rc entry would run at the next login or JARVIS start).
+# The only places a command may write (audit 2026-11-04 #4). Scratch space plus David's ordinary
+# work folders: where a download, a convert or a build in one of his projects belongs. Not $HOME
+# itself, ~/.config, ~/.local, ~/.cache or ~/src (the Lan Mouse build): all of those hold things
+# that run later outside the sandbox. A command's folder outside these stays read-only.
+WRITABLE = ("/tmp", "/var/tmp", "~/Downloads", "~/Desktop", "~/Documents", "~/Pictures", "~/Music",
+            "~/Videos", "~/projects", "~/JARVIS-Drop")
+# Read-only again inside WRITABLE: the JARVIS repo (whole: a json.py or .claude/settings.json in
+# its root runs at the next start), the vault (from config), and executables JARVIS runs.
+PROTECT = ("~/Desktop/grok-bot-local",)  # grokbot.py starts this binary outside the sandbox
+# Read-only already through the read-only root; kept as names for the console and older checks.
 PERSIST = ("~/.config/systemd", "~/.config/autostart", "~/.config/hypr", "~/.config/uwsm",
            "~/.config/fish", "~/.bashrc", "~/.bash_profile", "~/.profile", "~/.zshrc", "~/.zprofile",
            "~/.config/environment.d", "~/.pam_environment")
 # $XDG_RUNTIME_DIR is replaced by an empty tmpfs: its sockets (D-Bus -> systemd-run, Hyprland IPC
-# -> dispatch exec, gpg/ssh agents, keyrings, agent-browser, Lan Mouse) run things outside bwrap.
-# Only display and audio come back.
-RUNTIME_KEEP = ("wayland-*", "pipewire-0", "pulse")
-RUNTIME_ENV = ("DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "HYPRLAND_INSTANCE_SIGNATURE")
+# -> dispatch exec, gpg/ssh agents, keyrings, agent-browser, Lan Mouse, and since audit #4 Wayland,
+# PipeWire and Pulse: wtype typed into David's shell, grim took screenshots, the mic recorded)
+# run or see things outside bwrap. Nothing comes back.
+RUNTIME_KEEP = ()
+RUNTIME_ENV = ("DBUS_SESSION_BUS_ADDRESS", "SSH_AUTH_SOCK", "GPG_AGENT_INFO", "HYPRLAND_INSTANCE_SIGNATURE",
+               "WAYLAND_DISPLAY", "DISPLAY", "XAUTHORITY", "PULSE_SERVER", "PIPEWIRE_REMOTE")
+# Host sockets outside $XDG_RUNTIME_DIR, found when the sandbox is built and covered with
+# /dev/null: /run/docker.sock (docker group = root), tailscale, mullvad, the system bus (reboot,
+# NetworkManager), X11 (/tmp/.X11-unix) and Chrome's SingletonSocket in /tmp.
+SOCKET_DIRS = ("/run", "/tmp", "/var/tmp")
+
+
+def _sockets(top, depth=4):
+    found, stack = [], [(Path(top), 0)]
+    while stack:
+        here, level = stack.pop()
+        try:
+            entries = list(os.scandir(here))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if level + 1 < depth:
+                        stack.append((Path(entry.path), level + 1))
+                elif stat.S_ISSOCK(entry.stat(follow_symlinks=False).st_mode):
+                    found.append(entry.path)
+            except OSError:
+                pass
+    return sorted(found)
 
 
 def sandbox(folder=None, repo=None, config=None):
     """The bwrap prefix for a terminal command on Linux, or [] where it can't run (Windows,
     macOS, no bwrap, or terminal.sandbox: false in jarvis.config.json)."""
-    if os.name == "nt" or sys.platform == "darwin" or not shutil.which("bwrap"):
+    if on_windows() or on_macos() or not shutil.which("bwrap"):
         return []
     repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
     if config is None:
@@ -409,39 +461,52 @@ def sandbox(folder=None, repo=None, config=None):
         return []
     home = str(Path.home())
     expand = lambda p: Path(home + str(p)[1:]) if str(p).startswith("~") else Path(p)
-    args = ["bwrap", "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
-            "--die-with-parent"]
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    # Order matters: a later mount covers an earlier one. Read-only root, then the writable
+    # folders, then read-only again inside them, then the hidden things on top of everything.
+    args = ["bwrap", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
+            "--unshare-pid", "--new-session", "--die-with-parent"]
+    for path in WRITABLE:
+        if expand(path).is_dir() and not expand(path).is_symlink():
+            args += ["--bind", str(expand(path)), str(expand(path))]
+    vault = (config.get("vault") or {}).get("path")
+    vaults = list(vault.values()) if isinstance(vault, dict) else [vault]
+    projects = expand("~/projects")
+    hooks = [p for child in (sorted(projects.iterdir()) if projects.is_dir() else []) if child != repo
+             for p in (child / ".git" / "hooks", child / ".git" / "config")]  # run at David's next git command
+    for path in (repo, repo / "jarvis", repo / ".git", repo / ".venv",  # repo root covers all; subpaths for older checks
+                 *[expand(v) for v in vaults if v], *[expand(p) for p in PROTECT], *hooks):
+        if Path(path).exists():
+            args += ["--ro-bind", str(path), str(path)]
     for path in (*HIDDEN, str(repo / ".jarvis")):
         if expand(path).is_dir():
             args += ["--tmpfs", str(expand(path))]
     for path in HIDDEN_FILES:
         if expand(path).is_file():
             args += ["--ro-bind", "/dev/null", str(expand(path))]
-    for raw in sorted(Path("/dev").glob("hidraw*")) + [Path("/dev/uinput")]:
-        if raw.exists():  # raw keyboard/mouse devices and synthetic input
+    devices = [*sorted(Path("/dev").glob("hidraw*")), Path("/dev/uinput"), *sorted(Path("/dev").glob("video*"))]
+    for raw in devices:
+        if raw.exists():  # raw keyboard/mouse devices, synthetic input, cameras
             args += ["--ro-bind", "/dev/null", str(raw)]
-    vault = (config.get("vault") or {}).get("path")
-    vaults = list(vault.values()) if isinstance(vault, dict) else [vault]
-    for path in (repo / "jarvis", repo / ".git", repo / "jarvis.config.json", repo / "JARVIS.md",
-                 repo / "pyproject.toml", repo / "jarvis-memory", repo / ".venv",
-                 *[expand(p) for p in PERSIST], *[expand(v) for v in vaults if v]):
-        if Path(path).exists():
-            args += ["--ro-bind", str(path), str(path)]
-    runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    for top in SOCKET_DIRS:
+        for sock in _sockets(top):
+            if not sock.startswith(str(runtime) + "/"):
+                args += ["--ro-bind", "/dev/null", sock]
     if runtime.is_dir():
-        keep = [p for pattern in RUNTIME_KEEP for p in sorted(runtime.glob(pattern))
-                if not p.name.endswith(".lock")]
         args += ["--tmpfs", str(runtime)]
-        for path in keep:
+        for path in (p for pattern in RUNTIME_KEEP for p in sorted(runtime.glob(pattern))):
             args += ["--bind", str(path), str(path)]
     for name in RUNTIME_ENV:
         args += ["--unsetenv", name]
+    cache = f"/tmp/jarvis-sandbox-cache-{os.getuid()}"  # ~/.cache and ~/.npm are read-only
+    args += ["--setenv", "XDG_CACHE_HOME", cache, "--setenv", "npm_config_cache", cache + "/npm"]
     if folder:
         args += ["--chdir", str(folder)]
     # No host loopback (audit 2026-11-03): the console on 7777, the hub, the relay and browser
     # debug ports trust any local caller. pasta gives the command its own network namespace with
     # internet but no route to the host's 127.0.0.1 (-T/-U none: no namespace->host port
     # forwards; --no-map-gw: the gateway isn't the host). Without pasta: no network at all.
+    # --unshare-pid: when the shell ends, everything it started (setsid -f, nohup, &) dies with it.
     pasta = shutil.which("pasta")
     if pasta:
         return [pasta, "--quiet", "--config-net", "-t", "none", "-u", "none", "-T", "none",
@@ -452,7 +517,7 @@ def sandbox(folder=None, repo=None, config=None):
 def _kill_tree(proc):
     """Kill the shell and everything it started (builds, servers, grandchildren)."""
     try:
-        if os.name == "nt":
+        if on_windows():
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True,
                            timeout=10, creationflags=NO_WINDOW, stdin=subprocess.DEVNULL)
         else:
@@ -508,7 +573,7 @@ def _run_shell(argv, folder):
     the pipes are drained with a bounded wait, so a grandchild holding them can't hang us.
     Output is read in bounded pieces (_drain); past OUTPUT_CAP the rest is drained and discarded."""
     import threading
-    extra = ({"creationflags": NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt"
+    extra = ({"creationflags": NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if on_windows()
              else {"start_new_session": True})
     proc = subprocess.Popen(argv, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, encoding="utf-8", errors="replace",

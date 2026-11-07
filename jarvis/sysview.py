@@ -10,7 +10,7 @@ Three parts, all read-only:
 
 import importlib.util
 import json
-import os
+from .platforms import on_windows
 import shutil
 import sys
 from pathlib import Path
@@ -19,7 +19,7 @@ STATIONS = [
     {"id": "hear", "title": "Hear", "verb": "listens",
      "plain": "The listener records your voice through PipeWire, checks it is you against "
               "your voiceprint, and turns the speech into text with Whisper on this laptop.",
-     "modules": ["listen", "fragments", "onboard", "daemon", "overlay"]},
+     "modules": ["listen", "fragments", "onboard", "daemon", "overlay", "voice_eval"]},
     {"id": "decide", "title": "Decide", "verb": "routes",
      "plain": "Simple rules, no AI, pick the cheapest way to answer: the clock or your vault "
               "instantly, a quick chat, a web task, or a multi-step plan.",
@@ -36,7 +36,7 @@ STATIONS = [
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "control", "app_ui", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput", "peripherals", "connections", "screen"]},
+     "modules": ["actions", "control", "app_ui", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "remote_view", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput", "peripherals", "connections", "screen"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by ElevenLabs, falling back to Kokoro, a voice that "
               "runs on this laptop. ElevenLabs' agent also runs live calls from the console.",
@@ -147,7 +147,7 @@ def checks(console):
     out.append(_check("hear", "Listener running", voice.get("listening"),
                       f"pid {voice.get('pid')}" if voice.get("listening") else "nobody is listening",
                       f"{py} voice start", warn=not enrolled))
-    if os.name != "nt" and "sounddevice" not in deps:
+    if not on_windows() and "sounddevice" not in deps:
         try:
             import sounddevice
             names = {d["name"] for d in sounddevice.query_devices() if d["max_input_channels"] > 0}
@@ -196,7 +196,7 @@ def checks(console):
     out.append(_check("think", "Brain warmed up", warm, "first answer will be fast" if warm else
                       "starts on the first request (a few seconds slower once)", warn=True))
     chrome = next((b for b in ("google-chrome-stable", "google-chrome", "chrome") if shutil.which(b)), None) \
-        or (os.name == "nt" and "chrome")
+        or (on_windows() and "chrome")
     out.append(_check("act", "Browser for web tasks", bool(shutil.which("npx") and chrome),
                       "Playwright and agent-browser drive Chrome with their own profiles" if shutil.which("npx") and chrome
                       else "needs Node (npx) and Google Chrome", "install nodejs, npm and google-chrome"))
@@ -204,7 +204,7 @@ def checks(console):
     out.append(_check("speak", "Kokoro voice files", kokoro,
                       "local voice ready" if kokoro else "replies fall back to espeak or text",
                       "see README: Running on Arch (Kokoro download)"))
-    player = os.name == "nt" or any(shutil.which(p) for p in ("pw-play", "paplay", "aplay"))
+    player = on_windows() or any(shutil.which(p) for p in ("pw-play", "paplay", "aplay"))
     out.append(_check("speak", "Speaker output", player, "audio player found" if player else
                       "no audio player", "sudo pacman -S pipewire"))
     out.append(config_check(console.base))
@@ -268,7 +268,7 @@ def setup(console):
     return {"brain": console.brain()["name"], "chat_model": models.get("chatgpt", {}).get("model"),
             "claude": {k: v.get("model") for k, v in models.get("claude", {}).items()},
             "voice": voice.get("engine"), "kokoro_voice": voice.get("kokoro_voice"),
-            "stt": voice.get("stt_model"), "platform": sys.platform,
+            "stt": voice.get("stt_model"), "stt_engine": voice.get("stt_engine", "parakeet"), "platform": sys.platform,
             "python": sys.version.split()[0], "state": str(console.state)}
 
 

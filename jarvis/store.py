@@ -9,12 +9,16 @@ steps of a plan side by side."""
 import json
 import os
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+TERMINAL = ("finished", "failed", "timed_out", "interrupted")  # nothing moves these again
+KEEP_DAYS = 90        # finished tasks and their events are pruned after this long
+PRUNE_EVERY = 86400   # seconds between prunes, per ledger
 MAX_LANES = 4  # more than this thrashes the subscription without finishing sooner
 
 
@@ -52,6 +56,33 @@ class Store:
                 CREATE INDEX IF NOT EXISTS tasks_created_at ON tasks(created_at);
                 CREATE INDEX IF NOT EXISTS events_task ON events(task_id, seq);
             """)
+        self.prune_if_due()
+
+    def prune_if_due(self):
+        """At most once a day (stamp file mtime), see prune(). Never raises."""
+        stamp = self.directory / "tasks.pruned"
+        try:
+            if stamp.exists() and time.time() - stamp.stat().st_mtime < PRUNE_EVERY:
+                return 0
+            stamp.touch()
+            return self.prune()
+        except (OSError, sqlite3.Error):
+            return 0
+
+    def prune(self, days=KEEP_DAYS):
+        """Delete finished tasks (and their events) last updated over `days` ago, plus
+        events of tasks that no longer exist. Queued or running tasks are never touched.
+        Returns the number of tasks deleted."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        marks = ",".join("?" * len(TERMINAL))
+        with self.connect() as db:
+            old = f"SELECT id FROM tasks WHERE state IN ({marks}) AND updated_at < ?"
+            db.execute(f"DELETE FROM events WHERE task_id IN ({old})", (*TERMINAL, cutoff))
+            removed = db.execute(f"DELETE FROM tasks WHERE id IN ({old})",
+                                 (*TERMINAL, cutoff)).rowcount
+            db.execute("DELETE FROM events WHERE task_id NOT IN (SELECT id FROM tasks) "
+                       "AND at < ?", (cutoff,))
+        return removed
 
     @contextmanager
     def connect(self):

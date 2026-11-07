@@ -1,6 +1,5 @@
 """Open JARVIS console pages as standalone windows."""
 
-import os
 import subprocess
 import sys
 import time
@@ -8,7 +7,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 
 PAGES = {"wiki": "knowledge.html", "system": "design.html", "console": ""}
 PORTS = (7777, *range(7790, 7800))
@@ -36,7 +35,7 @@ def start_console(port=7777, wait=25):
     subprocess.Popen([sys.executable, "-m", "jarvis", "ui", "--port", str(port)], cwd=REPO,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags,
-                     start_new_session=os.name != "nt")
+                     start_new_session=not on_windows())
     end = time.time() + wait
     while time.time() < end:
         if serves_console(port, timeout=0.5):
