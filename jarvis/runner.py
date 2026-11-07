@@ -56,6 +56,9 @@ def make_plan(spec, config, base):
         args = [binary, "--print", "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "plan" if mode == "read-only" else "acceptEdits",
                 "--permission-prompts", "none"]
+        if spec.get("role") != "assistant":  # LEAN_FLAGS (below) already pins it
+            # Project settings only: user-level apiKeyHelper/env could re-enable API billing.
+            args += ["--setting-sources", "project"]
         if tier.get("model"):
             args += ["--model", tier["model"]]
         if tier.get("effort"):
