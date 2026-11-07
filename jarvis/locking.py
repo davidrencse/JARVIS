@@ -2,8 +2,13 @@
 
 import errno
 import os
+from .platforms import on_windows
 import time
 from contextlib import contextmanager
+
+
+class LockBusy(ValueError):
+    """The lock is held by another run. ValueError so existing handlers keep working."""
 
 
 @contextmanager
@@ -21,7 +26,7 @@ def exclusive_lock(path, timeout=0.0, poll=0.05):
         deadline = None  # the clock is read only when someone else holds the lock
         while True:
             try:
-                if os.name == "nt":
+                if on_windows():
                     import msvcrt
                     handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -35,13 +40,14 @@ def exclusive_lock(path, timeout=0.0, poll=0.05):
                 if deadline is None:
                     deadline = time.monotonic() + timeout
                 if time.monotonic() >= deadline:
-                    raise ValueError("Plan is busy in another run or recovery. Try again after "
-                                     "that operation finishes.") from exc
+                    name = os.path.basename(str(path))
+                    raise LockBusy(f"Lock {name!r} is busy in another run or recovery. Try "
+                                   "again after that operation finishes.") from exc
                 time.sleep(poll)
         try:
             yield
         finally:
-            if os.name == "nt":
+            if on_windows():
                 handle.seek(0)
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:

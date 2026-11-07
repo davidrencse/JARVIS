@@ -37,7 +37,7 @@ from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 from .fsio import atomic_write
 from .stemming import stem
 from .locking import exclusive_lock
@@ -648,8 +648,9 @@ class KnowledgeBase:
         return (self.raw / meta["extract"]).read_text(encoding="utf-8", errors="replace")
 
     def _write_raw(self, path, data):
-        path.write_bytes(data)
-        os.chmod(path, 0o444)  # the reader never edits; neither does anyone else by accident
+        # temp + fsync + replace, then read-only: the reader never edits, and a crash mid-write
+        # never leaves a truncated source behind
+        atomic_write(path, data, mode=0o444, fsync=True)
 
     # ---- reader ------------------------------------------------------------------------
     def ingest(self, item=None, text=None, title=None, digest=True, fetch=None, transcribe=None,
@@ -1273,7 +1274,7 @@ class KnowledgeBase:
         lines += [f"raw/{s} changed" for s in report["mutated"][:2]]
         title = "JARVIS checker needs you"
         try:
-            if os.name != "nt" and shutil.which("notify-send"):
+            if not on_windows() and shutil.which("notify-send"):
                 subprocess.run(["notify-send", "-a", "JARVIS", title, "\n".join(lines)], timeout=10)
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -1540,7 +1541,7 @@ class KnowledgeBase:
         return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd" / "user"
 
     def schedule_status(self):
-        if os.name == "nt":
+        if on_windows():
             return {"kind": "schtasks", "at": "02:00"}
         timer = self._unit_dir() / f"{self.UNIT}.timer"
         return {"kind": "systemd", "at": "02:00", "installed": timer.is_file()}
@@ -1549,7 +1550,7 @@ class KnowledgeBase:
         """Run the checker nightly: a systemd user timer on Arch, Task Scheduler on Windows."""
         command = [sys.executable, "-m", "jarvis", "--config", str(Path(config_path).resolve()),
                    "--state", str(Path(state).resolve()), "kb", "check", "--notify"]
-        if os.name == "nt":
+        if on_windows():
             name = "JARVIS knowledge check"
             if not enable:
                 subprocess.run(["schtasks", "/Delete", "/TN", name, "/F"], capture_output=True)
@@ -1576,15 +1577,17 @@ class KnowledgeBase:
             return {"schedule": False}
         folder.mkdir(parents=True, exist_ok=True)
         quoted = " ".join(f'"{c}"' for c in command)
-        service.write_text(
+        atomic_write(
+            service,
             "[Unit]\nDescription=JARVIS knowledge checker (contradictions, stale claims, orphans)\n\n"
             f"[Service]\nType=oneshot\nWorkingDirectory={Path(__file__).resolve().parent.parent}\n"
             f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"\n'
-            f"ExecStart={quoted}\n", encoding="utf-8")
-        timer.write_text(
+            f"ExecStart={quoted}\n")
+        atomic_write(
+            timer,
             "[Unit]\nDescription=Nightly JARVIS knowledge check\n\n"
             f"[Timer]\nOnCalendar=*-*-* {at}:00\nPersistent=true\n\n"
-            "[Install]\nWantedBy=timers.target\n", encoding="utf-8")
+            "[Install]\nWantedBy=timers.target\n")
         enabled = ctl("daemon-reload") and ctl("enable", "--now", timer.name)
         return {"schedule": True, "timer": str(timer), "enabled": enabled}
 
@@ -1602,7 +1605,7 @@ def knowledge_path(config, state):
     settings = (config or {}).get("knowledge") or {}
     path = settings.get("path")
     if isinstance(path, dict):
-        path = path.get("windows" if os.name == "nt" else "linux")
+        path = path.get("windows" if on_windows() else "linux")
     return Path(path).expanduser() if path else Path(state).resolve() / "knowledge"
 
 

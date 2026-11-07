@@ -5,14 +5,19 @@
 - Speaker check: sherpa-onnx ERes2Net speaker embedding (≈26 MB ONNX model, CPU),
   cosine similarity against an enrolled voiceprint. Runs before transcription so
   other voices never reach the model or the agents.
-- Transcription: faster-whisper on the RTX 4060 (CUDA fp16), CPU int8 fallback.
+- Transcription: Parakeet TDT 0.6B v3 (int8 ONNX via onnx-asr, the model Handy ships) in-process
+  on CPU first; faster-whisper (RTX 4060 CUDA fp16, CPU int8) is the fallback whenever Parakeet
+  is missing, fails, or its words lack the wake word. voice.stt_engine: parakeet | moonshine | whisper.
 
-Optional packages: pip install numpy sounddevice faster-whisper sherpa-onnx
+Optional packages: pip install numpy sounddevice faster-whisper sherpa-onnx onnx-asr
 Speaker model: SPEAKER_MODEL_URL below, saved to .jarvis/voice/.
 """
 
 import json
 import os
+import re
+from contextlib import contextmanager
+from .platforms import on_windows
 import time
 from pathlib import Path
 
@@ -32,7 +37,7 @@ ENROLL_PHRASES = (
     "Jarvis, summarize my unread email and flag anything urgent.",
     "Jarvis, start a new plan for the Underlord game.",
 )
-INSTALL_HINT = "Voice input needs: pip install numpy sounddevice faster-whisper sherpa-onnx"
+INSTALL_HINT = "Voice input needs: pip install numpy sounddevice faster-whisper sherpa-onnx onnx-asr"
 
 
 def _np():
@@ -79,7 +84,7 @@ def _input_device(sd, preferred=None):
     names = {d["name"] for _, d in devices}
     if preferred is not None and (preferred in names or preferred in (i for i, _ in devices)):
         return _resolve_device(sd, devices, preferred)
-    if os.name == "nt":
+    if on_windows():
         return None
     return next((n for n in ("pipewire", "pulse") if n in names), None)
 
@@ -92,7 +97,7 @@ def _resolve_device(sd, devices, preferred):
     matches = [(i, d) for i, d in devices if d["name"] == preferred]
     if len(matches) == 1:
         return matches[0][0]
-    if os.name == "nt":
+    if on_windows():
         try:
             apis = sd.query_hostapis()
             for i, d in matches:
@@ -113,7 +118,7 @@ def input_devices():
     seen, out = set(), []
     for d in sd.query_devices():
         name = d["name"]
-        if d["max_input_channels"] < 1 or name in seen or (os.name != "nt" and "(hw:" in name):
+        if d["max_input_channels"] < 1 or name in seen or (not on_windows() and "(hw:" in name):
             continue
         seen.add(name)
         out.append(name)
@@ -320,18 +325,26 @@ class LiveMic:
         self.level = 0.0  # RMS of the newest block, for the setup screen's meter
         self.peak = 0.0   # loudest block since take_peak(), for the console's wave
         self.block = VAD_CHUNK if _vad_model() else FRAME
+        self.device = None
         self.blocks = queue.Queue(maxsize=max(1, int(backlog * RATE / self.block)))
         if stream is None:
             try:
                 import sounddevice as sd
             except ImportError:
                 raise RuntimeError(INSTALL_HINT) from None
+            self.device = _input_device(sd, self.tuning.get("device"))
             stream = sd.InputStream(samplerate=RATE, channels=1, dtype="float32",
-                                    blocksize=self.block,
-                                    device=_input_device(sd, self.tuning.get("device")),
+                                    blocksize=self.block, device=self.device,
                                     callback=self._callback)
         self.stream = stream
-        self.stream.start()
+        try:
+            self.stream.start()
+        except Exception:  # never leave a half-open stream behind a PortAudio re-init
+            try:
+                self.stream.close()
+            except Exception:
+                pass
+            raise
 
     def _callback(self, data, frames, time_info, status):
         chunk = data[:, 0].copy()
@@ -352,7 +365,7 @@ class LiveMic:
         try:
             return self.blocks.get(timeout=5)
         except self._queue.Empty:
-            raise RuntimeError("The microphone stopped sending audio.") from None
+            raise MicLost("The microphone stopped sending audio.") from None
 
     def take_peak(self):
         """The loudest block since the last call (0 when none arrived), then reset."""
@@ -374,6 +387,103 @@ class LiveMic:
             self.stream.close()
 
 
+class MicLost(RuntimeError):
+    """The open stream stopped delivering audio (suspend/resume, a source change): reopen
+    it, which is no failed request."""
+
+
+def _reinit_portaudio(sd):
+    """PortAudio lists devices once, when it starts: a PipeWire node that appears later
+    (WirePlumber still starting at login) stays invisible until it is re-initialised.
+    Private sounddevice API, so guarded. Only call it while this process has no stream open."""
+    terminate, initialize = getattr(sd, "_terminate", None), getattr(sd, "_initialize", None)
+    if not (callable(terminate) and callable(initialize)):
+        return False
+    try:
+        terminate()
+        initialize()
+        return True
+    except Exception:
+        return False
+
+
+@contextmanager
+def _quiet_stderr():
+    """Mute fd 2 while PortAudio probes the mic: a missing PipeWire node makes ALSA print a
+    dozen lines per try. Best effort; our own one-line summary is logged afterwards."""
+    import sys
+    try:
+        sys.stderr.flush()
+        saved, null = os.dup(2), os.open(os.devnull, os.O_WRONLY)
+        os.dup2(null, 2)
+    except (OSError, AttributeError, ValueError):
+        yield
+        return
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(null)
+
+
+def describe_input(sd, device):
+    """The capture device as one log phrase: name, host API, default rate and channels."""
+    try:
+        info = sd.query_devices(device, "input") if device is not None else sd.query_devices(kind="input")
+        api = sd.query_hostapis(info["hostapi"])["name"]
+        return (f"{info['name']} ({api}, {int(info['default_samplerate'])} Hz, "
+                f"{info['max_input_channels']} ch)")
+    except Exception:
+        return "default input" if device is None else str(device)
+
+
+MIC_WAIT = 90  # seconds of "waiting for the microphone" before it is reported missing
+
+
+def open_mic(tuning=None, log=print, wait=MIC_WAIT, sleep=time.sleep, sd=None, factory=None,
+             on_missing=None, fresh=False):
+    """A LiveMic, waiting for the mic to exist. At login PipeWire's source can be missing
+    for 20-60 s ("no target node available"); that is no failed request, so nothing is
+    spoken: one log line, a PortAudio re-init and a retry each second, then every 30 s
+    after `wait` seconds (when `on_missing` is told once). `fresh` re-initialises first
+    (a reopen after MicLost). Only a missing package raises."""
+    if sd is None:
+        try:
+            import sounddevice as sd
+        except ImportError:
+            raise RuntimeError(INSTALL_HINT) from None
+    factory = factory or (lambda: LiveMic(tuning=tuning))
+    if fresh:
+        _reinit_portaudio(sd)
+    started, tries, missing = time.monotonic(), 0, False
+    while True:
+        try:
+            with _quiet_stderr():
+                mic = factory()
+        except Exception as exc:
+            if INSTALL_HINT in str(exc):
+                raise
+            tries += 1
+            if tries == 1:
+                detail = (str(exc).splitlines() or [""])[0][:160]
+                log(f"waiting for the microphone (PipeWire not ready): {type(exc).__name__}: {detail}")
+            if not missing and time.monotonic() - started >= wait:
+                missing = True
+                log(f"microphone still missing after {wait}s; checking every 30 s")
+                if on_missing:
+                    try:
+                        on_missing()
+                    except Exception:
+                        pass
+            _reinit_portaudio(sd)
+            sleep(30 if missing else 1)
+            continue
+        after = f" after {tries} tries" if tries else ""
+        log(f"microphone: {describe_input(sd, getattr(mic, 'device', None))}{after}")
+        return mic
+
+
 def save_wav(path, audio):
     """16-bit mono WAV, used to keep enrollment clips for re-calibration/diagnosis."""
     import wave
@@ -388,7 +498,13 @@ def save_wav(path, audio):
 
 
 class VoicePrint:
-    """Enrolled speaker embedding + threshold, stored in .jarvis/voice/voiceprint.json."""
+    """Enrolled speaker embedding + threshold, stored in .jarvis/voice/voiceprint.json.
+
+    The profile is the enrollment clips ("pinned", the first `clips` entries, never changed)
+    followed by clips learned live. Learned clips can only nudge a score (NUDGE) and must
+    themselves match the enrollment (ANCHOR): until 2026-11-07 any clip scoring 0.48 joined,
+    with no wake word, and 3 learned clips of the TV or a call were enough to accept it.
+    voice.adapt: false stops learning; forget_learned() drops what was learned."""
 
     def __init__(self, state_dir, config=None):
         cfg = (config or {}).get("voice", {})
@@ -396,8 +512,10 @@ class VoicePrint:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.model = Path(cfg.get("speaker_model") or self.dir / Path(SPEAKER_MODEL_URL).name)
         self.path = self.dir / "voiceprint.json"
+        self.adapt = cfg.get("adapt", True) is not False
         self._extractor = None
         self.last_embedding = None
+        self.last_score = self.last_limit = None
 
     def _embed(self, audio):
         np = _np()
@@ -417,10 +535,18 @@ class VoicePrint:
         vector = np.array(self._extractor.compute(stream), dtype="float32")
         return vector / (np.linalg.norm(vector) or 1.0)
 
-    # ERes2Net cosine on this mic: other voices ≤ 0.26, JARVIS's own Kokoro voice ≤ 0.18,
-    # David live (not enrollment) 0.38–0.45. Enrollment clips score higher than live
+    # ERes2Net cosine on this mic: other voices <= 0.26, JARVIS's own Kokoro voice <= 0.19,
+    # David live (not enrollment) 0.38-0.45. Enrollment clips score higher than live
     # speech, so the learned threshold is capped well below them.
-    FLOOR, CEILING, MARGIN, ADAPT_MARGIN, MAX_PROFILE = 0.30, 0.36, 0.10, 0.12, 40
+    # Offline (2026-11-07, jarvis.voice_eval): his enrollment clips stay >= 0.465 against
+    # each other under 3 dB noise or 0.7 s reverb, so learned clips only need to nudge.
+    FLOOR, CEILING, MARGIN, MAX_PROFILE = 0.30, 0.36, 0.10, 40
+    NUDGE = 0.10        # learned clips lift a score at most this far above the enrolled match
+    ANCHOR = 0.30       # a learned clip must match the enrollment alone at least this well
+    LEARN_MARGIN = 0.05  # only turns this far above the threshold teach the profile
+    DUPLICATE = 0.90    # a new clip this close to a learned one replaces it (one session,
+                        # one voice, can't fill the profile)
+    NEG_GAP = 0.05      # calibrate(): the threshold sits at least this far above negatives
 
     @staticmethod
     def _unit(vector):
@@ -428,8 +554,8 @@ class VoicePrint:
         return vector / (np.linalg.norm(vector) or 1.0)
 
     @classmethod
-    def score(cls, embedding, profile):
-        """Best of: match to the centroid, or mean of the 3 closest enrolled clips."""
+    def _match(cls, embedding, profile):
+        """Best of: match to the centroid, or mean of the 3 closest clips."""
         np = _np()
         profile = np.asarray(profile, dtype="float32")
         centroid = float(embedding @ cls._unit(profile.mean(axis=0)))
@@ -437,34 +563,102 @@ class VoicePrint:
         return max(centroid, float(nearest.mean()))
 
     @classmethod
-    def calibrate(cls, embeddings):
+    def score(cls, embedding, profile, pinned=0):
+        """The match to the profile. With `pinned` (enrollment clips at its front) the
+        enrollment match anchors it: learned clips that match the enrollment themselves
+        (ANCHOR) can lift it by at most NUDGE, so no voice is accepted on learned clips alone."""
+        if not pinned or pinned >= len(profile):
+            return cls._match(embedding, profile)
+        base = cls._match(embedding, profile[:pinned])
+        learned = cls.trusted(profile, pinned)[pinned:]
+        if not learned:
+            return base
+        return max(base, min(cls._match(embedding, learned), base + cls.NUDGE))
+
+    @classmethod
+    def trusted(cls, profile, pinned):
+        """The profile without learned clips that don't match the enrollment (ANCHOR):
+        a voiceprint poisoned before 2026-11-07 is defused without rewriting the file."""
+        np = _np()
+        if not pinned or pinned >= len(profile):
+            return list(profile)
+        enrolled = list(profile[:pinned])
+        return enrolled + [e for e in profile[pinned:]
+                           if cls._match(np.asarray(e, dtype="float32"), enrolled) >= cls.ANCHOR]
+
+    @classmethod
+    def calibrate(cls, embeddings, negatives=None, report=None):
         """Leave-one-out: score each clip against the others; threshold sits just below
-        the weakest genuine match, clamped to [FLOOR, CEILING]."""
+        the weakest genuine match, clamped to [FLOOR, CEILING]. `negatives` (other voices'
+        embeddings) push it up to NEG_GAP above the closest of them, but never above CEILING
+        or his own weakest clip minus MARGIN: live David scores 0.38-0.45, so a stricter
+        cutoff would lock him out. A negative closer than that is reported, not obeyed
+        (2026-11-07 eval: one Kokoro voice at 0.332 asked for 0.382).
+        `report` (a dict) is filled with what the choice rests on."""
         np = _np()
         if len(embeddings) < 2:
             raise ValueError("Need at least 2 clips to calibrate.")
         own = [cls.score(e, [o for j, o in enumerate(embeddings) if j != i])
                for i, e in enumerate(embeddings)]
         threshold = min(cls.CEILING, max(cls.FLOOR, min(own) - cls.MARGIN))
+        info = {"own_min": round(min(own), 3), "negatives": len(negatives or ())}
+        if negatives:
+            neg = [cls.score(n, embeddings) for n in negatives]
+            need = max(neg) + cls.NEG_GAP
+            cap = max(cls.FLOOR, min(cls.CEILING, min(own) - cls.MARGIN))
+            if need > threshold:
+                threshold = min(need, cap)
+            info.update(negative_max=round(max(neg), 3), negatives_too_close=need > cap,
+                        false_accept=round(float(np.mean([n >= threshold for n in neg])), 4))
+        info.update(threshold=round(threshold, 3),
+                    false_reject=round(float(np.mean([o < threshold for o in own])), 4))
+        if report is not None:
+            report.update(info)
         return cls._unit(np.mean(embeddings, axis=0)), threshold, own
 
     def _add(self, data, embedding):
-        """Append a learned clip. Enrollment clips are pinned; only learned ones rotate."""
+        """Append a learned clip, if it matches the enrollment (ANCHOR). Enrollment clips
+        are pinned; only learned ones rotate, and a near-copy replaces its twin."""
         np = _np()
         profile = data.get("profile") or [data["embedding"]]
-        pinned = profile[:data.get("clips", 0)]
+        clips = data.get("clips", 0)
+        pinned = profile[:clips]
+        if pinned and self._match(embedding, pinned) < self.ANCHOR:
+            return False
+        learned = list(profile[len(pinned):])
+        if learned:
+            sims = np.asarray(learned, dtype="float32") @ embedding
+            twin = int(np.argmax(sims))
+            if sims[twin] >= self.DUPLICATE:
+                learned.pop(twin)
         room = max(1, self.MAX_PROFILE - len(pinned))  # [-0:] would keep everything
-        learned = (profile[len(pinned):] + [embedding.tolist()])[-room:]
+        learned = (learned + [embedding.tolist()])[-room:]
         data["profile"] = pinned + learned
         data["embedding"] = self._unit(np.mean(data["profile"], axis=0)).tolist()
         self._save(data, keep_threshold=True)
+        return True
 
     def learn(self):
-        """Add the last verified clip: called once the transcript also starts with 'Jarvis',
-        which is strong evidence it was David talking to JARVIS."""
-        if self.last_embedding is not None and self.path.is_file():
-            self._add(self._load(), self.last_embedding)
-            self.last_embedding = None
+        """Add the last verified clip: called once a turn that said "Jarvis" itself passed
+        the full voice check by LEARN_MARGIN, which is strong evidence it was David."""
+        embedding, score, limit, self.last_embedding = (
+            self.last_embedding, self.last_score, self.last_limit, None)
+        if (not self.adapt or embedding is None or not self.path.is_file()
+                or score is None or limit is None or score < limit + self.LEARN_MARGIN):
+            return False
+        return self._add(self._load(), embedding)
+
+    def forget_learned(self):
+        """Drop every learned clip; the enrollment stays. Returns how many were dropped."""
+        np = _np()
+        data = self._load()
+        profile, clips = data.get("profile") or [], data.get("clips", 0)
+        if not clips or len(profile) <= clips:
+            return 0
+        data["profile"] = profile[:clips]
+        data["embedding"] = self._unit(np.mean(data["profile"], axis=0)).tolist()
+        self._save(data, keep_threshold=True)
+        return len(profile) - clips
 
     def _save(self, data, keep_threshold=False):
         # voice service and console transcribe both read and write this file
@@ -487,48 +681,47 @@ class VoicePrint:
                     raise
                 time.sleep(0.05)
 
-    def enroll(self, clips):
+    def enroll(self, clips, negatives=None):
+        """`negatives`: embeddings of other voices that the threshold must reject."""
         if len(clips) < 3:
             raise ValueError("Enroll with at least 3 clips of your voice.")
         embeddings = [self._embed(c) for c in clips]
-        center, threshold, own = self.calibrate(embeddings)
+        report = {}
+        center, threshold, own = self.calibrate(embeddings, negatives, report)
+        report["date"] = time.strftime("%Y-%m-%d %H:%M")
         self._save({"embedding": center.tolist(), "profile": [e.tolist() for e in embeddings],
-                    "threshold": threshold, "clips": len(clips), "model": self.model.name})
+                    "threshold": threshold, "clips": len(clips), "model": self.model.name,
+                    "calibration": report})
         return {"threshold": round(threshold, 3), "clips": len(clips),
-                "own_scores": [round(s, 3) for s in own], "path": str(self.path)}
+                "own_scores": [round(s, 3) for s in own], "path": str(self.path),
+                "calibration": report}
 
     def recalibrate(self):
         """Rebuild the voiceprint from saved enrollment clips (e.g. after a model change).
-        Built-in local voices in voice/impostors/ double-check the cutoff rejects others."""
+        Learned clips are dropped; the old file is kept as voiceprint.json.prev. Local
+        voices in voice/impostors/ are negatives: the cutoff is fitted to reject them."""
         import glob
-        import wave
-        np = _np()
+        import shutil
 
-        def load(path):
-            with wave.open(path) as w:
-                pcm = np.frombuffer(w.readframes(w.getnframes()), "<i2").astype("float32")
-                rate = w.getframerate()
-            pcm /= 32768
-            if rate != RATE:
-                pcm = np.interp(np.arange(0, len(pcm), rate / RATE), np.arange(len(pcm)),
-                                pcm).astype("float32")
-            return pcm
-
-        clips = [load(p) for p in sorted(glob.glob(str(self.dir / "enroll" / "*.wav")))]
+        clips = [load_wav(p) for p in sorted(glob.glob(str(self.dir / "enroll" / "*.wav")))]
         if len(clips) < 3:
             raise RuntimeError("No saved enrollment clips. Run: jarvis voice enroll")
-        result = self.enroll(clips)
         others = sorted(glob.glob(str(self.dir / "impostors" / "*.wav")))
+        negatives = [self._embed(load_wav(p)) for p in others]
+        if self.path.is_file():
+            shutil.copy2(self.path, self.path.with_name(self.path.name + ".prev"))
+        result = self.enroll(clips, negatives or None)
         if others:
             data = self._load()
-            scores = [self.score(self._embed(load(p)), data["profile"]) for p in others]
+            scores = [self.score(e, data["profile"], data.get("clips", 0)) for e in negatives]
             result["impostor_max"] = round(max(scores), 3)
             result["safe"] = max(scores) < data["threshold"]
         return result
 
-    def verify(self, audio, threshold=None, learn=True):
-        """(accepted, score). Confident matches join the profile so it adapts to the
-        real mic and room; borderline ones never do. learn=False only scores (a mic check)."""
+    def verify(self, audio, threshold=None, learn=False):
+        """(accepted, score). Only scores: the profile learns through learn(), once the
+        turn has proved itself (said "Jarvis", passed by LEARN_MARGIN). learn=True is the
+        old one-call form: score, then learn() if confident."""
         _np()  # fail early with the install hint if numpy is missing
         if not self.path.is_file():
             raise RuntimeError("No voiceprint yet. Run: python -m jarvis voice enroll")
@@ -538,19 +731,47 @@ class VoicePrint:
                                "Run: jarvis voice recalibrate")
         profile = data.get("profile") or [data["embedding"]]
         embedding = self._embed(audio)
-        score = self.score(embedding, profile)
+        score = self.score(embedding, profile, data.get("clips", 0) if "profile" in data else 0)
         limit = data["threshold"] if threshold is None else threshold
         self.last_embedding = embedding if score >= limit else None
-        if learn and score >= data["threshold"] + self.ADAPT_MARGIN and "profile" in data:
-            self._add(data, embedding)
-            self.last_embedding = None  # already learned
-        return score >= limit, round(score, 3)
+        self.last_score, self.last_limit = score, data["threshold"]
+        accepted = score >= limit
+        if learn and accepted:
+            self.learn()
+        return accepted, round(score, 3)
+
+
+def load_wav(path):
+    """16-bit WAV as float32 mono 16 kHz (resampled linearly if needed)."""
+    import wave
+    np = _np()
+    with wave.open(str(path)) as w:
+        pcm = np.frombuffer(w.readframes(w.getnframes()), "<i2").astype("float32")
+        rate, channels = w.getframerate(), w.getnchannels()
+    if channels > 1:
+        pcm = pcm.reshape(-1, channels).mean(axis=1)
+    pcm /= 32768
+    if rate != RATE:
+        pcm = np.interp(np.arange(0, len(pcm), rate / RATE), np.arange(len(pcm)),
+                        pcm).astype("float32")
+    return pcm
+
+
+def score_text(score, limit):
+    """"0.358 < 0.36": a score shown next to its cutoff, truncated so a miss never reads
+    as a pass after rounding."""
+    import math
+    if score is None:
+        return "unchecked"
+    shown = math.floor(float(score) * 1000) / 1000
+    if limit is None:
+        return f"{shown:.3f}"
+    return f"{shown:.3f} {'>=' if score >= limit else '<'} {limit:g}"
 
 
 def _expose_cuda_dlls():
     """pip's nvidia-cublas/cudnn wheels put DLLs in site-packages/nvidia/*/bin, which
     Windows doesn't search. Add them so ctranslate2 finds CUDA instead of failing over."""
-    import os
     import sys
     if sys.platform != "win32":
         return
@@ -580,6 +801,90 @@ class Moonshine:
         return self._tok.decode_batch(self._model.generate(audio[:64 * RATE][None]))[0].strip()
 
 
+# Parakeet TDT 0.6B v3 languages (ISO 639-1). Other languages go straight to Whisper.
+PARAKEET_LANGS = ("bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu", "it",
+                  "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru", "uk")
+
+
+class Parakeet:
+    """NVIDIA Parakeet TDT 0.6B v3, int8 ONNX, in-process via onnx-asr (pip: onnx-asr): the
+    model Handy ships. ~0.3 s for a 3 s clip on this CPU vs ~1.5 s for small.en (measured
+    2026-11-05). Returns (text, mean token logprob or None), or None while it isn't ready.
+
+    It loads in a background thread on first use (the first run downloads ~640 MB), so a
+    slow link never blocks the listener: Whisper answers until it's ready. A failed load
+    (offline at login) is retried after RETRY seconds; only a missing package is final.
+    Threads are capped and don't spin, so it doesn't starve the voice check and TTS."""
+
+    RETRY = 120
+
+    def __init__(self, name="nemo-parakeet-tdt-0.6b-v3", threads=4):
+        import threading
+        self.name, self.threads, self._lock = name, threads, threading.Lock()
+        self._model, self._loading, self._failed_at, self.error, self.missing = (
+            None, None, None, None, None)
+
+    def _load(self):
+        try:
+            import onnx_asr
+            import onnxruntime as rt
+            opts = rt.SessionOptions()
+            opts.intra_op_num_threads = self.threads
+            opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            model = onnx_asr.load_model(self.name, quantization="int8",
+                                        sess_options=opts).with_timestamps()
+        except ImportError as exc:
+            self.missing = self.error = exc
+        except Exception as exc:  # offline, disk full, corrupt download: try again later
+            self.error, self._failed_at = exc, time.monotonic()
+        else:
+            self._model, self.error = model, None
+        finally:
+            with self._lock:
+                self._loading = None
+
+    def ready(self):
+        """True once loaded; otherwise starts (or retries) the background load."""
+        if self._model is not None:
+            return True
+        with self._lock:
+            if self.missing is not None:
+                raise ImportError(f"onnx-asr unavailable: {self.missing}")
+            retry_due = self._failed_at is None or time.monotonic() - self._failed_at > self.RETRY
+            if self._loading is None and retry_due:
+                import threading
+                self._loading = threading.Thread(target=self._load, name="parakeet-load",
+                                                 daemon=True)
+                self._loading.start()
+        return False
+
+    def __call__(self, audio):
+        import numpy as np
+        audio = np.asarray(audio, dtype="float32")
+        if len(audio) < RATE // 10:  # before ready(): too short to be worth a load
+            return "", None
+        if not self.ready():
+            return None
+        r = self._model.recognize(audio[:60 * RATE], sample_rate=RATE)
+        lps = list(getattr(r, "logprobs", None) or [])
+        return (r.text or "").strip(), (sum(lps) / len(lps) if lps else None)
+
+
+_CUDA = None
+
+
+def _has_cuda():
+    """A CUDA GPU for Whisper? Checked once; there large-v3-turbo is fast and better."""
+    global _CUDA
+    if _CUDA is None:
+        try:
+            import ctranslate2
+            _CUDA = bool(ctranslate2.get_cuda_device_count())
+        except Exception:
+            _CUDA = False
+    return _CUDA
+
+
 def plausible(text, seconds):
     """False for what a small model emits on noise: too many words for the time spoken,
     or one word looping ("the the the the the")."""
@@ -594,6 +899,83 @@ def plausible(text, seconds):
     return True
 
 
+# Parakeet's own spellings of "Jarvis" in a noisy room (2026-11-07: David's enrollment clips
+# at 9.4 dB SNR, Kokoro voices). Not English words, so they count as the wake word outright.
+# Real words it also produced ("drivers", "try this", "Java") only send the clip to Whisper
+# (fuzzy_wake), whose words then decide; "Travis" stays a name, never the wake word.
+WAKE_VARIANTS = ("jovers", "jarbus", "jovis")
+
+
+def wake(text):
+    """assistant.wake_word with Parakeet's variants too: the request, or None."""
+    from .assistant import wake_word
+    try:
+        from .assistant import WAKE_WORDS
+    except ImportError:  # a stand-in assistant module (tests): its own rule only
+        return wake_word(text or "")
+    return wake_word(text or "", WAKE_WORDS + WAKE_VARIANTS)
+
+
+def _edits(a, b):
+    """Levenshtein distance."""
+    row = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev, row[0] = row[0], i
+        for j, cb in enumerate(b, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (ca != cb))
+    return row[-1]
+
+
+_SOUNDS = {"g": "j", "d": "j", "t": "j", "b": "v", "f": "v", "w": "v", "z": "s", "c": "s", "x": "s"}
+
+
+def _skeleton(word):
+    """Consonant outline, by sound: "jarvis", "jarbus", "drivers" -> jrvs / jrvs / jrvrs."""
+    w = re.sub(r"[^a-z]", "", word.lower())
+    for a, b in (("th", "s"), ("ch", "j"), ("dj", "j"), ("dr", "jr"), ("tr", "jr"), ("ph", "v")):
+        w = w.replace(a, b)
+    out = []
+    for c in w:
+        c = _SOUNDS.get(c, c)
+        if c not in "aeiouhy" and (not out or out[-1] != c):
+            out.append(c)
+    return "".join(out)
+
+
+_WAKE_PREFIXES = ("jav", "jarv", "jerv", "jorv", "jov", "jarb", "jerb")
+
+
+def fuzzy_wake(text):
+    """Could the opening words be a misheard "Jarvis"? ("Okay, Jovers", "Try this stall",
+    "Drivers summarized", "Javi."). Only the start counts: that is where the wake word is
+    said. Never the wake word by itself, only a reason to ask Whisper."""
+    try:
+        from .assistant import WAKE_LEAD
+    except ImportError:  # a stand-in assistant module (tests): common fillers only
+        WAKE_LEAD = r"(?:(?:hey|hi|hello|ok|okay|so|um|uh)[\s,.!?]+)*"
+    lead = re.match(r"^\W*" + WAKE_LEAD, text or "", re.I)
+    tokens = re.findall(r"[a-z']+", (text or "")[lead.end() if lead else 0:].lower())[:3]
+    if not tokens:
+        return False
+    try:
+        from .assistant import WAKE_WORDS as names
+    except ImportError:
+        names = ("jarvis",)
+    if any(t in names or t in WAKE_VARIANTS for t in tokens):
+        return True  # "Who Jarvis, what time is it?": the name behind an unknown filler word
+    first = re.sub(r"[^a-z]", "", tokens[0])
+    if len(first) >= 4 and (first.startswith(_WAKE_PREFIXES) or _edits(first, "jarvis") <= 2):
+        return True
+    one = _skeleton(first)
+    if len(one) >= 3 and one[0] == "j" and _edits(one, "jrvs") <= (2 if one[-1] == "s" else 1):
+        return True  # "jovers", "drivers" (2 off, same ending), "driver" (1 off)
+    if len(tokens) > 1:  # "jar this", "try this": the name split in two
+        two = _skeleton(first + tokens[1])
+        return len(two) >= 3 and two[0] == "j" and two[-1] == "s" and _edits(two, "jrvs") <= 1
+    return False
+
+
+
 class Transcriber:
     def __init__(self, config=None):
         cfg = (config or {}).get("voice", {})
@@ -602,35 +984,80 @@ class Transcriber:
         # voice.stt_engine "moonshine": try Moonshine first and keep its words only when
         # they carry the wake word; anything else (no "Jarvis", noise, a failure) is
         # transcribed by Whisper as before, so a misheard wake word is never lost.
-        self.engine = cfg.get("stt_engine", "whisper")
-        self.fast = Moonshine(cfg.get("moonshine_model", "base")) \
-            if self.engine == "moonshine" and self.language.startswith("en") else None
+        # "parakeet" (default): Parakeet v3 first, same rule. "whisper": no fast engine.
+        self.engine = cfg.get("stt_engine", "parakeet")
+        lang = self.language.lower()
+        self.fast = None
+        if self.engine == "parakeet" and lang.split("-")[0] in PARAKEET_LANGS:
+            self.fast = Parakeet()
+        elif self.engine == "moonshine" and lang.startswith("en"):
+            self.fast = Moonshine(cfg.get("moonshine_model", "base"))
         self._model, self.device = None, None
         self._stats = {}
         self.last_engine = None
+        self.need_wake = True  # see _try_fast
+        # A fuzzy "Jarvis" from the fast engine went to Whisper: did Whisper hear the wake
+        # word? (None: no second opinion was asked.) Counted for the log and the eval.
+        self.fuzzy = None
+        self.rescued = self.second_opinions = 0
 
     def __call__(self, audio):
-        if self.fast is not None and self.device != "cuda":  # Whisper on a GPU is fast already
+        # On a CUDA node Whisper is fast already: never load (or download) Parakeet there.
+        if isinstance(self.fast, Parakeet) and _has_cuda():
+            self.fast = None
+        # A str is a file path (knowledge.py): Whisper reads files, the fast engines don't.
+        self.fuzzy, hint = None, False
+        if self.fast is not None and not isinstance(audio, str) and self.device != "cuda":
             text = self._try_fast(audio)
             if text is not None:
                 return text
+            hint = self._hint
         self.last_engine = "whisper"
-        return self._whisper(audio)
+        text = self._whisper(audio)
+        if hint:
+            self.second_opinions += 1
+            self.fuzzy = wake(text) is not None
+            self.rescued += self.fuzzy
+        return text
 
     def _try_fast(self, audio):
-        """Moonshine's words when they hold the wake word, else None (Whisper decides)."""
-        from .assistant import wake_word
+        """The fast engine's words, else None (Whisper decides). The engine returns str
+        (Moonshine), (text, logprob) (Parakeet), or None (Parakeet still loading).
+        With `need_wake` (the default: the caller needs "Jarvis" in it) words without the
+        wake word go to Whisper too, so a misheard "Jarvis" ("Jovers") is never lost.
+        A caller that needs no wake word (push-to-talk, a follow-up window) sets it False
+        and gets Parakeet's words when they look sure, without a second transcription.
+        Words that only sound like "Jarvis" (fuzzy_wake: "Drivers", "Try this") go to
+        Whisper whatever the caller needs: Parakeet stays confident when it mishears it."""
+        self._hint = False
         try:
-            text = self.fast(audio)
+            out = self.fast(audio)
+        except ImportError:
+            self.fast = None  # missing package: Whisper only from now on
+            return None
+        except RuntimeError as exc:
+            if INSTALL_HINT in str(exc):
+                self.fast = None
+            return None
         except Exception:
-            self.fast = None  # missing package or model: Whisper only from now on
+            return None  # one bad clip; Parakeet stays on for the next
+        if out is None:
             return None
-        if not plausible(text, len(audio) / RATE) or wake_word(text) is None:
+        text, logprob = out if isinstance(out, tuple) else (out, None)
+        engine = "parakeet" if isinstance(out, tuple) else "moonshine"
+        if not plausible(text, len(audio) / RATE):
             return None
+        stats = {"logprob": logprob, "no_speech": None, "engine": engine}
+        if wake(text) is None:
+            if fuzzy_wake(text):
+                self._hint = True
+                return None
+            if self.need_wake or engine != "parakeet" or unsure(stats):
+                return None
         # No log probabilities from Moonshine: unsure() sees None and lets it through.
-        self.last = {"logprob": None, "no_speech": None, "engine": "moonshine"}
+        self.last = stats
         self._remember(audio, self.last)
-        self.last_engine = "moonshine"
+        self.last_engine = engine
         return text
 
     def _remember(self, audio, stats):
@@ -687,11 +1114,18 @@ class Transcriber:
 # ("for the day." answered with "It's Tuesday.", 2026-10-27). Mostly-silence clips that still
 # produced text are guesses too.
 UNSURE_LOGPROB, UNSURE_NO_SPEECH = -1.0, 0.6
+# Parakeet's mean token logprob is on a different scale (it is rarely below -0.5 on clean speech).
+# Measured 2026-11-05 on the 7 enrollment clips in .jarvis/voice (clean, 1.5-3.8 s): min -0.49
+# (a 2-word "Jarvis stop."), median -0.11, max -0.04; none flagged. No garbled clips were
+# available, so this sits well below the clean minimum: only clearly guessed text trips it.
+PARAKEET_UNSURE_LOGPROB = -0.9
 
 
 def unsure(stats):
     """True when a transcript's confidence (Transcriber.last) says it was probably misheard."""
     if not isinstance(stats, dict) or stats.get("logprob") is None:
         return False
+    if stats.get("engine") == "parakeet":
+        return stats["logprob"] < PARAKEET_UNSURE_LOGPROB
     logprob, silence = stats["logprob"], stats.get("no_speech") or 0.0
     return logprob < UNSURE_LOGPROB or (silence > UNSURE_NO_SPEECH and logprob < -0.6)

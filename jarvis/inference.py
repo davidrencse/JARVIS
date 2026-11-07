@@ -25,7 +25,7 @@ Subscriptions only, both ways: the ChatGPT lane is the Codex CLI on David's plan
 Claude lane the Claude CLI on his (fastlane.subscription_env strips API keys).
 """
 
-import json
+import re
 import threading
 from pathlib import Path
 
@@ -36,7 +36,9 @@ ROLES = {
     "grok_check": {"tier": "low", "timeout": 30},     # Grok handoff preflight (draft + review)
     "consolidate": {"tier": "mid", "timeout": 180},   # the daily memory summary
 }
-LIMIT_WORDS = ("usage limit", "usagelimitexceeded")
+LIMIT_WORDS = ("usage limit", "usagelimitexceeded", "rate limit", "rate_limit", "too many requests",
+               "hit your limit", "limit reached")
+LIMIT_CODE = re.compile(r"\b429\b")
 
 BRAIN_PERSONA = (
     "You are JARVIS, David's personal assistant, standing in for the usual brain while "
@@ -59,7 +61,8 @@ def role(config, name):
 
 
 def is_limit(exc):
-    return any(word in str(exc).lower() for word in LIMIT_WORDS)
+    text = str(exc).lower()
+    return any(word in text for word in LIMIT_WORDS) or bool(LIMIT_CODE.search(text))
 
 
 def claude_lane(config, base, name, **options):
@@ -74,7 +77,7 @@ def claude_brain(config, base, state):
     """A Claude brain with JARVIS's tools: the same parts as ChatGPT's tools lane."""
     from .chatgpt import brain_parts
     from .browser_proxy import mcp_entries
-    from .tools_mcp import SERVER, mcp_config
+    from .tools_mcp import mcp_config
     parts = brain_parts(config, base, state)
     config_path = Path(base) / "jarvis.config.json"
     servers = mcp_config(config_path, state)
@@ -95,7 +98,8 @@ class Failover:
 
     def __init__(self, primary, fallback, name="lane"):
         self.primary, self._make_fallback, self.name = primary, fallback, name
-        self.fallback, self.last, self._on_tool = None, primary, None
+        self.fallback, self._on_tool = None, None
+        self._local = threading.local()  # .last: per request thread, not shared
         # In-flight asks per lane and closes waiting for them: a lane's process (and the
         # browser it holds) must never be killed under another request's turn.
         self._busy, self._deferred, self._guard = {}, [], threading.RLock()
@@ -147,6 +151,15 @@ class Failover:
         return self.primary.pick(text) if hasattr(self.primary, "pick") else "chat"
 
     @property
+    def last(self):
+        """The lane that answered (or is answering) this thread's latest ask."""
+        return getattr(self._local, "last", self.primary)
+
+    @last.setter
+    def last(self, lane):
+        self._local.last = lane
+
+    @property
     def tool_log(self):
         return getattr(self.last, "tool_log", [])
 
@@ -170,7 +183,7 @@ class Failover:
             lanes, self.fallback = (self.primary, self.fallback), None
         for lane in lanes:
             if lane is not None:
-                lane.close()
+                self._close_when_idle(lane)  # never under a request that is mid-turn
 
     # -- answering ---------------------------------------------------------------------------
     def _standin(self, enter=False):
