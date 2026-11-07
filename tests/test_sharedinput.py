@@ -248,7 +248,7 @@ if __name__ == "__main__":
 class StatusCostTests(unittest.TestCase):
     def test_stop_reads_the_status_once(self):
         with mock.patch.object(si, "os") as fake_os, \
-                mock.patch.object(si, "_run") as run, \
+                mock.patch.object(si, "_run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run, \
                 mock.patch.object(si, "lan_mouse_status", return_value={"running": False, "build": None}) as st:
             fake_os.name = "nt"
             self.assertTrue(si.stop()["stopped"])
@@ -260,7 +260,8 @@ class StatusCostTests(unittest.TestCase):
 
         def run(*args, timeout=5):
             calls.append(args[0])
-            return SimpleNamespace(stdout="lan-mouse.exe,1\n" if args[0] == "tasklist" else "", returncode=0)
+            return SimpleNamespace(stdout="lan-mouse.exe,1\n" if args[0] == "tasklist" else "",
+                                   returncode=1 if args[0] == "schtasks" else 0, stderr="")
         with mock.patch.object(si, "os") as fake_os, mock.patch.object(si, "_run", side_effect=run), \
                 mock.patch.object(si, "_desktop", return_value="windows"), \
                 mock.patch.object(si, "_units", return_value=[]), \
@@ -305,3 +306,121 @@ class LocalNetworkFamilyTests(unittest.TestCase):
                 mock.patch.object(si.shutil, "which", side_effect=lambda b: None if b == "ip" else "/sbin/ifconfig"), \
                 mock.patch.object(si, "_run", return_value=SimpleNamespace(stdout=text)):
             self.assertEqual([str(n) for n in si.local_networks(families=(4, 6))], ["fe80::/64", "172.1.0.0/24"])
+
+
+class ElevatedTaskTests(unittest.TestCase):
+    def win(self, existing, status=None):
+        calls = []
+
+        def run(*args, timeout=5):
+            calls.append(args)
+            if args[0] == "schtasks" and args[1] == "/Query":
+                return SimpleNamespace(stdout="", stderr="", returncode=0 if args[3] in existing else 1)
+            if args[0] == "taskkill":
+                return SimpleNamespace(stdout="", stderr="Access is denied", returncode=1)
+            return SimpleNamespace(stdout="lan-mouse.exe,1\n" if args[0] == "tasklist" else "", stderr="", returncode=0)
+        return calls, run
+
+    def patches(self, run, statuses):
+        fake_os = mock.MagicMock()
+        fake_os.name = "nt"
+        fake_os.environ = {"USERDOMAIN": "PC", "USERNAME": "david", "LOCALAPPDATA": tempfile.mkdtemp()}
+        return [mock.patch.object(si, "os", fake_os), mock.patch.object(si, "_run", side_effect=run),
+                mock.patch.object(si, "_desktop", return_value="windows"),
+                mock.patch.object(si, "_units", return_value=[]),
+                mock.patch("time.sleep"),
+                mock.patch.object(si, "lan_mouse_status", side_effect=statuses)]
+
+    def enter(self, patches):
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_start_uses_the_task_when_it_exists(self):
+        calls, run = self.win({si.ELEVATED_TASK})
+        self.enter(self.patches(run, [{"running": False, "build": None}, {"running": True, "build": "patched"}]))
+        with mock.patch.object(si.subprocess, "Popen") as popen:
+            self.assertTrue(si.start()["started"])
+        popen.assert_not_called()
+        self.assertIn(("schtasks", "/Run", "/TN", si.ELEVATED_TASK), calls)
+
+    def test_start_falls_back_without_the_task(self):
+        calls, run = self.win(set())
+        self.enter(self.patches(run, [{"running": False, "build": None}, {"running": True, "build": "patched"}]))
+        with mock.patch.object(si, "_windows_launcher", return_value=Path("/nonexistent")), \
+                mock.patch.object(si, "_windows_once_launcher", return_value=Path("/nonexistent")), \
+                mock.patch.object(si, "_binary", return_value="lan-mouse.exe"), \
+                mock.patch.object(si.subprocess, "Popen") as popen, \
+                mock.patch("builtins.open", mock.mock_open()), mock.patch.object(Path, "mkdir"):
+            self.assertTrue(si.start()["started"])
+        popen.assert_called_once()
+        self.assertNotIn(("schtasks", "/Run", "/TN", si.ELEVATED_TASK), calls)
+
+    def test_stop_runs_the_stop_task(self):
+        calls, run = self.win({si.ELEVATED_STOP_TASK})
+        self.enter(self.patches(run, [{"running": False, "build": None}]))
+        out = si.stop()
+        self.assertIn(("schtasks", "/Run", "/TN", si.ELEVATED_STOP_TASK), calls)
+        self.assertTrue(out["stopped"])
+
+    def test_elevate_refuses_when_not_admin(self):
+        calls, run = self.win(set())
+        self.enter(self.patches(run, []))
+        with mock.patch.object(si, "_is_admin", return_value=False), self.assertRaises(ValueError) as cm:
+            si.elevate()
+        self.assertIn("admin terminal", str(cm.exception))
+        self.assertFalse([c for c in calls if c[1:2] == ("/Create",)])
+
+    def test_elevate_creates_both_tasks(self):
+        import tempfile
+        calls, run = self.win(set())
+        self.enter(self.patches(run, [{"running": False, "build": None}] * 3))
+        copied = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(si, "_is_admin", return_value=True), \
+                mock.patch.object(si, "install_dir", return_value=Path(tmp)), \
+                mock.patch("shutil.copytree", lambda src, dst, **kw: copied.append((src, dst))), \
+                mock.patch.object(si, "start", return_value={"started": True}) as start, \
+                mock.patch.object(si, "_binary", return_value=str(Path("/home/u/lm/bin/lan-mouse.exe"))):
+            out = si.elevate()
+            vbs = (Path(tmp) / "start-elevated.vbs").read_text()
+        # Audit cluster-07: it wasn't running (say the guard stopped it while apart): stays off.
+        start.assert_not_called()
+        self.assertEqual(out, {"elevated": True, "tasks": [si.ELEVATED_TASK, si.ELEVATED_STOP_TASK], "running": False})
+        self.assertEqual(len([c for c in calls if c[:2] == ("schtasks", "/Create")]), 2)
+        # The elevated task runs only the admin-only copy, never the user-writable original.
+        self.assertEqual(copied, [(Path("/home/u/lm/bin"), Path(tmp))])
+        self.assertIn(str(Path(tmp) / "lan-mouse.exe"), vbs)
+        self.assertNotIn("/home/u/lm", vbs)
+
+    def test_elevate_restarts_a_running_daemon_through_the_task(self):
+        import tempfile
+        calls, run = self.win(set())
+        self.enter(self.patches(run, [{"running": True, "build": "official"}] * 3))
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(si, "_is_admin", return_value=True), \
+                mock.patch.object(si, "install_dir", return_value=Path(tmp)), \
+                mock.patch("shutil.copytree"), \
+                mock.patch.object(si, "stop") as stop, \
+                mock.patch.object(si, "start", return_value={"started": True}) as start, \
+                mock.patch.object(si, "_binary", return_value=str(Path("/home/u/lm/bin/lan-mouse.exe"))):
+            out = si.elevate()
+        stop.assert_called_once()
+        start.assert_called_once()
+        self.assertTrue(out["running"])
+
+    def test_elevated_copy_counts_as_the_patched_build(self):
+        # Audit cluster-06: the Program Files copy elevate() runs was labelled official.
+        with mock.patch.object(si, "install_dir", return_value=Path("C:/Program Files/JARVIS Lan Mouse")):
+            self.assertEqual(si._windows_build(r"C:\Program Files\JARVIS Lan Mouse\lan-mouse.exe"), "patched")
+            self.assertEqual(si._windows_build(r"C:\Users\d\AppData\Local\lan-mouse\bin\lan-mouse.exe"), "patched")
+            self.assertEqual(si._windows_build(r"C:\Program Files\Lan Mouse\lan-mouse.exe"), "official")
+            self.assertEqual(si._windows_build(r"C:\Program Files\JARVIS Lan Mouse Old\lan-mouse.exe"), "official")
+
+    def test_task_xml(self):
+        xml = si._task_xml("wscript.exe", '"C:\\a&b\\x.vbs"', "PC\\david")
+        for needle in ("HighestAvailable", "InteractiveToken", "PT0S", "a&amp;b", "PC\\david",
+                       "<AllowStartOnDemand>true", "<Hidden>true"):
+            self.assertIn(needle, xml)
+        self.assertNotIn("<Triggers", xml)
+        self.assertNotIn("a&b", xml)

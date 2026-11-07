@@ -54,8 +54,19 @@ class Base(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        self.addCleanup(self._wait_for_indexer)  # runs first: the indexer may still be writing
         self.dir = tmp.name
         self.fake = FakeEmbed()
+
+    def _wait_for_indexer(self, timeout=5.0):
+        import time
+        from jarvis import memory
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            with memory._INDEX_LOCK:
+                if not any(k.startswith(self.dir) for k in memory._INDEXING):
+                    return
+            time.sleep(0.01)
 
     def mem(self, semantic=True):
         return Memory(self.dir, semantic=semantic)
@@ -112,6 +123,33 @@ class SemanticOff(Base):
         m.warm_vectors()
         self.assertFalse([t for t in threading.enumerate() if t.name == "jarvis-memory-index"])
         self.assertEqual(self.vector_count(m), 0)
+
+
+class SearchFilters(Base):
+    """Memory.search(text, min_importance=, ids=) on the FTS path: filters run before LIMIT."""
+    def setUp(self):
+        super().setUp()
+        self.patch_embed(_boom)
+        self.m = self.mem(semantic=False)
+        self.old = self.m.add("note", "thesis outline", importance=0.9)["id"]
+        self.age(self.m, self.old, 86400 * 90)
+        self.newer = [self.m.add("note", f"thesis thesis draft {i}", importance=0.1)["id"]
+                      for i in range(30)]
+
+    def test_old_match_found_past_limit(self):
+        self.assertNotIn(self.old, [r["id"] for r in self.m.search("thesis", limit=2)])
+        res = self.m.search("thesis", limit=2, min_importance=0.8)
+        self.assertEqual([r["id"] for r in res], [self.old])
+        res = self.m.search("thesis", limit=2, ids=[self.old])
+        self.assertEqual([r["id"] for r in res], [self.old])
+
+    def test_empty_ids_returns_nothing(self):
+        self.assertEqual(self.m.search("thesis", ids=[]), [])
+
+    def test_ids_restrict_results(self):
+        pick = {self.old, self.newer[3], self.newer[7]}
+        res = self.m.search("thesis", limit=10, ids=pick)
+        self.assertEqual({r["id"] for r in res}, pick)
 
 
 class IndexVectors(Base):
