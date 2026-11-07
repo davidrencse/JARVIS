@@ -295,8 +295,23 @@ class PullUpdateTests(unittest.TestCase):
         config["devices"]["dell"] = {"transport": "cluster"}
         self.assertFalse(deploy.is_ssh_node(config, "dell"))
         self.assertTrue(deploy.is_ssh_node(config, "node"))
-        report = deploy.update(config, self.tmp.name, "dell")
+        with patch("jarvis.release.cut", return_value={"released": True, "code": "x"}) as cut:
+            report = deploy.update(config, self.tmp.name, "dell")
         self.assertTrue(report["pull"])
+        cut.assert_called_once()  # a pull node gets a fresh tested release, not a no-op
+
+    def test_pull_update_says_when_release_tests_block_it(self):
+        config = configuration()
+        config["devices"]["dell"] = {"transport": "cluster"}
+        failed = {"released": False, "code": "x", "tests": "FAILED (failures=1)",
+                  "note": "Tests failed; nodes keep the last release."}
+        with patch("jarvis.release.cut", return_value=failed):
+            report = deploy.update(config, self.tmp.name, "dell")
+        self.assertIn("release tests failed", report["note"])
+        self.assertIn("FAILED (failures=1)", report["note"])
+        with patch("jarvis.release.cut", return_value={"released": False, "note": "Nodes already get this code."}):
+            report = deploy.update(config, self.tmp.name, "dell")
+        self.assertIn("next poll", report["note"])
 
     def test_auto_update_skips_non_ssh_node_quietly(self):
         config = configuration()
@@ -335,7 +350,8 @@ class SshUpdateTests(unittest.TestCase):
 
     def test_non_posix_node_pulls_instead_of_running_a_shell_script(self):
         remote = Mock(return_value=(1, "", "'uname' is not recognized"))
-        with patch("jarvis.deploy._remote", remote):
+        with patch("jarvis.deploy._remote", remote), \
+                patch("jarvis.release.cut", return_value={"released": True, "code": "x"}):
             report = deploy.update(self.config, self.tmp.name, "node")
             self.assertTrue(report["pull"])
             self.assertEqual(remote.call_count, 1)  # only the probe ran

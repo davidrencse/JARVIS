@@ -45,7 +45,9 @@ NODE_RUNS = int(os.environ.get("JARVIS_CHAOS_NODE_RUNS", "8"))
 
 def _tmpdir():
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    return tempfile.TemporaryDirectory(dir=SCRATCH)
+    # A session thread can still be finishing a marker write as the test ends; that must not
+    # fail the run (it blocked a node release on 2026-11-07).
+    return tempfile.TemporaryDirectory(dir=SCRATCH, ignore_cleanup_errors=True)
 
 
 def until(check, seconds=5.0):
@@ -283,6 +285,10 @@ class Rig(unittest.TestCase):
             s.end("test over")
         for s in list(self.created):
             s.join(2)
+        # sessions a test took out of self.created (a "killed" node) and pause workers
+        for t in threading.enumerate():
+            if t is not threading.current_thread() and t.name.startswith(("remote-", "lan-mouse-controller")) and t.name != "remote-sweeper":
+                t.join(2)
 
     # -- helpers ---------------------------------------------------------------------
     def _driving(self):

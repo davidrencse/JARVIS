@@ -299,7 +299,9 @@ for line in sys.stdin:
         assert p["approvalPolicy"] == "on-request"
         assert [t["name"] for t in p["dynamicTools"]] == ["open_app", "list_apps", "terminal", "open_url",
                                                           "open_page", "close_app", "focus_window",
-                                                          "media", "scroll", "spotify", "computer", "app_ui", "volume"]
+                                                          "media", "scroll", "spotify", "computer", "app_ui", "volume",
+                                                          "brightness", "screenshot", "system_status", "workspace", "bluetooth",
+                                                          "lock_screen", "reminder", "weather"]
         send({"method": "mcpServer/startupStatus/updated", "params": {"name": "playwright", "status": "ready"}})
         send({"id": rid, "result": {"thread": {"id": "t1"}}})
     elif meth == "turn/start":

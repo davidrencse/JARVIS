@@ -61,7 +61,7 @@
     {"text": "open notes on chrome", "expect": null},
     {"text": "go to youtube on firefox and chrome", "expect": null},
     {"text": "hello there", "expect": null},
-    {"text": "what's the weather like", "expect": null},
+    {"text": "what's the weather like", "expect": [["weather", "dell", {}, []]]},
     {"text": "how are you doing today", "expect": null},
     {"text": "tell me a joke", "expect": null},
 
@@ -145,7 +145,7 @@
      "expect": [["open_url", "dell", {"url": "https://www.youtube.com", "browser": "Chrome"}, []]]},
     {"text": "open chrome on my phone", "expect": null},
     {"text": "open the thing", "expect": null},
-    {"text": "start a timer for ten minutes", "expect": null},
+    {"text": "start a timer for ten minutes", "expect": [["reminder", "dell", {"minutes": "10"}, []]]},
     {"text": "volume 300", "expect": null},
     {"text": "turn up the volume", "expect": [["volume", "dell", {"level": "up"}, []]]},
     {"text": "reply to sam's last dm", "expect": null},
