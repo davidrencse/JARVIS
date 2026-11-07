@@ -42,6 +42,14 @@ OTP_STRONG = re.compile(r"\b(otp|2fa|mfa|two[- ]?factor|verification|one[- ]time
                         re.I)
 CHANGE_PASSWORD = re.compile(r"\b(change|update|reset|set)\b[^.]{0,25}\bpass(?:word|code)\b|"
                              r"\bpass(?:word|code)\b[^.]{0,15}\b(change|update|reset)\b", re.I)
+# Tools that type text: press_sequentially types too, and takes `submit` like browser_type.
+TYPING = re.compile(r"type|fill|press_sequentially", re.I)
+# Commit words inside raw selectors and test ids (button[data-testid=tweetButton], #sendBtn,
+# .post-btn): a word start, no word end, since ids glue words together ("tweetbutton").
+SELECTOR_COMMIT = re.compile(r"(?<![a-z])(send|post|tweet|reply|publish|submit|pay|buy|purchase|"
+                             r"checkout|order|confirm|transfer|donate|subscribe|share|retweet|"
+                             r"repost|comment|delete|remove|withdraw)", re.I)
+TARGET_KEYS = ("ref", "target", "selector", "startTarget", "endTarget", "startRef", "endRef")
 REFERENCE = re.compile(r"^@?[a-z]{0,3}\d+(?:[a-z]\d+)*$", re.I)  # @e12, e12, f1e3
 _TYPED = {}  # server -> was the last field typed into a search box (Enter is then harmless)
 _LOCK = threading.Lock()
@@ -147,7 +155,7 @@ def blocked(tool, args):
     tool, args = str(tool or ""), args if isinstance(args, dict) else {}
     if not INTERACTIVE.search(tool):
         return None
-    if re.search(r"type|fill", tool, re.I):
+    if TYPING.search(tool):
         for described, text in _typed(args):
             if SECRET_FIELD.search(described):
                 return "JARVIS never types passwords, PINs or card security codes"
@@ -238,7 +246,7 @@ NAVIGATING = re.compile(r"navigate|goto|open|tab|back|forward|reload|close", re.
 def _forget_typing(server, tool):
     """Enter is only exempt right after typing into a search box: anything else between
     (a click, a navigation, a tab switch) ends that."""
-    if not re.search(r"type|fill", str(tool), re.I) and \
+    if not TYPING.search(str(tool)) and \
             (INTERACTIVE.search(str(tool)) or NAVIGATING.search(str(tool))):
         with _LOCK:
             _TYPED[server] = False
@@ -272,7 +280,7 @@ def site_of(url):
 
 
 def _ref_of(item):
-    for key in ("ref", "target", "selector"):
+    for key in TARGET_KEYS:
         value = item.get(key)
         if isinstance(value, str) and REFERENCE.match(value.strip()):
             return value.strip()
@@ -321,10 +329,21 @@ def enrich(server, args):
     return out
 
 
+def _selector_commit(args):
+    """A commit word in a raw selector or test id the call targets (not a bare ref)."""
+    for key in TARGET_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value.strip() and not REFERENCE.match(value.strip()):
+            found = SELECTOR_COMMIT.search(re.sub(r"([a-z])([A-Z])", r"\1 \2", value))
+            if found:
+                return found
+    return None
+
+
 def _verb(tool):
     if re.search(r"dialog", tool, re.I):
         return "dialog"
-    if re.search(r"type|fill", tool, re.I):
+    if TYPING.search(tool):
         return "type"
     if re.search(r"press|key", tool, re.I):
         return "press"
@@ -335,8 +354,8 @@ def _verb(tool):
 
 def judge(params):
     """None when the call may run unasked; else what David is asked: {"question", "reason",
-    "verb", "target", "site", "stakes": "high"|"low", "named"}. high: commit words, Enter,
-    submit, a page dialog. named: something says what the element is (grants need that)."""
+    "verb", "target", "site", "stakes": "high"|"low", "named", "checked"}. high: commit words,
+    Enter, submit, a page dialog. checked: False when no snapshot showed the click target. named: something says what the element is (grants need that)."""
     server, tool = params.get("serverName") or "", _tool(params)
     args = (params.get("_meta") or {}).get("tool_params") or {}
     if not re.search(r"press|key", tool, re.I):  # press reads and clears it below
@@ -353,16 +372,17 @@ def judge(params):
     where = f" on {site}" if site else ""
     named = bool(_label(args))
 
-    def out(reason, stakes, question, suffix=""):
+    def out(reason, stakes, question, suffix="", checked=True):
         return {"question": question + where + suffix, "reason": reason, "verb": verb,
-                "target": target, "site": site, "stakes": stakes, "named": named}
+                "target": target, "site": site, "stakes": stakes, "named": named and checked,
+                "checked": checked}
 
     if "dialog" in tool:
         return out("accept a page dialog", "high", "accept a page dialog") \
             if args.get("accept", True) else None
     described = " ".join(s for k, v in args.items() if k not in ("text", "value", "values")
                          for s in _strings(v))
-    typing = re.search(r"type|fill", tool, re.I)
+    typing = TYPING.search(tool)
     if typing:
         items = [i for i in (args.get("fields") if isinstance(args.get("fields"), list) else [args])
                  if isinstance(i, dict)]
@@ -408,14 +428,26 @@ def judge(params):
     name = re.sub(r"^(?:agent_)?browser_", "", tool).replace("_", " ")
     ref = _ref_of(args)
     described = " ".join(s for k, v in args.items() if k not in ("text",) for s in _strings(v))
-    found = COMMIT.search(described)
+    found = COMMIT.search(described) or _selector_commit(args)
     if found:
         return out(f"{name} “{found.group(0)}” ({described[:60]})", "high",
                    f"{name} {target or described[:60]}")
-    if not named:  # only a ref/selector like @e12: nothing says what it commits
-        shown = f"an element the page didn't name ({ref})" if ref else "an element the page didn't name"
+    hit = _lookup(server, args) if ref else None
+    if hit is None:
+        # No snapshot names this target (a raw selector, or a ref the gate never saw: the Codex
+        # lane passes no tool results). The model's own `element` words are not evidence that
+        # it isn't Post or Pay (audit 2026-11-04): unchecked, never grantable, and it asks
+        # even under rules.confirm: never while money or messages are in rules.always_ask.
+        if element.strip():
+            return out(f"{name} on an element no snapshot showed ({described[:40]})", "low",
+                       f"{name} {target}", " (not checked against the page)", checked=False)
+        shown = f"an element the page didn't name ({ref})" if ref else \
+            f"“{_clean(described, 40)}”" if described.strip() else "an element the page didn't name"
         return out(f"{name} on {described[:30] or 'an unnamed element'} (no label)", "low",
-                   f"{name} {shown}")
+                   f"{name} {shown}", checked=False)
+    if not hit[1]:  # the snapshot shows it without a name: nothing says what it commits
+        return out(f"{name} on {described[:30] or 'an unnamed element'} (no label)", "low",
+                   f"{name} an element the page didn't name ({ref})")
     return None
 
 
@@ -469,10 +501,36 @@ ALWAYS_ASK = {
 }
 
 
+# Commit words that may send or pay, whichever of money/messages is on.
+SEND_OR_PAY = re.compile(r"\b(submit|confirm|order|checkout)\b|“(?:send|post|tweet|reply|publish|"
+                         r"submit|pay|buy|purchase|checkout|order|confirm|transfer|donate|"
+                         r"subscribe|share|retweet|repost|comment|withdraw)”", re.I)
+
+
 def always_asks(info, config):
-    kinds = ((config or {}).get("rules") or {}).get("always_ask", ["money", "messages"])
+    """True when this browser action waits for David even under rules.confirm: never. Judged
+    by the action's stakes, not the question's wording: Enter or Ctrl+Enter in a composer,
+    type-and-submit, a dialog accept or a click on an unchecked target can send or pay with no
+    "send" or "pay" in sight (audit 2026-11-04). While money or messages is in
+    rules.always_ask these ask: Enter/submit/dialog accept, any click or choice no snapshot
+    checked, and high-stakes clicks whose words (selectors and test ids included) say send,
+    post, pay, buy, submit, confirm, order... A checked "Delete draft" or "Next page" doesn't."""
+    kinds = ((config or {}).get("rules") or {}).get("always_ask")
+    kinds = ["money", "messages"] if kinds is None else [kinds] if isinstance(kinds, str) else kinds
+    if not isinstance(kinds, (list, tuple, set)):
+        kinds = list(ALWAYS_ASK)  # unreadable: fail closed
+    if not any(k in ALWAYS_ASK for k in kinds):
+        return False  # [] (or only unknown kinds): full auto
+    if info.get("checked") is False:
+        return True
+    if info.get("stakes") != "high":
+        return False
+    if info.get("verb") in ("type", "press", "dialog"):  # Enter, submit, accept: always commits
+        return True
     text = " ".join(str(info.get(k) or "") for k in ("question", "target", "reason"))
-    return info.get("stakes") == "high" and any(ALWAYS_ASK[k].search(text) for k in kinds if k in ALWAYS_ASK)
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    return bool(SEND_OR_PAY.search(text)) or \
+        any(ALWAYS_ASK[k].search(text) for k in kinds if k in ALWAYS_ASK)
 
 
 def ask(action, config, state, wait=WAIT, queue=None, info=None, subject="the browser"):

@@ -217,7 +217,23 @@ def orchestrate(text, config, base, state, run_tools=None, step=None, ask=None, 
                     result, level = run_tools(_context(text, done, s) + background), "tools"
             else:
                 result, level = call(s["level"], _context(text, done, s) + background, WORKER)
-            verdict, _ = call(1, f"Step: {s['do']}\n\nResult:\n{result}", CHECKER)
+            if s["tools"]:
+                # The tools already acted: a checker failure must not report the step failed
+                # (David might retry a side effect). Done, unchecked.
+                try:
+                    verdict, _ = call(1, f"Step: {s['do']}\n\nResult:\n{result}", CHECKER)
+                except Exception as exc:
+                    step(node, "plan", f"{s['id']} · {level}", f"done, unchecked ({str(exc)[:80]})", "done")
+                    return {**s, "result": f"{result}\n(done, unchecked: the checker failed: {exc})",
+                            "ok": True, "unchecked": True}
+            else:
+                # The worker's answer is finished: a checker that can't run (limits, timeout)
+                # leaves it unchecked, not lost. The combiner still gets the text.
+                try:
+                    verdict, _ = call(1, f"Step: {s['do']}\n\nResult:\n{result}", CHECKER)
+                except Exception as exc:
+                    step(node, "plan", f"{s['id']} · L{level}", f"unchecked ({str(exc)[:80]})", "fail")
+                    return {**s, "result": f"{result} (unchecked)", "ok": False, "unchecked": True}
             ok = verdict.strip().upper().startswith("PASS")
             if not ok and not s["tools"] and isinstance(level, int) and level < 3:
                 step(node, "plan", f"{s['id']} · retry L{level + 1}", verdict.strip()[:120], "run")

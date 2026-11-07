@@ -44,8 +44,9 @@ def interpreter(argv):
 
 
 def _word(arg):
-    """One ExecStart word: quoted only when it has to be; % is systemd's specifier sign."""
-    arg = str(arg).replace("%", "%%")
+    """One ExecStart word: quoted only when it has to be; % is systemd's specifier sign and
+    $ starts a variable even inside quotes (so $$ for a literal one)."""
+    arg = str(arg).replace("%", "%%").replace("$", "$$")
     return json.dumps(arg) if not arg or any(c in arg for c in ' \t"\'\\;$') else arg
 
 

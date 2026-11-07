@@ -424,11 +424,24 @@ class ChatGPTLane:
                     return result
                 except BaseException as exc:
                     note_usage_limit(exc)
+                    # This turn's own tool calls, copied while the lock is held: Brain and
+                    # Failover read them from the exception, because self.tool_log is reset by
+                    # the next turn and Brain.last can be moved by another request. Without
+                    # them a limit hit after tools ran looks like "nothing ran" and the
+                    # stand-in would run the same side effects again (audit 2026-11-07).
+                    ran = list(self.tool_log)
+                    if not hasattr(exc, "tool_log"):
+                        try:
+                            exc.tool_log = ran
+                        except Exception:
+                            pass
                     # A turn abandoned mid-flight would leave its remaining events in the pipe,
                     # and the next ask would read them as its own answer. Start clean instead.
                     self.close()
                     if isinstance(exc, MALFORMED) and exc not in theirs:  # odd reply or failed spawn: one error type
-                        raise RuntimeError(f"ChatGPT lane failed: {type(exc).__name__}: {exc}") from exc
+                        wrapped = RuntimeError(f"ChatGPT lane failed: {type(exc).__name__}: {exc}")
+                        wrapped.tool_log = ran
+                        raise wrapped from exc
                     if (not isinstance(exc, RuntimeError) or attempt == 2
                             or "serverOverloaded" not in str(exc) or not self.fallback):
                         raise
@@ -436,9 +449,11 @@ class ChatGPTLane:
                         # Tools already ran this turn (a Grok handoff, open_app...): replaying
                         # the turn on the fallback model would run them a second time.
                         names = ", ".join(sorted({str(t[0]) for t in self.tool_log}))
-                        raise RuntimeError(
+                        stop = RuntimeError(
                             f"ChatGPT was overloaded after {names} already ran; not repeating "
-                            "it. Check the result and ask again if needed.") from exc
+                            "it. Check the result and ask again if needed.")
+                        stop.tool_log = ran
+                        raise stop from exc
                     # Model at capacity: swap to the fallback (and back again next time).
                     self.model, self.fallback = self.fallback, self.model
 
@@ -497,11 +512,21 @@ class ChatGPTLane:
             elif method == "item/started" and (params.get("item") or {}).get("type") == "mcpToolCall":
                 item = params["item"]
                 self._tool(item.get("id"), f"{item.get('server')}.{item.get('tool')}", None, "")
+                # Codex runs the browser MCP itself (no browser_proxy): tell the click gate
+                # about navigations here and about snapshots below, so refs it judges are
+                # checked against the page, not the model's own description (audit 2026-11-04).
+                from .browser_gate import observe_call
+                observe_call(str(item.get("server") or ""), str(item.get("tool") or ""),
+                             item.get("arguments"))
             elif method == "item/completed" and (params.get("item") or {}).get("type") == "mcpToolCall":
                 item = params["item"]
                 self._tool(item.get("id"), f"{item.get('server')}.{item.get('tool')}",
                            item.get("status") == "completed",
                            (item.get("error") or {}).get("message", ""))
+                if item.get("status") == "completed":
+                    from .browser_gate import observe_result
+                    observe_result(str(item.get("server") or ""), item.get("result"),
+                                   str(item.get("tool") or ""))
             elif method == "error" and not params.get("willRetry"):
                 raise RuntimeError(f"ChatGPT error: {params.get('error')}")
             elif method == "turn/completed":
@@ -604,6 +629,14 @@ class Brain:
             nudge = HEARD.format(heard=" ".join(spoken)) + nudge
         try:
             return self.act.ask(nudge + str(text), (), on_sentence=on_sentence)
+        except Exception as exc:
+            # The lane put only the second turn's calls on exc: add the first turn's.
+            if earlier and hasattr(exc, "tool_log"):
+                try:
+                    exc.tool_log = earlier + list(exc.tool_log or ())
+                except Exception:
+                    pass
+            raise
         finally:  # both turns' calls, also when the second raises: the failed-turn report needs them
             log = getattr(self.act, "tool_log", None)
             if earlier and isinstance(log, list):
@@ -818,10 +851,22 @@ class ConfirmGate:
         from .remote import Remote
         return Remote(self.config, self.state).here()
 
+    def _device(self, given, here):
+        """The device id a tool's `device` means: aliases ("windows", "arch", "my other
+        pc") go through Remote.resolve like every executor call; None is this laptop."""
+        if not given:
+            return here
+        try:
+            from .remote import Remote
+            resolved = Remote(self.config, self.state).resolve(given)
+        except Exception:
+            resolved = str(given)
+        return str(resolved or here)
+
     def command(self, name, args, here):
         """The registry command a risky call becomes, or None when it may run now."""
         from . import registry
-        device = str(args.get("device") or here)
+        device = self._device(args.get("device"), here)
         if name == "close_app":
             command = {"intent": "close_app", "device": device,
                        "args": {"name": str(args.get("name", ""))}}
