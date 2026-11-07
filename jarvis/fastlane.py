@@ -43,6 +43,52 @@ KEEP_CLAUDE_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DES
 SENTENCE_END = re.compile(r"(.+?[.!?])(\s+|$)", re.S)
 
 
+# Claude's own plan limit ("Claude AI usage limit reached", "You've hit your limit - resets
+# 3pm"). While it holds, every spawn is doomed: refuse fast instead of paying ~4 s each.
+# Phrases taken from the Claude CLI itself (2.1.318): "You've hit your {session,five-hour,
+# monthly spend} limit", "You've reached your … limit", "You're out of (extra) usage /
+# usage credits", "Your org is out of …", "Usage limit reached", "Budget limit reached".
+CLAUDE_LIMIT_RE = re.compile(
+    r"you'?ve hit your|you'?ve reached your|out of (?:extra )?usage|out of usage credits|"
+    r"your org is out of|hit your limit|usage limit|rate limit|\b429\b|limit reached|"
+    r"spend limit|\bresets\s+(?:at\s+)?\d", re.I)
+CLAUDE_LIMIT_FALLBACK = 15 * 60  # seconds, when the reset time can't be read
+_CLAUDE_LIMIT = {"until": 0.0, "text": ""}
+
+
+def is_claude_limit(exc):
+    return bool(CLAUDE_LIMIT_RE.search(str(exc)))
+
+
+def note_claude_limit(exc, now=None):
+    """Remember a Claude limit refusal until the reset it names (else a short default)."""
+    text = str(exc)
+    if not is_claude_limit(text):
+        return
+    import datetime as dt
+    now = now or datetime.now()
+    until = None
+    found = re.search(r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap]m)", text, re.I)
+    if found:
+        hour, minute, half = int(found.group(1)) % 12, int(found.group(2) or 0), found.group(3).lower()
+        if hour <= 11 and minute < 60:
+            until = now.replace(hour=hour + (12 if half == "pm" else 0), minute=minute,
+                                second=0, microsecond=0)
+            if until <= now:
+                until += dt.timedelta(days=1)
+    if until is None:
+        from .chatgpt import _reset_time
+        until = _reset_time(text, now)
+    if until is None:
+        until = now + dt.timedelta(seconds=CLAUDE_LIMIT_FALLBACK)
+    _CLAUDE_LIMIT.update(until=until.timestamp(), text=f"until {until:%I:%M %p}".replace(" 0", " "))
+
+
+def claude_limit(now=None):
+    """'until 8:00 PM' while Claude's plan is out of quota, else ''."""
+    return _CLAUDE_LIMIT["text"] if (now or time.time()) < _CLAUDE_LIMIT["until"] else ""
+
+
 def subscription_env():
     return {k: v for k, v in os.environ.items() if k.upper() not in API_KEY_VARS and (
         not k.upper().startswith("CLAUDE") or k.upper() in KEEP_CLAUDE_VARS)}
@@ -168,6 +214,9 @@ class FastLane:
 
         on_sentence(str) is called with each complete sentence as it streams in, so
         speech can start ~1-2 s before the CLI finishes the turn."""
+        limited = claude_limit()
+        if limited and not self.command:  # a fake test CLI isn't the real plan
+            raise RuntimeError(f"Claude usage limit {limited}; not starting a run.")
         with self.lock:
             try:
                 return self._ask(text, recall, on_sentence)
@@ -247,7 +296,12 @@ class FastLane:
                     pending, spoke = pending[match.end():], True
             if event.get("type") == "result":
                 if event.get("is_error") or not isinstance(event.get("result"), str):
-                    raise RuntimeError(f"Fast lane error: {event.get('subtype')}")
+                    detail = event["result"].strip()[:300] if isinstance(event.get("result"), str) else ""
+                    exc = RuntimeError(f"Fast lane error: {event.get('subtype')}"
+                                       + (f": {detail}" if detail else ""))
+                    if event.get("is_error"):
+                        note_claude_limit(exc)
+                    raise exc
                 from .usage import record
                 cost = event.get("total_cost_usd")
                 if isinstance(cost, (int, float)) and not isinstance(cost, bool):

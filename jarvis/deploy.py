@@ -24,6 +24,7 @@ import base64
 import fnmatch
 import hashlib
 import io
+import json
 import os
 import re
 import shlex
@@ -214,6 +215,23 @@ def verify_job(job, node, key, now=None):
     return None
 
 
+BUNDLE_DOMAIN = b"jarvis-code-v2\n"  # a versioned bundle's signature can't pass as a job's or a legacy one
+VERSION_FILE = "cluster-code-version.json"
+
+
+def _bundle_bytes(raw, version, code):
+    return BUNDLE_DOMAIN + f"{int(version)}\n{code}\n".encode("ascii") + raw
+
+
+def installed_version(state):
+    """The newest signed bundle version this node ever installed (0 when none)."""
+    try:
+        value = json.loads((Path(state) / VERSION_FILE).read_text(encoding="utf-8")).get("version")
+    except (OSError, ValueError, AttributeError):
+        return 0
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def code_bundle(state):
     """What /v1/code serves: the tested release's jarvis/ + pyproject.toml (release.py) as
     base64 zip, with its fingerprint and the main's signature over the zip."""
@@ -227,8 +245,11 @@ def code_bundle(state):
         if pyproject.is_file():
             bundle.write(pyproject, "pyproject.toml")
     raw = buffer.getvalue()
-    return {"code": code_fingerprint(root), "zip": base64.b64encode(raw).decode("ascii"),
-            "signature": sign(raw, state)}
+    code, version = code_fingerprint(root), int(time.time())
+    # `signature` (over the zip alone) stays for nodes that predate versions; `vsig` also covers
+    # the version and fingerprint, so a replayed older bundle can't pass as a newer one.
+    return {"code": code, "zip": base64.b64encode(raw).decode("ascii"), "signature": sign(raw, state),
+            "version": version, "vsig": sign(_bundle_bytes(raw, version, code), state)}
 
 
 def _safe_name(name):
@@ -239,16 +260,33 @@ def _safe_name(name):
     return parts
 
 
-def apply_bundle(bundle, key, repo=PACKAGE.parent):
+def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
     """Check a /v1/code bundle's signature against the pinned main `key` and its
     fingerprint, then replace this checkout's files (tmp + os.replace each, so a crash
-    never leaves a half-written .py). Returns the count."""
+    never leaves a half-written .py). Returns the count.
+
+    state: this node's state folder. With it, a bundle older than the newest one installed
+    here is refused (a replayed old signed bundle would downgrade the node), and once a
+    versioned bundle was installed an unversioned one is refused too."""
     repo = Path(repo).resolve()
     if not key:
         raise ValueError("No code-signing key is pinned for the main PC; re-join with a fresh "
                          "invite (jarvis cluster invite on the main) to accept its updates.")
     raw = base64.b64decode(bundle["zip"], validate=True)
-    if not verify(raw, bundle.get("signature"), key):
+    version = None
+    have = installed_version(state) if state is not None else 0
+    if bundle.get("vsig") is not None or bundle.get("version") is not None:
+        version = bundle.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or not verify(
+                _bundle_bytes(raw, version, bundle.get("code")), bundle.get("vsig"), key):
+            raise ValueError("The code bundle isn't signed by the main PC's pinned key; not installed.")
+        if version < have:
+            raise ValueError("The code bundle is older than the code installed here "
+                             f"(version {version} < {have}); refused as a replay.")
+    elif have:
+        raise ValueError("The code bundle carries no version but this node already installed a "
+                         "versioned one; refused as a possible replay.")
+    elif not verify(raw, bundle.get("signature"), key):
         raise ValueError("The code bundle isn't signed by the main PC's pinned key; not installed.")
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         entries = [(i.filename, _safe_name(i.filename)) for i in archive.infolist() if not i.is_dir()]
@@ -286,6 +324,9 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent):
             for path in _files(repo / "jarvis"):
                 if path.resolve() not in keep:
                     path.unlink(missing_ok=True)
+    if state is not None and version is not None:
+        from .fsio import atomic_write
+        atomic_write(Path(state) / VERSION_FILE, json.dumps({"version": version}))
     return len(entries)
 
 

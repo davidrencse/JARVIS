@@ -11,6 +11,7 @@ app_exists), so the gates themselves stay pure and testable.
 
 import json
 import os
+from .platforms import on_windows
 import posixpath
 import time
 import threading
@@ -104,6 +105,25 @@ def asks_now(config, state=None):
     return asks(config)
 
 
+_LOCAL = {}  # config path -> (mtime, config)
+
+
+def local_config(base=None):
+    """This computer's jarvis.config.json (next to the jarvis package), for checks that run
+    where no config was handed down (a node's terminal, desktop typing). {} if unreadable:
+    hard_deny still refuses everything it can judge without the vault paths."""
+    path = Path(base or Path(__file__).resolve().parent.parent) / "jarvis.config.json"
+    try:
+        mtime = path.stat().st_mtime
+        cached = _LOCAL.get(str(path))
+        if not cached or cached[0] != mtime:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            _LOCAL[str(path)] = cached = (mtime, data if isinstance(data, dict) else {})
+        return cached[1]
+    except (OSError, ValueError):
+        return {}
+
+
 # What a brain terminal command may never do, asked or not (hard_deny): enter credentials.
 CREDENTIAL_CMD = re.compile(
     r"\bsudo\s+(?:-\w*S\w*|--stdin)\b|--password\b|--passwd\b|--passphrase\b|--with-token\b|"
@@ -145,12 +165,37 @@ def _vault_paths(config):
     return [str(p) for p in paths if p]
 
 
-def _abs(path, here):
-    text = os.path.expanduser(os.path.expandvars(str(path).replace("\\", "/")))
+def _abs(path, here, real=True):
+    """`path` made absolute against `here`, with symlinks resolved; real=False keeps the
+    path as written (normalised only), for checks on where a write lands by name."""
+    # expanduser gives C:\Users\x on Windows: slashes after it too, or no guard ever matches.
+    text = os.path.expanduser(os.path.expandvars(str(path).replace("\\", "/"))).replace("\\", "/")
     if not (text.startswith("/") or re.match(r"[A-Za-z]:", text)):
         text = posixpath.join(str(here).replace("\\", "/"), text)
     text = re.sub(r"^/{2,}", "/", text)  # bash reads //home as /home; normpath keeps the //
-    return posixpath.normpath(text).rstrip("/") or "/"
+    text = posixpath.normpath(text).rstrip("/") or "/"
+    return _real(text) if real else text
+
+
+def _real(path):
+    """`path` with symlinks resolved (audit 2026-11-04: `ln -s ~ /tmp/h`, then `rm -rf
+    /tmp/h/projects` was judged as /tmp). A C:/ path on a non-Windows PC stays as written."""
+    if re.match(r"[A-Za-z]:", path) and not on_windows():
+        return path
+    try:
+        real = os.path.realpath(path).replace("\\", "/")
+    except (OSError, ValueError):
+        return path
+    return real.rstrip("/") or "/" if not re.fullmatch(r"[A-Za-z]:/", real) else real
+
+
+# Windows paths keep their backslashes as path separators: bash-style parsing (_words) would
+# read C:\Users\jdoe as C:Usersdavid (audit 2026-11-04: `cd C:\Users && rd /s /q david`).
+_WINPATH = re.compile(r"[A-Za-z]:\\[^\s'\"]*|(?<![\w\\$`])(?:~|\.\.?)\\[^\s'\"]*")
+
+
+def _winslash(text):
+    return _WINPATH.sub(lambda m: m.group(0).replace("\\", "/"), text)
 
 
 # Any home folder or drive root, on any OS: `rm -rf C:\Users\jdoe` on the Dell is checked on
@@ -162,7 +207,68 @@ EXPANDS = re.compile(r"[$`*?\[{]|^~[^/]|%\w+%")
 # code (red team 2026-11-03). Fail-closed: the brain can always write the command out plainly.
 _DELETE = r"(?:rm|rmdir|rd|del|erase|remove-item|ri|unlink|shred|truncate)(?:\.exe)?"
 _SHELL = r"(?:bash|sh|zsh|dash|ksh|fish|pwsh|powershell|cmd)(?:\.exe)?"
+# The console (7777), the hub, the relay and browser debug ports trust any local caller (a
+# fixed header is all the console asks), so a brain command that talks to them could approve
+# its own confirmation. On Linux the sandbox has no route to the host's loopback; Windows and
+# macOS have no sandbox, so refuse the shape here (audit 2026-11-04).
+# Every spelling of 127.0.0.0/8, 0.0.0.0 and ::1: dotted 1-4 parts (decimal, octal, hex first
+# part), one big integer (decimal, octal, hex), expanded IPv6. A bare `0` host is URL-only.
+_LOOPBACK = (r"(?:localhost|0\.0\.0\.0|(?:0*127|0+177|0x0*7f)(?:\.(?:0x[0-9a-f]+|\d+)){1,3}|"
+             r"21(?:3\d|4[0-7])\d{6}|0+17[0-7]{9}|0x0*7f[0-9a-f]*|"
+             r"\[?(?:(?:0{1,4}(?::0{1,4}){0,5})?::0*1|(?:0{1,4}:){7}0{0,3}1)\]?)")
+LOCAL_CONSOLE = re.compile(r"(?<![\w.])" + _LOOPBACK + r"(?![\w.])|(?:(?<=//)|(?<=@))0+(?=[:/\s]|$)|"
+                           r"/api/(?:confirm|ask|settings|send|remote)\b|\bX-JARVIS\b", re.I)
+
+CONSOLE_PORTS = (7777, 7780)  # the console's and the hub's default ports; cluster.listen_port too
+_CONSOLE_WHY = "JARVIS doesn't let commands talk to its own console or hub on this computer"
+
+
+def _console_port(text, config):
+    """A command naming the console's or hub's port with any host: a hostname that resolves to
+    loopback (localtest.me, *.nip.io) reaches them as well as 127.0.0.1 does."""
+    ports = set(CONSOLE_PORTS)
+    try:
+        ports.add(int(((config or {}).get("cluster") or {}).get("listen_port")))
+    except (TypeError, ValueError):
+        pass
+    alts = "0*(?:" + "|".join(str(p) for p in sorted(ports)) + r")(?!\d)"
+    if re.search(r"[\w\]\-.%]:" + alts, text):
+        return True
+    # bash's /dev/tcp/HOST/PORT (and udp): the port, or one the text can't read ($P, {a,b})
+    if re.search(r"/dev/(?:tcp|udp)/[^/\s]+/(?:" + alts + r"|(?!\d+(?![^\s;|&)<>'\"])))", text, re.I):
+        return True
+    # A bare port argument to a network tool: nc localtest.me 7777, telnet h 7780 < body.txt
+    port = r"(?<![\w.:/=%-])" + alts + r"(?![\w.:])"
+    if NET_TOOL.search(text) and re.search(port, text):
+        return True
+    # Inline code with the port as its own literal: ('localtest.me',7777), connect((h, 7780))
+    return bool(INLINE_CODE.search(text) and re.search(r"(?:[,(]\s*|\bport\s*[=:]\s*)" + alts + r"\s*[,)}]", text, re.I))
+
+
+NET_TOOL = re.compile(r"(?<![\w.-])(?:nc|ncat|netcat|telnet|socat|openssl|curl|wget|nmap|httpie|http(?!s?://)|xh|"
+                      r"test-netconnection|tnc|invoke-webrequest|iwr|invoke-restmethod|irm)(?:\.exe)?(?![\w.-])", re.I)
+INLINE_CODE = re.compile(r"\b(?:python[\d.]*|(?<!\.)py|perl|ruby|node|php|deno|bun|lua|pwsh|powershell|awk|gawk|"
+                         r"tclsh|osascript)\b|new-object|\[[\w.]*sockets?[\w.]*\]|::new\(", re.I)
+
+
+def _url_path_norm(text):
+    """Percent-decoded, with dot segments and doubled slashes taken out, as curl and browsers
+    send the path: /api/./remote/start and /x/../api/%72emote are /api/remote."""
+    from urllib.parse import unquote
+    for _ in range(3):
+        text = unquote(text)
+    text = text.replace("\\", "/")
+    while True:
+        new = re.sub(r"/\.(?=/|\s|$)", "", text)
+        new = re.sub(r"/[^/\s]+/\.\.(?=/|\s|$)", "", new)
+        new = re.sub(r"(?<!:)//+", "/", new)
+        if new == text:
+            return text
+        text = new
+
+
 STRUCTURAL = [
+    (LOCAL_CONSOLE, _CONSOLE_WHY),
     (re.compile(r"(?:^|[\s;&|({`])(?:\S*/)?" + _DELETE + r"\b.*(?:\$\(|`|<\()|(?:\$\(|`|<\().*\b" + _DELETE + r"\b", re.I),
      "deletes can't use command substitution; name the target plainly"),
     (re.compile(r"\b(?:xargs|parallel)\b[^|;&]*\b(?:" + _DELETE + r"|" + _SHELL + r"|find)\b", re.I),
@@ -193,7 +299,76 @@ STRUCTURAL = [
                 r"clean\b.*-\w*[fdx])", re.I), "JARVIS doesn't run git commands that throw work away"),
     (re.compile(r"\|\s*(?:remove-item|ri|rm|del|erase)\b[^|;&]*-r", re.I),
      "piping a listing into a recursive delete isn't allowed"),
+    # audit 2026-11-04: Windows shapes a path check can't read.
+    (re.compile(r"\|\s*(?:(?:foreach-object|foreach|%)\s*\{\s*)?(?:remove-item|ri|rm|del|erase|rd|rmdir|"
+                r"unlink)(?:\.exe)?\b", re.I), "piping into a delete isn't allowed; name the files plainly"),
+    (re.compile(r"\.(?:delete|moveto)\s*\(", re.I), "JARVIS doesn't delete or move through .Delete()/.MoveTo()"),
+    (re.compile(r"\brobocopy\b.*\s/(?:mir|purge|mov|move)\b", re.I),
+     "robocopy /MIR, /PURGE and /MOV delete files; use plain commands"),
+    (re.compile(r"(?:^|[\s;&|({])" + _DELETE + r"\b[^;&|\n]*(?:\(|\[(?:system\.)?environment\])", re.I),
+     "deletes can't take their target from a subexpression; name it plainly"),
+    # audit 2026-11-07: autostart a path check can't see (registry Run keys, scheduled tasks,
+    # cron, systemd links) and the PowerShell $PROFILE. `crontab -l` and `reg query` stay allowed.
+    (re.compile(r"\breg(?:\.exe)?\s+(?:import|restore|load)\b|"
+                r"(?:\breg(?:\.exe)?\s+(?:add|copy)\b|\b(?:new|set|copy|rename)-itemproperty\b)[^;&|\n]*"
+                r"currentversion[\\/]*(?:policies[\\/]*explorer[\\/]*)?run(?:once)?\b", re.I),
+     "JARVIS doesn't add programs to the registry's autostart keys"),
+    (re.compile(r"\bschtasks(?:\.exe)?\b[^;&|\n]*\s[/-](?:create|change)\b|"
+                r"\b(?:register|set)-scheduledtask\b", re.I),
+     "JARVIS doesn't create or change scheduled tasks"),
+    # crontab as the command word (segment start, after sudo/env/..., or inside `sh -c`), unless its
+    # only options are -l and -u USER in any order: `man crontab`, `cat /etc/crontab` aren't writes.
+    (re.compile(r"(?:^|[;&|(`{\n]|\b" + _SHELL + r"\b[^;&|\n]*?\s-\w*c)\s*"
+                r"(?:(?:sudo|doas|env|exec|nohup|command|nice|time|timeout|setsid|stdbuf|ionice|xargs|watch|"
+                r"then|do|else|!)(?![\w.-])[^;&|\n`)]*?\s)?(?:\S*/)?crontab(?:\.exe)?(?![\w.-])"
+                r"(?!(?:\s+-u\s*[^\s;&|]+)*\s+-l(?:\s+-u\s*[^\s;&|]+)*\s*(?:$|[;&|\n)<>`]|\d>))", re.I),
+     "JARVIS doesn't change crontabs (crontab -l is fine)"),
+    (re.compile(r"\bsystemctl\b[^;&|\n]*(?<![\w.-])(?:enable|link|edit|add-wants|add-requires|preset|"
+                r"preset-all|reenable)(?![\w.-])", re.I),
+     "JARVIS doesn't enable or link systemd units"),
+    # $PROFILE as a destination only: a redirect, a content/tee writer, -Destination, or the last
+    # plain argument of a copy/move (`cp $PROFILE /tmp/x` only reads it).
+    (re.compile(r"(?:>>?\|?\s*|-destination\s*:?\s*|\b(?:add-content|ac|set-content|sc|out-file|tee-object|tee|"
+                r"new-item|ni)\b[^;&|\n]*)\$\{?profile\b|"
+                r"\b(?:copy-item|cpi|copy|cp|move-item|mi|mv|move)\b[^;&|\n]*?\s(?!-)[^\s;&|]+\s+"
+                r"\$\{?profile\b(?:\.\w+)*\}?(?:\s+-\S+)*\s*(?:$|[;&|\n)])", re.I),
+     "JARVIS doesn't write the PowerShell profile"),
+    (re.compile(r"\bgit\b[^;&|\n]*(?:\bconfig\b(?![^;&|\n]*--get)[^;&|\n]*|\s-c\s*)(?:core\.(?:fsmonitor|hookspath|"
+                r"sshcommand|pager|editor|askpass|gitproxy)|sequence\.editor|include(?:if)?\.|credential\.helper|"
+                r"diff\.external|filter\.\S+\.(?:clean|smudge|process)|alias\.\S*(?:\s+|=)['\"]?!)", re.I),
+     "JARVIS doesn't set git options that run programs (hooks, fsmonitor, ! aliases)"),
 ]  # what bash fills in at run time: unknowable here
+
+
+# A link made and a destructive command in one line: the link doesn't exist yet when this
+# check resolves paths (audit 2026-11-04: `ln -s ~ /tmp/h && rm -rf /tmp/h/projects`).
+LINK_MADE = re.compile(r"\bln\b[^;&|\n]*\s-\w*s|\bln\b[^;&|\n]*--symbolic|\bcp\b[^;&|\n]*\s-\w*s\b|"
+                       r"\bmklink\b|-itemtype\s*:?\s*['\"]?(?:symboliclink|junction|hardlink)", re.I)
+DESTROYS = re.compile(r"(?:^|[\s;&|({])(?:" + _DELETE + r")\b[^;&|\n]*\s(?:-\w*[rR]\w*|--r\w*|-recurse\w*|/s)\b|"
+                      r"(?:^|[\s;&|({])(?:rmdir|rd)\b|\bfind\b.*\s-(?:delete|exec|execdir|ok)\b|"
+                      r"\brsync\b.*--del|(?:^|[\s;&|({])(?:mv|move|move-item|mi|rename-item|ren)\b|"
+                      r"\b(?:chmod|chown|chgrp|setfacl)\b[^;&|\n]*\s-\w*R|\b(?:icacls|takeown|robocopy)\b", re.I)
+# Folders directly in a home that nobody moves or locks away (Move-Item ~\Documents x).
+HOME_DIRS = re.compile(r"^(?:/home/[^/]+|/Users/[^/]+|/root|[a-z]:/users/[^/]+)/(?:documents|desktop|pictures|"
+                       r"music|videos|downloads|onedrive[^/]*|appdata|projects|src)$", re.I)
+# Where a written file runs later on its own (autostart, PATH, git hooks): never written by the
+# brain (defence in depth next to the sandbox; the only barrier on Windows/macOS).
+PERSIST = re.compile(r"/(?:\.local/bin|\.local/share/systemd|\.config/systemd|\.config/autostart|\.gitconfig|"
+                     r"\.config/git|\.local/share/applications|library/launchagents|"
+                     r"appdata/roaming/microsoft/windows/start menu/programs/startup)(?:/|$)", re.I)
+# Shell/desktop startup files and the PowerShell profile run in every new shell (audit 2026-11-07).
+# Judged on written paths only: reading or git-inspecting dotfiles (`awk 1 ~/.bashrc`, `git status`
+# in ~/.config/hypr) stays allowed. shortcut: inline code that writes them (awk print >, python -c)
+# isn't seen here; on Linux the bubblewrap sandbox makes them read-only.
+PERSIST_STARTUP = re.compile(r"/(?:\.bashrc|\.bashrc\.d|\.bash_profile|\.bash_login|\.bash_logout|\.profile|"
+                             r"\.zshrc|\.zprofile|\.zshenv|\.zlogin|\.xprofile|\.xinitrc|\.xsession|\.xsessionrc|"
+                             r"\.config/(?:fish|hypr|uwsm|environment\.d)|"
+                             r"documents/(?:windows)?powershell/[^/]*profile\.ps1)(?:/|$)", re.I)
+# Commands that write their destination (the last plain argument) or every plain argument.
+WRITE_DEST = frozenset({"cp", "mv", "install", "ln", "rsync", "scp", "copy-item", "cpi", "copy", "move-item",
+                        "mi", "move", "xcopy", "robocopy", "rename-item", "ren"})
+WRITE_ALL = frozenset({"tee", "touch", "truncate", "mkdir", "set-content", "sc", "add-content", "ac", "out-file",
+                       "new-item", "ni", "md"})
 
 
 # Folder moves the cwd tracking below can't follow (audit 2026-11-04: `cd /tmp; cd -; rm -rf
@@ -243,7 +418,10 @@ def _under(path, root):
 SECRET_TEXT = re.compile(
     r"\.codex[/\\]+auth|\.claude[/\\]+\.?credentials|\.ssh(?:[/\\]|\b)|[/\\]id_(?:rsa|ed25519|ecdsa|dsa)\b|"
     r"\.gnupg\b|\.password-store\b|\.aws[/\\]+credentials|\.config[/\\]+gh[/\\]+hosts|"
-    r"\.netrc\b|\.git-credentials\b|\bcode-signing\.key\b|cluster-owner\.token", re.I)
+    r"\.netrc\b|\.git-credentials\b|\bcode-signing\.key\b|cluster-owner\.token|"
+    # Other assistants' and tools' logins (audit 2026-11-04).
+    r"\.grok(?:[/\\'\"\s]|$)|\.hermes(?:[/\\'\"\s]|$)|\.config[/\\]+(?:openclaw|grok\\? ?bot|codex|cursor|gogcli)\b",
+    re.I)
 # JARVIS's own config, state and gate code, named anywhere in a command that changes things
 # ("python -c \"open('.../jarvis.config.json','w')\"" slipped past the path check).
 OWN_TEXT = re.compile(r"jarvis\.config\.json|(?:^|[\s'\"=/\\(])\.jarvis(?:[/\\'\"\s)]|$)|JARVIS\.md", re.I)
@@ -289,7 +467,6 @@ def _home_variants(command, config):
     limit, known, parts, at, size = max(4000, 4 * len(command)), {}, [], 0, 0
 
     def fill(piece):
-        nonlocal size
         def use(m):
             nonlocal size
             value = known.get(m.group(1), m.group(0))
@@ -368,6 +545,11 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
     for pattern, why in STRUCTURAL:
         if pattern.search(command) or pattern.search(plain):
             return why
+    if _console_port(command, config) or _console_port(plain, config) or \
+            LOCAL_CONSOLE.search(_url_path_norm(plain)):
+        return _CONSOLE_WHY
+    if LINK_MADE.search(plain) and DESTROYS.search(plain):
+        return "JARVIS doesn't make a link and delete, move or re-permission in one command"
     if CWD_JUMP.search(command) or CWD_JUMP.search(plain) or _pwd_after_cd(command) or _pwd_after_cd(plain):
         return "JARVIS can't follow cd -, popd, ~-, ~+, $OLDPWD or $PWD; name the folder plainly"
     if re.search(r"\b(?:python3?|perl|ruby|node|php|awk|gawk|deno|bun)\b", command, re.I) and \
@@ -376,7 +558,7 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
 
     def judge(step, here, unknown):
         """Why this one command (cwd `here`) is refused, or None."""
-        words = terminal._words(step) or [(w, w) for w in step.split()]
+        words = terminal._words(_winslash(step)) or [(w, w) for w in _winslash(step).split()]
         if not words:
             return None
         values = [v for v, _ in words]
@@ -424,7 +606,42 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
         # Windows paths as PowerShell sees them (the parsed words lost their backslashes), found
         # anywhere: -Path:C:\x, [IO.File]::WriteAllText("C:\x"), and > redirect targets.
         paths += [_abs(w, here) for w in windows]
-        paths += [_abs(m, here) for m in re.findall(r">>?\s*([^\s'\";&|>]+)", step)]
+        redirects = re.findall(r">>?\s*([^\s'\";&|>]+)", step)
+        paths += [_abs(m, here) for m in redirects]
+        # Written paths as typed: judged both resolved and by name below.
+        wrote = [m for m in redirects if not re.search(r"[$%`]", m)]
+        # $VAR here would be filled from JARVIS's own environment ($PWD): the filled-in variants judge those.
+        plainargs = [v for v in values[1:] if not v.startswith("-") and not re.fullmatch(r"/[a-zA-Z]{1,8}", v)
+                     and not re.search(r"[$%`]", v)]
+        if name in WRITE_DEST and plainargs:
+            wrote.append(plainargs[-1])
+        if name in WRITE_ALL or name == "sed" and any(re.match(r"-\w*i|--in-place", v) for v in values[1:]):
+            wrote += plainargs
+        for k, v in enumerate(values[1:-1], 1):  # -t dir, -Destination x, curl -o x, dd of=x
+            if re.fullmatch(r"-t|--target-directory|-destination|-o|--output|--output-document|-d|-P", v, re.I):
+                if not re.search(r"[$%`]", values[k + 1]):
+                    wrote.append(values[k + 1])
+        wrote += [v.split("=", 1)[1] for v in values[1:]
+                  if re.match(r"(?:of|--target-directory|--output(?:-document)?)=.", v)]
+        written = [_abs(w, here) for w in wrote]
+        # A symlink in a persistence spot (~/.local/bin/claude -> ~/.local/share/claude/...) is
+        # written through by name: resolving it first let `cp x ~/.local/bin/claude` pass (audit
+        # 2026-11-07). Lexical paths only add refusals; deletes keep the resolved ones.
+        by_name = [_abs(w, here, real=False) for w in wrote]
+        looks = name in terminal.READERS | {"ls", "stat", "file", "diff", "less", "more", "wc", "dir", "gci",
+                                            "get-childitem", "systemctl", "journalctl"}
+        for path in written + by_name + ([] if looks else paths + [_abs(t, here, real=False) for t in targets]):
+            if PERSIST.search(path):
+                return "JARVIS doesn't write where programs start on their own (autostart, PATH, git hooks)"
+        for path in written + by_name:
+            if PERSIST_STARTUP.search(path):
+                return "JARVIS doesn't write shell or desktop startup files"
+        for path in written + by_name:  # the repo's own root: sitecustomize.py, conftest.py, .claude/...
+            if path.casefold() == repo_s.casefold() or \
+                    posixpath.dirname(path).casefold() == repo_s.casefold() and not os.path.isdir(path) \
+                    and path.rsplit("/", 1)[-1].casefold() not in REPO_BUILD or \
+                    _under(path, repo_s + "/.claude"):
+                return "JARVIS doesn't write files into its own repo's root"
         for path in paths:
             if any(_under(path, v) for v in vaults):
                 return "the Obsidian vault is read-only"
@@ -445,7 +662,9 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
         if name in ("mv", "move", "move-item", "mi", "rename-item", "ren") and targets:
             sources = [t for t in targets if not t.startswith("-")][:-1] or targets[:1]
             for t in sources:  # moving home, the repo or the vault away destroys them as surely
-                if any(_under(g, _abs(t, here)) for g in [repo_s, home] + vaults) or TOP_FOLDERS.match(_abs(t, here)):
+                src = _abs(t, here)
+                if any(_under(g, src) for g in [repo_s, home] + vaults) or TOP_FOLDERS.match(src) or \
+                        HOME_DIRS.match(src):
                     return "that move would take away JARVIS, its vault or the home folder"
         if name in ("chmod", "chown", "chgrp", "setfacl"):
             recursive = any(re.fullmatch(r"-[a-zA-Z]*R[a-zA-Z]*|--recursive", v) for v in values[1:])
@@ -462,10 +681,22 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
                     return "chmod/chown/setfacl can't cover JARVIS's repo, its vault or the home folder"
                 if recursive and _under(path, repo_s):
                     return "recursive chmod/chown can't cover JARVIS's repo, its vault or the home folder"
+        if name in ("icacls", "cacls", "takeown"):
+            changes = name == "takeown" or any(
+                re.fullmatch(r"/(?:grant|deny|remove|setintegritylevel|inheritance|reset|setowner|restore|"
+                             r"substitute)(?::\w+)?", v, re.I) or v.lower() in ("/e", "/g", "/p", "/r", "/d")
+                for v in values[1:])
+            for t in values[1:]:
+                if not changes or re.fullmatch(r"/\w+(?::\w+)?", t) or (":" in t and not re.match(r"[A-Za-z]:", t)):
+                    continue
+                path = _abs(t, here)
+                if any(_under(g, path) for g in [repo_s, home, "/"] + vaults) or TOP_FOLDERS.match(path) or \
+                        HOME_DIRS.match(path):
+                    return "icacls/takeown can't change the permissions of home, JARVIS or the vault"
         if name in RM_NAMES:
             # -Path:C:\x / -LiteralPath:x carry their target inside the option.
             targets += [v.split(":", 1)[1] for v in values[1:] if re.match(r"-\w+:.", v)]
-            targets += [w.strip("'\"").split(":", 1)[1] for w in step.split()[1:]
+            targets += [w.strip("'\"").split(":", 1)[1].strip("'\"") for w in step.split()[1:]
                         if re.match(r"-\w+:.", w.strip("'\""))]  # -Path:C:\x keeps its backslashes raw
             recursive = any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--r\w*|-recurse\w*|/s", v, re.I)
                             or v == "--no-preserve-root" for v in values[1:])
@@ -516,7 +747,7 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
             found = judge(step, h, unknown)
             if found:
                 return found
-        words = terminal._words(step) or [(w, w) for w in step.split()]
+        words = terminal._words(_winslash(step)) or [(w, w) for w in _winslash(step).split()]
         values = [v for v, _ in words]
         if values:
             at, name = _command_name(values)
@@ -560,11 +791,13 @@ def hard_deny(name, args, config, base=None):
     return None
 
 
-def trusted_rules(config):
-    """The trusted_local rule, defaults filled in from TRUSTED_LOCAL."""
+def trusted_rules(config, state=None):
+    """The trusted_local rule, defaults filled in from TRUSTED_LOCAL. With `state`, never_ask
+    follows rules.confirm as jarvis.config.json says now (asks_now): a switch back to "ask"
+    takes effect without a restart, as it does for the brain and browser gates."""
     rule = {**TRUSTED_LOCAL, **((config or {}).get("rules") or {}).get("trusted_local", {})}
     rule["skip"] = [s for s in rule.get("skip") or () if s in SKIPPABLE]
-    rule["never_ask"] = not asks(config)
+    rule["never_ask"] = not asks_now(config, state)
     return rule
 
 

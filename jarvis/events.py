@@ -25,6 +25,8 @@ import time
 from collections import deque
 from pathlib import Path
 
+from .locking import LockBusy, exclusive_lock
+
 FEED = "events.jsonl"
 MAX_FEED = 1_000_000  # bytes before the feed rolls over to events.1.jsonl
 RELAYED = ("turn.", "voice.", "kb.", "grok.")  # kinds other processes may put on the feed
@@ -75,8 +77,12 @@ def emit(state, kind, **data):
         path = Path(state).resolve() / FEED
         try:
             if path.is_file() and path.stat().st_size > MAX_FEED:
-                path.replace(path.with_name("events.1.jsonl"))
-        except OSError:  # the console is mid-read (Windows); roll over next time
+                # Two processes seeing "too big" must not both roll: the second would
+                # replace events.1.jsonl with the nearly empty fresh feed. Re-check inside.
+                with exclusive_lock(path.with_name("events.lock"), timeout=1.0):
+                    if path.is_file() and path.stat().st_size > MAX_FEED:
+                        path.replace(path.with_name("events.1.jsonl"))
+        except (OSError, LockBusy):  # console mid-read (Windows) or another roller; next time
             pass
         line = json.dumps({"kind": kind, "at": time.time(), "pid": os.getpid(), "data": data},
                           default=str)

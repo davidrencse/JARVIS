@@ -8,22 +8,58 @@ missing, embed() returns None and callers keep their keyword search.
     vectors = embed(["my thesis draft", "dissertation chapter 2"])   # 384-d, unit length
 """
 
+import logging
 import threading
 import time
+
+log = logging.getLogger("jarvis.embed")
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DIM = 384
 MAX_TOKENS = 256
 IDLE = 600  # seconds without a call before the model is freed
+RETRY_MISSING = 600  # seconds before looking again for model files that were not there
+RETRY_ERROR = 60     # ... after a transient failure (a locked file, a busy disk)
 
 _lock = threading.Lock()
-_state = {"session": None, "tokenizer": None, "last": 0.0, "timer": None, "missing": False}
+_state = {"session": None, "tokenizer": None, "last": 0.0, "timer": None, "missing": False,
+          "retry_at": 0.0, "paths": None, "logged": None}
 
 
 def _files():
+    """Resolved (model, tokenizer) paths, looked up once while they stay on disk."""
+    import os
     from huggingface_hub import hf_hub_download
-    return (hf_hub_download(MODEL, "onnx/model.onnx", local_files_only=True),
-            hf_hub_download(MODEL, "tokenizer.json", local_files_only=True))
+    cached = _state.get("paths")  # (resolver, paths): a different resolver means a fresh lookup
+    if cached and cached[0] is hf_hub_download and all(os.path.exists(p) for p in cached[1]):
+        return cached[1]
+    paths = (hf_hub_download(MODEL, "onnx/model.onnx", local_files_only=True),
+             hf_hub_download(MODEL, "tokenizer.json", local_files_only=True))
+    _state["paths"] = (hf_hub_download, paths)
+    return paths
+
+
+def _is_missing(exc):
+    """Model files or onnxruntime absent (worth a slow retry) vs. a transient failure."""
+    if isinstance(exc, (FileNotFoundError, ImportError)):
+        return True
+    return type(exc).__name__ in ("LocalEntryNotFoundError", "EntryNotFoundError",
+                                  "OfflineModeIsEnabled")
+
+
+def _fail(exc):
+    """Turn semantic recall off for a cooldown, saying why once per distinct reason."""
+    missing = _is_missing(exc)
+    _state["missing"] = True
+    _state["paths"] = None
+    _state["session"] = _state["tokenizer"] = None
+    _state["retry_at"] = time.monotonic() + (RETRY_MISSING if missing else RETRY_ERROR)
+    reason = f"{type(exc).__name__}: {exc}"
+    if _state.get("logged") != reason:
+        _state["logged"] = reason
+        log.warning("semantic recall off (%s): %s; retrying in %d s",
+                    "model files missing" if missing else "embedding failed", reason,
+                    RETRY_MISSING if missing else RETRY_ERROR)
 
 
 def _load():
@@ -53,7 +89,9 @@ def _unload_when_idle():
 def available():
     """True when the model files and onnxruntime are present (no download is attempted)."""
     if _state["missing"]:
-        return False
+        if time.monotonic() < _state.get("retry_at", 0.0):
+            return False
+        _state["missing"] = False  # cooldown over: look again
     try:
         import importlib.util
         import sys
@@ -62,8 +100,8 @@ def available():
             raise ImportError("onnxruntime")
         _files()
         return True
-    except Exception:
-        _state["missing"] = True
+    except Exception as exc:
+        _fail(exc)
         return False
 
 
@@ -77,8 +115,8 @@ def embed(texts):
         try:
             if _state["session"] is None:
                 _state["session"], _state["tokenizer"] = _load()
-        except Exception:
-            _state["missing"] = True
+        except Exception as exc:
+            _fail(exc)
             return None
         session, tokenizer = _state["session"], _state["tokenizer"]
         _state["last"] = time.monotonic()

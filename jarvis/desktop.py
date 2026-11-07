@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import os
+from .platforms import on_windows
 import re
 import shutil
 import subprocess
@@ -36,7 +37,7 @@ def pem_fingerprint(text):
 
 
 def local_cert_path():
-    if os.name == "nt":
+    if on_windows():
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".config")
     else:
         base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
