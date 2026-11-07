@@ -440,6 +440,24 @@ def _node_code(state, node):
     return status, (status or {}).get("code")
 
 
+def _pull(state, node, how, cut=None):
+    """A pull node takes the main's *release*, never the live tree. Cut one now (the full
+    suite runs first) so the update means what David asked for, and say plainly when the
+    tests hold it back: before, a failed release left the node on old code with no hint."""
+    from .release import cut as cut_release
+    report = (cut or cut_release)(state, quiet=0)
+    out = {"node": node, "updated": False, "pull": True, "release": report}
+    if report.get("released") or "already get" in str(report.get("note", "")):
+        out["note"] = (f"{how} on its next poll (within ~30 s while its node agent runs) "
+                       "and restarts.")
+    elif report.get("tests"):
+        out["note"] = (f"Not sent: the release tests failed, so {node} keeps its last release. "
+                       f"Fix the failing test, then run this again. ({str(report['tests'])[-200:]})")
+    else:
+        out["note"] = f"Not sent yet: {report.get('note') or 'no release could be cut'}"
+    return out
+
+
 def update(config, state, node, rollback=False):
     """Bring `node` to this main's code (or back to its previous code). Returns a report."""
     from .topology import identity
@@ -451,18 +469,14 @@ def update(config, state, node, rollback=False):
     if not is_ssh_node(config, node):
         if rollback:
             raise ValueError(f"{node} has no SSH link, so it can't be rolled back remotely.")
-        return {"node": node, "updated": False, "pull": True,
-                "note": f"{node} has no SSH link: it pulls the main's code itself on its next poll "
-                        "(within ~30 s while its node agent runs) and restarts."}
+        return _pull(state, node, f"{node} has no SSH link: it pulls the main's code itself")
     _, _, folder = _ssh(config, state, node)
     kernel = _node_os(config, state, node)
     if kernel is None:
         # The scripts below need a POSIX shell, tar and a known service manager.
         if rollback:
             raise ValueError(f"{node} isn't a Linux or macOS node, so it can't be rolled back remotely.")
-        return {"node": node, "updated": False, "pull": True,
-                "note": f"{node} isn't a Linux or macOS node: it pulls the main's code itself on "
-                        "its next poll (within ~30 s while its node agent runs) and restarts."}
+        return _pull(state, node, f"{node} isn't a Linux or macOS node: it pulls the main's code itself")
     started = time.monotonic()
     _, before = _node_code(state, node)
     from .release import served_code, source

@@ -105,7 +105,7 @@ def ask(text, store, memory, config, base, tier=None, write=False, timeout=600, 
 
 
 def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600, lane=None,
-         on_sentence=None, on_start=None, channel="cli", on_step=None):
+         on_sentence=None, on_start=None, channel="cli", on_step=None, _inbound=None):
     """on_sentence: optional callback for streamed sentences (fast lane only).
     on_start({"route", "message"}): called once the request is routed and remembered.
     channel: where it came from (console, voice, cli), kept on the inbound message.
@@ -136,11 +136,12 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
             result = {**result, "streamed": True}
         return {**result, "via": "main"}
     routing = config.get("routing", {})
-    _note_correction(text, memory)
-    confirmed = _confirmation_turn(text, memory, config, base, channel,
-                                   on_start, on_sentence, on_step)
-    if confirmed is not None:
-        return confirmed
+    if _inbound is None:  # a re-run (Grok not needed) already did these once
+        _note_correction(text, memory)
+        confirmed = _confirmation_turn(text, memory, config, base, channel,
+                                       on_start, on_sentence, on_step)
+        if confirmed is not None:
+            return confirmed
     if tier is None and not write and routing.get("fast_path", True):
         fast = _fast_path(text, memory, config, channel, on_start, on_sentence, on_step)
         if fast is not None:
@@ -173,11 +174,14 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
     if tier is None and not write:
         _shadow(config, memory, text, "agent" if agent or (not quick and grok_first(text, config)) else
                 "build" if route["tier"] == "complex" else "converse")
-    inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
-                         meta={"route": route, "channel": channel,
-                               "origin_device": __import__("jarvis.topology", fromlist=["ORIGIN"]).ORIGIN.get()}, importance=0.4)
-    if on_start:
-        on_start({"route": route, "message": inbound["id"]})
+    if _inbound is not None:  # the Grok fallback: the owner's message is remembered already
+        inbound = _inbound
+    else:
+        inbound = memory.add("message", text, source="owner", tags=["inbound", route["tier"]],
+                             meta={"route": route, "channel": channel,
+                                   "origin_device": __import__("jarvis.topology", fromlist=["ORIGIN"]).ORIGIN.get()}, importance=0.4)
+        if on_start:
+            on_start({"route": route, "message": inbound["id"]})
     step = _stepper(on_step)
     built = []
 
@@ -292,7 +296,7 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
         elif adapter["kind"] == "browser_agent" and adapter["name"] == "grokbot" and \
                 adapter.get("integration") == "window_automation":
             from .grokbot import Grokbot
-            from .grok_preflight import assess
+            from .grok_preflight import GrokNotNeeded, assess
             step("grok-check", "adapter", "Grok preflight", "inference and ten checks", "run")
             bot = Grokbot(config, memory.path.parent)
             stage = "grok-check"
@@ -331,6 +335,12 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                                       prechecked=True)
                 else:
                     result = None
+            except GrokNotNeeded as exc:
+                step("grok-check", "adapter", "Grok preflight", "not needed; using the brain", "done")
+                _shadow(config, memory, text, "converse", job="grok_preflight", decided=False)
+                return {**_ask(text, store, memory, config, base, "simple", write, timeout, lane,
+                               on_sentence, on_start, channel, on_step, _inbound=inbound),
+                        "grok_fallback": str(exc)}
             except (TimeoutError, RuntimeError, ValueError, LookupError, OSError) as exc:
                 reply = f"Grok request failed: {exc}"
                 detail["state"] = "failed"

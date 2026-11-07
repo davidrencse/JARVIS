@@ -19,6 +19,8 @@ def summary(command):
         what = args["text"]
     elif intent == "close_app":
         what = "close " + args["name"]
+    elif intent == "bluetooth":
+        what = f"bluetooth {args.get('action', '')} {args.get('name', '')}"
     elif intent == "terminal":
         what = f"run \"{args['command']}\" in the terminal"
     else:

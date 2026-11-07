@@ -42,6 +42,7 @@ from pathlib import Path
 
 from .platforms import NO_WINDOW, on_windows
 from . import platforms
+from .remote import SYSTEM_ACTIONS
 from .showcase import PAGES
 
 MACHINE = platforms.label()  # e.g. "Windows 11", "Arch Linux (Hyprland)", "macOS"
@@ -284,6 +285,43 @@ class DesktopTools:
              "description": "Speaker volume: up, down, mute, unmute, or a level 0-100.",
              "inputSchema": {"type": "object", "required": ["level"], "additionalProperties": False,
                              "properties": {"level": {"type": "string"}}}},
+            *self._system_tools(),
+        ]
+
+    @staticmethod
+    def _system_tools():
+        """Typed system tools (sysintents.py). They run outside the terminal sandbox, which
+        hides Wayland, Hyprland's socket and D-Bus: use these instead of terminal for them."""
+        def tool(tool_name, description, required=(), /, **properties):
+            return {"type": "function", "name": tool_name, "description": description,
+                    "inputSchema": {"type": "object", "required": list(required),
+                                    "additionalProperties": False, "properties": properties}}
+        return [
+            tool("brightness", "Screen brightness: up, down (10 percent a step) or a level 0-100.",
+                 ["level"], level={"type": "string"}),
+            tool("screenshot", "Save a screenshot (whole screen, or the active window with "
+                 "window=true) and report the exact saved path. Optional path must be under "
+                 "~/Pictures, ~/Downloads, ~/Desktop or ~/Documents (default ~/Pictures/Screenshots).",
+                 path={"type": "string"}, window={"type": "boolean"}),
+            tool("system_status", "Read-only: battery percent and charging, Wi-Fi network, "
+                 "Bluetooth on/off, open windows (class and title, up to 15).",
+                 what={"type": "string", "enum": ["battery", "wifi", "bluetooth", "windows", "all"]}),
+            tool("workspace", "Switch to workspace number n (Hyprland).", ["n"],
+                 n={"type": "integer", "minimum": 1, "maximum": 99}),
+            tool("bluetooth", "Bluetooth: on/off, scan (about 8 s, then discovery is stopped), list "
+                 "paired devices, connected, connect/disconnect a PAIRED device by name, pair a "
+                 "device from a recent scan or forget a paired one (pair and forget wait for "
+                 "David's OK). unnamed=true keeps nameless scan results.", ["action"],
+                 action={"type": "string", "enum": ["on", "off", "scan", "list", "connected",
+                                                    "connect", "disconnect", "pair", "forget"]},
+                 name={"type": "string"}, unnamed={"type": "boolean"}),
+            tool("lock_screen", "Lock the screen."),
+            tool("reminder", "Notify David after `minutes` (up to 1440, decimals allowed) with "
+                 "optional text. Also the way to set a timer. Held in memory while JARVIS runs.",
+                 ["minutes"], minutes={"type": "number"}, text={"type": "string"}),
+            tool("weather", "Read-only weather from wttr.in for a city (default from config) "
+                 "today or tomorrow.", city={"type": "string"},
+                 day={"type": "string", "enum": ["today", "tomorrow"]}),
         ]
 
     def call(self, name, args):
@@ -292,7 +330,7 @@ class DesktopTools:
         if device and self.remote:
             from .remote import ARG
             arg = str(args.get(ARG.get(name, ""), ""))
-            if name in ("scroll", "terminal", "computer", "spotify", "app_ui"):
+            if name in ("scroll", "terminal", "computer", "spotify", "app_ui", *SYSTEM_ACTIONS):
                 arg = json.dumps({k: v for k, v in args.items() if k != "device"})
             if name == "computer":
                 from .control import as_result
@@ -333,6 +371,10 @@ class DesktopTools:
                 return media(str(args.get("command", "")))
             if name == "volume":
                 return volume(str(args.get("level", "")))
+            if name in SYSTEM_ACTIONS:
+                from .sysintents import run as system_run
+                spec = args.get("spec")
+                return system_run(name, spec if isinstance(spec, str) else json.dumps(args))
             if name == "scroll":
                 spec = args.get("spec")
                 return scroll(spec if isinstance(spec, str) else json.dumps(args))

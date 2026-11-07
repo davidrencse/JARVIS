@@ -887,6 +887,13 @@ class ConfirmGate:
             extra = {"cwd": str(args["cwd"])} if args.get("cwd") else {}
             return {"intent": "terminal", "device": device,
                     "args": {"command": str(args.get("command", "")), **extra}}
+        if name == "bluetooth":  # pair and forget wait for David; the rest run now
+            command = {"intent": "bluetooth", "device": device,
+                       "args": {k: v for k, v in args.items() if k in ("action", "name", "unnamed")}}
+            try:
+                return None if registry.risk(command) == "allow" else command
+            except KeyError:  # unknown shape: ask, never run unasked
+                return command
         if name == "grok_agent":
             return {"intent": "agent_task", "device": here,
                     "args": {"text": str(args.get("task", ""))}}

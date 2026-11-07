@@ -110,6 +110,8 @@ class Agent:
 
     def session(self):
         """A signed WebSocket URL (valid ~15 min) plus the voice to ask for."""
+        if self.voice.muted:
+            raise ValueError("JARVIS only talks on the main PC. Use the voice agent there.")
         agent = self.agent_id()
         if not agent or not ID.fullmatch(agent):
             raise ValueError("No ElevenLabs agent yet. Run: jarvis voice agent-setup")
