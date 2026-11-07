@@ -27,7 +27,11 @@ DIRECT = {"open_app": ("open_app", "name"), "open_url": ("open_url", "url"),
           "focus_window": ("focus_window", "name"), "close_app": ("close_app", "name"),
           "media": ("media", "command"), "volume": ("volume", "level"),
           "list_apps": ("list_apps", "query"), "scroll": ("scroll", None),
-          "browse": ("browse", None), "terminal": ("terminal", None)}
+          "browse": ("browse", None), "terminal": ("terminal", None),
+          "brightness": ("brightness", None), "screenshot": ("screenshot", None),
+          "system_status": ("system_status", None), "workspace": ("workspace", None),
+          "lock_screen": ("lock_screen", None), "reminder": ("reminder", None),
+          "weather": ("weather", None), "bluetooth": ("bluetooth", None)}
 # spotify_play is not here on purpose: tested live on 2026-10-26, a freshly opened Spotify
 # has no media session, so neither the media key nor Space starts Liked Songs; it needs a
 # click on the page's Play button. That's UI judgement, so it goes to Grok Bot.

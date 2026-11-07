@@ -41,6 +41,11 @@ class PreflightError(ValueError):
     """A handoff could not be prepared safely; no prompt was sent to Grok."""
 
 
+class GrokNotNeeded(PreflightError):
+    """The checks passed except grok_needed: the task needs no logged-in browser (a public
+    page, a lookup), so the caller should run the request on JARVIS's own brain instead."""
+
+
 def chatgpt_lane(config, base):
     """A separate tool-free lane; the action lane may be busy handling this call.
     max_turns=1 starts a new thread for every ask, so the review never sees the draft's
@@ -130,6 +135,9 @@ def _assess(request, infer):
     if failed:
         reason = review.get("reason")
         detail = reason.strip()[:300] if isinstance(reason, str) else ""
-        raise PreflightError("Grok preflight blocked " + ", ".join(failed) +
-                             (f": {detail}" if detail else "."))
+        # Only grok_needed failing is a routing miss, not a safety problem; any other
+        # failed check (alone or beside it) still fails closed.
+        blocked = GrokNotNeeded if failed == ["grok_needed"] else PreflightError
+        raise blocked("Grok preflight blocked " + ", ".join(failed) +
+                      (f": {detail}" if detail else "."))
     return {"decision": "forward", "task": task.strip(), "reply": None, "checks": checks}

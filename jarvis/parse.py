@@ -112,6 +112,127 @@ VOLUME = (
      lambda m: "up" if m.group(1) in ("raise", "increase") else "down"),
 )
 
+# System intents (sysintents.py): whole-clause phrases, read before the verb table so "switch
+# to workspace 3" isn't "focus workspace 3" and "what's the weather" isn't chat. Each spec
+# returns (intent, args). Anything that doesn't fit one of these exactly stays unparsed.
+NUMBER_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+                "seven": 7, "eight": 8, "nine": 9, "ten": 10, "fifteen": 15, "twenty": 20,
+                "thirty": 30, "forty five": 45, "forty-five": 45, "sixty": 60, "half an": 0.5}
+_NUM = r"(\d+(?:\.\d+)?|a|an|one|two|three|four|five|six|seven|eight|nine|ten|fifteen|twenty|" \
+       r"thirty|forty[ -]five|sixty|half an)"
+_UNIT = r"(seconds?|secs?|minutes?|mins?|hours?|hrs?)"
+_BRIGHT = r"(?:the\s+)?(?:screen\s+|display\s+)?brightness"
+
+
+def _minutes(number, unit):
+    value = float(NUMBER_WORDS.get(number, number))
+    value *= {"s": 1 / 60, "m": 1, "h": 60}[unit[0]]
+    return f"{value:g}"
+
+
+def _remind(number, unit, text=None):
+    args = {"minutes": _minutes(number, unit)}
+    return ("reminder", {**args, "text": text} if text else args)
+
+
+def _clean(text):
+    return re.sub(r"\s+", " ", text).strip(" ,;")
+
+
+SYSTEM = (
+    (re.compile(r"(?:set\s+)?" + _BRIGHT + r"\s+(?:to\s+)?(\d{1,3})(?:\s*(?:percent|%))?\Z"),
+     lambda m: ("brightness", {"level": m.group(1)})),
+    (re.compile(r"(?:set\s+)?(?:the\s+)?(?:screen\s+|display\s+)?brightness\s+(?:to\s+)?(?:half|"
+                r"fifty)\Z"), lambda m: ("brightness", {"level": "50"})),
+    (re.compile(r"(?:turn\s+|bring\s+)?" + _BRIGHT + r"\s+(up|down)\Z"),
+     lambda m: ("brightness", {"level": m.group(1)})),
+    (re.compile(r"(?:turn|bring)\s+(up|down)\s+" + _BRIGHT + r"\Z"),
+     lambda m: ("brightness", {"level": m.group(1)})),
+    (re.compile(r"(raise|increase|lower|decrease|reduce)\s+" + _BRIGHT + r"\Z"),
+     lambda m: ("brightness", {"level": "up" if m.group(1) in ("raise", "increase") else "down"})),
+    (re.compile(r"dim\s+(?:the\s+)?(?:screen|display)\Z"), lambda m: ("brightness", {"level": "down"})),
+    (re.compile(r"brighten\s+(?:the\s+)?(?:screen|display)\Z"), lambda m: ("brightness", {"level": "up"})),
+    (re.compile(r"make\s+(?:the\s+)?(?:screen|display)\s+(brighter|dimmer|darker)\Z"),
+     lambda m: ("brightness", {"level": "up" if m.group(1) == "brighter" else "down"})),
+    (re.compile(r"(?:take\s+(?:a\s+)?)?screen\s?shot\s+(?:of\s+)?(?:this|the\s+(?:active|current|"
+                r"focused))\s+window\Z"), lambda m: ("screenshot", {"window": True})),
+    (re.compile(r"(?:screen\s?shot|capture)\s+(?:the\s+)?(?:active|current|focused)\s+window\Z"),
+     lambda m: ("screenshot", {"window": True})),
+    (re.compile(r"(?:take\s+(?:a\s+)?)?screen\s?shot(?:\s+of\s+(?:my|the)\s+(?:screen|desktop))?\Z"),
+     lambda m: ("screenshot", {})),
+    (re.compile(r"(?:how\s+much\s+battery(?:\s+(?:do\s+i\s+have|is\s+left|left|have\s+i\s+got))?|"
+                r"what(?:'s|\s+is)\s+(?:my|the)\s+battery(?:\s+(?:level|percentage|percent|status))?|"
+                r"(?:check|show)\s+(?:my\s+)?battery(?:\s+level)?|battery\s+(?:level|status|"
+                r"percentage)|(?:is|am)\s+(?:my\s+(?:laptop|battery)|it|i)\s+charging)\Z"),
+     lambda m: ("system_status", {"what": "battery"})),
+    (re.compile(r"(?:what\s+wi-?fi(?:\s+network)?\s+am\s+i\s+(?:on|connected\s+to)|"
+                r"what(?:'s|\s+is)\s+(?:my|the)\s+wi-?fi(?:\s+(?:network|name|ssid))?|"
+                r"which\s+wi-?fi(?:\s+network)?\s+am\s+i\s+(?:on|connected\s+to)|"
+                r"am\s+i\s+connected\s+to\s+wi-?fi|is\s+(?:the\s+|my\s+)?wi-?fi\s+(?:on|connected|"
+                r"working))\Z"), lambda m: ("system_status", {"what": "wifi"})),
+    (re.compile(r"(?:is\s+(?:the\s+|my\s+)?bluetooth\s+(?:on|off|enabled|active)|"
+                r"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?bluetooth\s+status)\Z"),
+     lambda m: ("system_status", {"what": "bluetooth"})),
+    (re.compile(r"(?:(?:what|which)\s+(?:apps|windows|programs|applications)\s+(?:do\s+i\s+have\s+|"
+                r"are\s+)?(?:open|running)(?:\s+right\s+now)?|(?:list|show)\s+(?:my\s+)?open\s+"
+                r"(?:windows|apps))\Z"), lambda m: ("system_status", {"what": "windows"})),
+    (re.compile(r"(?:switch|go|move|jump)\s+to\s+work\s?space\s+(\d{1,2}|one|two|three|four|five|"
+                r"six|seven|eight|nine|ten)\Z"),
+     lambda m: ("workspace", {"n": str(NUMBER_WORDS.get(m.group(1), m.group(1)))})),
+    (re.compile(r"lock\s+(?:my\s+|the\s+)?(?:screen|computer|laptop|pc|session)\Z"),
+     lambda m: ("lock_screen", {})),
+    (re.compile(r"remind\s+me\s+in\s+" + _NUM + r"\s*" + _UNIT + r"\s+to\s+(.+)\Z"),
+     lambda m: _remind(m.group(1), m.group(2), _clean(m.group(3)))),
+    (re.compile(r"remind\s+me\s+to\s+(.+?)\s+in\s+" + _NUM + r"\s*" + _UNIT + r"\Z"),
+     lambda m: _remind(m.group(2), m.group(3), _clean(m.group(1)))),
+    (re.compile(r"(?:(?:set|start|begin)\s+(?:a\s+)?(?:timer|alarm)\s+(?:for|of)|"
+                r"(?:set|start)\s+(?:a\s+)?" + _NUM + r"[ -]?" + _UNIT + r"\s+timer)(?:\s+" + _NUM
+                + r"\s*" + _UNIT + r")?\Z"),
+     lambda m: _remind(*[g for g in m.groups() if g][:2])),
+    (re.compile(r"(?:what(?:'s|\s+is)|how(?:'s|\s+is)|check|show\s+me|tell\s+me)?\s*(?:the\s+)?"
+                r"weather(?:\s+forecast)?(?:\s+like)?(?:\s+(today|tomorrow))?"
+                r"(?:\s+(?:in|for|at)\s+([a-z][a-z .'-]{1,58}?))?(?:\s+(today|tomorrow))?\Z"),
+     lambda m: ("weather", {**({"city": m.group(2)} if m.group(2) else {}),
+                            **({"day": m.group(1) or m.group(3)} if m.group(1) or m.group(3) else {})})),
+)
+
+# Bluetooth (sysintents.bluetooth). Device names are data: only matched against paired
+# devices later. Words that mean a different connection are never read as a device.
+_NOT_BT = r"(?!(?:to\s+)?(?:the\s+)?(?:wi-?fi|wifi|vpn|internet|network|server|ssh|wireless|it|that|this|them|" \
+          r"me|you|jarvis|github|database|db|site|website|phone)\b)"
+_DEVICE_NAME = r"(?:my\s+|the\s+)?([a-z0-9][a-z0-9 .'+_-]{0,59}?)(?:\s+(?:via\s+|over\s+|on\s+)?bluetooth)?"
+
+
+def _bluetooth(action, name=None, **extra):
+    return ("bluetooth", {"action": action, **({"name": name} if name else {}), **extra})
+
+
+BLUETOOTH = (
+    (re.compile(r"(?:turn|switch)\s+(on|off)\s+(?:the\s+|my\s+)?bluetooth\Z"),
+     lambda m: _bluetooth(m.group(1))),
+    (re.compile(r"(?:turn|switch)\s+(?:the\s+|my\s+)?bluetooth\s+(on|off)\Z"),
+     lambda m: _bluetooth(m.group(1))),
+    (re.compile(r"(enable|disable)\s+(?:the\s+|my\s+)?bluetooth\Z"),
+     lambda m: _bluetooth("on" if m.group(1) == "enable" else "off")),
+    (re.compile(r"(?:scan|search|look)\s+for\s+(?:nearby\s+|new\s+)?bluetooth\s+(?:devices|things)"
+                r"(?:\s+(?:nearby|around(?:\s+me)?))?(\s+including\s+unnamed(?:\s+ones)?)?\Z"),
+     lambda m: _bluetooth("scan", **({"unnamed": True} if m.group(1) else {}))),
+    (re.compile(r"what\s+bluetooth\s+devices\s+are\s+(?:nearby|around(?:\s+me)?|available|close"
+                r"(?:\s+by)?|in\s+range)(\s+including\s+unnamed(?:\s+ones)?)?\Z"),
+     lambda m: _bluetooth("scan", **({"unnamed": True} if m.group(1) else {}))),
+    (re.compile(r"find\s+(?:my\s+)?(headphones|headset|earbuds|earphones|airpods|speaker|keyboard|mouse)\Z"),
+     lambda m: _bluetooth("scan", m.group(1))),
+    (re.compile(r"what\s+bluetooth\s+devices\s+are\s+(?:connected|on)\Z"), lambda m: _bluetooth("connected")),
+    (re.compile(r"(?:list|show)\s+(?:me\s+)?(?:all\s+)?(?:my\s+)?(?:paired\s+)?bluetooth\s+devices\Z"),
+     lambda m: _bluetooth("list")),
+    (re.compile(r"what\s+bluetooth\s+devices\s+(?:do\s+i\s+have|are\s+paired)\Z"), lambda m: _bluetooth("list")),
+    (re.compile(r"(connect|disconnect|pair|forget|unpair)\s+(?:with\s+|from\s+|to\s+)?" + _NOT_BT + _DEVICE_NAME + r"\Z"),
+     lambda m: _bluetooth({"unpair": "forget"}.get(m.group(1), m.group(1)), _clean(m.group(2)))),
+    (re.compile(r"connect\s+to\s+" + _NOT_BT + _DEVICE_NAME + r"\Z"),
+     lambda m: _bluetooth("connect", _clean(m.group(1)))),
+)
+SYSTEM = SYSTEM + BLUETOOTH
+
 # Scrolling, read before the verb table so "start scrolling" isn't "open scrolling".
 # "in the agent browser" anywhere moves pages and scrolling to JARVIS's own browser
 # (agent_browser.py, shown live in the console) instead of David's.
@@ -273,7 +394,7 @@ def _parse(text, devices, origin, main, apps):
         clause = _clause(raw.strip(" ,;"), aliases, catalog, verb)
         clause["then"] = then
         if clause["verb"] is None:  # "open spotify ... and chrome on my other pc"
-            if verb is None or verb == "scroll":  # a scroll has no object to carry over
+            if verb is None or verb in ("scroll", "system"):  # neither has an object to carry over
                 raise Unsure("no action verb")
             clause["verb"], clause["inherited"] = verb, True
         verb = clause["verb"]
@@ -323,6 +444,7 @@ def _parse(text, devices, origin, main, apps):
 
 
 AUDIO = ("media", "volume")
+ORDERED = ("screenshot", "workspace", "lock_screen")
 APP_LIFECYCLE = ("open_app", "close_app")
 
 
@@ -331,6 +453,8 @@ def _shares(prev, command):
     sound (media/volume). Playing media after opening/closing an app counts too: the
     player is that app ("close spotify and play it")."""
     name, other = command["args"].get("name"), prev["args"].get("name")
+    if command["intent"] in ORDERED:  # "open chrome and take a screenshot": after it, not beside it
+        return True
     if name and name == other:
         return True
     if command["intent"] in AUDIO and prev["intent"] in AUDIO:
@@ -486,6 +610,12 @@ def _clause(text, aliases, catalog, inherited=None):
     for pattern, spec in SCROLL:
         if match := pattern.match(" ".join(words)):
             return {"verb": "scroll", "object": "", "device": device, "scroll": spec(match)}
+    for pattern, spec in SYSTEM:
+        if match := pattern.match(" ".join(words)):
+            intent, args = spec(match)
+            if args.get("name") and _device(args["name"], aliases):  # "connect to my arch linux"
+                raise Unsure(f"{args['name']!r} is a computer here, not a bluetooth device")
+            return {"verb": "system", "object": "", "device": device, "system": (intent, args)}
     # The verb first, so the "on" in "go on youtube" or "focus on" isn't read as a place.
     verb, rest = _verb(words)
     head = " ".join(words[:words.index("on")] if "on" in words else words)
@@ -566,6 +696,9 @@ def _command(clause, catalog):
         verb = "previous"
     if verb == "scroll":
         return {"intent": "scroll", "args": dict(clause["scroll"])}
+    if verb == "system":
+        intent, args = clause["system"]
+        return {"intent": intent, "args": dict(args)}
     if verb in ("next", "previous") and NEXT_VIDEO.match(
             re.sub(r"^(?:to\s+)?(?:the\s+)?(?:next|previous|last)?\s*", "", obj)):
         return {"intent": "scroll", "args": {"mode": "once",

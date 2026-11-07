@@ -146,6 +146,12 @@ def menu(config, origin):
             "scroll": "direction down|up; mode once|auto|stop (auto keeps scrolling the window "
                       "every `every` seconds, a string 2-300, until stopped); target: a word "
                       "from the window title such as youtube; app: the browser; url: the page",
+            "system": "brightness level up|down|0-100; screenshot path (optional, under "
+                      "Pictures/Downloads/Desktop/Documents) window true|false; system_status "
+                      "what battery|wifi|bluetooth|windows|all; workspace n; lock_screen; "
+                      "reminder minutes (string) text; weather city day today|tomorrow; bluetooth action "
+                      "on|off|scan|list|connected|connect|disconnect|pair|forget, name (the device), "
+                      "unnamed (scan only); pair and forget wait for David's OK",
             "browse": "JARVIS's own agent browser, shown live in the console: action "
                       "open|scroll|back|forward|reload|close; url (open, http(s)); direction, "
                       "mode and every as for scroll"}
