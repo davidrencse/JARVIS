@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 
 FIX_MARKER = b"keyboard event dropped: capture queue stayed full"
 ACK_MARKER = b"did not acknowledge Enter within"  # stuck-capture guard
@@ -37,7 +37,7 @@ def result(name, flag, detail):
 
 
 # -- Windows input plumbing -----------------------------------------------------------
-if os.name == "nt":
+if on_windows():
     from ctypes import wintypes
 
     ULONG_PTR = ctypes.c_size_t
@@ -242,7 +242,7 @@ def check_peer(config):
     if not host:
         return result("peer reachable", "SKIP", "no SSH peer configured")
     # Windows ping: -n count, -w milliseconds; elsewhere: -c count, -W seconds.
-    flags = ["-n", "1", "-w", "1500"] if os.name == "nt" else ["-c", "1", "-W", "2"]
+    flags = ["-n", "1", "-w", "1500"] if on_windows() else ["-c", "1", "-W", "2"]
     ok = subprocess.run(["ping", *flags, host], capture_output=True,
                         creationflags=NO_WINDOW).returncode == 0
     return result(f"{name} reachable", "PASS" if ok else "WARN",
@@ -387,7 +387,7 @@ def check_capture(probe, stress=False):
 
 
 def keyboard(config, base, capture=False, stress=False):
-    if os.name != "nt":
+    if not on_windows():
         return [result("platform", "SKIP", "Windows-only self-test")]
     results, proc = check_lan_mouse()
     results.append(check_queue_log(log_lines()))
