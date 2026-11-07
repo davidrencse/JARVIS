@@ -63,6 +63,27 @@ class PlatformsLabelTests(unittest.TestCase):
         self.assertIn(actions.MACHINE, actions.INSTRUCTIONS)
 
 
+class WindowsBootTests(unittest.TestCase):
+    """Audit cluster-04: Fast Startup keeps the uptime counter running across Shutdown, so
+    Windows' "boot" is the console session's logon time, with the counter as fallback."""
+
+    def test_logon_time_wins_and_the_counter_is_the_fallback(self):
+        self.assertEqual(platforms._windows_boot(lambda: 2000.0, lambda: 1000.0), 2000.0)
+        self.assertEqual(platforms._windows_boot(lambda: None, lambda: 1000.0), 1000.0)
+
+        def broken():
+            raise OSError("no wtsapi32")
+        self.assertEqual(platforms._windows_boot(broken, lambda: 1000.0), 1000.0)
+        self.assertIsNone(platforms._windows_boot(lambda: None, lambda: None))
+
+    def test_boot_time_on_windows_uses_it(self):
+        with mock.patch.object(platforms, "_os", return_value="windows"), \
+                mock.patch.object(platforms, "_windows_logon_time", return_value=3000.0), \
+                mock.patch.object(platforms, "_windows_tick_boot", return_value=1.0):
+            self.assertEqual(platforms.boot_time(), 3000.0)
+            self.assertEqual(platforms.boot_time(), 3000.0)  # fixed for the login, no jitter
+
+
 class ObserveListingTests(unittest.TestCase):
     def listing(self, desktop, tools, handler):
         fake = Fake(handler)
@@ -77,9 +98,10 @@ class ObserveListingTests(unittest.TestCase):
             {"app": "Steam", "title": "Steam", "focused": False},
             {"app": "pavucontrol", "title": "Volume", "focused": False}])
 
-    def test_sway_bad_json_is_empty(self):
+    def test_sway_bad_json_is_unknown(self):
+        # A failed query is "can't tell" (None), not "no windows" (audit 2026-11-04).
         got, _ = self.listing("sway", ["swaymsg"], lambda a: done("not json"))
-        self.assertEqual(got, [])
+        self.assertIsNone(got)
 
     def test_wmctrl_with_xdotool_focus(self):
         got, fake = self.listing("x11", ["wmctrl", "xdotool"],

@@ -279,6 +279,21 @@ class BlockedTests(Base):
         self.assertIn("OK", got["reply"])
         self.assertEqual(got["outcomes"][0]["state"], "not_sent")
 
+    def test_switch_back_to_ask_is_live(self):
+        # audit 2026-11-07: rules.confirm "never" in memory, "ask" on disk now: the on-disk
+        # value wins, as it does for the brain and browser gates, so close_app is parked.
+        (self.state / "jarvis.config.json").write_text(json.dumps({"rules": {"confirm": "ask"}}))
+        state = self.state / ".jarvis"
+        state.mkdir()
+        config = {**CONFIG, "rules": {**CONFIG["rules"], "confirm": "never"}}
+        remote = FakeRemote()
+        got = pipeline.fast_path("close notepad", config, state, remote=remote,
+                                 app_exists=lambda d, n: True, history=False)
+        self.assertEqual(remote.acts, [])
+        self.assertEqual(got["outcomes"][0]["state"], "not_sent")
+        self.assertTrue(gates.trusted_rules({"rules": {"confirm": "never"}})["never_ask"])
+        self.assertFalse(gates.trusted_rules({"rules": {"confirm": "never"}}, state)["never_ask"])
+
     def test_held_dependent_tells_you_to_ask_again(self):
         got, remote = self.run_fast("close notepad and then open chrome")
         self.assertEqual(remote.calls, [])

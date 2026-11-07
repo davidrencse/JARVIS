@@ -208,6 +208,27 @@ class RunHereToolsTests(unittest.TestCase):
         self.assertEqual(fake.calls, [("list_apps", {"query": "spot"}), ("open_app", {"name": "Spotify"})])
 
 
+class NodeTerminalGateTests(unittest.TestCase):
+    # audit 4: a node ran terminal commands from the hub with no hard_deny of its own.
+    def test_node_refuses_hard_denied_terminal_commands(self):
+        cfg = {"vault": {"path": {"windows": "C:\\Users\\jdoe\\Documents\\Vault"}}}
+        with patch("jarvis.gates.local_config", return_value=cfg), \
+                patch("jarvis.terminal.run", side_effect=AssertionError("ran")), \
+                patch.dict("os.environ", {"WAYLAND_DISPLAY": "w", "DISPLAY": ":0"}):
+            for arg in ("rm -rf ~", json.dumps({"command": "cat ~/.grok/auth.json"}),
+                        "Remove-Item -Recurse -Force C:\\Users\\jdoe\\Documents\\Vault"):
+                ok, text = remote.run_here("terminal", arg)
+                self.assertFalse(ok, arg)
+                self.assertIn("Refused", text)
+
+    def test_node_runs_allowed_terminal_commands(self):
+        with patch("jarvis.gates.local_config", return_value={}), \
+                patch("jarvis.terminal.run", return_value=(True, "hi")) as run, \
+                patch.dict("os.environ", {"WAYLAND_DISPLAY": "w", "DISPLAY": ":0"}):
+            self.assertEqual(remote.run_here("terminal", "echo hi"), (True, "hi"))
+        run.assert_called_once_with("echo hi")
+
+
 class LocalTargetWithClusterTests(unittest.TestCase):
     def check(self, local):
         cfg = {"devices": {"dell": {"transport": "local", "hostname": "d"},

@@ -21,8 +21,23 @@ def ts(online=True, cur="", host="WinLaptop", ips=("100.64.0.13",)):
 
 class PeerNearbyTests(unittest.TestCase):
     def test_lan_direct_address_is_near(self):
-        r = near(CONFIG, ts(cur="10.0.0.12:41641"))
+        r = near(CONFIG, ts(cur="172.1.41.12:41641"))
         self.assertIs(r["near"], True)
+
+    def test_private_address_on_another_network_is_apart(self):
+        for cur in ("10.0.0.12:41641", "192.168.1.20:41641"):
+            self.assertIs(near(CONFIG, ts(cur=cur))["near"], False, cur)
+
+    def test_stale_cur_addr_on_offline_peer_is_not_near(self):
+        r = near(CONFIG, ts(online=False, cur="172.1.41.40:41641"))
+        self.assertIs(r["near"], False)
+
+    def test_virtual_and_vpn_interfaces_are_not_own_subnets(self):
+        for name in ("tun0", "utun3", "ppp0", "vmnet8", "vboxnet0", "cni0", "flannel.1", "ham0",
+                     "wg0", "tailscale0", "docker0", "br-ab12", "veth1", "virbr0", "tap0"):
+            self.assertTrue(sharedinput.VIRTUAL_IF.match(name), name)
+        for name in ("wlan0", "eth0", "enp3s0", "Wi-Fi", "Ethernet"):
+            self.assertFalse(sharedinput.VIRTUAL_IF.match(name), name)
 
     def test_public_endpoint_and_offline_are_apart(self):
         for status in (ts(cur="198.51.100.58:55157"), ts(online=False)):
@@ -49,7 +64,7 @@ class PeerNearbyTests(unittest.TestCase):
 
     def test_matches_peer_by_tailscale_ip_when_hostname_differs(self):
         r = near({"clients": [{"hostname": "", "ips": ["100.64.0.13"]}]},
-                                    ts(host="DESKTOP-X", cur="192.168.1.20:41641"))
+                                    ts(host="DESKTOP-X", cur="172.1.41.20:41641"))
         self.assertIs(r["near"], True)
 
     def test_unknown_when_no_tailscale_or_no_peer(self):
@@ -64,6 +79,7 @@ class GuardTests(unittest.TestCase):
         self.state = Path(self.dir.name)
         self.running = True
         self.calls = []
+        self.clock = 1000.0
 
     def tearDown(self):
         self.dir.cleanup()
@@ -77,8 +93,9 @@ class GuardTests(unittest.TestCase):
 
         def stop():
             self.calls.append("stop"); self.running = False
+        self.clock += 30
         return sharedinput.guard(self.state, nearby=lambda: {"near": near, "peer": "Dell", "why": "test."},
-                                 status_fn=status, start_fn=start, stop_fn=stop)
+                                 status_fn=status, start_fn=start, stop_fn=stop, now=self.clock)
 
     def test_stops_after_two_apart_readings_and_restarts_when_back(self):
         self.assertIsNone(self.step(False)["action"])          # one reading: could be a blip
@@ -104,6 +121,7 @@ class GuardTests(unittest.TestCase):
 
     def test_manual_start_while_apart_is_an_override(self):
         self.step(False); self.step(False)            # guard stops it
+        self.clock += sharedinput.GUARD_GRACE         # well past the stop
         self.running = True                           # David starts it by hand
         for _ in range(3):
             self.assertIsNone(self.step(False)["action"])
@@ -111,6 +129,57 @@ class GuardTests(unittest.TestCase):
         self.step(True)                               # together again: override ends
         self.step(False); self.step(False)
         self.assertEqual(self.calls, ["stop", "stop"])
+
+    def test_daemon_still_dying_after_stop_is_not_a_manual_start(self):
+        self.step(False); self.step(False)            # guard signals the stop
+        self.running = True                           # the daemon is still alive one tick later
+        r = self.step(True)
+        self.assertFalse(r["override"])
+        self.assertTrue(r["stopped_by_guard"])
+        self.running = False                          # it finally exits
+        self.assertEqual(self.step(True)["action"], "started")
+        self.assertEqual(self.calls, ["stop", "start"])
+
+    def test_failed_start_is_retried_next_reading(self):
+        self.step(False); self.step(False)
+        attempts = []
+
+        def start():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("systemctl refused")
+            self.running = True
+
+        def go():
+            self.clock += 30
+            return sharedinput.guard(self.state, nearby=lambda: {"near": True, "peer": "D", "why": "t."},
+                                     status_fn=lambda: {"running": self.running}, start_fn=start,
+                                     stop_fn=lambda: None, now=self.clock)
+        go()                                          # together streak 1
+        self.assertEqual(go()["action"], "start_failed")
+        r = go()
+        self.assertEqual(r["action"], "started")
+        self.assertEqual(len(attempts), 2)
+        self.assertFalse(r["stopped_by_guard"])
+
+    def test_start_that_leaves_it_stopped_is_not_remembered_as_done(self):
+        self.step(False); self.step(False)
+        r = None
+        for _ in range(2):
+            self.clock += 30
+            r = sharedinput.guard(self.state, nearby=lambda: {"near": True, "peer": "D", "why": "t."},
+                                  status_fn=lambda: {"running": False}, start_fn=lambda: {"started": False},
+                                  stop_fn=lambda: None, now=self.clock)
+        self.assertEqual(r["action"], "start_failed")
+        self.assertTrue(r["stopped_by_guard"])
+
+    def test_busy_lock_skips_the_tick(self):
+        from jarvis.locking import exclusive_lock
+        with exclusive_lock(self.state / (sharedinput.GUARD_FILE + ".lock")):
+            r = self.step(False)
+        self.assertTrue(r.get("busy"))
+        self.assertIsNone(r["action"])
+        self.assertFalse((self.state / sharedinput.GUARD_FILE).exists())
 
     def test_default_stop_keeps_the_ip_watcher(self):
         from unittest import mock
@@ -166,3 +235,69 @@ class GuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SharingPausedTests(GuardTests):
+    """Clipboard + shared input follow one rule: off while apart or while remote control is on."""
+
+    def test_apart_pauses_and_together_resumes(self):
+        self.assertIsNone(sharedinput.sharing_paused(self.state))
+        self.step(False); self.step(False)
+        self.assertEqual(sharedinput.sharing_paused(self.state), "the laptops are apart")
+        self.step(None)  # can't tell: no change
+        self.assertEqual(sharedinput.sharing_paused(self.state), "the laptops are apart")
+        self.step(True); self.step(True)
+        self.assertIsNone(sharedinput.sharing_paused(self.state))
+
+    def test_remote_session_pauses_and_blocks_guard_restart(self):
+        self.step(False); self.step(False)  # guard stopped it
+        (self.state / sharedinput.REMOTE_MARKER).write_text("{}")
+        self.assertEqual(sharedinput.sharing_paused(self.state), "remote control is on")
+        self.step(True); self.step(True); self.step(True)
+        self.assertEqual(self.calls, ["stop"])  # not restarted under the remote session
+        (self.state / sharedinput.REMOTE_MARKER).unlink()
+        self.assertEqual(self.step(True)["action"], "started")
+
+    def test_stale_remote_marker_is_ignored(self):
+        import os, time
+        marker = self.state / sharedinput.REMOTE_MARKER
+        marker.write_text("{}")
+        old = time.time() - sharedinput.REMOTE_MARKER_TTL - 5
+        os.utime(marker, (old, old))
+        self.assertIsNone(sharedinput.sharing_paused(self.state))
+
+    def test_clipboard_apply_skips_while_paused(self):
+        from unittest import mock
+        from jarvis import clipsync
+        (self.state / sharedinput.REMOTE_MARKER).write_text("{}")
+        with mock.patch.object(clipsync, "local_clipboard") as board:
+            self.assertFalse(clipsync.apply(str(self.state), "text", b"hi"))
+            board.assert_not_called()
+
+
+class DisabledSwitchTests(unittest.TestCase):
+    """lan_mouse.enabled false: the guard may stop sharing but never starts it (2026-11-05,
+    David switched Lan Mouse off until its Windows bugs were fixed)."""
+
+    def test_guard_never_starts_when_disabled(self):
+        import tempfile
+        from jarvis import sharedinput as si
+        state = tempfile.mkdtemp()
+        started = []
+        running = {"r": False}
+        for i in range(6):
+            si.guard(state, nearby=lambda: {"near": True, "peer": "Dell", "why": "t."},
+                     status_fn=lambda: {"running": running["r"]}, start_fn=lambda: started.append(1),
+                     stop_fn=lambda: None, autostart=True, boot=1_000_000.0 + (3600 if i > 2 else 0),
+                     now=10_000 + 30 * i, allow_start=False)
+        self.assertEqual(started, [])
+
+    def test_guard_for_reads_the_switch(self):
+        from unittest import mock
+        from jarvis import sharedinput as si
+        with mock.patch.object(si, "guard", lambda state, **kw: kw), \
+                mock.patch("jarvis.platforms.boot_time", lambda: 5.0):
+            off = si.guard_for({"lan_mouse": {"enabled": False}}, "/tmp/x")
+            on = si.guard_for({}, "/tmp/x")
+        self.assertEqual((off["allow_start"], off["autostart"]), (False, False))
+        self.assertEqual((on["allow_start"], on["autostart"], on["boot"]), (True, True, 5.0))

@@ -77,6 +77,23 @@ class CutTests(unittest.TestCase):
         self.assertEqual(release.source(self.state), deploy.PACKAGE)
 
 
+class StageTests(unittest.TestCase):
+    def test_nested_checkouts_are_not_staged(self):
+        # Audit cluster-10: a stray repo copy (with its own secrets) rode into every stage.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, stage = Path(tmp, "repo"), Path(tmp, "stage")
+            tree(repo, {"jarvis/__init__.py": "", "tests/test_x.py": "", "README.md": "r",
+                        "stray/.git/HEAD": "ref", "stray/jarvis/x.py": "",
+                        "skills/inner/.git/HEAD": "ref", "skills/inner/a.txt": "", "skills/b.txt": ""})
+            stage.mkdir()
+            release._stage(repo, stage)
+            self.assertTrue((stage / "jarvis" / "__init__.py").exists())
+            self.assertTrue((stage / "README.md").exists())
+            self.assertTrue((stage / "skills" / "b.txt").exists())
+            self.assertFalse((stage / "stray").exists())
+            self.assertFalse((stage / "skills" / "inner").exists())
+
+
 class DependencyTests(unittest.TestCase):
     OLD = '[project]\nname = "jarvis"\ndependencies = ["Pillow>=12"]\n'
     NEW = '[project]\nname = "jarvis"\ndependencies = ["Pillow>=12", "psutil>=5.9"]\n'
