@@ -48,14 +48,15 @@ class JobSigningTests(unittest.TestCase):
         self.assertIsNone(worker._untrusted(signed))
         self.assertIn("replayed", worker._untrusted(signed))
 
-    def test_node_without_pinned_key_accepts_as_before(self):
+    def test_node_without_pinned_key_refuses(self):
+        # Fail closed (audit 2026-11-04): an unpinned node can't tell the hub from a port squatter.
         from jarvis.cluster import NodeWorker
         node_state = self.state / "old"
         node_state.mkdir()
         save_json(node_state / "cluster-node.json", {"node_id": "dell"})
         worker = NodeWorker.__new__(NodeWorker)
         worker.state = node_state
-        self.assertIsNone(worker._untrusted(self.job))
+        self.assertIn("never pinned", worker._untrusted(self.job))
 
 
 if __name__ == "__main__":

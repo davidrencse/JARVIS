@@ -2,6 +2,7 @@
 rules.confirm "never", and everyday commands that must keep working. Pure checks only:
 nothing here is ever executed."""
 import os
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -44,6 +45,16 @@ REFUSED = [
     "Set-Content $env:USERPROFILE\\Documents\\Vault\\a.md x", "rd /s /q %USERPROFILE%",
     "V=~/Documents/obsidian-vault; echo hi >> $V/x.md", "Get-ChildItem Env:", "Get-Item HKCU:\\Software",
     "Get-ChildItem \\\\asus\\c$",
+    # SEC-2 (2026-11-07): the console/hub port with no host:PORT shape
+    "nc localtest.me 7777", "ncat localtest.me 7780 < body.txt", "telnet localtest.me 7777",
+    "nc localtest.me \"7777\"", "openssl s_client -connect localtest.me -port 7777",
+    "Test-NetConnection localtest.me -Port 7777",
+    "bash -c 'exec 3<>/dev/tcp/localtest.me/7777; cat body >&3'", "cat body > /dev/udp/localtest.me/7780",
+    "exec 3<>/dev/tcp/localtest.me/$P",
+    "python3 -c \"import socket;socket.create_connection(('localtest.me',7777))\"",
+    "python3 - <<EOF\nimport socket\ns=socket.socket();s.connect((h, 7780))\nEOF",
+    "node -e \"require('net').connect({port: 7777, host: 'localtest.me'})\"",
+    "pwsh -c \"New-Object Net.Sockets.TcpClient('localtest.me', 7777)\"",
 ]
 
 ALLOWED = [
@@ -57,6 +68,9 @@ ALLOWED = [
     "New-Item -ItemType Directory C:\\Users\\jdoe\\Desktop\\new",
     "Remove-Item C:\\Users\\jdoe\\Downloads\\old.zip", "Start-Process notepad",
     "Set-Content $env:USERPROFILE\\Documents\\notes.txt x", "X=1; echo $X", "cd $HOME/projects && ls",
+    "docker run -p 7777:80 nginx", "ls", "git log", "git log -n 7777", "echo order 7777 shipped",
+    "nc example.com 80", "grep -c 7777 notes.txt", "exec 3<>/dev/tcp/example.com/80",
+    "pytest tests/a.py -k \"t(7777)\"", "git clone http://example.com/r.git && head -c 7777 r/README",
 ]
 
 
@@ -238,6 +252,201 @@ class Audit3Followups(unittest.TestCase):
         self.assertIsNotNone(self.deny("echo x > ${PWD}/.git/config", cwd=self.REPO))
         for command in ("cd /tmp; cp a $PWD/b", "popd; rm -rf projects", "echo $OLDPWD"):
             self.assertIsNotNone(self.deny(command, cwd=self.HOME), command)
+
+
+class Audit4Bypasses(unittest.TestCase):
+    """audit 4 (2026-11-04): symlinks, Windows delete shapes, secret stores, persistence."""
+    HOME = os.path.expanduser("~")
+    REPO = str(Path(gates.__file__).resolve().parent.parent)
+    WINDOWS_REFUSED = [
+        "gci C:\\Users\\jdoe -Recurse -File | Remove-Item -Force",
+        "(Get-Item C:\\Users\\jdoe).Delete($true)",
+        "robocopy C:\\empty C:\\Users\\jdoe /MIR",
+        "Remove-Item -Recurse -Force (Resolve-Path ~)",
+        "Remove-Item -Recurse -Force ([Environment]::GetFolderPath('UserProfile'))",
+        "cd C:\\Users && rd /s /q david",
+        "sl C:\\Users; Remove-Item -Recurse -Force david",
+        "Remove-Item -Recurse -Force -Path:\"C:\\Users\\jdoe\"",
+        "Move-Item C:\\Users\\jdoe\\Documents C:\\tmp\\gone",
+        "icacls C:\\Users\\jdoe /deny Everyone:F /t",
+    ]
+    WINDOWS_ALLOWED = [
+        "Remove-Item C:\\Users\\jdoe\\Downloads\\old.zip", "robocopy C:\\a C:\\b",
+        "Get-ChildItem C:\\Users\\jdoe -Recurse", "Remove-Item -Recurse C:\\Users\\jdoe\\Downloads\\junk",
+        "cd C:\\Users\\jdoe\\Downloads && rd /s /q junk", "icacls C:\\Users\\jdoe\\Downloads\\a.txt",
+        "Move-Item C:\\Users\\jdoe\\Downloads\\a.pdf C:\\Users\\jdoe\\Documents\\",
+    ]
+
+    def deny(self, command, cwd=None):
+        return gates.hard_deny("terminal", {"command": command, "cwd": cwd or self.HOME}, CONFIG)
+
+    def test_windows_delete_shapes_refused(self):
+        self.assertEqual([c for c in self.WINDOWS_REFUSED if not self.deny(c)], [])
+
+    def test_windows_everyday_commands_allowed(self):
+        self.assertEqual([(c, self.deny(c)) for c in self.WINDOWS_ALLOWED if self.deny(c)], [])
+
+    def test_commands_cannot_reach_the_local_console(self):
+        # No sandbox on Windows/macOS: a brain command must not approve its own confirmation.
+        refused = ['curl -X POST -H "X-JARVIS: 1" http://127.0.0.1:7777/api/confirm',
+                   "Invoke-WebRequest http://localhost:7777/api/confirm -Method Post",
+                   "curl -d x http://[::1]:7777/api/x", "wget --post-data=x localhost:7777",
+                   "curl -d a=1 http://127.0.0.1:41234/",
+                   # remote control drives another computer: any host spelling, by its path
+                   "curl -X POST http://127.1:7777/api/remote/input -d x",
+                   "curl -X POST http://localhost.:7777/api/remote/start -d x",
+                   # breakit 2026-11-07 (SEC-2): a hostname that resolves to loopback, dot
+                   # segments and encodings in the path
+                   "curl -H @h -d x http://localtest.me:7777/api/./remote/start",
+                   "curl -d x http://127.0.0.1.nip.io:7780/v1/remote/input",
+                   "curl -d x http://example.org/x/../api/%72emote/start"]
+        allowed = ["curl https://example.com", "curl https://mylocalhost.com/x", "ping 8.8.8.8"]
+        self.assertEqual([c for c in refused if not self.deny(c)], [])
+        self.assertEqual([c for c in allowed if self.deny(c)], [])
+
+    def test_every_loopback_spelling_refused(self):
+        hosts = ["127.1", "127.1:7777", "0177.0.0.1", "127.0.1", "017700000001", "[0:0:0:0:0:0:0:1]",
+                 "[::1]", "[0::1]", "2130706433", "2130706434", "2147483647", "0x7f000001", "0x7f.1",
+                 "0x07f.0.0.1", "00177.0.0.1", "0.0.0.0", "[::ffff:127.0.0.1]", "127.0.0.1", "LOCALHOST"]
+        refused = [f"curl http://{h}:7777/" for h in hosts] + ["curl http://0:7777/", "curl http://0/",
+                                                              "curl http://user@0:7777/", "wget http://00/x"]
+        allowed = ["exit 0", "sleep 0", "pip install numpy==1.27.1", "echo v1.127.1",
+                   "curl https://example.com/127/", "ls /tmp/0", "head -n 0 file", "python3.12 -V",
+                   "node 0.10.48", "ffmpeg -ss 00:00:01 -i a b"]
+        self.assertEqual([c for c in refused if not self.deny(c)], [])
+        self.assertEqual([(c, self.deny(c)) for c in allowed if self.deny(c)], [])
+
+    def test_symlinks_are_resolved(self):
+        # The link points at the folder holding JARVIS's own checkout, wherever it lives: in
+        # ~/projects normally, in a temp folder when a release is tested from a staged copy
+        # (a link to ~ with "projects" only held while the checkout sat in ~/projects).
+        repo = Path(gates.__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as tmp:
+            link = os.path.join(tmp, "h")
+            os.symlink(repo.parent, link)
+            self.assertIsNotNone(self.deny(f"rm -rf {link}/{repo.name}"))
+            self.assertIsNotNone(self.deny(f"rm -rf {repo.name}", cwd=link))  # cwd is a link
+            self.assertIsNotNone(self.deny(f"cd {link} && rm -rf {repo.name}"))
+            self.assertIsNone(self.deny(f"rm -rf {tmp}/build"))
+        with tempfile.TemporaryDirectory() as tmp:  # and a link to home still reaches ~/.ssh
+            link = os.path.join(tmp, "h")
+            os.symlink(self.HOME, link)
+            self.assertIsNotNone(self.deny(f"rm -rf {link}/.ssh"))
+
+    def test_link_and_destroy_in_one_command_refused(self):
+        for command in (f"ln -s {self.HOME} /tmp/h && rm -rf /tmp/h/projects", "ln -sf ~ x; rm -r x/projects",
+                        "ln --symbolic ~ /tmp/h; mv /tmp/h/projects /tmp/gone",
+                        "New-Item -ItemType Junction C:\\j -Target C:\\Users\\jdoe; rd /s /q C:\\j"):
+            self.assertIsNotNone(self.deny(command), command)
+        self.assertIsNone(self.deny("ln -s /opt/app/bin/app ~/bin-app"))
+
+    def test_secret_stores_unreadable(self):
+        for command in ("cat ~/.grok/auth.json", "cat ~/.hermes/config.yaml", "ls ~/.config/openclaw",
+                        "cat \"$HOME/.config/Grok Bot/Cookies\"", "cat ~/.config/Codex/state.json",
+                        "cat ~/.config/Cursor/User/globalStorage/state.vscdb", "cat ~/.config/gogcli/token"):
+            self.assertIsNotNone(self.deny(command), command)
+
+    def test_persistence_locations_unwritable(self):
+        for command in ("cp evil ~/.local/bin/ls", "echo x > ~/.config/systemd/user/a.service",
+                        "tee ~/.config/autostart/x.desktop", "echo x >> ~/.gitconfig",
+                        "cp x.desktop ~/.local/share/applications/", "mv x ~/.local/share/systemd/user/",
+                        "git config --global core.hooksPath /tmp/h", "git config --global core.fsmonitor /tmp/x",
+                        "git config --global alias.st '!rm -rf ~'", "git -c core.fsmonitor=/tmp/x status",
+                        f"echo x > {self.REPO}/sitecustomize.py", f"cp x {self.REPO}/conftest.py",
+                        f"cp x {self.REPO}/.claude/settings.json", "cp x .", "touch usercustomize.py"):
+            cwd = self.REPO if command in ("cp x .", "touch usercustomize.py") else None
+            self.assertIsNotNone(self.deny(command, cwd=cwd), command)
+        for command in ("ls ~/.local/bin", "cat ~/.config/systemd/user/x.service", "git config --global user.name D",
+                        "git config --get core.editor", f"cp x {self.REPO}/tests/", "rm -rf node_modules",
+                        "echo hi > /tmp/x"):
+            cwd = self.REPO if command == "rm -rf node_modules" else None
+            self.assertIsNone(self.deny(command, cwd=cwd), command)
+
+
+
+class Audit20261107Persistence(unittest.TestCase):
+    """audit 2026-11-07: shell startup files, the PowerShell profile, Run keys, scheduled
+    tasks, cron, systemd links, and symlinks in persistence spots."""
+    HOME = os.path.expanduser("~")
+
+    def deny(self, command, cwd=None):
+        return gates.hard_deny("terminal", {"command": command, "cwd": cwd or self.HOME}, CONFIG)
+
+    def test_autostart_shapes_refused(self):
+        refused = [
+            "echo x >> ~/.zshrc", "echo x >> ~/.profile", "echo x >> ~/.bashrc",
+            "echo x >> ~/.config/fish/config.fish", "tee -a ~/.bash_profile", "cp x ~/.zprofile",
+            "echo x >> ~/.config/hypr/hyprland.conf",
+            "Add-Content -Path C:\\Users\\jdoe\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1 -Value x",
+            "Add-Content $PROFILE x", "echo x >> $PROFILE", "Set-Content -Path $PROFILE -Value x",
+            "reg add HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run /v x /d calc.exe",
+            "reg.exe add HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce /v x /d calc.exe",
+            "reg import evil.reg",
+            "schtasks /create /tn x /tr calc.exe /sc onlogon", "schtasks.exe /Change /tn x /tr calc.exe",
+            "Register-ScheduledTask -TaskName x -Action $a",
+            "crontab evil.txt", "echo '* * * * * x' | crontab -", "crontab -e",
+            "systemctl --user enable x", "systemctl enable --user x.service", "systemctl --user link /tmp/x.service",
+            "systemctl --user edit x",
+        ]
+        self.assertEqual([c for c in refused if not self.deny(c)], [])
+
+    def test_reading_them_stays_allowed(self):
+        allowed = ["crontab -l", "reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                   "cat ~/.zshrc", "systemctl --user status x", "systemctl --user is-enabled x",
+                   "schtasks /query", "echo $PROFILE", "echo hi > /tmp/x"]
+        self.assertEqual([(c, self.deny(c)) for c in allowed if self.deny(c)], [])
+
+    def test_followup_refusals(self):
+        """audit follow-up 2026-11-07: crontab writes in any spelling, systemctl links, $PROFILE as
+        a destination, and X/bashrc.d startup files."""
+        refused = [
+            "crontab file", "crontab -", "crontab -e", "crontab -r", "crontab\t-r", "crontab",
+            "sudo crontab -e", "sudo -u root crontab -r", "env X=1 crontab x", "/usr/bin/crontab -e",
+            "bash -c 'crontab -r'", "crontab -l; crontab -r", "crontab -l -r", "crontab -u root -e",
+            "$(crontab -r)", "c\\rontab -e",
+            "systemctl --user link /tmp/x.service", "systemctl enable --user x", "sudo systemctl --now enable x",
+            "cp x $PROFILE", "Copy-Item x $PROFILE -Force", "Copy-Item -Path x -Destination $PROFILE",
+            "Copy-Item x -Destination:$PROFILE", "mv x $PROFILE.CurrentUserAllHosts", "echo x > $PROFILE",
+            "tee $PROFILE", "echo x | Out-File $PROFILE",
+            "echo x > ~/.bashrc.d/x", "echo x >> ~/.xprofile", "echo x >> ~/.xinitrc", "echo x >> ~/.xsession",
+            "echo x >> ~/.xsessionrc", "cp x ~/.xprofile",
+        ]
+        self.assertEqual([c for c in refused if not self.deny(c)], [])
+
+    def test_followup_allowed(self):
+        allowed = ["crontab -l -u root", "crontab -u root -l", "crontab -l | grep x", "crontab -l > /tmp/c",
+                   "sudo crontab -l", "man crontab", "which crontab", "cat /etc/crontab",
+                   "systemctl status systemd-networkd.link", "cp $PROFILE /tmp/x", "Copy-Item $PROFILE backup.ps1",
+                   "Copy-Item $PROFILE -Destination /tmp/x", "cat ~/.xsession-errors"]
+        self.assertEqual([(c, self.deny(c)) for c in allowed if self.deny(c)], [])
+
+    def test_startup_files_readable_but_not_writable(self):
+        """follow-up 2026-11-07: the shell/desktop startup files are judged on writes only, so
+        reading and git-inspecting David's dotfiles stays allowed (as before the overhaul)."""
+        h = self.HOME
+        allowed = [("sed -n 1p ~/.config/hypr/hyprland.conf", None), ("awk 1 ~/.bashrc", None),
+                   ("source ~/.bashrc", None), ("jq . ~/.config/hypr/x.json", None),
+                   ("python3 ~/.config/hypr/x.py", None), ("git status", h + "/.config/hypr"),
+                   ("git diff", h + "/.config/fish"), ("git -C ~/.config/hypr log", None),
+                   ("systemctl status enable.service", None)]
+        self.assertEqual([(c, self.deny(c, cwd)) for c, cwd in allowed if self.deny(c, cwd)], [])
+        refused = [("sed -i s/a/b/ ~/.bashrc", None), ("cd ~/.config/fish && echo x > config.fish", None),
+                   ("echo x > config.fish", h + "/.config/fish"), ("cp x ~/.bashrc.d/", None),
+                   ("tee -a ~/.bash_profile", None), ("systemctl preset x", None),
+                   ("Set-Content -Path C:\\Users\\jdoe\\Documents\\WindowsPowerShell\\profile.ps1 -Value x", None)]
+        self.assertEqual([c for c, cwd in refused if not self.deny(c, cwd)], [])
+
+    def test_symlink_in_persistence_spot_judged_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / ".local" / "bin").mkdir(parents=True)
+            (home / ".local" / "share" / "tool").mkdir(parents=True)
+            target = home / ".local" / "share" / "tool" / "1.0"
+            target.write_text("x")
+            (home / ".local" / "bin" / "tool").symlink_to(target)
+            self.assertIsNotNone(self.deny(f"cp /tmp/evil {home}/.local/bin/tool", cwd=tmp))
+            self.assertIsNotNone(self.deny("echo x > .local/bin/tool", cwd=tmp))
+            self.assertIsNone(self.deny(f"cp /tmp/evil {target}", cwd=tmp))  # not a persistence spot
 
 
 if __name__ == "__main__":

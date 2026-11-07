@@ -215,5 +215,87 @@ class HistoryRetry(unittest.TestCase):
             pipeline._HISTORIES.pop(key, None)
 
 
+class FailedTurnToolsTravelOnTheError(unittest.TestCase):
+    """Audit 2026-11-07 F1: a ChatGPT turn that ran tools then hit the usage limit must not
+    be re-asked on the Claude stand-in, even when another request moved Brain.last."""
+
+    def setUp(self):
+        from jarvis import chatgpt
+        saved = dict(chatgpt._LIMIT)  # note_usage_limit records the fake limit: put it back
+        self.addCleanup(lambda: (chatgpt._LIMIT.clear(), chatgpt._LIMIT.update(saved)))
+
+    def test_limit_after_tools_ran_is_not_replayed_on_the_standin(self):
+        from jarvis.chatgpt import Brain, ChatGPTLane
+
+        class Chat:
+            tool_log, on_tool = [], None
+
+            def ask(self, *a, **k):
+                return "chat"
+
+        with tempfile.TemporaryDirectory() as d:
+            act = ChatGPTLane({}, Path(d))
+            brain = Brain(Chat(), act, wants=lambda t: True)
+
+            def fake(text, recall, on_sentence):
+                act.tool_log.append(("close_app", True, "closed"))
+                brain.last = brain.chat  # another console request took the talk lane
+                raise RuntimeError("usageLimitExceeded: You've hit your usage limit")
+
+            standins = []
+
+            def make():
+                lane = Lane("standin")
+                standins.append(lane)
+                return lane
+            fo = Failover(brain, make)
+            with mock.patch("jarvis.chatgpt.usage_limit", return_value=""), \
+                    mock.patch.object(act, "_ask", side_effect=fake):
+                with self.assertRaises(RuntimeError) as ctx:
+                    fo.ask("close discord")
+            self.assertEqual([t[0] for t in ctx.exception.tool_log], ["close_app"])
+            self.assertFalse(standins, "the stand-in must not re-run close_app")
+
+    def test_wrapped_lane_failure_keeps_the_tools_that_ran(self):
+        from jarvis.chatgpt import ChatGPTLane
+        with tempfile.TemporaryDirectory() as d:
+            lane = ChatGPTLane({}, Path(d))
+
+            def fake(text, recall, on_sentence):
+                lane.tool_log.append(("open_app", True, "ok"))
+                raise ValueError("odd reply")
+            with mock.patch("jarvis.chatgpt.usage_limit", return_value=""), \
+                    mock.patch.object(lane, "_ask", side_effect=fake):
+                with self.assertRaises(RuntimeError) as ctx:
+                    lane.ask("open spotify")
+            self.assertEqual(ctx.exception.tool_log, [("open_app", True, "ok")])
+
+    def test_nudged_retry_failure_reports_both_turns_tools(self):
+        from jarvis.chatgpt import Brain, ChatGPTLane
+
+        class Chat:
+            tool_log, on_tool = [], None
+        with tempfile.TemporaryDirectory() as d:
+            act = ChatGPTLane({}, Path(d))
+            brain = Brain(Chat(), act, wants=lambda t: True)
+            turns = []
+
+            def fake(text, recall, on_sentence):
+                turns.append(text)
+                if len(turns) == 1:
+                    act.tool_log.append(("list_apps", True, "ok"))
+                    return "I can't do that, the tool is disabled"  # ungrounded: nudged once
+                act.tool_log.append(("open_app", True, "ok"))
+                raise RuntimeError("usageLimitExceeded: You've hit your usage limit")
+            with mock.patch("jarvis.chatgpt.usage_limit", return_value=""), \
+                    mock.patch("jarvis.chatgpt.ungrounded", side_effect=["nudge: ", None]), \
+                    mock.patch.object(act, "_ask", side_effect=fake):
+                act._mine.log = None
+                with self.assertRaises(RuntimeError) as ctx:
+                    brain.ask("open spotify")
+            self.assertEqual(len(turns), 2)
+            self.assertEqual([t[0] for t in ctx.exception.tool_log], ["list_apps", "open_app"])
+
+
 if __name__ == "__main__":
     unittest.main()
