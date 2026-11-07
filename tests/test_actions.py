@@ -216,6 +216,26 @@ class DesktopToolTests(unittest.TestCase):
         self.assertEqual(self.tools.match("spotfy")[0]["Name"], "Spotify")  # typo
         self.assertEqual(self.tools.match("photoshop"), [])
 
+    def test_matching_uses_observer_names_and_no_loose_neighbours(self):
+        # audit 2026-11-07: "discord" opened KDE Discover, "steam"/"teams" opened Telegram.
+        tools = DesktopTools()
+        tools._apps, tools._loaded = [
+            {"Name": "Discover", "AppID": "org.kde.discover.desktop"},
+            {"Name": "Telegram", "AppID": "org.telegram.desktop"},
+            {"Name": "Vesktop", "AppID": "dev.vencord.Vesktop.desktop"},
+            {"Name": "KiCad PCB Calculator", "AppID": "org.kicad.pcbcalculator.desktop"},
+            {"Name": "KCalc", "AppID": "org.kde.kcalc.desktop"},
+            {"Name": "Spotify", "AppID": "spotify.desktop"}], 1e18
+        self.assertEqual([a["Name"] for a in tools.match("Discord")], ["Vesktop"])
+        self.assertEqual(tools.match("steam"), [])
+        self.assertEqual(tools.match("teams"), [])
+        self.assertEqual(tools.match("Calculator")[0]["Name"], "KCalc")
+        self.assertEqual(tools.match("spotfy")[0]["Name"], "Spotify")  # a typo still finds it
+        self.assertEqual(tools.match("discover")[0]["Name"], "Discover")
+        ok, said = tools.call("open_app", {"name": "steam"})
+        self.assertFalse(ok)
+        self.assertIn("No installed app", said)
+
     @unittest.skipUnless(os.name == "nt", "Windows launches through the Start Apps folder")
     @patch("jarvis.actions.subprocess.Popen")
     def test_open_app_launches_through_shell_apps_folder(self, popen):

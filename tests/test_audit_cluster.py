@@ -24,6 +24,9 @@ def job(**extra):
 
 class WorkerCase(unittest.TestCase):
     def setUp(self):
+        _skip = patch.object(NodeWorker, "_untrusted", return_value=None)  # these fixtures' nodes pin no key
+        _skip.start()
+        self.addCleanup(_skip.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name) / "node"
@@ -212,7 +215,7 @@ class PullUpdateTests(unittest.TestCase):
             with patch("jarvis.deploy.apply_bundle", return_value=3) as apply:
                 self.assertFalse(worker.once())
                 self.assertTrue(worker.restarting)
-                apply.assert_called_once_with(bundle, "ssh-ed25519 AAAA")
+                apply.assert_called_once_with(bundle, "ssh-ed25519 AAAA", state=state)
                 worker.restarting = False
                 worker.once()  # same target again within 10 minutes: no second download
                 apply.assert_called_once()
@@ -385,6 +388,115 @@ class FingerprintTests(unittest.TestCase):
             self.assertEqual(deploy.code_fingerprint(a), deploy.code_fingerprint(b))
             make_tree(b, {"x.py": b"one\r\nTWO\r\n"})
             self.assertNotEqual(deploy.code_fingerprint(a), deploy.code_fingerprint(b))
+
+
+class UnpinnedNodeTests(unittest.TestCase):
+    def test_node_without_pinned_key_refuses_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            save_json(state / "cluster-node.json", {"node_id": "old"})
+            worker = NodeWorker.__new__(NodeWorker)
+            worker.state = state
+            why = worker._untrusted(job())
+            self.assertIn("never pinned", why)
+            self.assertIn("cluster join", why)
+
+    def test_pinned_node_still_runs_signed_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main, state = Path(tmp, "main"), Path(tmp, "node")
+            save_json(state / "cluster-node.json", {"node_id": "dell", "code_key": deploy.code_key(main)})
+            worker = NodeWorker.__new__(NodeWorker)
+            worker.state = state
+            self.assertIsNone(worker._untrusted(deploy.sign_job(job(), "dell", main)))
+
+
+class VersionedBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.repo, self.state, self.main = root / "repo", root / "node", root / "main"
+        make_tree(self.repo, {"jarvis/a.py": b"old\n", "pyproject.toml": b"old\n"})
+        self.key = deploy.code_key(self.main)
+        self.files = {"jarvis/a.py": b"new\n", "pyproject.toml": b"new\n"}
+        make_tree(root / "stage", self.files)
+        self.want = deploy.code_fingerprint(root / "stage" / "jarvis")
+
+    def bundle(self, version, files=None):
+        raw_bundle = bundle_of(files or self.files, self.want)
+        raw = base64.b64decode(raw_bundle["zip"])
+        raw_bundle["signature"] = deploy.sign(raw, self.main)
+        raw_bundle["version"] = version
+        raw_bundle["vsig"] = deploy.sign(deploy._bundle_bytes(raw, version, self.want), self.main)
+        return raw_bundle
+
+    def test_main_signs_a_version_and_node_records_it(self):
+        with patch("jarvis.release.source", return_value=self.repo / "jarvis"):
+            served = deploy.code_bundle(self.main)
+        self.assertIsInstance(served["version"], int)
+        self.assertTrue(served["signature"] and served["vsig"])  # legacy signature kept for old nodes
+        deploy.apply_bundle(self.bundle(2000), self.key, self.repo, state=self.state)
+        self.assertEqual(deploy.installed_version(self.state), 2000)
+
+    def test_older_signed_bundle_is_refused_as_replay(self):
+        deploy.apply_bundle(self.bundle(2000), self.key, self.repo, state=self.state)
+        with self.assertRaisesRegex(ValueError, "older"):
+            deploy.apply_bundle(self.bundle(1999), self.key, self.repo, state=self.state)
+        deploy.apply_bundle(self.bundle(2001), self.key, self.repo, state=self.state)
+
+    def test_version_is_covered_by_the_signature(self):
+        forged = self.bundle(1000)
+        forged["version"] = 99999999999
+        with self.assertRaisesRegex(ValueError, "isn't signed"):
+            deploy.apply_bundle(forged, self.key, self.repo, state=self.state)
+
+    def test_unversioned_bundle_refused_once_versioned_was_installed(self):
+        legacy = bundle_of(self.files, self.want, self.main)
+        deploy.apply_bundle(legacy, self.key, self.repo, state=self.state)  # nothing recorded yet: as before
+        deploy.apply_bundle(self.bundle(2000), self.key, self.repo, state=self.state)
+        with self.assertRaisesRegex(ValueError, "no version"):
+            deploy.apply_bundle(legacy, self.key, self.repo, state=self.state)
+
+
+class OwnerTokenTests(unittest.TestCase):
+    def test_empty_leftover_file_is_regenerated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broker = Broker(Path(tmp))
+            (Path(tmp) / "cluster-owner.token").write_text("")
+            token = broker.owner_token()
+            self.assertGreaterEqual(len(token), 32)
+            self.assertEqual(broker.owner_token(), token)
+            self.assertEqual((Path(tmp) / "cluster-owner.token").stat().st_mode & 0o077, 0)
+
+    def test_fresh_token_is_stable_and_no_temp_files_remain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broker = Broker(Path(tmp))
+            token = broker.owner_token()
+            self.assertEqual(Broker(Path(tmp)).owner_token(), token)
+            self.assertEqual([p.name for p in Path(tmp).glob(".cluster-owner*")], [])
+
+
+class RunLoopTests(unittest.TestCase):
+    def test_error_in_the_loop_is_not_reported_as_already_running(self):
+        with tempfile.TemporaryDirectory() as tmp, patch("jarvis.cluster._refresh_clipboard"):
+            worker = NodeWorker.__new__(NodeWorker)
+            worker.state, worker.restarting = Path(tmp), False
+            worker._poll_loop = Mock(side_effect=ValueError("boom"))
+            with patch("builtins.print") as out, self.assertRaises(ValueError):
+                worker.run()
+            self.assertFalse(any("already running" in str(c) for c in out.call_args_list))
+
+    def test_held_lock_reports_already_running(self):
+        from jarvis.locking import exclusive_lock
+        with tempfile.TemporaryDirectory() as tmp, patch("jarvis.cluster._refresh_clipboard") as clip:
+            worker = NodeWorker.__new__(NodeWorker)
+            worker.state, worker.restarting = Path(tmp), False
+            worker._poll_loop = Mock()
+            with exclusive_lock(Path(tmp) / "cluster-node.lock"), patch("builtins.print") as out:
+                worker.run()
+            worker._poll_loop.assert_not_called()
+            clip.assert_not_called()  # audit cluster-05: no second clipboard keep-alive
+            self.assertTrue(any("already running" in str(c) for c in out.call_args_list))
 
 
 if __name__ == "__main__":

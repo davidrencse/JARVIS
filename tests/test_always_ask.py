@@ -29,8 +29,13 @@ class AlwaysAskTests(unittest.TestCase):
             self.assertFalse(ok, element)  # declined in this test, so it never ran
 
     def test_ordinary_clicks_still_run_alone(self):
-        for element in ("Next page", "Show more", "Delete draft"):
-            ok, asked = self.run_gate(call("browser_click", element=element, ref="e1"))
+        # Only clicks checked against a page snapshot run alone (audit 2026-11-04): an
+        # unseen ref is judged by the model's own words, so it asks.
+        browser_gate.PAGES.clear()
+        browser_gate.observe("chrome", '- link "Next page" [ref=e1]\n- button "Show more" [ref=e2]\n'
+                                     '- button "Delete draft" [ref=e3]')
+        for ref, element in (("e1", "Next page"), ("e2", "Show more"), ("e3", "Delete draft")):
+            ok, asked = self.run_gate(call("browser_click", element=element, ref=ref))
             self.assertEqual(asked, [], element)
             self.assertTrue(ok, element)
 

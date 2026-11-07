@@ -137,5 +137,12 @@ class CaptureReleaseTests(unittest.TestCase):
         self.assertEqual(out[0]["flag"], "WARN")
 
 
+class SystemdWordTests(unittest.TestCase):
+    def test_dollar_and_percent_are_escaped(self):
+        self.assertEqual(autostart._word("a$HOME"), '"a$$HOME"')
+        self.assertEqual(autostart._word("100%"), "100%%")
+        self.assertEqual(autostart._word("plain"), "plain")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -340,6 +340,35 @@ class AppUiTest(unittest.TestCase):
             ok, text = self.act({"action": "type", "ref": f"@t{i}:e1", "text": "rm -rf ~"}, Fake())
             self.assertFalse(ok, app)
 
+    def test_terminal_overlong_line_refused(self):
+        # audit 4: a line past TYPED_MAX was cut to its tail, so `rm -rf /tmp/q` + spaces + ` ~` passed.
+        self.learn("@u1:e1", "textfield", "Input", app="konsole")
+        fake = Fake()
+        self.assertTrue(self.act({"action": "type", "ref": "@u1:e1", "text": "rm -rf /tmp/q"}, fake)[0])
+        ok, text = self.act({"action": "type", "ref": "@u1:e1", "text": " " * app_ui.TYPED_MAX}, fake)
+        self.assertFalse(ok, text)
+        self.assertTrue(text.startswith("Refused"))
+
+    def test_terminal_line_does_not_expire(self):
+        self.learn("@u2:e1", "textfield", "Input", app="foot")
+        fake = Fake()
+        self.assertTrue(self.act({"action": "type", "ref": "@u2:e1", "text": "rm -rf /tmp/q"}, fake)[0])
+        with mock.patch("jarvis.app_ui.time.time", return_value=time.time() + app_ui.TYPED_TTL + 5):
+            self.assertFalse(self.act({"action": "type", "ref": "@u2:e1", "text": " ~"}, fake)[0])
+
+    def test_terminal_check_uses_config_and_home(self):
+        # audit 4: hard_deny got {} and cwd /tmp, so the vault was unknown.
+        cfg = {**CFG, "vault": {"path": {"linux": "~/Documents/obsidian-vault"}}}
+        for i, text in enumerate(("rm -rf ~/Documents/obsidian-vault", "cat ~/.grok/auth.json")):
+            self.learn(f"@u3:e{i}", "textfield", "Input", app="konsole")
+            ok, said = self.act({"action": "type", "ref": f"@u3:e{i}", "text": text}, Fake(), config=cfg)
+            self.assertFalse(ok, text)
+        self.learn("@u4:e1", "textfield", "Input", app="konsole")  # a node: its own config
+        with mock.patch("jarvis.gates.local_config", return_value=cfg):
+            ok, said = self.act({"action": "type", "ref": "@u4:e1", "text": "rm -rf ~/Documents/obsidian-vault"},
+                                Fake(), config=None)
+        self.assertFalse(ok, said)
+
     def test_typed_buffer_expires(self):
         self.learn("@s10:e1", "textfield", "Code", app="shop")
         fake = Fake()
