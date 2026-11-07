@@ -253,5 +253,50 @@ class AssistantHookTests(unittest.TestCase):
                                         "the top three and recommend one", {}))
 
 
+class AuditOverhaulFixes(unittest.TestCase):
+    """Audit 2026-11-07: F6 (checker failure keeps a worker's answer), F5 (spoken lead only)."""
+
+    def test_checker_failure_on_a_plain_step_keeps_the_worker_result(self):
+        class Boom(Stub):
+            def __call__(self, level, prompt, instructions=""):
+                if instructions is brain.CHECKER:
+                    raise RuntimeError("both providers limited")
+                return super().__call__(level, prompt, instructions)
+        stub = Boom(plan_json(S("s1", "summarise it")), worker=lambda lvl, p: "WORKER-OUT")
+        with tempfile.TemporaryDirectory() as d:
+            res = brain.orchestrate("req", {}, Path(d), d, ask=stub)
+        step = res["steps"][0]
+        self.assertFalse(step["ok"])
+        combined = next(c[1] for c in stub.calls if c[2] == "combine")
+        self.assertIn("WORKER-OUT (unchecked)", combined)
+        self.assertNotIn("this step failed", combined)
+
+    def run_orchestrated(self, reply):
+        spoken, detail = [], {}
+        out = {"reply": reply, "steps": [], "levels": [3], "l3_left": 1}
+        with tempfile.TemporaryDirectory() as d, \
+                patch("jarvis.brain.orchestrate", return_value=out):
+            memory = SimpleNamespace(path=Path(d) / "memory.sqlite3")
+            got = _orchestrated("research the best 4k monitors under 400 dollars, compare the top "
+                                "three and recommend one", {}, Path(d), memory, MagicMock(),
+                                lambda *a, **k: None, lambda: [], spoken.append, detail)
+        return got, spoken
+
+    def test_table_and_links_are_not_spoken(self):
+        reply = ("The Dell S2722QC is the pick. It is the cheapest of the three!\n\n"
+                 "| Model | Price |\n|---|---|\n| Dell | $299 |\n\nhttps://example.com/dell")
+        got, spoken = self.run_orchestrated(reply)
+        self.assertEqual(got, reply)  # the transcript and memory keep everything
+        self.assertEqual(spoken, ["The Dell S2722QC is the pick.", "It is the cheapest of the three!"])
+
+    def test_list_right_after_the_lead_stops_speech(self):
+        got, spoken = self.run_orchestrated("Here are three\n- one\n- two")
+        self.assertEqual(spoken, ["Here are three"])
+
+    def test_reply_that_opens_with_a_table_says_it_is_on_screen(self):
+        got, spoken = self.run_orchestrated("| a | b |\n|---|---|")
+        self.assertEqual(spoken, ["The answer is on screen."])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -162,7 +162,9 @@ class RefreshTests(unittest.TestCase):
         import tempfile
         from unittest import mock
         from jarvis import clipsync
-        with tempfile.TemporaryDirectory() as state:
+        # The detached-watcher path, whatever this computer's own systemd unit says.
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch.object(clipsync, "_unit_installed", return_value=False):
             with open(f"{state}/{clipsync.CODE_FILE}", "w") as f:
                 f.write("old")
             alive = iter([4242, None, None])
@@ -356,3 +358,67 @@ class AlphaTests(unittest.TestCase):
         header = struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 32, 0, 4, 0, 0, 0, 0)
         png = dib_to_png(header + bytes([10, 20, 30, 0]))
         self.assertEqual(png_decode(png)[2][0][3], 255)
+
+
+class HandStopTests(unittest.TestCase):
+    """Audit cluster-02/05: a stop by hand sticks for the boot; one watcher per state folder."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = tmp.name
+
+    def test_stop_sticks_for_this_boot_and_start_clears_it(self):
+        with mock.patch.object(clipsync, "_boot", return_value=1000.0), \
+                mock.patch.object(clipsync, "_pid", return_value=None):
+            self.assertFalse(clipsync.stop(self.state)["stopped"])  # already down: still marked
+            self.assertTrue(clipsync.stopped_by_hand(self.state))
+        with mock.patch.object(clipsync, "_boot", return_value=99999.0):
+            self.assertFalse(clipsync.stopped_by_hand(self.state))  # a later boot
+        with mock.patch.object(clipsync, "_boot", return_value=None):
+            self.assertFalse(clipsync.stopped_by_hand(self.state))  # unknown never keeps it off
+        with mock.patch.object(clipsync, "_boot", return_value=1000.0), \
+                mock.patch.object(clipsync, "_pid", return_value=4242), \
+                mock.patch.object(clipsync, "status", return_value={}):
+            clipsync.start(self.state)
+            self.assertFalse(clipsync.stopped_by_hand(self.state))
+
+    def test_keep_alive_leaves_a_hand_stopped_watcher_off(self):
+        from jarvis import cluster
+
+        class Now:
+            def __init__(self, target, **_):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        stop = threading.Event()
+        stop.set()  # one keep-alive tick, then return
+        with mock.patch.object(clipsync, "_boot", return_value=1000.0), \
+                mock.patch.object(clipsync, "_pid", return_value=None):
+            clipsync.stop(self.state)
+            with mock.patch("jarvis._under_tests", return_value=False), \
+                    mock.patch.object(cluster.threading, "Thread", Now), \
+                    mock.patch.object(clipsync, "refresh"), \
+                    mock.patch.object(clipsync, "start") as start:
+                cluster._refresh_clipboard(self.state, {}, stop)
+            start.assert_not_called()
+            os.remove(os.path.join(self.state, clipsync.STOPPED))
+            with mock.patch("jarvis._under_tests", return_value=False), \
+                    mock.patch.object(cluster.threading, "Thread", Now), \
+                    mock.patch.object(clipsync, "refresh"), \
+                    mock.patch("builtins.print"), \
+                    mock.patch.object(clipsync, "start", return_value={"started": True}) as start:
+                cluster._refresh_clipboard(self.state, {}, stop)
+            start.assert_called_once()
+
+    def test_second_watcher_exits_without_watching(self):
+        from jarvis.locking import exclusive_lock
+        with exclusive_lock(os.path.join(self.state, clipsync.LOCK)), \
+                mock.patch.object(clipsync, "_run_watcher") as watch:
+            self.assertIsNone(clipsync.run({}, self.state))
+        watch.assert_not_called()
+        with mock.patch.object(clipsync, "_run_watcher", return_value="ran") as watch:
+            self.assertEqual(clipsync.run({}, self.state), "ran")  # free lock: it runs
+        watch.assert_called_once()

@@ -132,7 +132,8 @@ class LabelTest(unittest.TestCase):
             self.assertEqual(info["stakes"], "low")
 
     def test_element_description_and_resolved_name_count(self):
-        self.assertIsNone(judge(call("browser_click", element="Next page", ref="e1")))
+        # Without a snapshot the model's own words are unchecked (audit 2026-11-04).
+        self.assertFalse(judge(call("browser_click", element="Next page", ref="e1"))["checked"])
         observe("pw", SNAP)
         self.assertIsNone(judge(call("browser_click", ref="e13")))
 
@@ -223,6 +224,87 @@ class QueueTest(unittest.TestCase):
         with queue.history.connect() as db:
             row = db.execute("SELECT status FROM confirmations").fetchone()
         self.assertEqual(row["status"], "expired")
+
+
+NEVER = {"rules": {"confirm": "never"}}
+
+
+class AlwaysAskByStakesTest(unittest.TestCase):
+    """Audit 2026-11-04: under rules.confirm: never, money/messages asked only when the
+    question said send/post. These committed unasked."""
+
+    def setUp(self):
+        reset()
+
+    def run_gate(self, params, config=NEVER):
+        asked = []
+        with tempfile.TemporaryDirectory() as state, \
+                mock.patch.object(browser_gate, "ask",
+                                  side_effect=lambda q, *a, **k: (asked.append(q), (False, "no"))[1]):
+            ok, _ = browser_gate.gate(lambda p: (True, "ok"), config, state)(params)
+        return ok, asked
+
+    def must_ask(self, params, config=NEVER):
+        ok, asked = self.run_gate(params, config)
+        self.assertTrue(asked, params)
+        self.assertFalse(ok, params)
+
+    def must_not_ask(self, params, config=NEVER):
+        ok, asked = self.run_gate(params, config)
+        self.assertEqual(asked, [], params)
+        self.assertTrue(ok, params)
+
+    def test_submit_enter_and_dialogs_ask_in_full_auto(self):
+        observe("pw", SNAP)
+        for params in (call("browser_type", element="composer", ref="e3", text="hi", submit=True),
+                       call("browser_type", element="composer", text="hi", submit=True),
+                       call("browser_press_sequentially", text="hi", submit=True),
+                       call("browser_press_key", key="Control+Enter"),
+                       call("browser_press_key", key="Meta+Enter"),
+                       call("browser_keydown", key="Enter"),
+                       call("browser_keyup", key="Enter"),
+                       call("agent_browser_press", server="agent_browser", key="Enter"),
+                       call("browser_handle_dialog", accept=True)):
+            self.must_ask(params)
+
+    def test_commit_selectors_and_test_ids_are_high_stakes(self):
+        for args in ({"selector": "button[data-testid=tweetButton]"},
+                     {"selector": "[data-testid=tweetbutton]"}, {"selector": "#sendBtn"},
+                     {"selector": "button.checkout-now"}, {"selector": "form#pay > button"}):
+            info = judge(call("agent_browser_click", server="agent_browser", **args))
+            self.assertEqual(info["stakes"], "high", args)
+            self.must_ask(call("agent_browser_click", server="agent_browser", **args))
+        for selector in ("div.border-box", "#composer"):  # no commit word: not high
+            self.assertEqual(judge(call("agent_browser_click", server="agent_browser",
+                                        selector=selector))["stakes"], "low", selector)
+
+    def test_unchecked_ref_click_asks_whatever_the_model_called_it(self):
+        # The Codex lane never sees snapshots: the model's own `element` is not evidence.
+        params = call("browser_click", ref="e12", element="blue button at bottom of composer")
+        info = judge(params)
+        self.assertFalse(info["checked"])
+        self.assertFalse(info["named"])  # never grantable
+        self.must_ask(params)
+        self.must_ask(params, {"rules": {"confirm": "ask"}})
+
+    def test_checked_harmless_actions_still_run_alone(self):
+        observe("pw", SNAP)
+        for params in (call("browser_snapshot"), call("browser_navigate", url="https://x.com/explore"),
+                       call("browser_click", ref="e13", element="Home"),
+                       call("browser_type", ref="e2", text="weather"),
+                       call("browser_press_key", key="ArrowDown"),
+                       call("browser_handle_dialog", accept=False),
+                       call("agent_browser_scroll", server="agent_browser", direction="down"),
+                       call("agent_browser_snapshot", server="agent_browser")):
+            self.must_not_ask(params)
+        observe("pw", '- button "Delete draft" [ref=e20]')  # high, but neither money nor messages
+        self.must_not_ask(call("browser_click", ref="e20"))
+
+    def test_switched_off_means_full_auto(self):
+        off = {"rules": {"confirm": "never", "always_ask": []}}
+        for params in (call("browser_press_key", key="Enter"),
+                       call("browser_click", ref="e12", element="blue button")):
+            self.must_not_ask(params, off)
 
 
 if __name__ == "__main__":

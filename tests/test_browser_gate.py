@@ -18,7 +18,8 @@ class CommitDetectionTest(unittest.TestCase):
         browser_gate._TYPED.clear()
         browser_gate.PAGES.clear()
         # Search boxes count only when a snapshot shows them (not the model's own words).
-        browser_gate.observe("playwright", '- searchbox "Search" [ref=e11]\n- textbox "Message to Sam" [ref=e2]')
+        browser_gate.observe("playwright", '- searchbox "Search" [ref=e11]\n- textbox "Message to Sam" [ref=e2]\n'
+                                           '- link "Next page" [ref=e4]')
 
     def test_reading_and_moving_around_never_ask(self):
         for params in (call("browser_navigate", url="https://x.com"), call("browser_snapshot"),

@@ -31,6 +31,40 @@ class ApproveBrowserTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(actions.approve_browser(params("playwright", "browser_click", element="Ok"))[0])
 
+    def test_page_tools_and_unknown_names_fail_closed(self):
+        # Audit 2026-11-04: browser_webmcp_call ran page-registered tools (send_email) unasked.
+        for server, tool in (("playwright", "browser_webmcp_call"), ("chrome", "browser_webmcp_call"),
+                             ("playwright", "browser_mouse_click_xy"), ("playwright", "browser_mouse_down"),
+                             ("playwright", "browser_cookie_get"), ("playwright", "browser_network_request"),
+                             ("playwright", "browser_set_storage_state"), ("playwright", "browser_route"),
+                             ("playwright", "browser_some_future_tool"),
+                             ("agent_browser", "agent_browser_webmcp_invoke"),
+                             ("agent_browser", "agent_browser_dialog_accept"),
+                             ("agent_browser", "agent_browser_keyboard_type"),
+                             ("agent_browser", "agent_browser_some_future_tool")):
+            ok, why = actions.approve_browser(params(server, tool, name="send_email", arguments={}))
+            self.assertFalse(ok, tool)
+            self.assertIn("not allowed", why)
+        self.assertIn("browser_webmcp_call", actions.BROWSER_BLOCKED)
+        self.assertFalse(actions.BROWSER_ALLOWED & actions.BROWSER_BLOCKED)
+        self.assertFalse(actions.AGENT_BROWSER_ALLOWED & actions.AGENT_BROWSER_BLOCKED)
+
+    def test_read_only_and_navigation_tools_still_allowed(self):
+        for server, tool, args in (("playwright", "browser_snapshot", {}),
+                                   ("playwright", "browser_navigate", {"url": "https://example.com"}),
+                                   ("playwright", "browser_wait_for", {"time": 1}),
+                                   ("playwright", "browser_webmcp_list", {}),
+                                   ("playwright", "browser_press_sequentially", {"text": "hi"}),
+                                   ("agent_browser", "agent_browser_scroll", {"direction": "down"}),
+                                   ("agent_browser", "agent_browser_snapshot", {}),
+                                   ("agent_browser", "agent_browser_get_text", {"selector": "@e1"})):
+            self.assertTrue(actions.approve_browser(params(server, tool, **args))[0], tool)
+
+    def test_press_sequentially_is_typing(self):
+        self.assertEqual(browser_gate.blocked("browser_press_sequentially", {"text": "4111 1111 1111 1111"}),
+                         "JARVIS never types card numbers")
+        self.assertTrue(browser_gate.commits(params("t", "browser_press_sequentially", text="hi", submit=True)))
+
     def test_playwright_output_dir_is_under_state(self):
         with tempfile.TemporaryDirectory() as state, \
                 mock.patch("shutil.which", return_value="/usr/bin/npx"):
@@ -49,7 +83,8 @@ class GateTests(unittest.TestCase):
             self.assertTrue(browser_gate.commits(params("s", tool, **args)), tool)
 
     def test_labelled_harmless_click_is_automatic(self):
-        self.assertIsNone(browser_gate.commits(params("s", "browser_click", element="Next page",
+        browser_gate.observe("labelled", '- link "Next page" [ref=e12]')  # only a snapshot proves it
+        self.assertIsNone(browser_gate.commits(params("labelled", "browser_click", element="Next page",
                                                       ref="e12", button="left")))
 
     def test_line_break_in_typed_text_commits(self):
