@@ -28,12 +28,14 @@ import http.client
 import json
 import math
 import os
+from .platforms import on_windows
 import re
 import socket
 import sqlite3
 import threading
 import time
 import unicodedata
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -155,7 +157,7 @@ def _target(names, link):
 def open_link(link):
     """Hand a link to the desktop's default handler. One seam for the whole package, so
     no caller (and no test) has to branch on os.name itself."""
-    if os.name == "nt":
+    if on_windows():
         os.startfile(link)  # hands the obsidian:// link to the Obsidian app
     else:
         import webbrowser
@@ -753,7 +755,8 @@ class Vault:
         if full is None or full.suffix.lower() != ".md":
             raise ValueError(f"Refusing to write outside the vault's Markdown notes: {rel}")
         rel = full.relative_to(self.root).as_posix()
-        if rel.startswith(READ_ONLY) or rel.lower() in self.protected:
+        folded = rel.casefold()  # Windows/macOS filesystems ignore case: so must the guard
+        if folded.startswith(READ_ONLY) or folded in self.protected:
             raise ValueError(f"{rel} is read-only for JARVIS (generated, archived or a template).")
         return full, rel
 
@@ -772,10 +775,37 @@ class Vault:
             now = _raw(full) if full.exists() else None
             if now != before:
                 raise RuntimeError(f"{rel} changed while JARVIS was editing it; try again.")
-        atomic_write(full, text, newline="")  # never leaves a half-written file in the vault
+        if before is None:
+            self._create(full, rel, text)
+        else:
+            atomic_write(full, text, newline="")  # never leaves a half-written file in the vault
         forget(self.root)
         with self.connect() as db:
             self._index(db, rel, full)
+
+    @staticmethod
+    def _create(full, rel, text):
+        """Create a new note without ever replacing one: write a temp file, then hard-link it
+        into place (os.link fails if the target exists, so a note made meanwhile survives)."""
+        full.parent.mkdir(parents=True, exist_ok=True)
+        tmp = full.with_name(f".{full.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="") as stream:
+                stream.write(text)
+            try:
+                os.link(tmp, full)
+            except FileExistsError:
+                raise RuntimeError(f"{rel} appeared while JARVIS was creating it; "
+                                   "append to it instead.") from None
+            except OSError:  # no hard links here (FAT/exFAT, some shares): O_EXCL still refuses
+                try:
+                    with open(full, "x", encoding="utf-8", newline="") as stream:
+                        stream.write(text)
+                except FileExistsError:
+                    raise RuntimeError(f"{rel} appeared while JARVIS was creating it; "
+                                       "append to it instead.") from None
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _audit(self, action, rel, text, channel):
         entry = {"at": datetime.now().isoformat(timespec="seconds"), "action": action,
@@ -910,8 +940,12 @@ class Vault:
             rel = full.relative_to(self.root).as_posix()
             if not full.exists():
                 full, rel = self._check_writable(rel)
-                self._save(full, rel, self._new_daily(when), before=None)
-                self._audit("daily+create", rel, "", channel)
+                try:
+                    self._save(full, rel, self._new_daily(when), before=None)
+                    self._audit("daily+create", rel, "", channel)
+                except RuntimeError:
+                    if not full.exists():
+                        raise  # someone else made today's note meanwhile: just open it
         elif word in ("tasks", "task list", "todo", "to-do"):
             rel = "tasks.md" if (self.root / "tasks.md").exists() else None
         else:
@@ -1244,8 +1278,8 @@ def vault_path(settings):
     serves both laptops. A Windows-only path means "not configured" off Windows."""
     path = settings.get("path")
     if isinstance(path, dict):
-        path = path.get("windows" if os.name == "nt" else "linux")
-    if not path or (os.name != "nt" and re.match(r"[A-Za-z]:[\\/]", str(path))):
+        path = path.get("windows" if on_windows() else "linux")
+    if not path or (not on_windows() and re.match(r"[A-Za-z]:[\\/]", str(path))):
         return None
     return str(path)
 

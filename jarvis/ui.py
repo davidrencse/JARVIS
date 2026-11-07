@@ -12,6 +12,7 @@ Endpoints read the same state the CLI uses (.jarvis/), so the console and
 import ast
 import json
 import os
+from .platforms import on_windows
 import queue
 import re
 import shutil
@@ -305,7 +306,8 @@ class Console:
                       "chars_this_month": usage.get(month, 0),
                       "budget": self.config.get("voice", {}).get("monthly_char_budget", 30000),
                       "tts_model": self.config.get("voice", {}).get("model"),
-                      "stt_model": self.config.get("voice", {}).get("stt_model")},
+                      "stt_model": self.config.get("voice", {}).get("stt_model"),
+                      "stt_engine": self.config.get("voice", {}).get("stt_engine", "parakeet")},
             "tools": {name: shutil.which(name) is not None
                       for name in ("claude", "codex", "ssh", "tailscale", "lan-mouse")},
         }
@@ -530,14 +532,13 @@ class Console:
     def search(self, query):
         limit = max(1, min(int(query.get("limit", 40)), 200))
         case = query.get("case") or None
-        items = self.memory.search(query.get("q", ""), query.get("kind") or None,
-                                   query.get("tag") or None, query.get("since") or None,
-                                   200 if case else limit)
-        if case:
-            ids = self.case_ids(case)
-            items = [i for i in items if i["id"] in ids]
         floor = float(query.get("min_importance") or 0)
-        return [i for i in items if i["importance"] >= floor][:limit]
+        # both filters run in the SQL, before LIMIT: filtering the newest `limit` rows
+        # afterwards left "High only" and old case items nearly empty (audit SU-2)
+        return self.memory.search(query.get("q", ""), query.get("kind") or None,
+                                  query.get("tag") or None, query.get("since") or None,
+                                  limit, min_importance=floor or None,
+                                  ids=self.case_ids(case) if case else None)
 
     def capture(self, body):
         """Save a finding: kind, title, tags, importance, optional source URL and case."""
@@ -830,8 +831,7 @@ class Console:
         `wake` is the always-on mic: only speech that starts with "Jarvis" comes back;
         anything else is dropped here, so the page never even sees the words."""
         from . import daemon
-        from .assistant import wake_word
-        from .listen import RATE, Transcriber, VoicePrint, _np
+        from .listen import RATE, Transcriber, VoicePrint, _np, wake as wake_word
         np = _np()
         if len(raw) < RATE * 4 * 0.3 or len(raw) % 4:
             raise ValueError("That clip was too short to hear anything.")
@@ -858,15 +858,24 @@ class Console:
                 self._stt, self._ears = Transcriber(self.config), VoicePrint(self.state, self.config)
                 self._free_ears_later()
             owner, score, near = True, None, False
-            if verify and (self.state / "voice" / "voiceprint.json").is_file():
-                owner, score = self._ears.verify(audio)
+            if verify and (self.config.get("voice") or {}).get("speaker_check", True) is False:
+                owner, near = False, True  # check off: wake word for always-on, as the listener
+            elif verify and (self.state / "voice" / "voiceprint.json").is_file():
+                # Score only: browser audio (echo cancel, noise suppression, auto gain) is a
+                # different chain from the listener's mic, so it never teaches the voiceprint.
+                owner, score = self._ears.verify(audio, learn=False)
                 if not owner:
                     # A near miss (far from the mic, quieter) counts for push-to-talk, a
                     # deliberate key press here; always-on needs "Jarvis" too, like the listener.
                     from .daemon import BORDERLINE
                     near = score >= (self.config.get("voice") or {}).get("near_miss", BORDERLINE)
                     owner = near and not wake
-            text = self._stt(audio) if owner or near else ""
+            # Push-to-talk needs no wake word: Parakeet's sure words stand on their own.
+            self._stt.need_wake = wake
+            try:
+                text = self._stt(audio) if owner or near else ""
+            finally:
+                self._stt.need_wake = True
         request = wake_word(text)
         if near and wake:
             owner = request is not None
@@ -903,7 +912,9 @@ class Console:
             raise ValueError("That file is empty.")
         if length > transfer.MAX_BYTES:
             raise ValueError("That file is too large to send this way.")
-        with tempfile.TemporaryDirectory() as folder:
+        uploads = Path(self.state) / "uploads"  # on disk: /tmp may be a RAM tmpfs (2 GB cap)
+        uploads.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=uploads) as folder:
             path = Path(folder) / transfer.safe_name(name)
             left = length
             with open(path, "wb") as out:
@@ -1027,6 +1038,102 @@ class Console:
         shot = json.loads(text)
         return base64.b64decode(shot["b64"], validate=True), shot["mime"]
 
+    # -- Remote view: David drives another computer (remote_view.py) ---------------------
+    def _hub(self):
+        from .cluster import _HUBS
+        hub = _HUBS.get(str(Path(self.state).resolve()))
+        if hub is None:
+            raise LookupError("Remote control runs on the main computer, with JARVIS's cluster hub up.")
+        return hub
+
+    def remote_status(self):
+        """Computers David can take over, whether each is ready now, and the session."""
+        from .cluster import FRESH
+        from .deploy import code_fingerprint
+        from .release import served_code
+        from .topology import enabled, identity
+        live = code_fingerprint()
+        served = served_code(self.state)
+        release = {"live": live, "served": served}
+        if not enabled(self.config):
+            return {"devices": [], "session": None, "why": "The cluster is off, so there are no other computers to reach.", "release": release}
+        local, main = identity(self.config)
+        if local != main:
+            return {"devices": [], "session": None, "why": "Open the Remote view on the main computer.", "release": release}
+        try:
+            hub = self._hub()
+        except LookupError as exc:
+            return {"devices": [], "session": None, "why": str(exc), "release": release}
+        nodes = {n["id"]: n for n in hub.broker.nodes()}
+        from .release import current, release_dir
+        # Only a release without remote control blocks it; one merely older than the live
+        # tree (cut again automatically once edits settle) still works. Before the first
+        # release, nodes get the live tree itself.
+        shipped = not current(self.state) or \
+            (release_dir(self.state) / "jarvis" / "remote_view.py").is_file()
+        failed_path = Path(self.state) / "code-release-failed.json"
+        try:
+            failed = json.loads(failed_path.read_text(encoding="utf-8"))
+            if not isinstance(failed, dict):
+                failed = {}
+        except (OSError, ValueError):
+            failed = {}
+        out = []
+        for name, device in self.config.get("devices", {}).items():
+            if name == main:
+                continue
+            node = nodes.get(name)
+            online = bool(node and (node.get("online") or hub.alive(name, node)))
+            why = None
+            if node is None:
+                why = "Not paired with this computer (jarvis cluster invite " + name + ")."
+            elif "desktop" not in node.get("capabilities", []):
+                why = "Not enrolled for desktop actions."
+            elif not online:
+                why = "Offline: start JARVIS on it and check its link (jarvis cluster doctor)."
+            elif node.get("code") != served:
+                why = f"Runs older JARVIS code. Run: jarvis cluster update {name}"
+            elif not shipped:  # the release nodes get predates remote control
+                if failed.get("code") == live:
+                    why = "This computer's latest code failed its release tests, so nodes can't get it yet. Fix the failing test, then run: jarvis cluster release"
+                    tests = str(failed.get("tests") or "").strip()
+                    if tests:
+                        why += f" ({tests[-160:]})"
+                else:
+                    why = "Nodes don't have this computer's latest code yet. Run: jarvis cluster release, then jarvis cluster update " + name
+            out.append({"id": name, "label": device.get("label") or name, "online": online,
+                        "ready": why is None, "why": why, "platform": (node or {}).get("platform")})
+        return {"devices": out, "session": hub.remote.current(), "why": None,
+                "release": release}
+
+    def remote_start(self, body):
+        device, quality = body.get("device"), body.get("quality") or "medium"
+        if not isinstance(device, str) or not isinstance(quality, str):
+            raise ValueError("Pick a computer to control.")
+        hub = self._hub()
+        try:
+            return hub.remote_open(device, quality)
+        except (OSError, RuntimeError) as exc:  # offline, busy, old code: say it plainly
+            if "Nodes execute only" in str(exc):
+                raise ValueError(f"That computer runs older JARVIS code that can't do remote control yet. Run: jarvis cluster update {device}") from None
+            raise ValueError(str(exc)) from None
+
+    def remote_frame(self, query):
+        """(seq, jpeg, width, height) or None; raises remote_view.Ended."""
+        try:
+            after = int(query.get("after") or 0)
+        except ValueError:
+            raise ValueError("after must be a frame number.")
+        return self._hub().remote.wait_frame(query.get("session"), after)
+
+    def remote_input(self, body):
+        return {"ok": True, "queued": self._hub().remote.push(body.get("session"), body.get("events"))}
+
+    def remote_stop(self, body):
+        hub = self._hub()
+        session = hub.remote_close(body.get("session"))
+        return {"ok": True, "session": session}
+
     def grokbot_command(self, body):
         """Devices view: a command for Grokbot, a terminal, or a browser."""
         result = self.grokbot().command(str(body.get("text", "")), body.get("mode") or None,
@@ -1128,7 +1235,7 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _send(self, status, body, ctype="application/json; charset=utf-8", cache=False,
-              disposition=None, close=False):
+              disposition=None, close=False, headers=None):
         data = body if isinstance(body, bytes) else json.dumps(body, default=str).encode()
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -1138,6 +1245,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, str(value))
         if disposition:
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", disposition)
             self.send_header("Content-Disposition", f'attachment; filename="jarvis-{safe}"')
@@ -1145,7 +1254,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Security-Policy",
                              "default-src 'self'; connect-src 'self' https://api.open-meteo.com "
                              "wss://api.elevenlabs.io "
-                             "https://geocoding-api.open-meteo.com; img-src 'self' data:; "
+                             "https://geocoding-api.open-meteo.com; img-src 'self' data: blob:; "
                              "style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; "
                              "base-uri 'none'; form-action 'none'; object-src 'none'")
         self.end_headers()
@@ -1172,7 +1281,7 @@ class Handler(BaseHTTPRequestHandler):
         self.close_connection = True
         return self._send(HTTPStatus.FORBIDDEN, {"error": "Refused."})
 
-    DRAIN_CAP = 512 * 1024 * 1024
+    DRAIN_CAP = 1024 * 1024  # a rejected upload is not worth a thread's time; the connection closes after
 
     def _drain(self, left):
         """Read and discard an unread request body (bounded, with an idle timeout, after the
@@ -1196,8 +1305,19 @@ class Handler(BaseHTTPRequestHandler):
         self._send(status, {"error": message}, close=True)
         self._drain(length)
 
+    EVENT_STREAMS = threading.BoundedSemaphore(16)  # each stream pins a thread
+
     def _events(self, query):
         """Server-Sent Events: what a reconnecting tab missed (Last-Event-ID), then live."""
+        if not self.EVENT_STREAMS.acquire(blocking=False):
+            self.close_connection = True
+            return self._send(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Too many open event streams."}, close=True)
+        try:
+            self._stream_events(query)
+        finally:
+            self.EVENT_STREAMS.release()
+
+    def _stream_events(self, query):
         self.connection.settimeout(None)  # the stream idles between keep-alives
         after = self.headers.get("Last-Event-ID") or query.get("after") or ""
         sub, backlog = self.console.bus.subscribe(int(after) if re.fullmatch(r"\d+", after, re.ASCII) else None)
@@ -1236,7 +1356,14 @@ class Handler(BaseHTTPRequestHandler):
         status = (HTTPStatus.NOT_FOUND if isinstance(exc, LookupError) else
                   HTTPStatus.BAD_REQUEST if isinstance(exc, ValueError) else
                   HTTPStatus.INTERNAL_SERVER_ERROR)
-        self._send(status, {"error": str(exc) or type(exc).__name__}, close=close)
+        if status == HTTPStatus.INTERNAL_SERVER_ERROR:
+            import sys
+            import traceback
+            traceback.print_exception(exc, file=sys.stderr)
+            message = "Something went wrong \u2014 see the JARVIS log."
+        else:
+            message = str(exc) or type(exc).__name__
+        self._send(status, {"error": message}, close=close)
 
     def do_GET(self):
         if not self._allowed():
@@ -1297,6 +1424,20 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/screen":
                 data, mime = c.screen(query.get("device"))
                 return self._send(HTTPStatus.OK, data, mime)
+            if url.path == "/api/remote":
+                return self._send(HTTPStatus.OK, c.remote_status())
+            if url.path == "/api/remote/frame":
+                from .remote_view import Ended
+                try:
+                    frame = c.remote_frame(query)
+                except Ended as exc:
+                    return self._send(HTTPStatus.GONE, {"error": str(exc)})
+                if frame is None:  # the screen hasn't changed; say how lately the node checked in
+                    return self._send(HTTPStatus.NO_CONTENT, b"", "text/plain", headers={
+                        "X-Node-Ago": f"{c._hub().remote.node_ago(query.get('session')):.1f}"})
+                seq, jpeg, width, height = frame
+                return self._send(HTTPStatus.OK, jpeg, "image/jpeg", headers={
+                    "X-Frame-Seq": seq, "X-Frame-Width": width, "X-Frame-Height": height})
             if url.path in routes:
                 return self._send(HTTPStatus.OK, routes[url.path]())
             if url.path == "/api/export":
@@ -1396,6 +1537,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.agent_screen_command(body))
             if url.path == "/api/grokbot":
                 return self._send(HTTPStatus.OK, c.grokbot_command(body))
+            if url.path in ("/api/remote/start", "/api/remote/input", "/api/remote/stop"):
+                from .remote_view import Ended
+                try:
+                    return self._send(HTTPStatus.OK, {"/api/remote/start": c.remote_start,
+                                                      "/api/remote/input": c.remote_input,
+                                                      "/api/remote/stop": c.remote_stop}[url.path](body))
+                except Ended as exc:
+                    return self._send(HTTPStatus.GONE, {"error": str(exc)})
             if url.path == "/api/peripherals":
                 from .peripherals import act
                 return self._send(HTTPStatus.OK, act(c.config, c.base / "jarvis.config.json", c.state, body))
@@ -1458,7 +1607,7 @@ def app_window(url, size=(1480, 940), profile=None):
             subprocess.Popen([path, f"--app={url}", f"--window-size={size[0]},{size[1]}", *extra],
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, close_fds=True,
-                             start_new_session=os.name != "nt")  # outlive an SSH caller
+                             start_new_session=not on_windows())  # outlive an SSH caller
             return path
     webbrowser.open(url)
     return None

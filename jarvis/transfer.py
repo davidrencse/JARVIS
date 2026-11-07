@@ -296,7 +296,8 @@ def run_here(payload, state=None):
         finally:
             part.unlink(missing_ok=True)
         from .clipsync import apply
-        apply(state, payload["kind"], content)
+        if apply(state, payload["kind"], content) is False:  # apart / remote control on here
+            return {"pasted": None, "paused": True, "bytes": size}
         return {"pasted": payload["kind"], "bytes": size}
     final = _land(part, folder, safe_name(payload["name"]))
     return {"sent": final, "bytes": size}
