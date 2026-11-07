@@ -1,0 +1,85 @@
+/* Remote view (#view-remote): a node computer's screen, live, with its mouse and keyboard.
+   Tokens come from app.css / porcelain.css / cockpit.css; colour means state only
+   (live --ok, starting or stale --warn, ended with an error --alert). Reuses .cx-btn. */
+.rm { display: flex; flex-direction: column; gap: 12px; height: 100%; min-height: 0; max-width: 1680px; margin: 0 auto; padding: 2px; box-sizing: border-box; min-width: 0; }
+.rm-head { display: flex; align-items: center; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; }
+.rm-sr { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.rm-tools { display: flex; margin-left: auto; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+.rm-q { display: inline-flex; align-items: center; gap: 8px; color: var(--ink-2); font: 500 12.5px var(--sans); }
+.rm-q select { height: 30px; padding: 0 8px; border: 1px solid var(--line-2); border-radius: var(--r-sm); background: var(--bg); color: var(--ink); font: 500 12.5px var(--sans); }
+.rm-q select:disabled { opacity: .45; }
+.rm-q select:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+/* computer picker */
+.rm-devs { display: flex; flex: 1 1 280px; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.rm-devs.locked .rm-dev:not(.on) { opacity: .5; }
+.rm-dev { position: relative; display: inline-flex; align-items: center; gap: 10px; min-width: 0; max-width: 100%; padding: 8px 14px 8px 12px; border: 1px solid var(--line-2); border-radius: var(--r);
+  background: color-mix(in srgb, var(--hover) 40%, transparent); color: var(--ink); cursor: pointer; }
+.rm-dev:hover { background: var(--hover); }
+.rm-dev.on { border-color: var(--ink); }
+.rm-dev.off { border-style: dashed; cursor: not-allowed; }
+.rm-dev.off .rm-dev-t b { color: var(--ink-2); }
+.rm-dev:has(input:focus-visible) { outline: 2px solid var(--ink); outline-offset: 2px; }
+.rm-dev input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%; margin: 0; cursor: inherit; }
+.rm-dev-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+.rm-dev-dot.ok { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+.rm-dev-dot.warn { background: transparent; border: 1.5px solid var(--warn); }
+.rm-dev-t { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rm-dev-t b { font: 600 13px/1.25 var(--sans); overflow-wrap: anywhere; }
+.rm-dev-t small { color: var(--ink-2); font: 400 12px/1.3 var(--sans); overflow-wrap: anywhere; }
+.rm-empty { margin: 0; color: var(--ink-2); font-size: 13.5px; }
+.rm-empty code, .rm-ph code { font: 12px var(--mono); background: var(--hover); padding: 1px 5px; border-radius: var(--r-sm); }
+
+.rm-note { padding: 9px 12px; border: 1px solid var(--line-2); border-radius: var(--r); color: var(--ink-2); font: 400 13px/1.4 var(--sans); overflow-wrap: anywhere; }
+.rm-note.bad { color: var(--alert, var(--bad)); border-color: color-mix(in srgb, var(--alert, var(--bad)) 55%, transparent); }
+.rm-note.warn { color: var(--ink); border-color: color-mix(in srgb, var(--warn) 55%, transparent); }
+.rm-other { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; }
+.rm-other span { flex: 1 1 220px; }
+
+/* the screen */
+.rm-stage { position: relative; flex: 1 1 0; min-height: 180px; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden;
+  background: color-mix(in srgb, var(--ink) 7%, var(--bg)); }
+.rm-view { position: absolute; inset: 0; outline: none; touch-action: none; user-select: none; -webkit-user-select: none; cursor: default; }
+.rm-view:focus { outline: 2px solid var(--ink); outline-offset: -2px; }
+.rm-img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: contain; image-rendering: auto; -webkit-user-drag: none; }
+.rm-img[hidden], .rm-ph[hidden] { display: none; }
+.rm-ph { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center; overflow: auto; }
+.rm-ph > div { max-width: 60ch; margin: 0 auto; }
+.rm-ph h2 { margin: 0 0 6px; font: 600 15px/1.3 var(--sans); color: var(--ink); }
+.rm-ph p { margin: 0; color: var(--ink-2); font: 400 13.5px/1.5 var(--sans); overflow-wrap: anywhere; }
+.rm-stage:fullscreen { background: #000; border: 0; border-radius: 0; }
+
+/* status line */
+.rm-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 16px; color: var(--ink-2); font: 400 12px var(--mono); }
+.rm-state { display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: var(--ink-2); }
+.rm-state b { font: 600 12.5px var(--sans); overflow-wrap: anywhere; }
+.rm-dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--ink-3); }
+.rm-state[data-st="live"] { color: var(--ok); }
+.rm-state[data-st="live"] .rm-dot { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
+.rm-state[data-st="starting"], .rm-state[data-st="stale"] { color: var(--warn); }
+.rm-state[data-st="starting"] .rm-dot, .rm-state[data-st="stale"] .rm-dot { background: transparent; border: 1.5px solid var(--warn); }
+.rm-state[data-st="failed"] { color: var(--alert, var(--bad)); }
+.rm-state[data-st="failed"] .rm-dot { background: var(--alert, var(--bad)); }
+.rm-m { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rm-m.warn { color: var(--warn); }
+.rm-kb { color: var(--ink-2); white-space: nowrap; }
+.rm-kb[data-on="1"] { color: var(--ink); font-weight: 600; }
+.rm-hint { color: var(--ink-3); font: 400 12px var(--sans); flex: 1 1 260px; min-width: 0; }
+
+@media (max-width: 720px) {
+  .rm-dev { flex: 1 1 200px; }
+  .rm-tools { width: 100%; }
+}
+@media (max-width: 480px) {
+  .rm-tools .cx-btn { flex: 1 1 auto; justify-content: center; }
+  .rm-hint { flex-basis: 100%; }
+}
+@media (max-height: 520px) { .rm { gap: 8px; } .rm-dev { padding: 5px 10px; } .rm-dev-t small { display: none; } }
+/* Short screens (a 1440x900 laptop at 200% zoom is 720x450): the remote screen gets the free
+   band. In this view only, the assistant dock and the top bar's extras step aside; otherwise
+   the stage's minimum overflows and the picture's top or bottom sits under them, never clickable. */
+@media (max-height: 520px) {
+  body:has(#view-remote:not([hidden])) #dock,
+  body:has(#view-remote:not([hidden])) .topbar :is(.title-sub, .case-switch, .time-pill, .search-pill, #flow-history, #hero-refresh) { display: none; }
+  .rm-stage { min-height: 120px; }
+}

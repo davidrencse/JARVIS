@@ -23,6 +23,7 @@
 <link rel="stylesheet" href="files.css">
 <link rel="stylesheet" href="connections.css">
 <link rel="stylesheet" href="laptops.css">
+<link rel="stylesheet" href="remote.css">
 <link rel="stylesheet" href="voicesetup.css">
 <script src="theme.js"></script>
 <script src="esc.js"></script>
@@ -44,6 +45,7 @@
       <a href="#memory" data-view="memory" title="Memory (5)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></a>
       <a href="#files" data-view="files" title="Files across both laptops (6)"><svg class="i"><use href="icons.svg?v=2#i-database"/></svg><span>Files</span></a>
       <a href="#devices" data-view="devices" title="Connections: computers and peripherals (7)"><svg class="i"><use href="icons.svg?v=2#i-waypoints"/></svg><span>Connections</span></a>
+      <a href="#remote" data-view="remote" title="Remote control of a node computer (8)"><svg class="i"><use href="icons.svg?v=2#i-laptop-minimal"/></svg><span>Remote</span></a>
       <a href="#settings" data-view="settings" title="Voice and input settings"><svg class="i"><use href="icons.svg?v=2#i-audio-lines"/></svg><span>Settings</span></a>
     </nav>
     <div class="profile">
@@ -347,6 +349,9 @@
       <div id="peripherals"></div>
       <div class="devices-grid cx-stack" id="devices-grid"></div>
     </section>
+    <section class="view view-full" id="view-remote" data-title="Remote" hidden>
+      <div class="rm" id="rm-root"></div>
+    </section>
     <section class="view st" id="view-settings" data-title="Settings" hidden>
       <div class="st-shell">
         <nav class="st-rail" aria-label="Settings sections"><div role="tablist" aria-orientation="vertical" id="st-tabs">
@@ -531,6 +536,7 @@
 <script src="sharedinput.js"></script>
 <script src="peripherals.js"></script>
 <script src="laptops.js"></script>
+<script src="remote.js"></script>
 <script src="boardfield.js"></script>
 <script src="wheel.js"></script>
 <script src="layout.js"></script>

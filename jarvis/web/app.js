@@ -5,6 +5,7 @@
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const esc = window.JarvisEsc;
+  const safeHttp = (u) => { try { return /^https?:$/.test(new URL(String(u)).protocol); } catch (e) { return false; } };
   const icon = (name, cls = "i i-sm") => `<svg class="${cls}" aria-hidden="true"><use href="icons.svg?v=2#i-${name}"/></svg>`;
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -83,7 +84,7 @@
   // ---------- views ----------
   // Order is the rail's own order, so the number keys read top to bottom. "run" has no rail
   // link or number key: the console trace links to it when a plan exists.
-  const VIEWS = ["console", "graph", "system", "credits", "memory", "run", "files", "devices", "settings"];
+  const VIEWS = ["console", "graph", "system", "credits", "memory", "run", "files", "devices", "remote", "settings"];
   const KEYED = VIEWS.filter((v) => v !== "run");
   const loaded = {};
   async function show() {
@@ -188,7 +189,7 @@
     const groups = {};
     list.filter((r) => r.group !== "Model APIs").forEach((r) => (groups[r.group] = groups[r.group] || []).push(r));  // pay-per-token APIs are off-limits
     $("#credit-table").innerHTML = Object.entries(groups).map(([g, rows]) => `<section class="ct-group"><h3>${esc(g)}</h3>${rows.map((r) => `
-      <div class="ct-row" data-id="${r.id}">${srcMark(r)}
+      <div class="ct-row" data-id="${esc(r.id)}">${srcMark(r)}
         <div><div class="cr-name">${esc(r.name)}<small>${esc(r.blurb)}</small></div></div>
         <div class="meters">${headline(r)}${meters(r, 4)}</div>
         <div class="ct-facts mono">${r.facts.map(([k, v]) => `<div><span>${esc(k)}</span><span>${/^\d{4}-\d\d-\d\dT/.test(v || "") ? ago(v) : esc(v ?? "—")}</span></div>`).join("")}</div>
@@ -254,7 +255,7 @@
   }
   $("#case-select").addEventListener("change", async (e) => {
     if (e.target.value === "__new") {
-      const name = prompt("Name the investigation, e.g. “Home lab exposure” or “Acme public infrastructure”.");
+      const name = window.prompt("Name the investigation, e.g. “Home lab exposure” or “Acme public infrastructure”.");
       if (name && name.trim()) {
         try { const c = await api("/api/cases", { name }); state.case = c.slug; store.set("jarvis.case", c.slug); toast(`Investigation “${name.trim()}” started. New notes and asks are filed into it.`); }
         catch (err) { toast(plainError(err.message)); }
@@ -522,7 +523,7 @@
         return `<button class="link-btn mono" type="button" data-id="${esc(other)}">${out ? "" : "← "}${esc(l.rel)} · ${esc(other)}</button>`; };
       $("#mem-detail").innerHTML = `<h3 style="font-size:17px;font-weight:500;letter-spacing:-.015em">${esc(it.title)}</h3>
         <dl class="facts mono"><dt>ID</dt><dd>${esc(it.id)}</dd><dt>Source</dt><dd>${esc(it.source)}</dd><dt>Saved</dt><dd>${new Date(it.created_at).toLocaleString()}</dd><dt>Importance</dt><dd>${it.importance}</dd>
-          ${it.meta?.source_url ? `<dt>URL</dt><dd><a href="${esc(it.meta.source_url)}" target="_blank" rel="noopener noreferrer">${esc(it.meta.source_url)}</a></dd>` : ""}</dl>
+          ${it.meta?.source_url ? `<dt>URL</dt><dd>${safeHttp(it.meta.source_url) ? `<a href="${esc(it.meta.source_url)}" target="_blank" rel="noopener noreferrer">${esc(it.meta.source_url)}</a>` : esc(it.meta.source_url)}</dd>` : ""}</dl>
         ${it.tags.length ? `<div class="tags">${it.tags.map((t) => `<button type="button" class="state-word" data-tag="${esc(t)}" title="Filter by this tag">#${esc(t)}</button>`).join("")}</div>` : ""}
         <pre>${esc(it.body)}</pre>
         <div class="links-list">${it.links.length ? `<span class="ph"><h2>Links · ${it.links.length}</h2></span>${it.links.map(linkRow).join("")}` : ""}</div>
