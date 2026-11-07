@@ -22,6 +22,7 @@ seconds, or dies first, the watchdog restores the backup, records the fingerprin
 
 import json
 import os
+from .platforms import on_windows
 import shutil
 import subprocess
 import sys
@@ -101,11 +102,18 @@ def due(state, quiet=QUIET):
     return settled(quiet=quiet)
 
 
+def _nested_repo(path):
+    """A folder with its own .git is another checkout (audit cluster-10: a stray repo copy
+    rode into every release stage), never part of this one."""
+    return os.path.isdir(path) and os.path.exists(os.path.join(path, ".git"))
+
+
 def _stage(repo, stage):
     def skip(folder, names):
-        return [n for n in names if n in STAGE_SKIP or n.endswith(".pyc")]
+        return [n for n in names if n in STAGE_SKIP or n.endswith(".pyc")
+                or _nested_repo(os.path.join(folder, n))]
     for item in Path(repo).iterdir():
-        if item.name in STAGE_SKIP:
+        if item.name in STAGE_SKIP or _nested_repo(item):
             continue
         target = Path(stage) / item.name
         if item.is_dir():
@@ -117,7 +125,7 @@ def _stage(repo, stage):
 def run_tests(stage, timeout=TEST_TIMEOUT):
     """(passed, last lines of output) for the suite run on the staged copy."""
     env = {**os.environ, "PYTHONPATH": str(stage)}
-    nice = ["nice", "-n", "10"] if os.name != "nt" and shutil.which("nice") else []
+    nice = ["nice", "-n", "10"] if not on_windows() and shutil.which("nice") else []
     try:
         out = subprocess.run([*nice, sys.executable, "-m", "unittest", "discover", "-s", "tests"],
                              cwd=stage, env=env, capture_output=True, text=True,
@@ -336,5 +344,5 @@ def guard(state, want, argv=None, systemd=False, repo=None, wait=GUARD_WAIT):
     flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
              | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     subprocess.Popen(command, close_fds=True,
-                     **({"creationflags": flags} if os.name == "nt" else {"start_new_session": True}))
+                     **({"creationflags": flags} if on_windows() else {"start_new_session": True}))
     return command

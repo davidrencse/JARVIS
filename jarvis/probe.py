@@ -13,7 +13,6 @@ A daemon that is up and holding its socket is not proof that input crosses the
 link; the result says "daemons up", not "working".
 """
 
-import os
 import re
 import shutil
 import socket
@@ -22,7 +21,7 @@ import threading
 import time
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 
 PORT = 4242
 REMOTE_SCRIPT = r"""
@@ -76,7 +75,7 @@ def tcp_ping(host, port=22, timeout=2.0):
 
 def probe_local():
     out = {"lan_mouse": {"running": False, "pid": None, "listening": False, "peers": []}}
-    if os.name != "nt":  # on the Arch laptop: the same script the Dell sends over SSH
+    if not on_windows():  # on the Arch laptop: the same script the Dell sends over SSH
         try:
             out.update(remote_summary(parse_kv(_run(["bash", "-s"], 15, input=REMOTE_SCRIPT).stdout)))
         except (OSError, subprocess.TimeoutExpired) as exc:

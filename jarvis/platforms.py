@@ -111,6 +111,19 @@ def label():
     return detect()["label"]
 
 
+def on_windows():
+    """Cheap OS test that reads os.name at call time (tests patch it); detect() is heavier."""
+    return os.name == "nt"
+
+
+def on_macos():
+    return sys.platform == "darwin"
+
+
+def on_linux():
+    return sys.platform.startswith("linux")
+
+
 def is_windows():
     return detect()["os"] == "windows"
 
@@ -131,17 +144,76 @@ def private_dir(path):
     return path
 
 
-def boot_time():
-    """When this computer last booted (Unix seconds), or None if it can't be read. Windows
-    derives it from the uptime counter, so expect a second or two of jitter between calls."""
+FILETIME_EPOCH = 116444736000000000  # 1601-01-01 to 1970-01-01, in 100 ns ticks
+
+
+def _windows_logon_time():
+    """Unix seconds when the console desktop session logged on, or None. Fixed for the whole
+    login: node-agent restarts (even from an SSH shell, whose own logon session is newer)
+    don't move it."""
+    import ctypes
+    from ctypes import wintypes
+
+    class WTSINFOW(ctypes.Structure):
+        _fields_ = [("State", ctypes.c_int), ("SessionId", wintypes.DWORD),
+                    ("IncomingBytes", wintypes.DWORD), ("OutgoingBytes", wintypes.DWORD),
+                    ("IncomingFrames", wintypes.DWORD), ("OutgoingFrames", wintypes.DWORD),
+                    ("IncomingCompressedBytes", wintypes.DWORD),
+                    ("OutgoingCompressedBytes", wintypes.DWORD),
+                    ("WinStationName", ctypes.c_wchar * 32), ("Domain", ctypes.c_wchar * 17),
+                    ("UserName", ctypes.c_wchar * 21), ("ConnectTime", ctypes.c_longlong),
+                    ("DisconnectTime", ctypes.c_longlong), ("LastInputTime", ctypes.c_longlong),
+                    ("LogonTime", ctypes.c_longlong), ("CurrentTime", ctypes.c_longlong)]
+
+    active = ctypes.windll.kernel32.WTSGetActiveConsoleSessionId
+    active.restype = wintypes.DWORD  # the default c_int would read "none" (0xFFFFFFFF) as -1
+    session = active()
+    if session == 0xFFFFFFFF:  # no one at the console
+        return None
+    wts = ctypes.windll.wtsapi32
+    buf, size = ctypes.c_void_p(), wintypes.DWORD()
+    if not wts.WTSQuerySessionInformationW(None, session, 24, ctypes.byref(buf), ctypes.byref(size)):
+        return None  # 24 = WTSSessionInfo
+    try:
+        if size.value < ctypes.sizeof(WTSINFOW):
+            return None
+        logon = WTSINFOW.from_address(buf.value).LogonTime
+    finally:
+        wts.WTSFreeMemory(buf)
+    return (logon - FILETIME_EPOCH) / 1e7 if logon > FILETIME_EPOCH else None
+
+
+def _windows_tick_boot():
+    import ctypes
     import time
+    tick = ctypes.windll.kernel32.GetTickCount64
+    tick.restype = ctypes.c_ulonglong  # the default c_int wraps after 24.9 days of uptime
+    return time.time() - tick() / 1000
+
+
+def _windows_boot(logon=None, ticks=None):
+    """Windows' "boot" is the console session's logon time. Fast Startup (on by default)
+    resumes a hibernated kernel after Shutdown, so the uptime counter keeps running and a
+    power-on never looked like a new boot (audit cluster-04). The uptime counter is the
+    fallback when no one is logged on at the console."""
+    for source in (logon or _windows_logon_time, ticks or _windows_tick_boot):
+        try:
+            value = source()
+        except (OSError, ValueError, AttributeError):
+            continue
+        if value:
+            return float(value)
+    return None
+
+
+def boot_time():
+    """When this computer last booted (Unix seconds), or None if it can't be read. On Windows
+    it is when the console session logged on (see _windows_boot): new for every sign-in after
+    a Shutdown or Restart, fixed for the rest of that login."""
     try:
         system = _os()
         if system == "windows":
-            import ctypes
-            tick = ctypes.windll.kernel32.GetTickCount64
-            tick.restype = ctypes.c_ulonglong  # the default c_int wraps after 24.9 days of uptime
-            return time.time() - tick() / 1000
+            return _windows_boot()
         if system == "macos":  # "{ sec = 1730000000, usec = 0 } Mon Nov ..."
             out = run_quiet(["sysctl", "-n", "kern.boottime"]).stdout
             return float(out.split("sec =", 1)[1].split(",", 1)[0])

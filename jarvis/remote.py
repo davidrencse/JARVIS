@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 
 # Never via http_proxy: the tunnel token is for loopback only.
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -102,7 +102,7 @@ def run_here(action, arg, tools=None, config=None, state=None):
     asked (the main): app_ui then sends always_ask clicks to his confirm queue."""
     if action not in ACTIONS:
         return False, f"Unknown desktop action {action}."
-    if os.name != "nt" and not (os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY")):
+    if not on_windows() and not (os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY")):
         os.environ.update(session_env())  # started over SSH: borrow the desktop session
     if action == "open_page":
         from .showcase import open_page
@@ -126,6 +126,19 @@ def run_here(action, arg, tools=None, config=None, state=None):
         from .sharedinput import run
         return run(arg)
     if action == "terminal":  # a shell command; risky ones were confirmed before they got here
+        # The hub's check ran on the main, with the main's paths; Windows nodes have no sandbox.
+        # Judged again here with this computer's own config and folder (audit 2026-11-04).
+        from .gates import hard_deny, local_config
+        try:
+            spec = json.loads(arg) if str(arg).lstrip().startswith("{") else {"command": arg}
+        except ValueError:
+            spec = {"command": arg}
+        spec = spec if isinstance(spec, dict) else {"command": arg}
+        refusal = hard_deny("terminal", {"command": str(spec.get("command") or ""),
+                                         **({"cwd": str(spec["cwd"])} if spec.get("cwd") else {})},
+                            config if config is not None else local_config())
+        if refusal:
+            return False, f"Refused on this computer: {refusal}"
         from .terminal import run
         return run(arg)
     if action == "lan_mouse":  # start / stop / status / pair this computer's Lan Mouse
