@@ -381,7 +381,7 @@ class VoiceWorkflowTests(Temp):
             return item
 
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: score[audio]
         stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
             audio, str) else "")
         stt.device = "cpu"
@@ -438,7 +438,7 @@ class VoiceWorkflowTests(Temp):
             return item
 
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: score[audio]
         stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
             audio, str) else "")
         stt.device = "cpu"
@@ -474,7 +474,7 @@ class VoiceWorkflowTests(Temp):
             return item
 
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: score[audio]
         stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
             audio, str) else "")
         stt.device = "cpu"
@@ -522,7 +522,7 @@ class VoiceWorkflowTests(Temp):
 
         clock = [1000.0]
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: score[audio]
         stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
             audio, str) else "")
         stt.device = "cpu"
@@ -557,7 +557,7 @@ class VoiceWorkflowTests(Temp):
             return dict(reply)
 
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: score[audio]
         stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
             audio, str) else "")
         stt.device = "cpu"
@@ -618,7 +618,7 @@ class VoiceWorkflowTests(Temp):
             return item
 
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: score[audio]
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: score[audio]
         stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(
             audio, str) else "")
         stt.device = "cpu"
@@ -632,6 +632,7 @@ class VoiceWorkflowTests(Temp):
                 patch("jarvis.speech.Voice", return_value=MagicMock(limit=350)), \
                 patch("jarvis.speech.SpeechQueue", return_value=MagicMock()), \
                 patch("jarvis.chatgpt.make_lane", return_value=brain), \
+                patch("jarvis.listen.open_mic", lambda *a, **k: MagicMock()), \
                 patch.object(daemon.time, "monotonic",
                              side_effect=lambda: next(clock, None) or real_monotonic()), \
                 patch.object(daemon, "foreground_priority"):
@@ -657,7 +658,7 @@ class VoiceWorkflowTests(Temp):
             return item
 
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: (True, 0.7)
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: (True, 0.7)
         stt = MagicMock(side_effect=lambda audio: heard.get(audio, "") if isinstance(audio, str) else "")
         stt.stats.return_value = None
         stt.device = "cpu"
@@ -708,7 +709,7 @@ class VoiceWorkflowTests(Temp):
         confidence = {}
 
         ears = MagicMock()
-        ears.verify.side_effect = lambda audio, threshold=None: (True, 0.7)
+        ears.verify.side_effect = lambda audio, threshold=None, learn=False: (True, 0.7)
         stt = MagicMock(side_effect=transcribe)
         stt.stats.side_effect = lambda audio: confidence.pop(audio, None)
         stt.device = "cpu"
