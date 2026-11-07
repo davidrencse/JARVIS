@@ -61,6 +61,14 @@ def _level(value):
         (not value.isdigit() or int(value) <= 100)
 
 
+def _sys(name):
+    """A sysintents validator, looked up when used (the module is imported lazily)."""
+    def check(value):
+        from . import sysintents
+        return getattr(sysintents, name)(value)
+    return check
+
+
 @dataclass(frozen=True)
 class Intent:
     name: str
@@ -90,6 +98,25 @@ INTENTS = {i.name: i for i in (
            "playback state matches", 3, escalate=True),
     Intent("volume", "direct", "allow", {"level": (_level, True)},
            "the volume reads back", 1),
+    # System intents (sysintents.py): typed, run directly outside the terminal sandbox.
+    Intent("brightness", "direct", "allow", {"level": (_sys("valid_level"), True)},
+           "the brightness reads back", 1),
+    Intent("screenshot", "direct", "allow",
+           {"path": (_text, False), "window": (lambda v: isinstance(v, bool), False)}, None, None),
+    Intent("system_status", "direct", "allow",
+           {"what": (lambda v: v in ("battery", "wifi", "bluetooth", "windows", "all"), False)},
+           None, None),
+    Intent("workspace", "direct", "allow", {"n": (_sys("valid_workspace"), True)}, None, None),
+    # pair and forget are security decisions: risk() makes them "confirm" (David's OK).
+    Intent("bluetooth", "direct", "allow",
+           {"action": (_sys("valid_bt_action"), True), "name": (_name, False),
+            "unnamed": (lambda v: isinstance(v, bool), False)}, None, None),
+    Intent("lock_screen", "direct", "allow", {}, None, None),
+    Intent("reminder", "direct", "allow",
+           {"minutes": (_sys("valid_minutes"), True), "text": (_text, False)}, None, None),
+    Intent("weather", "direct", "allow",
+           {"city": (_sys("valid_city"), False),
+            "day": (lambda v: v in ("today", "tomorrow"), False)}, None, None),
     # auto keeps scrolling a window on its own until "stop", the window closes or 30 min.
     Intent("scroll", "direct", "allow",
            {"direction": (lambda v: v in SCROLL_DIRECTIONS, False),
@@ -133,6 +160,8 @@ def risk(command):
     intent = get(command["intent"])
     if intent.name == "close_app" and command["args"]["name"].strip().lower() in SAFE_TO_CLOSE:
         return "allow"
+    if intent.name == "bluetooth" and command["args"].get("action") in ("pair", "forget"):
+        return "confirm"
     if intent.name == "terminal":
         from .terminal import read_only
         args = command["args"]

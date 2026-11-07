@@ -38,15 +38,19 @@ _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PRE_SESSION = re.compile(r"ssh: connect to host|Could not resolve hostname|kex_exchange_identification|"
                          r"banner exchange|Host key verification failed|Permission denied \(", re.I)
 
+# Typed system actions (sysintents.py); each takes a JSON spec.
+SYSTEM_ACTIONS = ("brightness", "screenshot", "system_status", "workspace", "lock_screen",
+                  "reminder", "weather", "bluetooth")
 ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media",
            "volume", "scroll", "browse", "observe", "input_info", "screen", "lan_mouse", "terminal", "clipboard",
-           "computer", "spotify", "app_ui")
+           "computer", "spotify", "app_ui", *SYSTEM_ACTIONS)
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
        "focus_window": "name", "close_app": "name", "media": "command", "volume": "level",
        "scroll": "spec", "browse": "spec", "observe": "predicate", "input_info": "query",
        "screen": "spec", "lan_mouse": "command", "terminal": "spec", "clipboard": "command",
-       "computer": "spec", "spotify": "spec", "app_ui": "spec"}
+       "computer": "spec", "spotify": "spec", "app_ui": "spec",
+       **{name: "spec" for name in SYSTEM_ACTIONS}}
 # Desktop variables an SSH shell has wrong or lacks; the desktop's own values win.
 SESSION_KEYS = ("DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY",
                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
@@ -141,6 +145,9 @@ def run_here(action, arg, tools=None, config=None, state=None):
             return False, f"Refused on this computer: {refusal}"
         from .terminal import run
         return run(arg)
+    if action in SYSTEM_ACTIONS:  # typed system intents (sysintents.py), run outside the sandbox
+        from .sysintents import run
+        return run(action, arg)
     if action == "lan_mouse":  # start / stop / status / pair this computer's Lan Mouse
         from .sharedinput import control
         return control(arg)

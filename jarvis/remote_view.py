@@ -986,7 +986,11 @@ class NodeSession:
         else:
             self._drop_marker()
             self._restore_lan_mouse()
-        if not self.hub_ended:  # tell the console why at once, not after NODE_IDLE of silence
+        newer = _ACTIVE.get(self.sid)
+        superseded = newer is not None and newer is not self and not newer._done
+        # tell the console why at once, not after NODE_IDLE of silence; but never for an id a
+        # redelivered start now drives: that end would kill the live session on the hub
+        if not self.hub_ended and not superseded:
             try:
                 self.client.request("/v1/remote/frame", {"session": self.sid, "end": self.why}, timeout=5)
             except Exception:

@@ -23,6 +23,17 @@ WEB = re.compile(
     r"e-?mails?|mail|outlook|calendar|grok(?:\s*bot)?|"
     r"(?:my|the) (?:dms?|messages|texts|orders?|notifications|subscriptions?|bank|bills?))\b",
     re.I)
+# What only Grok Bot's logged-in browser can do: David's mail/calendar/DMs/accounts, posting
+# or reading on social sites, school/work portals, or naming Grok. A bare URL, "website",
+# "browser" or a lookup is public-web work for the brain, which can fetch pages itself.
+ACCOUNT = re.compile(
+    r"\b(instagram|twitter|x\.com|tiktok|linkedin|reddit|facebook|discord|telegram|notion|"
+    r"canvas|brightspace|gmail|inbox|log ?in|sign ?in|my account|scan (?:my|the)|"
+    r"check (?:my|the) (?:dm|messages|feed|notifications)|e-?mails?|mail|outlook|calendar|"
+    r"grok(?:\s*bot)?|"
+    r"(?:my|the) (?:dms?|messages|texts|orders?|notifications|subscriptions?|bank|bills?))\b",
+    re.I)
+URL = re.compile(r"https?://\S+|\bwww\.\S+", re.I)
 # Integrations that can't take a task and hand an answer back.
 NO_REPLY = (None, "unconfigured")
 
@@ -50,12 +61,12 @@ def grok_first(text, config):
     """Grok Bot is the orchestrator for work that needs David's accounts or the web:
     such requests go straight to it instead of waiting on the brain to pick a tool.
     routing.orchestrator: "grokbot" (default) or "brain"; routing.grok_scope: "accounts"
-    (default: email, logged-in sites, the web, anything naming Grok) or "all"."""
+    (default: email, accounts, social sites, anything naming Grok; public pages stay with the brain) or "all"."""
     if not grok_available(config):
         return False
     if MY_BROWSER.search(text) and "chrome" in (config.get("actions", {}).get("browser_engines") or ()):
         return False  # he asked for his own browser: the brain drives it (actions "chrome" server)
-    return config.get("routing", {}).get("grok_scope", "accounts") == "all" or bool(WEB.search(text))
+    return config.get("routing", {}).get("grok_scope", "accounts") == "all" or bool(ACCOUNT.search(URL.sub(" ", text)))
 
 
 def grok_available(config):

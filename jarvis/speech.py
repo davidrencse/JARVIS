@@ -82,9 +82,26 @@ def spoken(text, limit):
     return out or text[:limit].rsplit(" ", 1)[0] + "…"
 
 
+NODE_MUTED = "muted: JARVIS only talks on the main PC"
+
+
+def may_speak(config):
+    """JARVIS talks out loud only on the main PC (David, 2026-11-07). A node stays silent:
+    its replies still show as text. voice.nodes_speak: true lets a node talk again.
+    A config that can't say which computer this is counts as the main (never mute the main)."""
+    if ((config or {}).get("voice") or {}).get("nodes_speak") is True:
+        return True
+    try:
+        from .topology import is_node
+        return not is_node(config or {})
+    except (ValueError, KeyError, TypeError):
+        return True
+
+
 class Voice:
     def __init__(self, state_dir, config=None):
         cfg = {**DEFAULTS, **(config or {}).get("voice", {})}
+        self.muted = not may_speak(config)
         self.engine = cfg["engine"]
         self.kokoro_voice, self.speed = cfg["kokoro_voice"], float(cfg["kokoro_speed"])
         self.state = state_dir
@@ -201,6 +218,8 @@ class Voice:
         return path, "elevenlabs"
 
     def say(self, text, play=True, wait=True):
+        if self.muted:  # a node: no synthesis (no ElevenLabs characters spent), no sound
+            return {"spoken": "", "source": NODE_MUTED}
         line = spoken(text, self.limit)
         if not line:
             return {"spoken": "", "source": "none"}
@@ -222,6 +241,8 @@ class SpeechQueue:
         threading.Thread(target=self._play, daemon=True).start()
 
     def put(self, text):
+        if getattr(self.voice, "muted", False):  # a node never talks
+            return
         line = spoken(text, 10_000)
         if line:
             self.texts.put(line)
