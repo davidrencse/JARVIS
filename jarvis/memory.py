@@ -78,6 +78,27 @@ def _jaccard(a, b):
     return len(a & b) / len(a | b) if a and b else 0.0
 
 
+_NEGATION = {"not", "no", "never", "none", "cannot", "without", "isn't", "doesn't", "don't",
+             "won't", "can't", "didn't", "wasn't", "aren't", "hasn't", "haven't", "nor"}
+_CALENDAR = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+             "january", "february", "march", "april", "june", "july", "august", "september",
+             "october", "november", "december", "tomorrow", "yesterday", "today", "am", "pm"}
+
+
+def _distinct(text):
+    """Tokens that change a fact's meaning though word overlap hides them: numbers, dates,
+    weekdays, months, negations and capitalised words past the first."""
+    text = str(text).replace("\u2019", "'")
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'-]*", text)
+    out = set()
+    for at, word in enumerate(words):
+        low = word.lower()
+        if (any(c.isdigit() for c in low) or low in _CALENDAR or low in _NEGATION
+                or low.endswith("n't") or (at and word[0].isupper() and low != "i")):
+            out.add(low)
+    return out
+
+
 def semantic_recall(config):
     """memory.semantic in jarvis.config.json: meaning-based recall for JARVIS's own answers.
     Off when unset, or without the local model: recall stays keyword-only."""
@@ -342,11 +363,17 @@ class Memory:
         if not text:
             raise ValueError("Memory body must be non-empty text.")
         terms = set(_terms(text))
-        target = None
+        target, stale = None, None
         for known in self.knowledge((kind,), limit=500):
             if known["id"] in replaces:  # being replaced, never merged into
                 continue
-            if known["id"] == same_as or _jaccard(terms, set(_terms(known["text"]))) >= RECALL_DUPLICATE:
+            if known["id"] == same_as:
+                target = known["id"]
+                break
+            if _jaccard(terms, set(_terms(known["text"]))) >= RECALL_DUPLICATE:
+                if _distinct(text) != _distinct(known["text"]):
+                    stale = stale or known["id"]  # same topic, changed detail: new one wins
+                    continue
                 target = known["id"]
                 break
         if target is not None:
@@ -364,7 +391,7 @@ class Memory:
                             importance=KNOWLEDGE_IMPORTANCE[kind], meta={"seen": 1},
                             links=[("from", dst) for dst in sources])
             state, item_id = "added", item["id"]
-        for old in replaces:
+        for old in (*replaces, *([stale] if stale and state == "added" else [])):
             if old != item_id:
                 self.retire(old, "replaced", by=item_id)
         return item_id, state
@@ -409,11 +436,22 @@ class Memory:
                  for row in reversed(rows) if row["id"] not in skip]
         return lines[-limit:]
 
-    def search(self, text="", kind=None, tag=None, since=None, limit=10, kinds=None):
+    def search(self, text="", kind=None, tag=None, since=None, limit=10, kinds=None,
+               min_importance=None, ids=None):
         """Ranked search. Empty text lists newest items matching the filters. kinds: any of
-        several kinds (kind is one)."""
+        several kinds (kind is one). min_importance and ids (only these item ids) filter in
+        SQL, before LIMIT, so a narrow filter still finds old matches."""
         limit = max(1, min(int(limit), 200))
         where, args = [], []
+        if ids is not None:
+            ids = list(ids)
+            if not ids:
+                return []
+            where.append(f"i.id IN ({','.join('?' * len(ids))})")
+            args.extend(ids)
+        if min_importance:
+            where.append("i.importance >= ?")
+            args.append(float(min_importance))
         if kind:
             where.append("i.kind=?")
             args.append(kind)
@@ -470,10 +508,14 @@ class Memory:
     def index_vectors(self, limit=500):
         """Embed up to `limit` items that have no vector yet (newest first). Returns how many."""
         from .embed import MODEL, embed
+        self.prune_vectors(MODEL)
+        marks = ",".join("?" * len(RETIRED_KINDS))
         with self.connect() as db:
             rows = db.execute("SELECT i.id, i.title, i.body FROM items i LEFT JOIN vectors v "
                               "ON v.id = i.id AND v.model = ? WHERE v.id IS NULL "
-                              "ORDER BY i.created_at DESC LIMIT ?", (MODEL, limit)).fetchall()
+                              f"AND i.kind NOT IN ({marks}) "
+                              "ORDER BY i.created_at DESC LIMIT ?",
+                              (MODEL, *RETIRED_KINDS, limit)).fetchall()
         if not rows:
             return 0
         vectors = embed([self._vector_text(r) for r in rows])
@@ -483,6 +525,20 @@ class Memory:
             db.executemany("INSERT OR REPLACE INTO vectors(id, model, vec) VALUES(?,?,?)",
                            [(r["id"], MODEL, v.tobytes()) for r, v in zip(rows, vectors)])
         return len(rows)
+
+    def prune_vectors(self, model):
+        """Drop derived vectors nothing can use: other models', and those of retired or
+        missing items. Memory items themselves are never touched. Returns rows deleted."""
+        marks = ",".join("?" * len(RETIRED_KINDS))
+        with self.connect() as db:
+            dropped = db.execute(
+                "DELETE FROM vectors WHERE model != ? OR id NOT IN (SELECT id FROM items) "
+                f"OR id IN (SELECT id FROM items WHERE kind IN ({marks}))",
+                (model, *RETIRED_KINDS)).rowcount
+        if dropped:  # the in-memory matrix may still hold them
+            with _VCACHE_LOCK:
+                _VCACHE.pop((str(self.path), model), None)
+        return dropped
 
     def warm_vectors(self):
         """Index everything not yet embedded, in a background thread (startup), so no
@@ -628,7 +684,9 @@ class Memory:
             fused[item["id"]] = 1 / (self.RRF_K + rank + 1)
         for rank, (item_id, cosine) in enumerate(meaning):
             fused[item_id] = fused.get(item_id, 0) + 1 / (self.RRF_K + rank + 1)
-            by_id[item_id]["similarity"] = round(cosine, 3)
+            if item_id in by_id:  # a cached vector can outlive its item
+                by_id[item_id]["similarity"] = round(cosine, 3)
+        fused = {i: v for i, v in fused.items() if i in by_id}
         now = _now()
         for item_id, score in fused.items():
             item = by_id[item_id]

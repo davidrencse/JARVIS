@@ -21,7 +21,7 @@ import ctypes
 import uuid
 from urllib.parse import urlsplit
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 from . import platforms
 
 KINDS = ("window", "title", "focused", "gone", "playback", "volume")
@@ -217,15 +217,25 @@ def _windows_hyprland():
     def query(*args):
         try:
             out = subprocess.run(["hyprctl", *args, "-j"], capture_output=True, text=True,
-                                 timeout=5).stdout
+                                 timeout=5)
         except subprocess.TimeoutExpired:
             raise LookupError("hyprctl timed out") from None
-        return json.loads(out or "null")
+        except OSError:
+            return None
+        if out.returncode or not out.stdout.strip():
+            return None  # a failed query is not "no windows"
+        try:
+            return json.loads(out.stdout)
+        except ValueError:
+            return None
 
+    clients = query("clients")
+    if not isinstance(clients, list):
+        return None  # the window list is unknown (callers: None = can't tell)
     active = (query("activewindow") or {}).get("address")
     return [{"app": f"{app_class(c.get('class'))} {app_class(c.get('initialClass'))}",
              "title": c.get("title", ""), "focused": c.get("address") == active}
-            for c in query("clients") or []]
+            for c in clients]
 
 
 def _run(*args, timeout=5):
@@ -236,7 +246,7 @@ def _run(*args, timeout=5):
 def backend():
     """Which desktop family to drive. A non-Windows os.name never maps to the Windows
     backend: it falls back to Hyprland, the original non-Windows behaviour."""
-    if os.name == "nt":
+    if on_windows():
         return "windows"
     desktop = platforms.detect()["desktop"]
     return "hyprland" if desktop == "windows" else desktop
@@ -261,10 +271,11 @@ def _windows_sway():
     if not shutil.which("swaymsg"):
         raise LookupError("window control needs swaymsg (sway)")
     try:
-        tree = json.loads(_run("swaymsg", "-t", "get_tree").stdout or "null")
-    except ValueError:
-        return []
-    return _sway_tree(tree, []) if isinstance(tree, dict) else []
+        out = _run("swaymsg", "-t", "get_tree")
+        tree = json.loads(out.stdout) if not out.returncode and out.stdout.strip() else None
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return None  # unreadable is not "no windows"
+    return _sway_tree(tree, []) if isinstance(tree, dict) else None
 
 
 def _windows_wmctrl():
@@ -275,8 +286,14 @@ def _windows_wmctrl():
         out = _run("xdotool", "getactivewindow")
         if not out.returncode and out.stdout.strip().isdigit():
             active = int(out.stdout.strip())
+    try:
+        listing = _run("wmctrl", "-lx")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listing.returncode:
+        return None  # wmctrl failed (no display?): not "no windows"
     found = []
-    for line in _run("wmctrl", "-lx").stdout.splitlines():
+    for line in listing.stdout.splitlines():
         parts = line.split(None, 4)  # id, desktop, class, host, title
         if len(parts) < 4 or not re.fullmatch(r"0x[0-9a-fA-F]+", parts[0]):
             continue
@@ -311,7 +328,13 @@ def _windows_macos():
 
 def window_details():
     """Windows with their ids for the non-Windows, non-Hyprland desktops (actions.py uses
-    the ids to focus and close). Raises LookupError when nothing can drive this desktop."""
+    the ids to focus and close). Raises LookupError when nothing can drive this desktop;
+    a listing that failed reads as empty here (observation uses _list_details: None)."""
+    found = _list_details()
+    return [] if found is None else found
+
+
+def _list_details():
     desktop = backend()
     if desktop == "sway":
         return _windows_sway()
@@ -323,13 +346,16 @@ def window_details():
 
 
 def windows():
+    """The open windows, or None when the listing failed (can't tell, not "none")."""
     desktop = backend()
     if desktop == "windows":
         return _windows_nt()
     if desktop == "hyprland":
         return _windows_hyprland()
-    return [{"app": w["app"], "title": w["title"], "focused": w["focused"]}
-            for w in window_details()]
+    found = _list_details()
+    if found is None:
+        return None
+    return [{"app": w["app"], "title": w["title"], "focused": w["focused"]} for w in found]
 
 
 # -- playback and master volume ----------------------------------------------------------
@@ -363,7 +389,7 @@ try {
 
 
 def playback():
-    if os.name == "nt":
+    if on_windows():
         return _playback_nt()
     if backend() == "macos":
         if not shutil.which("nowplaying-cli"):
@@ -412,7 +438,7 @@ def macos_volume():
 
 
 def volume_state():
-    if os.name != "nt":
+    if not on_windows():
         if backend() == "macos":
             percent, muted = macos_volume()
             return {"percent": percent, "muted": muted}
@@ -449,7 +475,7 @@ def core_audio(level=None, mute=None):
     """
     if level is not None and not 0.0 <= float(level) <= 1.0:
         raise ValueError("level must be between 0.0 and 1.0")
-    if os.name != "nt":
+    if not on_windows():
         raise LookupError("Core Audio volume is available only on Windows")
 
     class GUID(ctypes.Structure):
@@ -615,6 +641,8 @@ def _is_app(window, query):
 def matches(predicate, listed):
     """(match, app) for a predicate against a window list."""
     kind = predicate["kind"]
+    if listed is None and kind not in ("playback", "volume"):
+        return False, None  # the window list couldn't be read: no proof either way
     if kind == "playback":
         state = listed
         if not state:
@@ -635,7 +663,7 @@ def matches(predicate, listed):
             return state["muted"], None
         if level == "unmute":
             return not state["muted"], None
-        return True, None  # relative adjustments are confirmed by a successful readback
+        return True, None  # relative: check() also needs a change (or a bound), see _relative
     if kind == "title":
         text = predicate["text"].strip()
         titles = [(w, page_title(w["title"])) for w in listed if is_browser(w["app"])]
@@ -663,14 +691,21 @@ def wants_snapshot(predicate):
     media executor itself ("Already paused."), volume and "gone" are fine as they are."""
     kind = (predicate or {}).get("kind")
     return kind in ("window", "focused", "title") or (
-        kind == "playback" and predicate.get("command") in ("next", "previous"))
+        kind == "playback" and predicate.get("command") in ("next", "previous")) or (
+        kind == "volume" and predicate.get("level") in ("up", "down"))
 
 
 def fingerprint(predicate, listed):
     """An opaque digest of the state the predicate looks at, so "did it change?" can be
     asked without window titles or track names leaving the machine. None: nothing to compare."""
     kind = predicate["kind"]
-    if kind == "playback":
+    if listed is None and kind not in ("playback", "volume"):
+        return None
+    if kind == "volume":
+        if not listed or predicate.get("level") not in ("up", "down"):
+            return None
+        state = [listed.get("percent"), bool(listed.get("muted"))]
+    elif kind == "playback":
         if not listed or not listed.get("track"):
             return None  # no track identity: a skip can't be told apart from no skip
         state = [listed.get("status", ""), listed["track"]]
@@ -684,6 +719,20 @@ def fingerprint(predicate, listed):
     else:
         return None
     return hashlib.sha256(json.dumps(state).encode()).hexdigest()[:16]
+
+
+def _relative(predicate, listed, changed):
+    """Whether a match still has to be set aside as unverified. A relative volume step or a
+    skip only proves itself by changing the readback (volume at 0/100 can't), so a no-op
+    key press, or no earlier reading to compare, is "can't tell", never "worked"."""
+    kind, key = predicate["kind"], predicate.get("level") or predicate.get("command")
+    if kind == "volume" and key in ("up", "down"):
+        percent = (listed or {}).get("percent")
+        bound = percent is not None and percent >= 100 if key == "up" else percent == 0
+        return changed is not True and not bound
+    if kind == "playback" and key in ("next", "previous"):
+        return changed is not True
+    return False
 
 
 def _lister(predicate):
@@ -716,10 +765,15 @@ def check(predicate, settle, lister=None, clock=time.monotonic, sleep=time.sleep
         if before is not None:
             now = fingerprint(predicate, listed)
             changed = None if now is None else now != before
+        unverified = listed is None or (match and _relative(predicate, listed, changed))
+        if unverified:
+            match = False
         elapsed = clock() - start
         # An unchanged match gets a short grace for a late change, not the whole settle.
         if (match and (changed is not False or elapsed >= UNCHANGED_GRACE)) or elapsed >= settle:
             seen = {"match": match, "after_ms": round(elapsed * 1000), "app": app}
+            if unverified:
+                seen["unverified"] = True  # no proof either way: the caller leaves it "sent"
             return {**seen, "changed": changed} if before is not None else seen
         sleep(min(POLL, settle - elapsed))
 
@@ -734,7 +788,10 @@ def now():
     David chose not to send with every request (2026-10-31)."""
     apps, focused = [], None
     try:
-        for w in windows():
+        listed = windows()
+        if listed is None:
+            raise LookupError("window list unreadable")
+        for w in listed:
             words = list(dict.fromkeys(str(w.get("app") or "").split()))  # "kitty kitty" -> kitty
             app = " ".join(words)
             if app and app not in apps:

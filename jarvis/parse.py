@@ -300,14 +300,19 @@ def _parse(text, devices, origin, main, apps):
     if agent:
         commands = [_in_agent_browser(c) for c in commands]
     _assign_devices(commands, origin)
-    for prev, command in zip(commands, commands[1:]):
+    for i, command in enumerate(commands):
         # "close spotify then open spotify" must run in order; plain "and" only when both
-        # act on the same app. Either way only on one device: PCs run independently.
-        name = command["args"].get("name")
-        if command["device"] == prev["device"] \
-                and (command.get("then") or (name and name == prev["args"].get("name"))) \
-                and prev not in command.get("after", []):
-            command["after"] = [*command.get("after", []), prev]
+        # touch the same app, or both the sound (media/volume: "mute and unmute" ends in
+        # whatever finished last when parallel). Either way only on one device: PCs run
+        # independently. Depends on the latest earlier command it shares a resource with.
+        for prev in reversed(commands[:i]):
+            if command["device"] != prev["device"]:
+                continue
+            adjacent = prev is commands[i - 1]
+            if (command.get("then") and adjacent) or _shares(prev, command):
+                if prev not in command.get("after", []):
+                    command["after"] = [*command.get("after", []), prev]
+                break
     for n, command in enumerate(commands, 1):
         command["id"] = f"c{n}"
     ids = {id(c): c["id"] for c in commands}
@@ -315,6 +320,23 @@ def _parse(text, devices, origin, main, apps):
         command["depends_on"] = [ids[id(d)] for d in command.pop("after", [])]
     return [{k: c[k] for k in ("id", "intent", "device", "args", "depends_on")}
             for c in commands]  # "then" and "after" are working fields only
+
+
+AUDIO = ("media", "volume")
+APP_LIFECYCLE = ("open_app", "close_app")
+
+
+def _shares(prev, command):
+    """Whether two same-device commands touch the same thing: the same app, or both the
+    sound (media/volume). Playing media after opening/closing an app counts too: the
+    player is that app ("close spotify and play it")."""
+    name, other = command["args"].get("name"), prev["args"].get("name")
+    if name and name == other:
+        return True
+    if command["intent"] in AUDIO and prev["intent"] in AUDIO:
+        return True
+    return (command["intent"] == "media" and prev["intent"] in APP_LIFECYCLE) or \
+        (prev["intent"] == "media" and command["intent"] in APP_LIFECYCLE)
 
 
 def _in_agent_browser(command):

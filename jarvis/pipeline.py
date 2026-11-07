@@ -180,7 +180,7 @@ def run_commands(text, commands, config, state, step=None, origin=None, origin_c
             "origin_class": origin_class, "parse_ms": parse_ms, "history": history}
     result = _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
                        history, state=state, channel=channel, request=turn["request"],
-                       rule=gates.trusted_rules(config))
+                       rule=gates.trusted_rules(config, state))
     _record(turn, commands, result, started)
     return result
 
@@ -490,7 +490,7 @@ def _snapshot(command, remote):
 def _observe(command, remote, step, label, before=None):
     """observed / unchanged / unconfirmed from the acting machine's own check; {} when
     the effect can't be seen as a window, or the check itself couldn't run (stays
-    acknowledged). unchanged: the predicate holds but already did before the action.
+    acknowledged; also when the check could only say "unverified"). unchanged: the predicate holds but already did before the action.
     Never a retry: an unconfirmed action is reported, not repeated."""
     from . import registry
     from .observe import predicate_for
@@ -509,6 +509,9 @@ def _observe(command, remote, step, label, before=None):
         ok, seen = False, None
     if not isinstance(seen, dict) or "match" not in seen:
         step(f"obs:{command['id']}", f"run:{command['id']}", "Observe", "couldn't check", "fail")
+        return {}
+    if seen.get("unverified"):  # the screen couldn't prove it either way: stays acknowledged
+        step(f"obs:{command['id']}", f"run:{command['id']}", "Observe", "unverified", "fail")
         return {}
     state = ("unconfirmed" if not seen["match"] else
              "unchanged" if seen.get("changed") is False else "observed")

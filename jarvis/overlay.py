@@ -12,13 +12,14 @@ directory, so it never mixes with your normal browsing.
 
 import ctypes
 import os
+from .platforms import on_windows
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 
-if os.name == "nt":
+if on_windows():
     import ctypes.wintypes  # MSG, used by the message loop in Overlay.run
 
 TITLE = "JARVIS Overlay"
@@ -298,7 +299,7 @@ def free_port(start):
 
 
 def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=False):
-    if os.name != "nt":
+    if not on_windows():
         raise RuntimeError("The overlay is Windows-only; on Arch, bind a Hyprland key to "
                            "`jarvis app` instead.")
     from .ui import Console, ConsoleServer, Handler
@@ -358,7 +359,7 @@ def _startup_file():
 
 def autostart(state, enable, hotkey="alt+1"):
     """Start the overlay hidden at login, so the hotkey works all day."""
-    if os.name != "nt":
+    if not on_windows():
         raise RuntimeError("The overlay is Windows-only; on Arch, bind a Hyprland key to "
                            "`jarvis app` instead.")
     path = _startup_file()
