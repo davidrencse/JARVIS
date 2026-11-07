@@ -179,6 +179,17 @@ class BrokerBulkTests(unittest.TestCase):
         self.broker.compact(job)
         self.assertEqual(self.broker.get(job)["result"], {})
 
+    def test_result_after_a_timed_out_compact_is_not_held(self):
+        # Audit cluster-11: a late result re-created a ~MB entry nobody would read.
+        job = self.broker.enqueue("node", "main", "transfer", {"data": "x"})
+        self.broker.claim("node", {"transfer"})
+        self.broker.compact(job)  # the requester timed out; the row is still running (GRACE)
+        self.broker.finish(job, "node", {"data": "Y" * 100_000})
+        self.assertNotIn(job, self.broker._bulk)
+        self.assertEqual(self.broker.get(job)["state"], "done")
+        self.broker.finish(job, "node", {"data": "Y" * 100_000})  # a lost-ack repeat stays quiet
+        self.assertNotIn(job, self.broker._bulk)
+
     def test_queued_chunk_is_expired_not_replayed_after_a_hub_restart(self):
         job = self.broker.enqueue("node", "main", "transfer", {"data": "x"})
         restarted = Broker(self.broker.path.parent)

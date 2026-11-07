@@ -231,6 +231,37 @@ class InvestigationTests(Temp):
         with self.assertRaises(LookupError):
             self.c.export("nope")
 
+    def test_search_filters_before_the_limit(self):
+        # audit SU-2: filters ran after LIMIT, so chatter hid the few important items
+        facts = [self.c.memory.add("fact", f"fact {n}", importance=0.8)["id"] for n in range(2)]
+        case = self.c.create_case("Old case")
+        old = self.c.capture({"text": "early finding", "kind": "finding", "case": case["slug"]})
+        for n in range(220):
+            self.c.memory.add("message", f"chatter {n}", importance=0.4)
+        hits = self.c.search({"q": "", "limit": "60", "min_importance": "0.6"})
+        self.assertTrue(set(facts) <= {h["id"] for h in hits})
+        self.assertTrue(all(h["importance"] >= 0.6 for h in hits))
+        hits = self.c.search({"q": "", "limit": "60", "case": case["slug"]})
+        self.assertEqual({h["id"] for h in hits} - {case["id"]}, {old["id"]})
+        self.assertEqual(self.c.search({"q": "", "case": "nothing-here"}), [])
+
+    def test_send_file_stages_upload_under_state_not_tmp(self):
+        # audit SU-4: /tmp can be a RAM tmpfs; uploads go to <state>/uploads
+        import io
+        seen = {}
+
+        def fake_send(config, state, path, device, name):
+            seen["path"] = Path(path)
+            seen["data"] = Path(path).read_bytes()
+            return {"sent": name, "bytes": len(seen["data"])}
+        with patch("tempfile.tempdir", str(self.base / "no-such-tmp")), \
+                patch("jarvis.transfer.send_file", side_effect=fake_send):
+            result = self.c.send_file(io.BytesIO(b"hello"), 5, "a.txt")
+        self.assertEqual(result["bytes"], 5)
+        self.assertEqual(seen["data"], b"hello")
+        self.assertTrue(seen["path"].resolve().is_relative_to((self.base / "uploads").resolve()))
+        self.assertFalse(seen["path"].exists())  # cleaned up after sending
+
     def test_history_pairs_requests_with_replies(self):
         q = self.c.memory.add("message", "what day is it", tags=["inbound", "simple"])
         self.c.memory.add("reply", "Tuesday.", links=[("answers", q["id"])], meta={"task": "abc"})
@@ -289,6 +320,44 @@ class ListenTests(Temp):
         self.assertEqual((r["text"], r["listener"], r["addressed"]), ("", True, True))
         r = self.hear("open up Spotify.", wake=False, listener=4242)  # push-to-talk only
         self.assertEqual(r["text"], "open up Spotify.")
+
+    def test_parakeet_variant_counts_as_addressed(self):
+        r = self.hear("Jovers, what time is it", wake=True)  # listen.wake: Parakeet's "Jarvis"
+        self.assertEqual((r["text"], r["addressed"]), ("what time is it", True))
+
+
+class SpeakerCheckOffTests(Temp):
+    """voice.speaker_check: false with a voiceprint on disk: it is never consulted."""
+    hear = ListenTests.hear
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import numpy
+        except ImportError:
+            self.skipTest("needs the [voice] extra: pip install numpy")
+        self.c = Console(CONFIG, ROOT, self.base)
+        self.c._ears, self.c._stt = MagicMock(), MagicMock(device="cpu")
+        self.clip = numpy.zeros(16000, dtype="<f4").tobytes()
+        self.c.config = {**self.c.config, "voice": {**(self.c.config.get("voice") or {}),
+                                                    "speaker_check": False}}
+        (self.base / "voice").mkdir(parents=True, exist_ok=True)
+        (self.base / "voice" / "voiceprint.json").write_text("{}")
+        self.c._ears.verify.side_effect = AssertionError("verify must not run with the check off")
+
+    def test_always_on_needs_jarvis_and_never_verifies(self):
+        r = self.hear("Good. Thank you.", wake=True)
+        self.assertEqual((r["text"], r["owner"], r["addressed"]), ("", False, False))
+        r = self.hear("Jarvis, open Spotify", wake=True)
+        self.assertEqual((r["text"], r["addressed"]), ("open Spotify", True))
+        self.c._ears.verify.assert_not_called()
+
+    def test_push_to_talk_still_returns_the_transcript(self):
+        # Differs from the listener (daemon), where the check off means every request needs
+        # "Jarvis": here a key press is deliberate, so the words stand without it.
+        r = self.hear("open up Spotify.", wake=False)
+        self.assertEqual((r["text"], r["owner"], r["addressed"]), ("open up Spotify.", False, False))
+        self.c._ears.verify.assert_not_called()
 
 
 class HttpTests(Temp):
