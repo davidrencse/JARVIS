@@ -122,11 +122,11 @@ class History:
                 "ago": round(now - row["at"])}
 
     def repeats(self, command, origin_class, now=None, window=H3_WINDOW):
-        """H3: how many times this command ran from this origin class within `window`."""
+        """H3: how many times this command actually ran (blocked, not_sent rows excluded) from this origin class within `window`."""
         now = time.time() if now is None else now
         with self.connect() as db:
             return db.execute("SELECT COUNT(*) FROM commands WHERE key=? AND origin_class=? "
-                              "AND at>=?", (command_key(command), origin_class,
+                              "AND at>=? AND state != 'not_sent'", (command_key(command), origin_class,
                                             now - window)).fetchone()[0]
 
     def check(self, command, origin_class="owner", now=None):

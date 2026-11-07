@@ -54,10 +54,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 
 HOME = Path.home()
-WINDOWS = os.name == "nt"
+WINDOWS = on_windows()
 DATA = HOME / ".grokbot"
 APP_PATHS = ("grok-bot", str(HOME / "Desktop/grok-bot-local/opt/Grok Bot/grok-bot"),
              "/opt/Grok Bot/grok-bot")
