@@ -171,12 +171,19 @@ def _check(state, action, spec, config):
         described = f"{known['role']} {known['name']}"
         if action == "type":  # typing adds to what is there: check the pieces together
             text = _typed_before(known) + text
+        terminal = TERMINAL_APP.search(f"{known['app']} {known['role']}")
+        if terminal and len(text.rsplit("\n", 1)[-1]) > TYPED_MAX:  # never checked in part
+            raise Refused(f"That line would pass {TYPED_MAX} characters; JARVIS can't check it. "
+                          "Clear the line first.")
         refusal = blocked("browser_type", {"text": text, "element": described})
         if not refusal and re.fullmatch(r"\s*\d(?:[\s-]?\d){3,7}\s*", text):
             refusal = "JARVIS never types one-time codes or PINs"
-        if not refusal and TERMINAL_APP.search(f"{known['app']} {known['role']}"):
-            from .gates import hard_deny  # a terminal runs what is typed; elsewhere it is prose
-            refusal = hard_deny("terminal", {"command": text, "cwd": "/tmp"}, {})
+        if not refusal and terminal:  # a terminal runs what is typed; elsewhere it is prose
+            # This computer's config (vault paths) and home, where a terminal opens: that
+            # terminal has no sandbox (audit 2026-11-04: cwd /tmp and {} let vault deletes by).
+            from .gates import hard_deny, local_config
+            refusal = hard_deny("terminal", {"command": text, "cwd": os.path.expanduser("~")},
+                                config if config else local_config())
         if refusal:
             raise Refused(refusal)
     with _LOCK:
@@ -198,6 +205,8 @@ def _typed_before(known):
     """What was typed into this element since its last newline, if within TYPED_TTL."""
     with _LOCK:
         text, at = _STATE["typed"].get(_target(known), ("", 0.0))
+    if TERMINAL_APP.search(f"{known['app']} {known['role']}"):
+        return text  # a shell line waits for Enter however long the pause
     return text if time.time() - at <= TYPED_TTL else ""
 
 

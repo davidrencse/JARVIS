@@ -61,7 +61,7 @@ def main():
     cb.add_argument("value", nargs="?", help="autostart: on|off")
     cb.add_argument("--device", help="the other laptop (default: every peer)")
     lm = sub.add_parser("lanmouse", help="Lan Mouse: start/stop, pairing, fingerprints, config")
-    lm.add_argument("action", choices=("start", "stop", "status", "pair", "fingerprint", "config", "guard", "nearby"))
+    lm.add_argument("action", choices=("start", "stop", "status", "pair", "fingerprint", "config", "guard", "nearby", "elevate", "unelevate"))
     lm.add_argument("--device", default="local",
                     help="start/stop/status/fingerprint: which computer (default: this one); pair: the peer")
     lm.add_argument("--peer-name", help="config: the other laptop's hostname")
@@ -307,6 +307,8 @@ def main():
                     raise ValueError("Usage: jarvis lanmouse pair --device PEER --position left|right|top|bottom "
                                      "(the side of this screen the peer sits on)")
                 emit(sharedinput.pair(config, args.state, remote.resolve(args.device), args.position, remote))
+            elif args.action in ("elevate", "unelevate"):  # this computer only, from an admin terminal
+                emit(getattr(sharedinput, args.action)(args.state))
             elif args.action == "nearby":  # read-only: are the laptops together?
                 emit(sharedinput.peer_nearby())
             elif args.action == "guard":  # one reading; the IP watcher runs it every 30 s

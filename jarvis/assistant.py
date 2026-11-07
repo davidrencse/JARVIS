@@ -253,7 +253,7 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                              if "usage limit" in str(exc).lower() else
                              "That answer was cut off partway through. "
                              "Ask again if you need the rest.")
-                elif "usage limit" in str(exc).lower() and \
+                elif _is_limit(exc) and \
                         routing.get("simple_provider", "claude") == "claude":
                     reply = _standin_reply(text, recalled(), config, base, timeout,
                                            on_sentence, step, detail)
@@ -416,6 +416,11 @@ def _run_waiting(store, spec, config, base, timeout, wait=None):
             raise
 
 
+def _is_limit(exc):
+    from .inference import is_limit
+    return is_limit(exc)
+
+
 def _fastlane(config, base, timeout):
     from .inference import claude_lane, role
     return claude_lane(config, base, "talk", timeout=min(timeout, role(config, "talk")["timeout"]))
@@ -424,44 +429,48 @@ def _fastlane(config, base, timeout):
 # While ChatGPT is over its plan's usage limit (hours, sometimes days), every request used to
 # fall back to a fresh `claude --print` run: ~4 s of cold start each. One warm Claude lane
 # stands in instead, and is closed again as soon as ChatGPT answers.
-_STANDIN = {"lane": None, "lock": __import__("threading").Lock()}
+_STANDIN = {"lane": None, "users": 0, "retire": False, "lock": __import__("threading").Lock()}
+
+
+def _standin_take():
+    """The lane to close now, or None: a lane that requests are still using is only marked
+    for retirement; the last one out closes it. Called with _STANDIN["lock"] held."""
+    if _STANDIN["users"] > 0:
+        _STANDIN["retire"] = True
+        return None
+    lane, _STANDIN["lane"], _STANDIN["retire"] = _STANDIN["lane"], None, False
+    return lane
 
 
 def _standin_reply(text, recall, config, base, timeout, on_sentence, step, detail):
     """The warm Claude lane's answer, or None to fall back to a ledger run."""
     with _STANDIN["lock"]:
         lane = _STANDIN["lane"] = _STANDIN["lane"] or _fastlane(config, base, timeout)
-    step("standin", "route", "Claude fast lane", "ChatGPT is over its usage limit", "run")
+        _STANDIN["users"] += 1  # while counted, _standin_done cannot close it under the ask
     try:
-        reply = lane.ask(text, recall, on_sentence=on_sentence)
-    except (RuntimeError, LookupError, TypeError, ValueError, OSError) as exc:
-        detail["lane_error"] = f"{detail.get('lane_error', '')} {exc}".strip()
-        step("standin", "route", "Claude fast lane", str(exc), "fail")
-        return None
-    detail.update(lane="FastLane", brain="claude", streamed=on_sentence is not None)
-    step("standin", "route", "Claude fast lane", "answered")
-    return reply
+        step("standin", "route", "Claude fast lane", "ChatGPT is over its usage limit", "run")
+        try:
+            reply = lane.ask(text, recall, on_sentence=on_sentence)
+        except (RuntimeError, LookupError, TypeError, ValueError, OSError) as exc:
+            detail["lane_error"] = f"{detail.get('lane_error', '')} {exc}".strip()
+            step("standin", "route", "Claude fast lane", str(exc), "fail")
+            return None
+        detail.update(lane="FastLane", brain="claude", streamed=on_sentence is not None)
+        step("standin", "route", "Claude fast lane", "answered")
+        return reply
+    finally:
+        with _STANDIN["lock"]:
+            _STANDIN["users"] -= 1
+            stale = _standin_take() if _STANDIN["retire"] else None
+        if stale is not None:
+            stale.close()
 
 
 def _standin_done():
     with _STANDIN["lock"]:
-        lane, _STANDIN["lane"] = _STANDIN["lane"], None
-    if lane is None:
-        return
-    lock = getattr(lane, "lock", None)
-    if lock is not None and not lock.acquire(blocking=False):
-        # Mid-turn on another request: closing now would cut its answer. Park it again so
-        # the next _standin_done closes it.
-        with _STANDIN["lock"]:
-            if _STANDIN["lane"] is None:
-                _STANDIN["lane"] = lane
-                return
-        lock = None  # a newer stand-in took the slot: this one is orphaned, close it below
-    try:
+        lane = _standin_take()
+    if lane is not None:
         lane.close()
-    finally:
-        if lock is not None:
-            lock.release()
 
 
 def _direct_reply(provider, text, recall, config, base, timeout, detail):
@@ -497,7 +506,11 @@ def _partial_reply(tool_log):
             "finishing. Check the result before asking again, so nothing runs twice.")
 
 
-LOGGED_OUT = ("not logged in", "please run /login", "invalid api key", "authentication")
+# Known Claude CLI sign-in errors only. A bare "authentication" matched ordinary answers
+# ("Two-factor authentication adds...").
+LOGGED_OUT = ("not logged in", "please run /login", "invalid api key", "authentication failed",
+              "authentication_error", "failed to authenticate", "oauth token has expired")
+ERROR_REPLY_MAX = 200  # a CLI error line is short; a real answer that long is never one
 
 
 def _failover_reply(reply, detail, provider):
@@ -505,7 +518,11 @@ def _failover_reply(reply, detail, provider):
     instead of reading out a CLI's error. Otherwise the reply as it came."""
     why = detail.get("lane_error") or ""
     text = (reply or "").strip()
-    if provider == "claude" and any(m in text.lower() for m in LOGGED_OUT):
+    # The error is the lane's own error text, or a short reply from a run that didn't finish
+    # (the ledger returns the CLI's error as the answer). Never a finished run's answer.
+    as_error = text if len(text) <= ERROR_REPLY_MAX and detail.get("state") != "finished" else ""
+    seen = f"{why} {as_error}".lower()
+    if provider == "claude" and any(m in seen for m in LOGGED_OUT):
         from .chatgpt import usage_limit
         until = usage_limit()  # "until 8:00 PM", parsed when the refusal came in
         first = (f"ChatGPT is over its plan's usage limit{' ' + until if until else ''}"
@@ -782,8 +799,36 @@ def _orchestrated(text, config, base, memory, lane, step, recalled, on_sentence,
     detail.update(lane="orchestrator", steps=out["steps"], levels=out["levels"], l3_left=out["l3_left"],
                   streamed=on_sentence is not None)
     if on_sentence and out["reply"]:
-        on_sentence(out["reply"])
+        for sentence in _spoken_lead(out["reply"]):
+            on_sentence(sentence)
     return out["reply"]
+
+
+_NOT_SPOKEN = re.compile(r"^\s*(\||[-*+]\s|\d+[.)]\s|#|>|```|https?://)")
+
+
+def _spoken_lead(reply):
+    """The sentences of an orchestrated reply to say aloud: the lead before its first blank
+    line or table/list/heading/link line (COMBINER puts a table or links after the spoken
+    part). One sentence per call, so the voice budget (voice.max_spoken_chars) applies to
+    each. The full reply still goes to the transcript and memory."""
+    from .fastlane import SENTENCE_END
+    lead = []
+    for line in str(reply).splitlines():
+        if not line.strip():
+            if lead:
+                break
+            continue
+        if _NOT_SPOKEN.match(line):
+            break
+        lead.append(line.strip())
+    text, out = " ".join(lead), []
+    while (match := SENTENCE_END.match(text)):
+        out.append(match.group(1).strip())
+        text = text[match.end():]
+    if text.strip():
+        out.append(text.strip())
+    return [s for s in out if s] or ["The answer is on screen."]  # it opened with a table
 
 
 def _stepper(on_step):

@@ -40,7 +40,7 @@ import time
 import threading
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 from . import platforms
 from .showcase import PAGES
 
@@ -360,7 +360,7 @@ class DesktopTools:
     # -- apps ------------------------------------------------------------------------
     def apps(self):
         if not self._apps or time.time() - self._loaded > self.cache_seconds:
-            if os.name != "nt":
+            if not on_windows():
                 self._apps = macos_apps() if _backend() == "macos" else desktop_entries()
                 self._loaded = time.time()
                 return self._apps
@@ -394,8 +394,23 @@ class DesktopTools:
             return 9
 
         hits = sorted((a for a in apps if rank(a) < 9), key=rank)
+        if not hits or rank(hits[0]) > 0:
+            # The names the observer knows it by (discord -> Vesktop, calculator -> KCalc), by app
+            # name or a piece of its desktop-entry ID, ahead of loose name hits: "Calculator"
+            # must not pick "KiCad PCB Calculator" when KCalc is installed (audit 2026-11-07).
+            from .observe import _flat, app_ids
+            alternates = app_ids(query)[1:]
+            known = [a for a in apps if alternates and (
+                _flat(a["Name"]) in alternates
+                or any(_flat(piece) in alternates
+                       for piece in re.split(r"[.\\/!_\s-]+", str(a.get("AppID", "")))
+                       if piece and piece.lower() != "desktop"))]
+            hits = known + [a for a in hits if a not in known]
         if not hits:
-            hits = [names[n] for n in difflib.get_close_matches(query, names, n=limit, cutoff=0.6)]
+            # Typos only ("spotfy"): a loose 0.6 cutoff opened Discover for "discord" and
+            # Telegram for "steam"; an unknown app is "not installed", not a near neighbour.
+            hits = [names[n] for n in difflib.get_close_matches(query, names, n=limit, cutoff=0.85)
+                    if n[:3] == query[:3]]
         return hits[:limit]
 
     def open_app(self, name):
@@ -405,7 +420,7 @@ class DesktopTools:
         app = hits[0]
         if not re.fullmatch(r"[\w .{}\\:!~()+\-]+", app["AppID"]):
             return False, "Refusing an app ID with unexpected characters."
-        if os.name != "nt":
+        if not on_windows():
             if _backend() == "macos":
                 return _macos_open(["-a", app["AppID"]], f"Opened {app['Name']}.", app["AppID"])
             return launch_desktop_entry(app)
@@ -417,7 +432,7 @@ class DesktopTools:
         if url.startswith("spotify:"):
             if not re.fullmatch(r"spotify:(?:collection:tracks|(?:playlist|album|track|artist):[A-Za-z0-9]{1,64})", url):
                 return False, "Invalid Spotify deep link."
-            if os.name == "nt":
+            if on_windows():
                 out = _run("cmd.exe", "/c", "start", "", url)
             elif _backend() == "macos":
                 out = _run("open", url)
@@ -427,7 +442,7 @@ class DesktopTools:
                 return False, out.stderr.strip() or "Couldn't open Spotify."
             # URI activation is asynchronous. Wait only while Spotify is starting;
             # do not assume a fixed delay means the requested context is playing.
-            if os.name == "nt":
+            if on_windows():
                 _wait_for_spotify()
             return True, "Opened Spotify."
         if not re.fullmatch(r"https?://[^\s\"'<>]+", url):
@@ -436,7 +451,7 @@ class DesktopTools:
             else:
                 return False, "Only http(s) links can be opened."
         if browser:
-            if os.name != "nt":
+            if not on_windows():
                 hits = self.match(browser)
                 if not hits:
                     return False, f"No installed browser matches {browser!r}."
@@ -645,7 +660,7 @@ def _flat(text):
 def _backend():
     """The desktop family driving this machine: windows, hyprland, sway, x11, gnome, kde,
     macos, wayland or none. A non-Windows os.name never means the Windows backend."""
-    if os.name == "nt":
+    if on_windows():
         return "windows"
     desktop = platforms.detect()["desktop"]
     return "hyprland" if desktop == "windows" else desktop
@@ -656,7 +671,7 @@ def open_windows():
     container id, an X11 window id or (macOS) the app name. On Windows, Store apps are
     named by their own process ("ApplicationFrameHost CalculatorApp") and the shell's
     desktop and taskbar windows are never listed."""
-    if os.name == "nt":
+    if on_windows():
         from .observe import _windows_nt
         return _windows_nt()
     if _backend() != "hyprland":
@@ -671,7 +686,7 @@ def open_windows():
 
 
 def _close(window):
-    if os.name == "nt":
+    if on_windows():
         import ctypes
         return bool(ctypes.windll.user32.PostMessageW(window["id"], 0x0010, 0, 0))  # WM_CLOSE
     backend = _backend()
@@ -754,7 +769,7 @@ def _focused_now(window, wait=FOCUS_WAIT, clock=time.monotonic, sleep=time.sleep
 
 def raise_window(window):
     """Focus one window from open_windows(); True if the desktop accepted it."""
-    if os.name == "nt":
+    if on_windows():
         import ctypes
         user32 = ctypes.windll.user32
         if user32.IsIconic(window["id"]):
@@ -874,7 +889,7 @@ def media(command):
     command = command.strip().lower().replace("-", "_").replace(" ", "_")
     if command not in MEDIA:
         return False, f"Media commands: {', '.join(MEDIA)}."
-    if os.name == "nt":
+    if on_windows():
         if command in ("play", "pause"):
             state = _windows_media_state()
             status = str((state or {}).get("status") or "").lower()
@@ -1010,7 +1025,7 @@ def volume(level):
     level = {"louder": "up", "higher": "up", "quieter": "down", "lower": "down"}.get(level, level)
     if not (level in ("up", "down", "mute", "unmute") or (level.isdigit() and int(level) <= 100)):
         return False, "Volume takes up, down, mute, unmute or a level from 0 to 100."
-    if os.name == "nt":
+    if on_windows():
         try:
             return _volume_core_audio(level)
         except (LookupError, OSError, ValueError):
@@ -1202,7 +1217,7 @@ def spotify(spec):
     else:
         return False, "spotify action must be play or search."
     backend = _backend()
-    if os.name == "nt":
+    if on_windows():
         out = _run("cmd.exe", "/c", "start", "", uri)
         return (out.returncode == 0, "Opened it in Spotify (on Windows it may need a click on Play)."
                 if out.returncode == 0 else out.stderr.strip() or "Couldn't open Spotify.")
@@ -1296,13 +1311,72 @@ def scroll(spec):
     return True, f"Scrolled {direction}."
 
 
-BROWSER_BLOCKED = {"browser_file_upload", "browser_drop", "browser_run_code_unsafe",
-                   "browser_evaluate"}
+# Playwright MCP tools JARVIS lets the model call (@playwright/mcp 0.0.83, every capability
+# listed). Anything else, including names a later version adds, is refused (audit 2026-11-04:
+# browser_webmcp_call ran page-registered tools like send_email unasked). Reading, waiting
+# and navigating run unasked; the interactive ones go through browser_gate.
+BROWSER_ALLOWED = {
+    # read-only
+    "browser_snapshot", "browser_find", "browser_take_screenshot", "browser_console_messages",
+    "browser_network_requests", "browser_wait_for", "browser_generate_locator",
+    "browser_get_config", "browser_webmcp_list", "browser_verify_element_visible",
+    "browser_verify_text_visible", "browser_verify_list_visible", "browser_verify_value",
+    # navigation and the window
+    "browser_navigate", "browser_navigate_back", "browser_navigate_forward", "browser_reload",
+    "browser_tabs", "browser_close", "browser_resize", "browser_emulate_media",
+    # interactive: browser_gate judges each call
+    "browser_click", "browser_hover", "browser_drag", "browser_select_option", "browser_check",
+    "browser_uncheck", "browser_type", "browser_fill_form", "browser_press_key",
+    "browser_press_sequentially", "browser_keydown", "browser_keyup", "browser_handle_dialog"}
+BROWSER_BLOCKED = {
+    "browser_file_upload", "browser_drop", "browser_run_code_unsafe", "browser_evaluate",
+    # tools the page itself registered (send_email, checkout...): nothing to judge
+    "browser_webmcp_call",
+    # request details carry auth headers and cookies a page could have read back out
+    "browser_network_request",
+    # blind coordinate input: no element, so no label to judge
+    "browser_mouse_click_xy", "browser_mouse_down", "browser_mouse_up", "browser_mouse_move_xy",
+    "browser_mouse_drag_xy", "browser_mouse_wheel",
+    # cookies, storage and saved sign-ins
+    "browser_cookie_list", "browser_cookie_get", "browser_cookie_set", "browser_cookie_delete",
+    "browser_cookie_clear", "browser_storage_state", "browser_set_storage_state",
+    "browser_localstorage_list", "browser_localstorage_get", "browser_localstorage_set",
+    "browser_localstorage_delete", "browser_localstorage_clear", "browser_sessionstorage_list",
+    "browser_sessionstorage_get", "browser_sessionstorage_set", "browser_sessionstorage_delete",
+    "browser_sessionstorage_clear",
+    # network rewriting
+    "browser_route", "browser_route_list", "browser_unroute", "browser_network_state_set",
+    "browser_network_clear",
+    # devtools, files written to disk
+    "browser_pdf_save", "browser_resume", "browser_highlight", "browser_hide_highlight",
+    "browser_annotate", "browser_console_clear", "browser_start_recording",
+    "browser_stop_recording", "browser_start_tracing", "browser_stop_tracing",
+    "browser_start_video", "browser_stop_video", "browser_video_chapter",
+    "browser_video_show_actions", "browser_video_hide_actions"}
 # Playwright tool arguments that name files: uploads read them, and `filename`/output paths
 # are written relative to the CLI's cwd (the repo), so a page could steer an overwrite.
 PLAYWRIGHT_BLOCKED_ARGS = {"filename", "path", "paths", "file", "files", "filepath", "outputpath",
                            "outputdir", "output_dir", "outputfile", "savepath", "downloadpath"}
-AGENT_BROWSER_BLOCKED = {"agent_browser_eval"}
+# agent-browser 0.39.1 `--tools core`, minus eval. Every other agent_browser_* name (webmcp
+# invoke, cookies, keyboard, mouse, dialogs...) is refused even if a profile exposes it.
+AGENT_BROWSER_ALLOWED = {
+    "agent_browser_tools_profiles", "agent_browser_open", "agent_browser_read",
+    "agent_browser_snapshot", "agent_browser_back", "agent_browser_forward",
+    "agent_browser_reload", "agent_browser_click", "agent_browser_fill", "agent_browser_type",
+    "agent_browser_press", "agent_browser_check", "agent_browser_uncheck",
+    "agent_browser_select", "agent_browser_scroll", "agent_browser_wait_ms",
+    "agent_browser_wait_for_selector", "agent_browser_wait_for_text",
+    "agent_browser_wait_for_load", "agent_browser_screenshot", "agent_browser_get_text",
+    "agent_browser_get_url", "agent_browser_get_title", "agent_browser_tab_new",
+    "agent_browser_tab_list", "agent_browser_tab_switch", "agent_browser_tab_close",
+    "agent_browser_close"}
+AGENT_BROWSER_BLOCKED = {"agent_browser_eval", "agent_browser_webmcp_invoke",
+                         "agent_browser_batch", "agent_browser_dialog_accept",
+                         "agent_browser_keyboard_type", "agent_browser_keyboard_insert_text",
+                         "agent_browser_upload", "agent_browser_cookies_get",
+                         "agent_browser_cookies_set", "agent_browser_storage_get",
+                         "agent_browser_storage_set", "agent_browser_auth_login",
+                         "agent_browser_state_load", "agent_browser_set_credentials"}
 # agent-browser tool arguments that become CLI flags: raw extra flags, other sessions or
 # saved states, TLS trust, JS checks, and screenshot files written to disk.
 AGENT_BROWSER_BLOCKED_ARGS = {"extraArgs", "namespace", "session", "restore", "restoreSave",
@@ -1413,13 +1487,13 @@ def approve_browser(params):
     if not isinstance(args, dict):
         return False, "the tool arguments are not readable"
     if server in ("playwright", "chrome"):
-        if not tool.startswith("browser_") or tool in BROWSER_BLOCKED:
+        if tool not in BROWSER_ALLOWED or tool in BROWSER_BLOCKED:  # unknown names fail closed
             return False, f"{tool or 'unknown tool'} is not allowed"
         bad = _file_args(args)
         if bad:
             return False, f"argument {bad} is not allowed"
     elif server == "agent_browser":
-        if not tool.startswith("agent_browser_") or tool in AGENT_BROWSER_BLOCKED:
+        if tool not in AGENT_BROWSER_ALLOWED or tool in AGENT_BROWSER_BLOCKED:
             return False, f"{tool or 'unknown tool'} is not allowed"
         bad = sorted(AGENT_BROWSER_BLOCKED_ARGS & set(args))
         if bad:

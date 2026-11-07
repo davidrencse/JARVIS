@@ -26,7 +26,7 @@ import threading
 import time
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 
 PACKAGE = "agent-browser"
 VERSION = "0.39.1"  # pinned with actions.AGENT_BROWSER
@@ -66,7 +66,7 @@ _SOURCE_SEEN = {}
 def source_build():
     """The source-built CLI's path when it exists and reports VERSION, else None."""
     root = Path(os.environ.get(SOURCE_ENV) or Path.home() / "projects" / PACKAGE).expanduser()
-    exe = root / "cli" / "target" / "release" / (PACKAGE + (".exe" if os.name == "nt" else ""))
+    exe = root / "cli" / "target" / "release" / (PACKAGE + (".exe" if on_windows() else ""))
     if not exe.is_file():
         return None
     key = (str(exe), exe.stat().st_mtime)
@@ -101,7 +101,7 @@ def binary():
             except (OSError, ValueError):
                 continue
             bins = package.parents[1] / ".bin"
-            for name in (PACKAGE + ".cmd", PACKAGE) if os.name == "nt" else (PACKAGE,):
+            for name in (PACKAGE + ".cmd", PACKAGE) if on_windows() else (PACKAGE,):
                 if (bins / name).is_file():
                     return [str(bins / name)]
     npx = shutil.which("npx")
