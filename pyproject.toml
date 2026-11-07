@@ -16,7 +16,7 @@ dependencies = ["Pillow>=12.3.0", "onnxruntime>=1.23", "tokenizers>=0.23,<0.24",
 # Pinned to the set running on the Arch main (.venv, Python 3.14). numpy stays a range:
 # its newest wheels drop older Pythons (uv.lock resolves 2.2.6 on 3.10).
 voice = ["numpy>=2.2", "sounddevice==0.5.6", "faster-whisper==1.2.1", "sherpa-onnx==2.0.1",
-         "kokoro-onnx==0.6.1"]
+         "kokoro-onnx==0.6.1", "onnx-asr==0.12.0"]
 
 [project.scripts]
 jarvis = "jarvis.__main__:main"

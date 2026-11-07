@@ -246,5 +246,8 @@
   "orchestrator": {
     "enabled": true,
     "l3_per_5h": 20
+  },
+  "lan_mouse": {
+    "enabled": true
   }
 }
