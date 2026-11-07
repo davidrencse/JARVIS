@@ -27,6 +27,7 @@ from pathlib import Path
 
 from .claude_auth import renew_claude_session
 from .fsio import atomic_write
+from .locking import exclusive_lock
 
 try:
     HOME = Path.home()
@@ -355,15 +356,18 @@ class Credits:
     def set_manual(self, provider, remaining, total=None, unit="USD", note=""):
         if provider not in {p[0] for p in PROVIDERS}:
             raise ValueError(f"Unknown provider: {provider}")
-        data = self.manual()
-        if remaining in (None, ""):
-            data.pop(provider, None)
-        else:
-            data[provider] = {"remaining": float(remaining),
-                              "total": float(total) if total not in (None, "") else None,
-                              "unit": str(unit)[:12] or "USD", "note": str(note)[:200],
-                              "updated_at": _now().isoformat()}
-        self.manual_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        self.manual_path.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_lock(self.manual_path.with_name(self.manual_path.name + ".lock"),
+                            timeout=5.0):  # read-modify-write: no lost update across processes
+            data = self.manual()
+            if remaining in (None, ""):
+                data.pop(provider, None)
+            else:
+                data[provider] = {"remaining": float(remaining),
+                                  "total": float(total) if total not in (None, "") else None,
+                                  "unit": str(unit)[:12] or "USD", "note": str(note)[:200],
+                                  "updated_at": _now().isoformat()}
+            atomic_write(self.manual_path, json.dumps(data, indent=2))
         with self._lock:
             self._cache.pop(provider, None)
         return data.get(provider)

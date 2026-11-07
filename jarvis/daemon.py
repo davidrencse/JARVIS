@@ -10,6 +10,7 @@ that unit installed, `start`/`stop` go through systemctl.
 
 import atexit
 import os
+from .platforms import on_windows, on_linux
 import re
 import shutil
 import signal
@@ -21,6 +22,8 @@ from pathlib import Path
 
 ACK = "On it."
 UNCLEAR = "Sorry, I didn't catch that."  # a transcript Whisper was unsure of (listen.unsure)
+# A clip let in by a window (no "Jarvis" of its own) can't open another window.
+WAKE_AGAIN = "Say \"Jarvis\" and the whole request, please."
 STARTUP_NAME = "JARVIS Voice.vbs"
 UNIT_NAME = "jarvis-voice.service"
 
@@ -30,7 +33,7 @@ def log(message):
 
 
 def _try_lock(handle):
-    if os.name == "nt":
+    if on_windows():
         import msvcrt
         handle.seek(0)
         msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
@@ -135,6 +138,72 @@ STRANGER_FLOOR = 0.08
 HEAD_SECONDS = 2.5
 
 
+def follow_up_ok(heard, began, armed, is_owner):
+    """Is this clip, with no wake word, the rest of a request a window is waiting for? It
+    must start inside the window and pass the full voice check itself: a near miss let in
+    because an earlier clip was David's walked ambient talk into the brain (2026-11-06)."""
+    return bool(heard and heard.strip()) and began < armed and is_owner
+
+
+def may_rearm(follow_up):
+    """A retry window ("Sorry?", "Open what?") opens only after a clip that said "Jarvis"
+    itself. One that came in through a window gets no second one: windows never chain."""
+    return not follow_up
+
+
+def check_voice(speaker_check, verify, audio, threshold):
+    """(is_owner, score). With voice.speaker_check off nobody is taken for David and the
+    voiceprint is never consulted: (False, None), so the clip is a near miss that needs
+    "Jarvis". `verify` is VoicePrint.verify (or a future of it already running)."""
+    if not speaker_check:
+        return False, None
+    return verify(audio, threshold, False)
+
+
+def is_near(is_owner, score, cutoff):
+    """A near miss: not David by the check, but close enough (or unscored, the check off)
+    that the clip still counts when it starts with "Jarvis"."""
+    return not is_owner and (score is None or score >= cutoff)
+
+
+def should_learn(is_owner, follow_up):
+    """Only a clip that passed the voice check AND said "Jarvis" itself may teach the
+    voiceprint. Follow-ups and reply-window answers came in without the wake word."""
+    return bool(is_owner) and not follow_up
+
+
+def reopen_after(exc, mic):
+    """A MicLost (suspend/resume, source change): close the dead stream quietly and ask for
+    a fresh PortAudio on the next pass -> (mic, reopen) = (None, True). No failed turn and
+    nothing said out loud: the caller neither counts it nor apologises."""
+    log(f"{exc} Reopening it.")
+    if mic is not None:
+        try:
+            mic.close()
+        except Exception:
+            pass
+    return None, True
+
+
+def dbfs(audio):
+    """A clip's loudness in dBFS, for the log (a number, never words)."""
+    import math
+    try:
+        rms = float((audio.astype("float64") ** 2).mean()) ** 0.5
+    except Exception:
+        return None
+    return round(20 * math.log10(rms), 1) if rms > 0 else -120.0
+
+
+def ignored_line(score, limit, audio, near=False):
+    """'ignored another voice (similarity 0.358 < 0.36, -41.2 dBFS[, near miss])'. status()
+    counts lines by the 'ignored another voice' prefix, so it stays exactly that."""
+    from .listen import score_text
+    level = dbfs(audio)
+    tail = (f", {level} dBFS" if level is not None else "") + (", near miss" if near else "")
+    return f"ignored another voice (similarity {score_text(score, limit)}{tail})"
+
+
 def warm_quietly(lane):
     """Warm the brain. Codex not up yet (at login) or down is no failed turn: logging it
     is enough. Uncaught, it killed the listener at startup until systemd gave up, and a
@@ -146,13 +215,14 @@ def warm_quietly(lane):
 
 
 def listen_loop(state, config, base, threshold=None, config_path=None):
-    from .assistant import ask, confirmation_words, wake_word
+    from .assistant import ask, confirmation_words
     from .chatgpt import make_lane
     from concurrent.futures import ThreadPoolExecutor
 
     from .events import Turn, emit, feed_sender
     from .instant import answer as instant_answer
-    from .listen import RATE, LiveMic, Transcriber, VoicePrint, _np, mic_settings, record_utterance, unsure
+    from .listen import (RATE, MicLost, Transcriber, VoicePrint, _np, mic_settings, open_mic,
+                         record_utterance, unsure, wake as wake_word)
     from .memory import Memory
     from .speech import SpeechQueue, Voice, spoken
     from .store import Store, lanes_from
@@ -183,8 +253,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
         atexit.register(lambda: pid_file.unlink(missing_ok=True))
         # `voice stop` sends SIGTERM, whose default action skips atexit and leaves the pid file.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-        # Warm up so the first real request isn't slow: load Whisper, cache the ack line.
-        for name, warm in (("Whisper", lambda: stt(_np().zeros(16000, dtype="float32"))),
+        # Warm up so the first real request isn't slow: load the speech-to-text engines, cache the ack line.
+        for name, warm in (("speech-to-text", lambda: stt(_np().zeros(16000, dtype="float32"))),
                            ("speech", lambda: voice.synth(ACK)), ("brain", lambda: warm_quietly(lane))):
             try:  # a failed warm-up costs the first request some speed, never the listener
                 warm()
@@ -198,7 +268,13 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
             consolidate_daily(config, memory, base, log=log)  # memory.consolidate: once a day
         log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device)
-        failures, mic, armed, armed_by_owner, chatting = 0, None, 0.0, False, 0.0
+        # voice.speaker_check: false is the off switch for the voice check. Nobody is then
+        # taken for David: every request needs "Jarvis", no window opens and nothing is learned.
+        speaker_check = (config.get("voice") or {}).get("speaker_check", True) is not False
+        if not speaker_check:
+            log("speaker check off (voice.speaker_check): every request needs \"Jarvis\"")
+        failures, mic, armed, chatting = 0, None, 0.0, 0.0
+        reopen = False  # the stream died: re-initialise PortAudio before opening it again
         pending = None  # a cut-off command ("open up") waiting for its rest (fragments.py)
         from .fragments import complete as complete_fragment, completes as completes_fragment, \
             judge as judge_fragment
@@ -218,7 +294,10 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
         start_level_poster(state, lambda: live[0])
         while True:
             try:
-                mic = mic or LiveMic(tuning=mic_settings(state))  # device + cutoffs from setup
+                if mic is None:  # device + cutoffs from setup; waits for PipeWire at login
+                    mic = open_mic(mic_settings(state), log=log, fresh=reopen,
+                                   on_missing=lambda: emit(state, "voice.mic_missing"))
+                    reopen = False
                 live[0] = mic
                 audio = record_utterance(mic=mic)
                 if audio is None:  # silence or a short noise: keep the brain warm
@@ -232,9 +311,12 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 # every TV line or passer-by would hog the cores and make David's next
                 # request queue behind it: there the check (~0.2 s) goes first.
                 # A stranger's transcript is discarded unread: never logged or answered.
-                check = pool.submit(ears.verify, audio, threshold)
+                check = pool.submit(check_voice, speaker_check, ears.verify, audio, threshold)
                 text = pool.submit(stt, audio) if stt.device == "cuda" else None
                 is_owner, score = check.result()
+                limit = threshold if threshold is not None else getattr(ears, "last_limit", None)
+                if isinstance(limit, bool) or not isinstance(limit, (int, float)):
+                    limit = None  # for the log line only: an unknown cutoff never fails the turn
                 # Only now does the pass count as working: a voice check that keeps raising
                 # (corrupt voiceprint) must back off, not apologise for every noise (audit
                 # 2026-11-01: the counter was reset as soon as the mic delivered audio).
@@ -242,7 +324,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 # A near miss (David further from the mic, quieter, music behind him) is
                 # accepted only when it also starts with "Jarvis"; strangers score far lower.
                 settings = config.get("voice", {})
-                near = not is_owner and score >= settings.get("near_miss", BORDERLINE)
+                near = is_near(is_owner, score, settings.get("near_miss", BORDERLINE))
                 heard, stats_of = None, audio  # stats_of: the array Whisper heard
                 if not is_owner and not near:
                     head, clip = None, audio[:int(HEAD_SECONDS * RATE)]
@@ -254,7 +336,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     if head is None or wake_word(head) is None:
                         if text is not None:
                             text.cancel()
-                        log(f"ignored another voice (similarity {score})")
+                        log(ignored_line(score, limit, audio))
                         emit(state, "voice.ignored", score=score)
                         continue
                     near = True
@@ -263,18 +345,26 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                         if text is None:
                             stats_of = clip  # its confidence was stored under the clip it heard
                 if heard is None:
-                    heard = text.result() if text is not None else stt(audio)
+                    # Inside a follow-up or reply window "Jarvis" is optional, so Parakeet's
+                    # sure words stand without a second pass through Whisper (listen._try_fast).
+                    stt.need_wake = not (began < armed or said_at < chatting)
+                    try:
+                        heard = text.result() if text is not None else stt(audio)
+                    finally:
+                        stt.need_wake = True
                 request = wake_word(heard)
+                if getattr(stt, "fuzzy", None) is not None:  # Parakeet heard something like it
+                    log(f"wake via whisper: {'yes' if stt.fuzzy else 'no'} "
+                        f"(rescued {stt.rescued} of {stt.second_opinions})")
                 if request == "":  # a bare "Jarvis" and a pause: the request comes next
-                    armed, armed_by_owner = began + len(audio) / RATE + FOLLOW_UP, is_owner
+                    armed = began + len(audio) / RATE + FOLLOW_UP
                     log(f"wake word ({score}): waiting for the request")
                     emit(state, "voice.wake", score=score)
                     continue
-                # The follow-up has no wake word of its own, so one of the two clips must
-                # pass the full voice check: two near misses are not enough.
+                # The follow-up has no wake word of its own, so it must pass the full voice
+                # check itself: a near miss let in by David's earlier clip is not enough.
                 follow_up = False
-                if request is None and heard.strip() and began < armed and (
-                        is_owner or armed_by_owner):
+                if request is None and follow_up_ok(heard, began, armed, is_owner):
                     request = heard.strip()  # the rest of "Jarvis, ... <pause> ..."
                     follow_up = True
                 # Answering JARVIS ("I can check it if you want." "Then check it.") needs
@@ -291,17 +381,18 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     armed = chatting = 0.0
                 if not request:  # not addressed to JARVIS: never answered
                     if near:  # still unconfirmed as David: discarded unread
-                        log(f"ignored another voice (similarity {score}, near miss)")
+                        log(ignored_line(score, limit, audio, near=True))
                     elif heard:  # David's own voice without the wake word: say so, never what
-                        log(f"no wake word ({score}): {len(heard.split())} words, not kept")
+                        log(f"no wake word ({score}, {dbfs(audio)} dBFS): "
+                            f"{len(heard.split())} words, not kept")
                     continue
                 if unsure(stt.stats(stats_of) if hasattr(stt, "stats") else None):
-                    # Probably misheard: ask again rather than answer a guess, and keep the
-                    # follow-up window open so the repeat needs no "Jarvis".
+                    # Probably misheard: ask again rather than answer a guess. The repeat
+                    # needs no "Jarvis" only if this clip said it (windows never chain).
                     log(f"unclear ({score}): asked to repeat")
                     emit(state, "voice.unclear", score=score)
-                    armed, armed_by_owner = time.monotonic() + FOLLOW_UP + 3, is_owner
-                    voice.say(UNCLEAR, wait=True)
+                    armed = time.monotonic() + FOLLOW_UP + 3 if may_rearm(follow_up) else 0.0
+                    voice.say(UNCLEAR if may_rearm(follow_up) else WAKE_AGAIN, wait=True)
                     mic.flush()
                     continue
                 if pending and began < pending[1] and completes_fragment(pending[0], request, understood):
@@ -315,13 +406,19 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 if verdict in ("unclear", "incomplete"):
                     log(f"{verdict} ({score}): {request!r}")
                     emit(state, "voice.fragment", verdict=verdict, score=score)
-                    armed, armed_by_owner = time.monotonic() + FOLLOW_UP + 3, is_owner
-                    pending = (request, armed) if verdict == "incomplete" else None
-                    voice.say(ask_back or UNCLEAR, wait=True)
+                    if may_rearm(follow_up):
+                        armed = time.monotonic() + FOLLOW_UP + 3
+                        pending = (request, armed) if verdict == "incomplete" else None
+                        voice.say(ask_back or UNCLEAR, wait=True)
+                    else:  # already let in by a window: the next part needs "Jarvis"
+                        armed, pending = 0.0, None
+                        voice.say(WAKE_AGAIN, wait=True)
                     mic.flush()
                     continue
-                if not near:
-                    ears.learn()  # passed the voice check AND said "Jarvis": adapt to live audio
+                if should_learn(is_owner, follow_up) and ears.learn():
+                    # Passed the voice check by a margin AND said "Jarvis" in this very clip:
+                    # adapt to the live mic and room (bounded, anchored, voice.adapt: false).
+                    log(f"voiceprint learned this clip ({score})")
                 # Seconds from the end of David's speech to these words: the silence wait,
                 # the voice check and Whisper. The reply line adds the brain's own time.
                 words_in = time.monotonic() - (began + len(audio) / RATE)
@@ -370,6 +467,9 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 failures = 0
             except KeyboardInterrupt:
                 raise
+            except MicLost as exc:  # suspend/resume, a source change: reopen, no failed turn
+                mic, reopen = reopen_after(exc, mic)
+                live[0] = None
             except Exception as exc:  # keep listening through any single failed turn
                 failures += 1
                 log(f"error: {type(exc).__name__}: {exc}")
@@ -391,7 +491,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
 def foreground_priority():
     """Hidden background processes get Windows EcoQoS throttling and normal priority;
     opt this one out so a spoken request is handled at full speed."""
-    if os.name != "nt":
+    if not on_windows():
         return
     import ctypes
 
@@ -412,7 +512,7 @@ def foreground_priority():
 
 
 def _alive(pid):
-    if os.name != "nt":
+    if not on_windows():
         try:
             os.kill(pid, 0)
         except OSError:
@@ -537,7 +637,7 @@ NOT_ENROLLED = ("No voiceprint on this machine, so every voice would be rejected
 def _under_systemd_unit():
     """True when this process runs inside a systemd service (Linux), whose cgroup would
     take the listener down with it on restart."""
-    if not sys.platform.startswith("linux"):
+    if not on_linux():
         return False
     if os.environ.get("INVOCATION_ID"):
         return True
@@ -559,7 +659,7 @@ def _detach_from_unit(command):
 def _supervised():
     """The Linux unit runs the listener itself (Type=simple), so systemd restarts it after
     a crash. Older units ran `voice start` as a oneshot and watched nothing."""
-    if os.name == "nt" or not shutil.which("systemctl"):
+    if on_windows() or not shutil.which("systemctl"):
         return False
     try:
         return "voice listen" in _startup_file().read_text(encoding="utf-8")
@@ -590,14 +690,14 @@ def start(state):
     logs = Path(state).resolve() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-             if os.name == "nt" else 0)
+             if on_windows() else 0)
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
     command = [sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()),
                "voice", "listen"]
     command = _detach_from_unit(command)
     with open(logs / "voice.log", "a", encoding="utf-8") as out:
         subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                         creationflags=flags, start_new_session=os.name != "nt", env=env,
+                         creationflags=flags, start_new_session=not on_windows(), env=env,
                          close_fds=True)
     return _wait_listening(state)
 
@@ -609,7 +709,7 @@ def stop(state):
     if _supervised() and _systemctl("is-active", "--quiet", UNIT_NAME):
         _systemctl("stop", UNIT_NAME)  # a plain kill would leave the unit to restart it
         return {"stopped": True, "pid": pid}
-    if os.name == "nt":
+    if on_windows():
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
     else:
         os.kill(pid, 15)
@@ -617,7 +717,7 @@ def stop(state):
 
 
 def _startup_file():
-    if os.name != "nt":
+    if not on_windows():
         config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
         return config / "systemd" / "user" / UNIT_NAME
     return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
@@ -660,7 +760,7 @@ def _systemd_autostart(state, enable):
 
 
 def autostart(state, enable):
-    if os.name != "nt":
+    if not on_windows():
         return _systemd_autostart(state, enable)
     path = _startup_file()
     if not enable:
