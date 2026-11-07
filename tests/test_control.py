@@ -161,6 +161,27 @@ class ControlTest(unittest.TestCase):
         self.assertEqual(self._typing(("type", "rm -rf "), ("click", 0), ("type", "~\n")),
                          [True, True, False])
 
+    def test_click_mid_line_makes_line_unknown(self):
+        # audit SU-3: "rm  ~", click between the spaces, "-rf" is really "rm -rf ~"
+        res = self._typing(("type", "rm  ~"), ("click", 0), ("type", "-rf"), ("key", "enter"))
+        self.assertEqual(res, [True, True, False, False])
+        ok, text = self.act({"action": "type", "text": "x"})
+        self.assertFalse(ok)
+        self.assertIn(control.UNKNOWN_MSG, text)
+        for action in ("double_click", "right_click"):
+            control._STATE["typed"] = "ls"
+            self.assertTrue(self.act({"action": action, "x": 10, "y": 10})[0])
+            self.assertIsNone(control._STATE["typed"])
+        control._STATE["typed"] = "ls"
+        self.assertTrue(self.act({"action": "drag", "x": 10, "y": 10, "x2": 20, "y2": 20})[0])
+        self.assertIsNone(control._STATE["typed"])
+
+    def test_click_on_empty_line_keeps_it_known(self):
+        self.assertEqual(self._typing(("click", 0), ("type", "ls"), ("key", "enter")),
+                         [True, True, True])
+        self.assertEqual(self._typing(("click", 0), ("type", "rm -rf ~"), ("key", "enter")),
+                         [True, False, True])  # still checked: the refused text was never sent
+
     def test_split_around_single_key_refused(self):
         self.assertEqual(self._typing(("type", "rm -rf "), ("key", "~"), ("key", "enter")),
                          [True, False, True])  # "~" refused and not sent: the line is still "rm -rf "
@@ -174,8 +195,36 @@ class ControlTest(unittest.TestCase):
         res = self._typing(("type", "ls"), ("key", "left"), ("type", "x"), ("key", "enter"))
         self.assertEqual(res, [True, True, False, False])
         ok, text = self.act({"action": "type", "text": "y"})
-        self.assertIn("ctrl+u", text)
-        self.assertEqual(self._typing(("key", "ctrl+u"), ("type", "ls"), ("key", "enter"))[1:], [True, True])
+        self.assertIn("ctrl+c", text)
+        # ctrl+c, not ctrl+u: the line is unknown here, and ctrl+u keeps text after the cursor
+        self.assertEqual(self._typing(("key", "ctrl+c"), ("type", "ls"), ("key", "enter"))[1:], [True, True])
+
+    def test_ctrl_u_after_click_does_not_clear_unknown_line(self):
+        # " ~", click (cursor maybe at the start), ctrl+u keeps " ~": "rm -rf" runs "rm -rf ~"
+        res = self._typing(("type", " ~"), ("click", 0), ("key", "ctrl+u"), ("type", "rm -rf"),
+                           ("key", "enter"))
+        self.assertEqual(res, [True, True, True, False, False])
+        self.assertIsNone(control._STATE["typed"])
+        ok, text = self.act({"action": "key", "keys": "enter"})
+        self.assertFalse(ok)
+        self.assertIn(control.UNKNOWN_MSG, text)
+
+    def test_ctrl_c_after_click_makes_line_known(self):
+        res = self._typing(("type", " ~"), ("click", 0), ("key", "ctrl+c"), ("type", "rm -rf ~"),
+                           ("type", "ls"), ("key", "enter"))
+        self.assertEqual(res, [True, True, True, False, True, True])  # rm -rf ~ refused by the gate
+
+    def test_ctrl_u_on_known_line_clears_it(self):
+        self.assertEqual(self._typing(("type", "rm -rf "), ("key", "ctrl+u"), ("type", "~"),
+                                      ("key", "enter")), [True, True, True, True])
+        self.assertEqual(control._STATE["typed"], "")
+
+    def test_cursor_keys_then_ctrl_u_stay_unknown(self):
+        for key in ("home", "left", "ctrl+a", "ctrl+e", "end"):
+            control._STATE["typed"] = ""
+            res = self._typing(("type", "x"), ("key", key), ("key", "ctrl+u"), ("type", "ls"))
+            self.assertEqual(res, [True, True, True, False], key)
+            self.assertIsNone(control._STATE["typed"], key)
 
     def test_enter_and_ctrl_c_clear_buffer(self):
         self.assertEqual(self._typing(("type", "echo hi"), ("key", "enter"), ("type", "ls ~")),
@@ -284,6 +333,31 @@ class ControlTest(unittest.TestCase):
             ok, said = self.act({"action": "type", "text": text})
             self.assertFalse(ok, text)
         self.assertTrue(self.act({"action": "type", "text": "hello from jarvis"})[0])
+
+    def test_overlong_line_fails_closed_not_truncated(self):
+        # audit 4: `rm -rf /tmp/q` + 4000 spaces, then `~`, then Enter got past a 4000-char tail.
+        self.shot()
+        self.assertTrue(self.act({"action": "type", "text": "rm -rf /tmp/q"})[0])
+        ok, text = self.act({"action": "type", "text": " " * control.TYPED_MAX})
+        self.assertFalse(ok, text)
+        self.assertIn("Refused", text)
+        self.assertEqual([c[0] for c in self.fake.calls].count("type"), 1)  # only the first piece
+        self.assertTrue(self.act({"action": "type", "text": " " * (control.TYPED_MAX - 13)})[0])  # exactly full
+        self.assertFalse(self.act({"action": "key", "keys": "space"})[0])
+        self.assertFalse(self.act({"action": "type", "text": "~"})[0])
+        self.assertTrue(self.act({"action": "key", "keys": "enter"})[0])  # the whole line was checked
+        self.assertEqual(control._typed_next("x" * control.TYPED_MAX, "type", {"text": "y"}), None)
+
+    def test_terminal_check_uses_config_and_home(self):
+        # audit 4: hard_deny got {} and cwd /tmp, so vault paths were unknown.
+        cfg = {"vault": {"path": {"linux": "~/Documents/obsidian-vault"}}}
+        self.shot()
+        with mock.patch("jarvis.gates.local_config", return_value=cfg):
+            for text in ("rm -rf ~/Documents/obsidian-vault", "cat ~/.grok/auth.json"):
+                ok, said = self.act({"action": "type", "text": text})
+                self.assertFalse(ok, text)
+                self.assertIn("Refused", said)
+            self.assertTrue(self.act({"action": "type", "text": "ls ~/Documents"})[0])
 
     def test_stop_file_blocks_until_resume(self):
         with mock.patch.object(control, "_release"):

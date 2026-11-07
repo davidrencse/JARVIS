@@ -75,6 +75,9 @@ class ControlRouteTests(unittest.TestCase):
 
 class UpdateJobTests(unittest.TestCase):
     def setUp(self):
+        _skip = patch.object(NodeWorker, "_untrusted", return_value=None)  # these fixtures' nodes pin no key
+        _skip.start()
+        self.addCleanup(_skip.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name)

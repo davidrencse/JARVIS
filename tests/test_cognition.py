@@ -676,8 +676,9 @@ class ListenTests(unittest.TestCase):
             vp.MAX_PROFILE = 6
             with patch.object(vp, "_embed", side_effect=lambda c: c):
                 vp.enroll(clips)
-                for _ in range(5):  # strong matches fill the profile past its cap
-                    vp.verify(unit(me + rng.normal(scale=0.1, size=32)))
+                for _ in range(5):  # strong wake-word turns fill the profile past its cap
+                    vp.verify(unit(me + rng.normal(scale=0.5, size=32)))
+                    vp.learn()
                 profile = json.loads(vp.path.read_text())["profile"]
                 self.assertEqual(len(profile), 6)
                 self.assertTrue(np.allclose(profile[:4], clips))  # enrollment never rotated out
@@ -713,7 +714,10 @@ class ListenTests(unittest.TestCase):
                 self.assertFalse(vp.verify(voice(rng.normal(size=64), 0.1))[0])  # stranger
                 self.assertEqual(size(), 8)  # strangers never join the profile
                 self.assertTrue(vp.verify(voice(me, 1.1))[0])
-                vp.verify(voice(me, 0.2))  # confident match joins the profile
+                vp.verify(voice(me, 0.2))
+                self.assertEqual(size(), 8)  # scoring alone never changes the profile
+                vp.verify(voice(me, 0.2))
+                vp.learn()  # a confident wake-word turn joins it
                 self.assertGreater(size(), 8)
 
 

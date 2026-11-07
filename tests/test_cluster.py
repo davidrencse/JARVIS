@@ -145,6 +145,9 @@ class BrokerTests(unittest.TestCase):
 
 class ClusterHTTPTests(unittest.TestCase):
     def setUp(self):
+        _skip = patch.object(NodeWorker, "_untrusted", return_value=None)  # these fixtures' nodes pin no key
+        _skip.start()
+        self.addCleanup(_skip.stop)
         # Long polls hold an empty queue for POLL_WAIT (25 s); tests don't need to wait it out.
         poll = patch("jarvis.cluster.POLL_WAIT", 0.5)
         poll.start()
@@ -599,8 +602,43 @@ class TunnelTests(unittest.TestCase):
                 patch.object(tunnel.time, "sleep", side_effect=sleep):
             tunnel.run(self.config, self.state)
         self.assertEqual(attempts, ["jdoe@192.0.2.1", "jdoe@192.0.2.2"] * 2)
-        self.assertEqual(sum(sleeps), 1)
+        self.assertEqual(sum(sleeps), 3 * tunnel.TARGET_PAUSE + 1)  # a pause per attempt, one backoff
         self.assertEqual(json.loads((self.state / "cluster-tunnel.json").read_text())["pid"], 0)
+
+    def test_flapping_tunnel_backs_off_and_only_a_long_session_resets(self):
+        from jarvis import cluster_tunnel as tunnel
+        clock, begun, ended, popens = [0.0], {}, [], []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def make():
+            proc = Mock()
+            proc.returncode = 255
+            begun[id(proc)] = clock[0]
+            popens.append(clock[0])
+            if len(popens) >= 12:
+                (self.state / "cluster-tunnel.stop").touch()
+            # session length comes from the test's table: 120 s each (> 60 s, < stable)
+            proc.poll.side_effect = lambda: None if clock[0] - begun[id(proc)] < self.session else 255
+            return proc
+
+        def run(session):
+            self.session, clock[0] = session, 0.0
+            popens.clear(); begun.clear()
+            (self.state / "cluster-tunnel.stop").unlink(missing_ok=True)
+            with patch.object(tunnel.shutil, "which", return_value="ssh"), \
+                    patch.object(tunnel.subprocess, "Popen", side_effect=lambda *a, **k: make()), \
+                    patch.object(tunnel, "reachable", return_value=False), \
+                    patch.object(tunnel.time, "monotonic", side_effect=lambda: clock[0]), \
+                    patch.object(tunnel.time, "sleep", side_effect=sleep):
+                tunnel.run(self.config, self.state)
+            # largest idle gap between the end of one 2-target round and the next redial
+            return max(b - a - session for a, b in zip(popens, popens[1:]))
+        flap = run(120)
+        stable = run(tunnel.STABLE_SESSION + 5)
+        self.assertGreaterEqual(flap, 8)       # backoff kept doubling despite sessions over 60 s
+        self.assertLessEqual(stable, 2)        # a long stable session resets it
 
     def test_fallback_switches_back_when_first_target_returns(self):
         from jarvis import cluster_tunnel as tunnel
@@ -778,6 +816,9 @@ class AuditThreeTests(unittest.TestCase):
 
 class NodeAuditTests(unittest.TestCase):
     def setUp(self):
+        _skip = patch.object(NodeWorker, "_untrusted", return_value=None)  # these fixtures' nodes pin no key
+        _skip.start()
+        self.addCleanup(_skip.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state = Path(tmp.name)

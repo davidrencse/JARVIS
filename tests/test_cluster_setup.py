@@ -56,6 +56,26 @@ class SetupTests(unittest.TestCase):
         self.assertIsNone(Broker(state).authenticate(note["token"]))
         self.assertTrue(Broker(state).authenticate(cluster_setup.decode(again["code"])["token"]))
 
+    def test_existing_invite_file_fails_before_anything_rotates(self):
+        # Audit cluster-01: a leftover --output file used to fail only after the node's SSH
+        # key and hub token were already replaced, unpairing it with no new code shown.
+        path, state = self.tmp / "main.json", self.tmp / "main-state"
+        path.write_text(json.dumps(MAIN), encoding="utf-8")
+        old = self.tmp / "invite.json"
+        old.write_text("{}", encoding="utf-8")
+        with mock.patch.object(cluster_setup, "_hostname", return_value="arch"), \
+                mock.patch("jarvis.topology.socket.gethostname", return_value="arch"), \
+                mock.patch.object(cluster_setup, "_sshd_up", return_value=True), \
+                mock.patch.object(cluster_setup, "authorize") as authorize, \
+                mock.patch.object(cluster_setup, "keypair") as keypair, \
+                mock.patch.object(cluster_setup.Broker, "enroll") as enroll:
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                cluster_setup.invite(MAIN, path, state, "dell", output=str(old))
+        authorize.assert_not_called()
+        keypair.assert_not_called()
+        enroll.assert_not_called()
+        self.assertEqual(old.read_text(encoding="utf-8"), "{}")
+
     def test_concurrent_authorizes_keep_every_line(self):
         # invite (CLI) and the hub's redeem (a thread) both rewrite the file: none may be lost.
         import threading
