@@ -240,7 +240,7 @@ workers are started through `explorer.exe` (see `cluster_tunnel.start`, `daemon.
 1. `listen.record_utterance`: 16 kHz mono; Silero VAD gate (or a loudness gate fitted to
    the room). On Linux it reads through PipeWire/Pulse, not raw ALSA.
 2. Speaker check (`listen.VoicePrint`, sherpa-onnx ERes2Net, CPU) runs **in parallel**
-   with Whisper (`faster-whisper`, CUDA if present, else CPU int8; `hotwords="Jarvis"`).
+   with speech-to-text: Parakeet v3 (Handy's model, `onnx-asr`, `voice.stt_engine`, default) first, kept only when it hears the wake word; otherwise Whisper (`faster-whisper`, CUDA if present, else CPU int8; `hotwords="Jarvis"`).
    - score ≥ threshold (≈ 0.36, `voiceprint.json`): David.
    - 0.24 ≤ score < threshold: a near miss (far from the mic, quieter, music behind him).
      Accepted only if the transcript starts with the wake word; never used for adaptation.

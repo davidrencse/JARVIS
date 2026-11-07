@@ -1,5 +1,7 @@
 # JARVIS
 
+**Handbook:** [docs/handbook/](docs/handbook/index.md) covers voice, remote control, input sharing, the cluster and the operations runbook.
+
 A local assistant and workflow layer for David's ASUS Zenbook (Arch/Hyprland, the
 main) and Dell G15 (Windows 11, a node), with a Python CLI, web console, desktop overlay and voice loop.
 
@@ -452,7 +454,8 @@ for local only.
 Run `python -m jarvis voice setup` once: paste the key at a hidden prompt, pick a
 voice from the list. Saved to `.jarvis/secrets.json` (git-ignored); environment
 variables `ELEVENLABS_API_KEY` / `ELEVENLABS_VOICE_ID` override it.
-Listening runs locally: faster-whisper large-v3-turbo on the RTX 4060 (≈0.3 s per
+Listening runs locally: Parakeet TDT 0.6B v3 (Handy's model, int8 ONNX via onnx-asr, ≈0.3 s per
+3 s clip on CPU) first, with faster-whisper large-v3-turbo on the RTX 4060 as fallback (≈0.3 s per
 sentence warm) and sherpa-onnx speaker verification (≈0.5 s, CPU). Optionally
 set `ELEVENLABS_MODEL_ID`; the default is `eleven_multilingual_v2`.
 `.env.example` lists the names; `.env` files are not auto-loaded.

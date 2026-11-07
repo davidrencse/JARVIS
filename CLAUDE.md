@@ -128,6 +128,11 @@ He answers in the console gate or by saying "Jarvis, yes".
 - **Desktop control (`control.py`, the `computer` tool):** JARVIS sees the screen and uses mouse/keyboard.
   Stop it with SUPER+SHIFT+ESCAPE, `jarvis control stop`, or "Jarvis, stop controlling my computer".
   It pauses when David moves the mouse. Tests must use a fake backend (`act(..., impl=Fake())`).
+- **Remote control (`remote_view.py`, console's Remote view):** David drives a node's screen,
+  mouse and keyboard from the main, over the existing hub/tunnel (no new port). Job kind `remote`,
+  which only the main's console can send; the brain has no tool for it. Ending (Disconnect, closed tab,
+  link loss, node `jarvis control stop`, restart) always lets go of held keys and buttons; keep that
+  true. Tests use fake injectors (`tests/test_remote_view.py`).
 - **Lan Mouse:**
   - A JARVIS-patched build: source `~/src/lan-mouse-jarvis`, binary `~/.local/bin/lan-mouse-jarvis`,
     user service `lan-mouse`.
@@ -135,8 +140,20 @@ He answers in the console gate or by saying "Jarvis, yes".
     together, and keeps it off while apart. Arch runs the guard from `lan-mouse-ipwatch.service`
     (enabled at login; `lan-mouse.service` stays disabled), Windows from the node agent. Opt out with
     `lan_mouse.autostart: false`. A stop by hand sticks until the next boot.
+    `lan_mouse.enabled: false` is the off switch: the guard never starts it.
+  - Same network only (2026-11-06): the patched build never connects to or accepts a Tailscale address
+    (100.64.0.0/10, fd7a:115c:a1e0::/48), and the IP watcher no longer writes the peer's Tailscale IP.
+    Far apart, an edge crossing finds no one and the pointer stays home.
+  - While the main's console drives a node (Remote view), the main's Lan Mouse is paused
+    (`sharedinput.ControllerPause`, marker `remote-controlling.json`) so David's mouse and keyboard
+    stay on the main; it comes back after, unless the laptops read apart. The node pauses its own too.
   - Windows: start Lan Mouse via `explorer.exe` (`%LOCALAPPDATA%\lan-mouse\start-now.vbs`); a child of
     the node's command shell dies with it.
+  - Windows: Lan Mouse runs elevated via the on-demand scheduled tasks `JARVIS Lan Mouse` / `JARVIS Lan Mouse Stop`
+    (one-time `jarvis lanmouse elevate` from an admin terminal) so admin windows don't trap the mouse; UAC's
+    secure-desktop prompt itself still can't be reached by any app. The tasks run a copy in
+    `C:\Program Files\JARVIS Lan Mouse` (admin-only, so nothing unelevated can swap it for silent admin);
+    re-run `elevate` after rebuilding Lan Mouse. Never point the tasks at a user-writable path.
   - wlroots virtual-pointer events need nonzero, increasing timestamps, or Qt never sees a
     double-click. The patch uses `CLOCK_MONOTONIC` for that.
 - **Off while apart:** `jarvis lanmouse guard` stops Lan Mouse after two checks in a row show
