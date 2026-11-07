@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -64,11 +65,31 @@ class Broker:
     def owner_token(self):
         path = self.state / "cluster-owner.token"
         try:
-            with path.open("x", encoding="ascii") as stream:
-                path.chmod(0o600)
-                stream.write(secrets.token_urlsafe(32))
-        except FileExistsError:
-            pass
+            token = path.read_text(encoding="ascii").strip()
+        except (OSError, ValueError):
+            token = ""
+        if token:
+            return token
+        # Missing, or empty from a crash under the old create-then-write: write a whole file
+        # to a private temp name, then link it into place (os.link fails if another process
+        # got there first, so everyone returns the same token).
+        fresh = secrets.token_urlsafe(32)
+        temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}")
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(fresh)
+            if path.exists():  # an empty leftover: replace it whole
+                os.replace(temp, path)
+            else:
+                try:
+                    os.link(temp, path)  # exclusive: a racing process's token wins, we read it below
+                except FileExistsError:
+                    pass
+                except OSError:  # no hard links on this filesystem
+                    os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
         return path.read_text(encoding="ascii").strip()
 
     def enroll(self, node, capabilities=NODE_DEFAULT, invite_ttl=None):
@@ -274,13 +295,15 @@ class Broker:
                 raise LookupError("Unknown job for this node.")
             target_state = "failed" if failed else "done"
             bulk = row["kind"] in BULK
+            # A bulk job its requester gave up on was compacted: nobody will read its result.
+            held = self._bulk.get(job_id) if bulk else None
             if row["state"] == target_state and (
-                    self._bulk.get(job_id, {}).get("result") == encoded if bulk else row["result"] == encoded):
+                    (held is None or held.get("result") == encoded) if bulk else row["result"] == encoded):
                 return  # result acknowledgement was lost: safe to repeat the result only
             if row["state"] != "running":
                 raise ValueError("Job is no longer running; it will not be executed again.")
-            if bulk:  # the result stays in memory; the row only records that it arrived
-                self._bulk.setdefault(job_id, {})["result"] = encoded
+            if held is not None:  # the result stays in memory; the row only records that it arrived
+                held["result"] = encoded  # (audit cluster-11: never re-create a compacted entry)
             db.execute("UPDATE jobs SET state=?,result=? WHERE id=?",
                        (target_state, "{}" if bulk else encoded, job_id))
 

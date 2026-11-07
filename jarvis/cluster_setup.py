@@ -33,7 +33,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .fsio import atomic_write
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 from .cluster import Client, save_json
 from .cluster_store import NODE_DEFAULT, Broker
 from .deploy import CODE_KEY, code_key
@@ -344,6 +344,10 @@ def invite(config, path, state, node, extra=(), capabilities=None, output=None):
     if mode(config) != "forward":
         raise ValueError('Invites make forward links (the node dials the main). Set '
                          '"cluster": {"tunnel": "forward"} or use jarvis cluster enroll.')
+    # Before anything is rotated: a leftover file must not unpair the node and print no code.
+    target = Path(output).expanduser() if output else None
+    if target is not None and target.exists():
+        raise ValueError("That invite file already exists; choose a new name.")
     if not _sshd_up():
         raise ValueError("This PC's SSH server isn't answering on port 22. " + SSHD_FIX[_os()])
     found = addresses(config, main, extra)
@@ -372,10 +376,7 @@ def invite(config, path, state, node, extra=(), capabilities=None, output=None):
                    "main": {k: me[k] for k in ("hostname", "label", "aliases") if k in me}})
     report = {"invited": node, "capabilities": caps, "addresses": found,
               "authorized_keys": keys_file, "expires": "in 24 hours, or once used"}
-    if output:
-        target = Path(output).expanduser()
-        if target.exists():
-            raise ValueError("That invite file already exists; choose a new name.")
+    if target is not None:
         save_json(target, {"code": code})  # 0600, like any credential
         report["invite_file"] = str(target)
     report.update(code=code, next=f"On {node}, in its JARVIS folder: jarvis cluster join \"<code>\". "
@@ -453,11 +454,11 @@ def _launch_agent(path, state):
     """Start `jarvis cluster run` in the background, the way the tunnel worker starts."""
     import sys
     python = Path(sys.executable)
-    if os.name == "nt" and python.with_name("pythonw.exe").is_file():
+    if on_windows() and python.with_name("pythonw.exe").is_file():
         python = python.with_name("pythonw.exe")
     argv = [str(python), "-m", "jarvis", "--config", str(Path(path).resolve()),
             "--state", str(Path(state).resolve()), "cluster", "run"]
-    if os.name == "nt":  # through Explorer, so it outlives this shell (see cluster_tunnel.start)
+    if on_windows():  # through Explorer, so it outlives this shell (see cluster_tunnel.start)
         script = Path(state) / "cluster-node-launch.vbs"
         from .autostart import vbs
         line = subprocess.list2cmdline(argv).replace('"', '""')

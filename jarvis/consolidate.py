@@ -186,6 +186,19 @@ def parse(raw, ids, known):
     return items, list(dict.fromkeys(closed)), list(dict.fromkeys(dropped))
 
 
+def _active(memory, ids):
+    """Of `ids`, those still active knowledge items (so a retire of them can succeed)."""
+    ids = list(ids)
+    if not ids:
+        return []
+    from .memory import KNOWLEDGE_KINDS
+    with memory.connect() as db:
+        rows = db.execute(f"SELECT id FROM items WHERE id IN ({','.join('?' * len(ids))}) "
+                          f"AND kind IN ({','.join('?' * len(KNOWLEDGE_KINDS))})",
+                          (*ids, *KNOWLEDGE_KINDS)).fetchall()
+    return [r["id"] for r in rows]
+
+
 def chatgpt_ask(config, base):
     """ask(prompt) -> reply text, a fresh tool-free session closed afterwards: ChatGPT, or
     Claude while ChatGPT's plan is over its limit (inference.ask, role "consolidate")."""
@@ -207,13 +220,14 @@ def consolidate(memory, ask, now=None):
         known = _known(memory)
         items, closed, dropped = parse(ask(prompt(known, lines)), ids, known)
         for item in items:
+            live = _active(memory, item["replaces"])  # retire() only moves these
             try:
                 item_id, state = memory.absorb(item["kind"], item["text"], item["sources"],
                                                same_as=item["same_as"], replaces=item["replaces"])
             except ValueError:
                 continue
             summary[state] += 1
-            summary["replaced"] += len(item["replaces"])
+            summary["replaced"] += sum(r != item_id for r in live)
         summary["closed"] = sum(memory.retire(c, "closed", kinds=("loop",)) for c in closed)
         summary["dropped"] = sum(memory.retire(d, "forgotten", kinds=("lesson",)) for d in dropped)
     memory.add("consolidation", f"Memory consolidated through {through}: {summary['read']} "
@@ -230,7 +244,7 @@ CHECK_EVERY = 1800  # seconds between "is a run due?" checks in the background
 def run_due(config, memory, base, ask=None):
     """Consolidate if due, holding a file lock so the console and the voice daemon on the
     same memory never both spend the day's call. The summary, or None (not due or busy)."""
-    from .locking import exclusive_lock
+    from .locking import LockBusy, exclusive_lock
     if not due(memory):
         return None
     try:
@@ -241,7 +255,7 @@ def run_due(config, memory, base, ask=None):
                 return consolidate(memory, ask or chatgpt_ask(config, base))
             except ValueError as exc:  # not to be mistaken for the lock being busy
                 raise RuntimeError(str(exc)) from exc
-    except ValueError:  # exclusive_lock: another process is running it
+    except LockBusy:  # another process is running it
         return None
 
 

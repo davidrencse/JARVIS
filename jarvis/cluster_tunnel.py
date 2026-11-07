@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from .platforms import NO_WINDOW
+from .platforms import NO_WINDOW, on_windows
 from .cluster import save_json
 from .locking import exclusive_lock
 from .topology import DEFAULT_PORT, identity
@@ -25,6 +25,10 @@ NAME = "cluster-tunnel"
 # While on a fallback target (e.g. Tailscale), how often to look for an earlier one (the
 # LAN) again. Doubles after each switch back that does not hold, up to LAN_RETRY_MAX.
 LAN_RETRY, LAN_RETRY_MAX = 60, 30 * 60
+# A session counts as stable (backoff back to 1 s) only after STABLE_SESSION seconds; a shorter
+# one leaves the backoff growing, so a tunnel that flaps every few minutes isn't redialled every
+# second. TARGET_PAUSE separates attempts on successive targets.
+STABLE_SESSION, TARGET_PAUSE = 600, 1
 HEARTBEAT = 5  # seconds between liveness refreshes of the status note (status() allows 15)
 
 
@@ -213,15 +217,17 @@ def run(config, state):
                             proc.kill()
                             proc.wait()
                         proc = None
-                    if time.monotonic() - started > 60:
+                    lasted = time.monotonic() - started
+                    if lasted >= STABLE_SESSION:
                         delay = 1
-                        if not index:
-                            retry = LAN_RETRY
+                    if lasted > 60 and not index:
+                        retry = LAN_RETRY
                     if preferred:
                         # Restart from the first target. If the switch back does not hold,
                         # we land on the fallback again and wait longer before the next try.
                         retry = min(retry * 2, LAN_RETRY_MAX)
                         break
+                    wait(TARGET_PAUSE)  # no instant redial of the next target
                 wait(delay)
                 delay = min(delay * 2, 60)
         finally:
@@ -238,7 +244,7 @@ def startup_path():
 
 def launcher(config_path, state):
     python = Path(sys.executable)
-    if os.name == "nt" and python.with_name("pythonw.exe").is_file():
+    if on_windows() and python.with_name("pythonw.exe").is_file():
         python = python.with_name("pythonw.exe")
     argv = [str(python), "-m", "jarvis", "--config", str(Path(config_path).resolve()),
             "--state", str(Path(state).resolve()), "cluster", "tunnel", "run"]
@@ -258,7 +264,7 @@ def start(config_path, state):
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True)
     argv = launcher(config_path, state)
-    if os.name == "nt":
+    if on_windows():
         script = state / f"{NAME}-launch.vbs"
         from .autostart import vbs
         line = subprocess.list2cmdline(argv).replace('"', '""')
