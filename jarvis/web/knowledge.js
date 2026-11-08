@@ -948,11 +948,17 @@ function tooltip(n) {
 
 /* ---------- loop ---------- */
 let frames = 0, fpsAt = performance.now(), lastDraw = 0, lastT = performance.now();
+let lastClock = "", lastTickAt = -1e9, lastTickLast = "", frameOn = true;
 function frame(now) {
+  if (document.hidden) { frameOn = false; return; }
   requestAnimationFrame(frame);
   const active = cam.drag || cam.pan || cam.panTo || cam.anchor || now < view.activeUntil || ST.busy || Math.abs(cam.spin) > 1e-5 || Math.abs(cam.zoomTo - cam.zoom) > 0.002 || view.pulses.length;
-  $("clock").textContent = new Date().toTimeString().slice(0, 8);
-  $("ticker").textContent = `${((now - view.started) / 1000).toFixed(2)}   ${view.last}`;
+  const clk = new Date().toTimeString().slice(0, 8);
+  if (clk !== lastClock) { lastClock = clk; $("clock").textContent = clk; }
+  if (now - lastTickAt >= 1000 || view.last !== lastTickLast) {  // the ticker needs no more than 1 Hz
+    lastTickAt = now; lastTickLast = view.last;
+    $("ticker").textContent = `${((now - view.started) / 1000).toFixed(2)}   ${view.last}`;
+  }
   if (reduced) { if (!view.dirty && !active) return; }
   else if (!active && !view.dirty && now - lastDraw < 32) return;
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now; lastDraw = now;
@@ -1119,7 +1125,6 @@ function select(n) {
 }
 
 /* ---------- panels ---------- */
-const stat = (k) => (view.snap ? view.snap.stats[k] || 0 : 0);
 function renderCounts() {
   const s = scene.stats || {}, st = view.snap ? view.snap.stats : {};
   const seg = (k, v, cls = "") => `<span class="${cls}"><i>${k}</i><b>${v}</b></span>`;
@@ -1495,3 +1500,6 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) { refresh(true); refreshMemory(); }  // catch up once on return
 });
 requestAnimationFrame(frame);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !frameOn) { frameOn = true; lastT = performance.now(); requestAnimationFrame(frame); }
+});
