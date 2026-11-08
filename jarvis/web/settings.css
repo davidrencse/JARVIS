@@ -92,7 +92,7 @@ label.st-label { cursor: pointer; }
 .st-adv > .st-group { margin-top: 8px; }
 /* Input panel blocks: flat, same rhythm as rows */
 .st-block { display: grid; gap: 16px; min-width: 0; padding: 18px 0; border-top: 1px solid var(--line-2); border-bottom: 1px solid var(--line); }
-.st-block .input-settings-facts, .st-block .si-machines, .st-block .input-peripheral-form { grid-template-columns: minmax(0, 1fr); min-width: 0; }
+.st-block .si-machines, .st-block .input-peripheral-form { grid-template-columns: minmax(0, 1fr); min-width: 0; }
 .st-block .input-peripheral-form { display: grid; gap: 12px; align-items: end; }
 .st-block .input-peripheral-form label { display: grid; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
 .st-block .input-peripheral-form .st-btn { justify-self: start; }
@@ -158,3 +158,8 @@ label.st-label { cursor: pointer; }
 .st-rail [role="tablist"] button.st-has-restart { }
 @media (min-width: 761px) { .st-bar { top: -1px; } }
 .st-filtering .st-stat, .st-filtering .vs-card-row, .st-filtering .st-foot, .st-filtering .st-adv:not([open]) { display: none; }
+
+/* Permissions: the read-only lists (always asks, never does, how to stop it). */
+.st-perm-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.st-perm-list li { position: relative; padding-left: 16px; color: var(--ink-2); font-size: 13px; line-height: 1.45; }
+.st-perm-list li::before { content: ""; position: absolute; left: 2px; top: .55em; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); }

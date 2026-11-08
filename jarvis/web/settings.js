@@ -5,7 +5,7 @@
   const view = document.getElementById("view-settings");
   if (!view) return;
   const $ = (s, r = view) => r.querySelector(s);
-  const SECS = ["machines", "voice", "calls", "intelligence", "memory", "input"];
+  const SECS = ["machines", "voice", "calls", "intelligence", "memory", "permissions", "input"];
   const esc = window.JarvisEsc;
   // Fields shown elsewhere (the machine list picks the main) stay out of the generic rows.
   const HIDDEN = new Set(["cluster.main_device"]);
@@ -13,13 +13,18 @@
   const GROUPS = {
     voice: [["Who it answers", ["voiceprint.threshold", "voice.near_miss"]],
             ["How it talks", ["voice.kokoro_voice", "voice.kokoro_speed", "voice.max_spoken_chars"]]],
+    permissions: [["Asking first", ["rules.confirm"]],
+                  ["What it may use", ["actions.enabled", "actions.browser", "actions.grokbot", "vault.write"]],
+                  ["Safety nets", ["terminal.sandbox"]],
+                  ["Shared mouse and keyboard", ["lan_mouse.enabled", "lan_mouse.off_when_apart"]]],
   };
   const NAMES = {
     chatgpt: "ChatGPT", claude: "Claude", reverse: "Reverse", forward: "Forward",
+    ask: "Ask first", never: "Act at once",
     bm_lewis: "Lewis · British", bm_george: "George · British", am_michael: "Michael · American",
     am_adam: "Adam · American", af_heart: "Heart · American", af_bella: "Bella · American", bf_emma: "Emma · British",
   };
-  let state = { fields: [], machines: [], this_os: "" };
+  let state = { fields: [], machines: [], this_os: "", permissions: null };
   let loading = false, confirmFor = "", confirmT;
   const pending = new Set();
   const restart = new Set();
@@ -94,8 +99,26 @@
       box.innerHTML = sectionHtml(sec, fs);
     }
     renderMachines();
+    renderPermissions();
     renderStats();
     applyFilter();
+  }
+
+  // The read-only half of Permissions: what always waits, what never happens, how to stop it.
+  function renderPermissions() {
+    const box = $("#st-perm-info"), p = state.permissions;
+    if (!box) return;
+    if (!p) { box.innerHTML = ""; return; }
+    const code = (t) => esc(t).replace(/`([^`]+)`/g, "<code>$1</code>");  // escaped first, so only our own backticks
+    const list = (items) => `<ul class="st-perm-list">${items.map((t) => `<li>${code(t)}</li>`).join("")}</ul>`;
+    const ask = (p.always_ask || []).map((a) => ({ money: "Buying or paying", messages: "Sending or posting as you" }[a] || a));
+    box.innerHTML =
+      `<div class="st-sub"><h3>Always asks you first</h3><span class="st-meta">Even with “Act at once”</span></div>` +
+      `<div class="st-block">${list([...ask, "Pairing or forgetting a Bluetooth device", "Browser clicks it can't name", "Shell commands it can't read"])}</div>` +
+      `<div class="st-sub"><h3>Never does</h3><span class="st-meta">No setting changes these</span></div>` +
+      `<div class="st-block">${list(p.never || [])}</div>` +
+      `<div class="st-sub"><h3>How to stop it</h3></div>` +
+      `<div class="st-block">${list(p.stop || [])}</div>`;
   }
 
   const chip = (t, tone) => `<span class="st-chip"${tone ? ` data-tone="${tone}"` : ""}><i aria-hidden="true"></i>${esc(t)}</span>`;
@@ -119,6 +142,10 @@
       put(sec, fs.map((f) => chip(f.label.toLowerCase() + " " + fieldText(f))).join(""));
     }
     put("input", chip("read-only") + chip("Lan Mouse"));
+    const rc = byPath("rules.confirm"), sb = byPath("terminal.sandbox"), ac = byPath("actions.enabled");
+    put("permissions", (rc ? chip(fieldText(rc).toLowerCase(), rc.value === "never" ? "warn" : "ok") : "")
+      + (ac ? chip(ac.value ? "acts on your PCs" : "talk only") : "")
+      + (sb && state.permissions?.sandbox_here ? chip(sb.value ? "sandbox on" : "sandbox off", sb.value ? "ok" : "warn") : ""));
     tabs.forEach((t) => {
       const has = state.fields.some((f) => f.section === t.dataset.sec && restart.has(f.path));
       t.classList.toggle("st-has-restart", has);
@@ -174,7 +201,8 @@
   }
 
   function applyState(d) {
-    state = { fields: d.fields || state.fields, machines: d.machines || state.machines, this_os: d.this_os || state.this_os };
+    state = { fields: d.fields || state.fields, machines: d.machines || state.machines, this_os: d.this_os || state.this_os,
+              permissions: d.permissions || state.permissions };
   }
 
   function fieldErr(path, msg) {
@@ -190,7 +218,13 @@
     const f = byPath(path); if (f) f.value = value;
     let failed = "";
     try {
-      const d = await api("/api/settings", { changes: { [path]: value } });
+      // Loosening a safety net (field.loosens) takes an explicit yes; the server refuses it otherwise.
+      let confirmed = false;
+      if (f && "loosens" in f && value === f.loosens && prev !== value) {
+        confirmed = window.confirm(`${f.label}: ${fieldText({ ...f, value }) || value}. This weakens a safety net on this computer. Continue?`);
+        if (!confirmed) throw new Error("kept as it was");
+      }
+      const d = await api("/api/settings", confirmed ? { changes: { [path]: value }, confirmed: true } : { changes: { [path]: value } });
       // Before applyState: it redraws the rows, and the row reads "Saved" from savedAt.
       savedAt.set(path, Date.now()); pending.delete(path);
       (d.restart || []).forEach((p) => restart.add(p));
