@@ -311,12 +311,12 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                 if risk == "deny":
                     raise ValueError("That task is refused by the risk checks.")
                 from .gates import always_asks_text
-                asks = gates_ask(config) or (risk == "confirm" and
-                                             always_asks_text(prepared.get("task") or text, config))
+                money_or_message = always_asks_text(prepared.get("task") or text, config)
+                asks = gates_ask(config) or money_or_message or False
                 if prepared["decision"] in ("forward", "confirm") and not asks:
                     prepared = {**prepared, "decision": "forward",
                                 "task": prepared.get("task") or text}
-                if prepared["decision"] in ("forward", "confirm") and risk == "confirm" and asks:
+                if prepared["decision"] in ("forward", "confirm") and (risk == "confirm" or money_or_message) and asks:
                     from .confirm import ConfirmQueue, prompt
                     from .remote import Remote
                     from .topology import ORIGIN
@@ -903,7 +903,7 @@ WAKE_OBJECT = re.compile(
     r"met|mean|meant|hear|heard|see|saw|know|knew|try|tried|said)\W*$", re.I)
 
 
-def wake_word(text, words=WAKE_WORDS):
+def wake_word(text, words=WAKE_WORDS, closing=True):
     """Strip the wake word; None if absent. "Jervis" is Whisper mishearing 'Jarvis';
     'Travis' is a real name, and "Jarvis's ..." is talking about JARVIS, not to it.
     The name may open the request after a greeting, or close it after a comma or as a
@@ -916,6 +916,8 @@ def wake_word(text, words=WAKE_WORDS):
         if not match.group(1).strip() and WAKE_SUBJECT.match(match.group(2)):
             return None  # "So Jarvis said it would rain": about it, not to it
         return match.group(2).strip()
+    if not closing:  # an unverified voice must open with the name (voice.md)
+        return None
     # The name closing the request. Found as the leftmost place the closing form fits, a
     # linear scan: the old lazy `^\W*(.*?\w.*?)(...)$` took 12 s on a 20k-character paste
     # (audit 2026-11-01), and this runs on every request.
