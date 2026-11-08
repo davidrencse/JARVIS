@@ -60,7 +60,9 @@ def set_main(config, path, device):
     save_json(path, proposed)
     return {**roles(proposed), "next": "Copy this jarvis.config.json to every machine (or "
             "commit it), restart `jarvis cluster run` on the new main and `jarvis cluster node` "
-            "on the others. See docs/architecture-guide.md#main-and-nodes."}
+            "on the others, and restart the voice listener on both (`jarvis voice stop` then "
+            "`jarvis voice start`, or `systemctl --user restart jarvis-voice`) so only the new "
+            "main talks. See docs/architecture-guide.md#main-and-nodes."}
 
 
 def run(args, config, base):

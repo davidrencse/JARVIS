@@ -4,6 +4,7 @@ import json
 import urllib.error
 
 from .cluster import Client, Hub, NodeWorker, _HUBS
+from .cluster_store import OWNER_TOKEN
 from .topology import is_node
 
 
@@ -184,7 +185,7 @@ def local_server(config, base, state, port, overlay=None):
     # Extra local windows and overlays must share the existing main brain too.
     running = _HUBS.get(str(Path(state).resolve()))
     client = None
-    if (Path(state) / "cluster-owner.token").is_file():
+    if (Path(state) / OWNER_TOKEN).is_file():
         candidate = Client(config, state, owner=True)
         try:
             candidate.request("/v1/status", timeout=1)

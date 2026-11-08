@@ -30,6 +30,9 @@ ONLINE = 75
 GRACE = 15  # seconds a running job may report past its deadline before it counts as uncertain
 
 
+OWNER_TOKEN = "cluster-owner.token"  # in the state folder; the main's owner credential
+
+
 class Broker:
     def __init__(self, state):
         self.state = Path(state).resolve()
@@ -63,7 +66,7 @@ class Broker:
             db.close()
 
     def owner_token(self):
-        path = self.state / "cluster-owner.token"
+        path = self.state / OWNER_TOKEN
         try:
             token = path.read_text(encoding="ascii").strip()
         except (OSError, ValueError):
@@ -162,7 +165,7 @@ class Broker:
 
     def heartbeat(self, node, info):
         # Never accept agent-provided paths, shell commands, or credentials as config.
-        safe = {k: str(info.get(k, ""))[:120] for k in ("hostname", "platform", "version", "code", "pulls")}
+        safe = {k: str(info.get(k, ""))[:120] for k in ("hostname", "platform", "version", "code", "pulls", "speaks")}
         with self.db() as db:
             db.execute("UPDATE nodes SET seen=?,info=? WHERE id=?", (time.time(), json.dumps(safe), node))
 
