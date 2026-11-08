@@ -27,6 +27,13 @@ class CommitDetectionTest(unittest.TestCase):
                        call("browser_type", element="Message box", ref="e9", text="post this now")):
             self.assertIsNone(commits(params), params)
 
+    def test_unnamed_ref_is_not_vouched_for_by_the_models_words(self):
+        browser_gate.observe("playwright", "- button [ref=e5]")
+        found = browser_gate.judge(call("browser_click", ref="e5", element="Next page arrow"))
+        self.assertIsNotNone(found)
+        self.assertFalse(found["checked"])
+        self.assertFalse(found["named"])
+
     def test_commit_clicks_ask(self):
         for label in ("Post button", "Send", "Reply", "Buy now", "Delete account", "Place order"):
             self.assertIsNotNone(commits(call("browser_click", element=label, ref="e1")), label)
