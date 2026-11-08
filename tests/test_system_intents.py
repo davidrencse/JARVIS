@@ -155,6 +155,16 @@ class ScreenshotTests(Env):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name).resolve()
 
+    def test_vault_is_refused(self):
+        vault = self.home / "Documents" / "obsidian-vault"
+        vault.mkdir(parents=True)
+        with mock.patch("jarvis.gates.local_config", return_value={"vault": {"path": str(vault)}}):
+            target, why = sysintents.screenshot_path(str(vault / "leak.png"), self.home)
+            self.assertIsNone(target)
+            self.assertIn("vault", why)
+            target, why = sysintents.screenshot_path("~/Documents/ok.png", self.home)
+            self.assertIsNone(why)
+
     def test_path_policy(self):
         pictures = self.home / "Pictures"
         for good in (pictures / "a.png", "~/Downloads/x.png", "Documents/sub/y.jpg"):
@@ -383,3 +393,23 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiskStatusTests(unittest.TestCase):
+    """2026-11-07: "how much disk space" went to the brain (5.7 s); now a free local read."""
+
+    def test_disk_reads_free_space_on_any_os(self):
+        from jarvis import sysintents
+        with mock.patch.object(sysintents, "_linux", return_value=False):
+            ok, text = sysintents.system_status({"what": "disk"})
+        self.assertTrue(ok)
+        self.assertIn("GB free of", text)
+
+    def test_parser_routes_disk_questions_and_leaves_others(self):
+        from jarvis.parse import parse_for
+        config = {"devices": {"zenbook": {"hostname": "z"}}}
+        for text in ("how much free disk space do I have", "check disk space"):
+            commands = parse_for(text, config, "zenbook")["commands"]
+            self.assertEqual([(c["intent"], c["args"]) for c in commands],
+                             [("system_status", {"what": "disk"})])
+        self.assertIsNone(parse_for("how much space is in the room", config, "zenbook")["commands"])
