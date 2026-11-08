@@ -452,7 +452,7 @@ def _pull(state, node, how, cut=None):
                        "and restarts.")
     elif report.get("tests"):
         out["note"] = (f"Not sent: the release tests failed, so {node} keeps its last release. "
-                       f"Fix the failing test, then run this again. ({str(report['tests'])[-200:]})")
+                       f"Fix the failing test, then run this again. ({str(report['tests'])[-800:]})")
     else:
         out["note"] = f"Not sent yet: {report.get('note') or 'no release could be cut'}"
     return out

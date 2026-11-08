@@ -15,7 +15,6 @@ import time
 log = logging.getLogger("jarvis.embed")
 
 MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-DIM = 384
 MAX_TOKENS = 256
 IDLE = 600  # seconds without a call before the model is freed
 RETRY_MISSING = 600  # seconds before looking again for model files that were not there
@@ -68,6 +67,7 @@ def _load():
     model, tokenizer_file = _files()
     options = onnxruntime.SessionOptions()
     options.intra_op_num_threads = 2  # stay light beside voice and the console
+    options.enable_cpu_mem_arena = False  # indexing batches would pin their peak for good
     session = onnxruntime.InferenceSession(model, options, providers=["CPUExecutionProvider"])
     tokenizer = Tokenizer.from_file(tokenizer_file)
     tokenizer.enable_truncation(MAX_TOKENS)
