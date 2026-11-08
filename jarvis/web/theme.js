@@ -10,7 +10,7 @@
   }
   window.JarvisTheme = { pref: pref, apply: apply };
   if (media && media.addEventListener) media.addEventListener("change", function () {
-    if (window.JarvisTheme.pref === "system") { apply(); if (window.Terrain) window.Terrain.redraw(); }
+    if (window.JarvisTheme.pref === "system") apply();
   });
   apply();
 })();

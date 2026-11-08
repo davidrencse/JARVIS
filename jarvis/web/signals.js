@@ -27,15 +27,6 @@
   }
   const dot = (g, x, y, r, color) => { g.fillStyle = color; g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill(); };
 
-  function bars(canvas, values) {
-    const s = surface(canvas); if (!s) return;
-    const { g, w, h, ink, off } = s, cols = values.length, step = 6, rows = Math.floor(h / step);
-    const pitch = w / cols, max = Math.max(...values, 1);
-    values.forEach((v, i) => {
-      const lit = Math.round((v / max) * rows), x = i * pitch + pitch / 2;
-      for (let r = 0; r < rows; r++) dot(g, x, h - 3 - r * step, 1.6, r < lit ? (i >= cols - 3 ? ink : css("--ink-2")) : off);
-    });
-  }
   function ring(canvas, pct) {
     const s = surface(canvas); if (!s) return;
     const { g, w, h, ink, off } = s, cx = w / 2, cy = h / 2, R = Math.min(w, h) / 2 - 4, n = 72;
@@ -141,20 +132,11 @@
   on("live", kick); on("view", kick); addEventListener("resize", kick);
   setInterval(kick, 4000); // the occasional blink while idle
 
-  // ---------- 02 Claude tokens ----------
+  // ---------- 02 Claude output, 24 h (a row under the Claude window) ----------
   async function loadTokens() {
-    let u; try { u = await J.api("/api/usage?hours=48"); } catch (e) { if ($("#sig-tok")) $("#sig-tok").textContent = "—"; return; }
-    const cur = u.output.slice(-24), prev = u.output.slice(0, -24);
-    const total = cur.reduce((a, b) => a + b, 0), before = prev.reduce((a, b) => a + b, 0);
+    let u; try { u = await J.api("/api/usage?hours=24"); } catch (e) { return; }
+    const total = u.output.slice(-24).reduce((a, b) => a + b, 0);
     if (claudeTokens !== total) { claudeTokens = total; limit(); }
-    if (!$("#sig-tok")) return; // the old tokens tile is gone from the console
-    const replies = u.replies.slice(-24).reduce((a, b) => a + b, 0);
-    $("#sig-tok").textContent = compact(total);
-    bars($("#dm-bars"), cur);
-    $("#sig-tok-stats").innerHTML = `<div><dt>Replies</dt><dd>${fmt.format(replies)}</dd></div>`;
-    const d = $("#sig-tok-delta");
-    if (!before) { d.textContent = "—"; d.title = "No output in the 24 hours before to compare"; }
-    else { const ch = Math.round(((total - before) / before) * 100); d.textContent = `${ch >= 0 ? "+" : "−"}${Math.abs(ch)}%`; d.title = "Compared with the 24 hours before"; }
   }
 
   // ---------- 03 Codex window ----------
@@ -260,8 +242,8 @@
 
   // ---------- boot ----------
   const redrawAll = () => { limit(); link(window.Jarvis.state.probe); loadTokens(); kick(); };
-  addEventListener("resize", () => { clearTimeout(redrawAll.t); redrawAll.t = setTimeout(() => { limit(); trace($("#dm-trace"), pings); loadTokens(); }, 200); });
-  $("#theme-toggle").addEventListener("click", () => setTimeout(() => { limit(); trace($("#dm-trace"), pings); loadTokens(); kick(); }, 40));
+  addEventListener("resize", () => { clearTimeout(redrawAll.t); redrawAll.t = setTimeout(() => { limit(); trace($("#dm-trace"), pings); }, 200); });
+  $("#theme-toggle").addEventListener("click", () => setTimeout(() => { limit(); trace($("#dm-trace"), pings); kick(); }, 40));
   document.fonts?.ready.then(() => kick());
   mood(); agentStats(); redrawAll(); loadToday(); drawActivity();
   setInterval(() => { if (!document.hidden) loadTokens(); }, 5 * 60 * 1000);

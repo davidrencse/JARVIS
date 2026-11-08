@@ -194,8 +194,6 @@
     } finally { b.disabled = false; }
   });
 
-  window.VoiceSetup = { open };
-
   // Settings > Voice: what is set up on this machine, and the button that opens setup.
   async function paintEntry(s) {
     const box = document.getElementById("vs-entry");

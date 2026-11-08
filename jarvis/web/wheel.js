@@ -11,8 +11,8 @@
   const on = (name, fn) => addEventListener("jarvis:" + name, (e) => fn(e.detail));
   const reduce = matchMedia("(prefers-reduced-motion: reduce)");
   const ctx = canvas.getContext("2d");
-  // The memory tangle runs on the GPU when it can (field.js); the 2D canvas then draws only
-  // the ring, rays and labels on a transparent layer above it.
+  // The 3D engine behind the wheel (boardfield.js -> engine3d.js) follows its layout, zoom and
+  // hover; the 2D canvas then draws only the ring, rays and labels on a transparent layer.
   const field = window.JarvisField ? window.JarvisField(canvas.parentElement, canvas) : null;
   let fieldBusy = false, inkRGB = [1, 1, 1], bgRGB = [0, 0, 0], dark = true;
   function rgb(color) {
@@ -260,7 +260,7 @@
   const tagEl = $("#lab-tag");
   function tag(s) {
     if (!tagEl) return;
-    tagEl.hidden = false; tagEl._s = s; tagEl._node = null;
+    tagEl.hidden = false; tagEl._s = s;
     tagEl.querySelector("b").textContent = `${String(s.i + 1).padStart(2, "0")} ${s.label}${s.state ? " · " + s.state : ""}`;
     tagEl.querySelector("span").textContent = s.last || s.lines.slice(0, 3).join(" · ");
     placeTag();
@@ -366,22 +366,10 @@
     const x = (sx - view.x) / view.k - G.cx, y = (sy - view.y) / view.k - G.cy;
     const d = Math.hypot(x, y), a = Math.atan2(y, x);
     const s = d > G.r - 10 && d < G.R + W ? STAGES[Math.floor((a + G.span) / G.step)] : null;
-    const hit = !s && field ? field.pick(sx, sy, view) : (field?.unhover(), null);
-    if (hit) { nodeTag(hit); hover = null; return; }
-    if (s !== hover || tagEl?._node) { hover = s || null; if (hover) tag(hover); else if (active) tag(active); else hideTag(); wake(); }
+    if (!s && field) field.pick(sx, sy, view); else field?.unhover();
+    if (s !== hover) { hover = s || null; if (hover) tag(hover); else if (active) tag(active); else hideTag(); wake(); }
   });
   canvas.parentElement.addEventListener("pointerleave", () => { hover = null; field?.unhover(); if (active) tag(active); else hideTag(); });
-  // Hovering a memory: what it is, where it came from, how connected it is.
-  function nodeTag({ node, x, y, links }) {
-    if (!tagEl) return;
-    tagEl.hidden = false; tagEl._s = null; tagEl._node = node;
-    tagEl.querySelector("b").textContent = `Memory · ${node.group || node.kind}${links ? " · " + links + " links" : ""}`;
-    tagEl.querySelector("span").textContent = node.label || node.id;
-    tagEl.style.left = Math.min(W - tagEl.offsetWidth - 8, x + 14) + "px";
-    tagEl.style.top = Math.max(8, Math.min(H - tagEl.offsetHeight - 30, y - 10)) + "px";
-    wake();
-  }
-
   // ---------- words: status line, trace panel, header strip ----------
   const stateEl = $("#lab-state"), stepsEl = $("#lab-steps"), metaEl = $("#lab-trace-meta"), bar = $("#lab-progress");
   const steps = new Map();
@@ -450,13 +438,6 @@
   new MutationObserver(() => { layout(); wake(); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
   document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(); });
   document.fonts?.ready.then(() => { layout(); wake(); });
-  let graphItems = -1;
-  async function loadGraph() {
-    if (!field) return;
-    try { field.setGraph(await J.api("/api/graph/heap")); graphItems = J.state.overview?.memory?.items ?? 0; wake(); }
-    catch (e) { /* the 2D ring still works; the next overview retries */ }
-  }
-  on("overview", (o) => { if (Math.abs((o.memory?.items ?? 0) - graphItems) >= 5) loadGraph(); });
-  layout(); header(); wake(); loadGraph();
+  layout(); header(); wake();
   window.JarvisWheel = { fire: (id, text, state) => byId[id] && fire(byId[id], text, state), stages: STAGES, fitRect, reset };
 })();

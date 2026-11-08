@@ -61,9 +61,6 @@
 .vs-field { display: grid; gap: 6px; width: min(340px, 100%); margin-top: 4px; text-align: left; }
 .vs-field > span { font: 650 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
 .vs-select { width: 100%; }
-.vs-points { display: grid; gap: 8px; margin: 4px 0 0; padding: 0; list-style: none; text-align: left; color: var(--ink-2); font: 500 13.5px/1.45 var(--sans); max-width: 42ch; }
-.vs-points li { display: flex; gap: 10px; }
-.vs-points .i { flex: none; width: 15px; height: 15px; margin-top: 2px; color: var(--ink); }
 
 /* done / failed */
 .vs-ok { display: grid; place-items: center; width: 72px; height: 72px; margin-top: 18px; border-radius: 50%; background: var(--inv-bg); color: var(--inv-ink); animation: vs-pop 520ms var(--vs-ease) both; }
