@@ -6,6 +6,8 @@
   const $$ = (s, r = document) => [...r.querySelectorAll(s)];
   const esc = window.JarvisEsc;
   const safeHttp = (u) => { try { return /^https?:$/.test(new URL(String(u)).protocol); } catch (e) { return false; } };
+  // The live mic level, read by signals.js for the agent tile's wave.
+  const Terrain = window.Terrain = { level: 0 };
   const icon = (name, cls = "i i-sm") => `<svg class="${cls}" aria-hidden="true"><use href="icons.svg?v=2#i-${name}"/></svg>`;
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
@@ -16,7 +18,9 @@
       method: "POST", headers: { "X-JARVIS": "1", "Content-Type": raw ? "application/octet-stream" : "application/json" },
       body: raw ? body : JSON.stringify(body) };
     const res = await fetch(path, opts);
-    const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    let data;
+    try { data = await res.json(); }
+    catch (e) { if (res.ok) throw new Error("The reply from JARVIS couldn't be read."); data = { error: `HTTP ${res.status}` }; }
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
     return data;
   }
@@ -113,7 +117,7 @@
     const order = ["system", "light", "dark"];
     JarvisTheme.pref = order[(order.indexOf(JarvisTheme.pref) + 1) % 3];
     try { localStorage.setItem("jarvis.theme", JarvisTheme.pref); } catch (e) {}
-    JarvisTheme.apply(); syncTheme(); Terrain.redraw(); graphs.forEach((g) => g.draw());
+    JarvisTheme.apply(); syncTheme(); graphs.forEach((g) => g.draw());
     toast(THEME_LABEL[JarvisTheme.pref] + ".");
   });
   syncTheme();
@@ -138,7 +142,8 @@
       ["Day", `${doy} / ${days}`], ["Year", Math.round((doy / days) * 100) + "% done"],
     ].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
   }
-  tick(); setInterval(tick, 1000);
+  tick(); setInterval(() => { if (!document.hidden) tick(); }, 1000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
 
   // ---------- credits ----------
   const SRC_TEXT = { live: "Live from the provider", local: "Read from logs on this laptop", manual: "Entered by you", none: "Not set up", error: "Check failed" };
@@ -573,11 +578,18 @@
   // come from /api/connections (~20 ms, no network); hardware from the overview's
   // inventory. Lan Mouse, clipboard and pairing are peripherals.js ("Connect & share"),
   // drawn between #devices-top and #devices-grid. Re-read every 8 s while visible.
+  const drops = [];  // upload log lines, kept here so a re-render of the grid restores them
+  function paintDrops() {
+    const log = $("#drop-log"); if (!log) return;
+    log.replaceChildren();
+    for (const d of drops) { const li = document.createElement("li"); li.className = d.cls; li.textContent = d.text; log.appendChild(li); }
+  }
   const conn = { data: null, error: "", busy: new Set(), timer: 0 };
   async function loadConnections() {
     try { conn.data = await api("/api/connections"); conn.error = ""; }
     catch (e) { conn.error = e.message; }
-    if (!$("#view-devices").hidden) renderDevices();
+    // A re-render would drop the full-screen view and any upload in progress.
+    if (!$("#view-devices").hidden && !document.fullscreenElement && !drops.some((d) => d.cls === "pending")) renderDevices();
   }
   function pollConnections() {
     clearTimeout(conn.timer);
@@ -846,14 +858,15 @@
     const zone = $("#dropzone"), input = $("#drop-input"), log = $("#drop-log"), target = $("#drop-device");
     if (!zone) return;
     target.addEventListener("change", () => store.set("jarvis.dropdevice", target.value));
-    const line = (text, cls) => { const li = document.createElement("li"); li.className = cls || ""; li.textContent = text; log.prepend(li); return li; };
+    const line = (text, cls) => { const d = { text, cls: cls || "" }; drops.unshift(d); drops.length = Math.min(drops.length, 30); paintDrops(); return d; };
+    paintDrops();
     async function sendAll(files) {
       for (const file of files) {
         const li = line(`Sending ${file.name} …`, "pending");
         try {
           const r = await api("/api/send?name=" + encodeURIComponent(file.name) + "&device=" + encodeURIComponent(target.value), file, true);
-          li.textContent = `Sent ${r.sent} (${compact(r.bytes)} bytes)`; li.className = "ok"; announce(li.textContent);
-        } catch (e) { li.textContent = `${file.name}: ${e.message}`; li.className = "bad"; }
+          li.text = `Sent ${r.sent} (${compact(r.bytes)} bytes)`; li.cls = "ok"; paintDrops(); announce(li.text);
+        } catch (e) { li.text = `${file.name}: ${e.message}`; li.cls = "bad"; paintDrops(); }
       }
     }
     zone.addEventListener("click", () => input.click());
@@ -1106,7 +1119,6 @@
       // Don't wipe an answer's trace when listening resumes; it clears to "listening" later.
       if (!auto || !$("#trace").children.length) trace(mic.wait ? LISTENING : [["listening · no “Jarvis” needed · stops when you pause · Esc cancels", "active"]]);
       if (!auto) announce("Listening.");
-      Terrain.redraw();
     } catch (e) {
       micDenied = e.name === "NotAllowedError" || e.name === "SecurityError";
       syncMicBtn();
@@ -1347,10 +1359,7 @@
       if (e.seq < live.seq) { live.turns.clear(); } // the server restarted: resync everything
       live.seq = e.seq; state.brain = d.brain;
       loadHistory(); soonOverview();
-      emit("vault", { resync: true }); // notes may have changed while disconnected
     },
-    // A note changed, in Obsidian or by JARVIS; the to-do board refetches (dashboard.js).
-    "vault.changed"(d) { emit("vault", d); },
     "brain.state"(d) { state.brain = d; if (state.overview) renderRouter(state.overview); },
     "connections.changed"() { if (!$("#view-devices").hidden) loadConnections(); },
     "turn.start"(d, e) {
@@ -1452,9 +1461,12 @@
   refreshCredits(false); loadMini();
   connectLive();
   // The live stream carries changes; these are the safety net if it drops.
-  setInterval(() => { if (!live.connected || Date.now() - lastOverview > 60000) refreshOverview(); }, 20000);
-  setInterval(() => { if (!live.connected || Date.now() - lastHistory > 120000) loadHistory(); }, 30000);
-  setInterval(() => refreshCredits(false), 120000);
+  setInterval(() => { if (!document.hidden && (!live.connected || Date.now() - lastOverview > 60000)) refreshOverview(); }, 20000);
+  setInterval(() => { if (!document.hidden && (!live.connected || Date.now() - lastHistory > 120000)) loadHistory(); }, 30000);
+  let creditsAt = Date.now();
+  const creditsNow = () => { creditsAt = Date.now(); refreshCredits(false); };
+  setInterval(() => { if (!document.hidden) creditsNow(); }, 120000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - creditsAt > 120000) creditsNow(); });
   refreshProbe(false);
   setInterval(() => { if (!document.hidden) refreshProbe(false); }, 60000); // the server caches for 55 s
   setInterval(() => { if (state.probe) $("#probe-checked").textContent = "checked " + ago(state.probe.checked_at); }, 15000);

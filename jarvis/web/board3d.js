@@ -1,4 +1,4 @@
-/* JARVIS as hardware: a 3D circuit board for the console's Memory panel (three.js, local copy).
+/* JARVIS as hardware: a 3D circuit board for the System design page (three.js, local copy).
    Original design, not a copy of any product: each part is a real piece of JARVIS.
      CPU + tower cooler = the brain (fan speeds up while a request is being thought about)
      RAM sticks         = memory, one stick per kind; chips and the LED bar light with item count
@@ -9,18 +9,16 @@
    It renders only while visible, idles at 30 fps, and stills completely with reduced motion. */
 import * as THREE from "./vendor/three-0.170.0.module.min.js";
 
-// Two mounts: the console's pipeline stage (#board3d, pinned in a slot beside the wheel) and the
-// System design page (#design-board, data-mode="full": fills its box, feeds itself live events,
-// and clicking a part scrolls to its section on that page instead of leaving it).
-const host = document.getElementById("board3d") || document.getElementById("design-board");
+// Mounted on the System design page (#design-board): it fills its box, feeds itself live events,
+// and clicking a part zooms in to it. (The console's stage runs engine3d.js instead.)
+const get = (path) => fetch(path).then((r) => r.json());
+const host = document.getElementById("design-board");
 if (host) start(host);
 
 function start(host) {
   const canvas = host.querySelector("canvas");
   const tip = host.querySelector(".board-tip");
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const full = host.dataset.mode === "full";
-  const go = (p) => { location.href = p.href; };  // embedded mode: a part links to its page (full mode zooms instead)
   let renderer;
   try {
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -262,7 +260,7 @@ function start(host) {
     wake(300);
   }
   const loadCards = async () => {
-    try { setCards(await (window.Jarvis && window.Jarvis.api ? window.Jarvis.api("/api/system/components") : fetch("/api/system/components").then((r) => r.json()))); } catch (e) {}
+    try { setCards(await get("/api/system/components")); } catch (e) {}
   };
   loadCards(); setInterval(() => { if (!document.hidden) loadCards(); }, 30000);
   const rows = (id) => (cards[id] ? cards[id].rows : [["status", "loading"]]);
@@ -348,8 +346,8 @@ function start(host) {
   }
   addEventListener("jarvis:overview", (ev) => setOverview(ev.detail));
   addEventListener("jarvis:live", (ev) => onLive(ev.detail));
-  (async () => {  // first paint without waiting for the console's next refresh
-    try { setOverview(await (window.Jarvis && window.Jarvis.api ? window.Jarvis.api("/api/overview") : fetch("/api/overview").then((r) => r.json()))); } catch (e) {}
+  (async () => {  // first paint without waiting for the next refresh
+    try { setOverview(await get("/api/overview")); } catch (e) {}
   })();
 
   // ---------- what each part is, and what it does in JARVIS ----------
@@ -512,7 +510,7 @@ function start(host) {
   canvas.addEventListener("pointerleave", leave);
 
   // ---------- keyboard: Tab to the board, arrows walk the parts in reading order, Enter zooms ----------
-  if (full) {
+  {
     canvas.tabIndex = 0;
     canvas.setAttribute("aria-label", "Board parts. Arrow keys move between parts, Enter zooms in, Escape zooms out.");
     const said = document.createElement("p"); said.className = "sr-only"; said.setAttribute("aria-live", "polite"); host.appendChild(said);
@@ -566,7 +564,7 @@ function start(host) {
       else document.querySelector(zoomed.section)?.scrollIntoView({ behavior: reduced ? "auto" : "smooth", block: "start" });
     }
   });
-  if (full) addEventListener("keydown", (e) => { if (e.key === "Escape" && zoomed) zoomTo(null); });
+  addEventListener("keydown", (e) => { if (e.key === "Escape" && zoomed) zoomTo(null); });
   // the page can point at and zoom to parts too (the rail's "under the hood" and "skills" rows)
   addEventListener("jarvis:part", (ev) => {
     const d = ev.detail || {}, p = d.name && byName(d.name);
@@ -709,48 +707,15 @@ function start(host) {
     wake(200);
   }
   addEventListener("jarvis:route", (ev) => runRoute(ev.detail && ev.detail.path, ev.detail && ev.detail.tier));
-  if (full) canvas.addEventListener("click", () => { if (hover) zoomTo(hover); else if (zoomed) zoomTo(null); });
-  else host.parentElement.addEventListener("click", () => { if (hover && hover.href) go(hover); });
-  if (full) {  // no console here: read the live stream and the overview ourselves
+  canvas.addEventListener("click", () => { if (hover) zoomTo(hover); else if (zoomed) zoomTo(null); });
+  {  // no console here: read the live stream and the overview ourselves
     if (window.EventSource) {
       const es = new EventSource("/api/events");
       es.addEventListener("message", (ev) => { let e; try { e = JSON.parse(ev.data); } catch (x) { return; } onLive(e); });
     }
-    const refresh = async () => { try { setOverview(await fetch("/api/overview").then((r) => r.json())); } catch (e) {} };
+    const refresh = async () => { try { setOverview(await get("/api/overview")); } catch (e) {} };
     setInterval(() => { if (!document.hidden) refresh(); }, 20000);
   }
-  // Pinned in the stage: a fixed-size slot at the left, clear of the wheel's ring. Its size is set
-  // once from the board's own proportions, so zooming the wheel or the page never resizes it;
-  // it only shrinks if the stage itself is too small to hold it.
-  const SLOT = { w: 420, h: 520, pad: 14 };
-  let area = null;
-  function place(G, W, H) {
-    const room = Math.max(160, Math.min(W, G.cx + G.r) - SLOT.pad * 3);  // stop short of the ring
-    // page zoom (Ctrl -/+): outer/inner width is the zoom factor; scale the slot by its inverse so
-    // the board keeps its size on screen, as long as the stage still has room for it
-    const zoom = Math.min(3, Math.max(0.3, (window.outerWidth || innerWidth) / Math.max(1, innerWidth)));
-    const want = 1 / zoom;
-    const fit = Math.min(want, room / SLOT.w, (H - SLOT.pad * 2) / SLOT.h);
-    const w = Math.round(SLOT.w * fit), h = Math.round(SLOT.h * fit);
-    if (host.style.width !== w + "px" || host.style.height !== h + "px") {
-      Object.assign(host.style, { width: w + "px", height: h + "px" });
-    }
-    area = null;  // the camera fits the slot itself
-    size();
-  }
-  // The wheel reports stage-local points; the board's slot is offset inside the stage.
-  function hoverStage(sx, sy) {
-    const r = canvas.getBoundingClientRect(), st = host.parentElement.getBoundingClientRect();
-    const x = sx - (r.left - st.left), y = sy - (r.top - st.top);
-    if (x < 0 || y < 0 || x > r.width || y > r.height) { if (hover || !tip.hidden) leave(); return; }
-    hoverAt(x, y);
-  }
-  if (!full) window.JarvisBoard = { place, hoverAt: hoverStage, leave };
-  if (!full) setTimeout(() => {  // after the loop below is set up: the wheel may have laid out already
-    const hook = window.JarvisBoardHook;
-    if (hook) { hook.board = window.JarvisBoard; if (hook.G) place(hook.G, hook.size.W, hook.size.H); }
-  }, 0);
-
   // ---------- size, camera, loop (renders only while visible; idles at 30 fps) ----------
   function size() {
     const w = Math.max(1, host.clientWidth), h = Math.max(1, host.clientHeight);
