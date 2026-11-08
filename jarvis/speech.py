@@ -55,6 +55,13 @@ def kokoro_model(state_dir):
         return _kokoro
 
 
+def release_kokoro():
+    """Drop the local voice model; kokoro_model() loads it again when next needed."""
+    global _kokoro
+    with _kokoro_lock:
+        _kokoro = None
+
+
 def write_wav(path, pcm, rate):
     partial = Path(path).with_suffix(".part")
     with wave.open(str(partial), "wb") as out:

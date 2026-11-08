@@ -22,6 +22,18 @@ PRUNE_EVERY = 86400   # seconds between prunes, per ledger
 MAX_LANES = 4  # more than this thrashes the subscription without finishing sooner
 
 
+@contextmanager
+def connect_database(path):
+    """Open a row-based ledger transaction and always close its connection."""
+    db = sqlite3.connect(path, timeout=10)
+    db.row_factory = sqlite3.Row
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -84,15 +96,8 @@ class Store:
                        "AND at < ?", (cutoff,))
         return removed
 
-    @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        return connect_database(self.path)
 
     def add(self, spec):
         task_id = uuid.uuid4().hex
