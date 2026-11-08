@@ -14,7 +14,8 @@ risk() reads the table, except for agent tasks, whose risk the gates ratchet.
 import re
 from dataclasses import dataclass
 
-RISKS = ("allow", "confirm", "deny")
+from .sysintents import STATUS_WHAT
+
 MEDIA = ("play_pause", "play", "pause", "next", "previous", "stop")
 # App deep links a command may open besides http(s); anything else is refused.
 DEEP_LINKS = ("spotify",)
@@ -27,7 +28,6 @@ SAFE_TO_CLOSE = frozenset({"spotify", "calculator", "grok bot"})
 # unchanged: the requested state holds, but it already did before the action ran.
 OUTCOMES = ("pre_effect_failure", "partial_effect", "acknowledged", "observed", "unchanged",
             "unconfirmed", "uncertain", "agent_claimed", "user_confirmed", "user_rejected")
-CERTAIN = frozenset({"pre_effect_failure", "observed", "user_confirmed", "user_rejected"})
 
 MAX_TEXT = 4000
 SPOTIFY = re.compile(r"(?:liked|(?:playlist|album|track|artist):[A-Za-z0-9]{1,64})\Z")
@@ -104,7 +104,7 @@ INTENTS = {i.name: i for i in (
     Intent("screenshot", "direct", "allow",
            {"path": (_text, False), "window": (lambda v: isinstance(v, bool), False)}, None, None),
     Intent("system_status", "direct", "allow",
-           {"what": (lambda v: v in ("battery", "wifi", "bluetooth", "windows", "all"), False)},
+           {"what": (lambda v: v in STATUS_WHAT, False)},
            None, None),
     Intent("workspace", "direct", "allow", {"n": (_sys("valid_workspace"), True)}, None, None),
     # pair and forget are security decisions: risk() makes them "confirm" (David's OK).

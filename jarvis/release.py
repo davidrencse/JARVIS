@@ -34,7 +34,8 @@ from .deploy import EXCLUDE, PACKAGE, SKIP, _files, code_fingerprint
 
 RELEASE = "code-release"        # in the main's state folder: jarvis/, pyproject.toml, release.json
 FAILED = "code-release-failed.json"
-QUIET = 60                      # seconds without a saved file before the tree counts as settled
+QUIET = 600                     # seconds without a saved file before the tree counts as settled (a cut runs the whole suite)
+FAST_QUIET = 60                 # ...when an online node is behind on code and waiting for it
 TEST_TIMEOUT = 900
 # Copied into the staging folder for the test run: everything but history, state and caches.
 STAGE_SKIP = {".git", ".jarvis", ".venv", "node_modules", "__pycache__", "jarvis.egg-info",
@@ -133,7 +134,10 @@ def run_tests(stage, timeout=TEST_TIMEOUT):
                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
         return False, f"tests took over {timeout} s"
-    tail = "\n".join((out.stderr or out.stdout).strip().splitlines()[-3:])
+    lines = (out.stderr or out.stdout).strip().splitlines()
+    # Name what failed, so a blocked release says which test to fix (not just "failures=1").
+    failed = [l for l in lines if l.startswith(("FAIL: ", "ERROR: "))][:10]
+    tail = "\n".join(failed + lines[-3:])
     return out.returncode == 0, tail
 
 

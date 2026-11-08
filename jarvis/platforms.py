@@ -19,7 +19,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-OSES = ("windows", "macos", "linux")
 # creationflags for a child process that must not flash a console window (0 off Windows).
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -28,6 +27,15 @@ def run_quiet(args, timeout=5, **kw):
     """Argument-list subprocess (never a shell), text out, no console window on Windows."""
     return subprocess.run(list(args), capture_output=True, text=True, encoding="utf-8",
                           errors="replace", timeout=timeout, creationflags=NO_WINDOW, **kw)
+
+
+def systemctl_user(*args, timeout=30):
+    """`systemctl --user ...` -> (returncode, stdout+stderr); never raises."""
+    try:
+        out = run_quiet(["systemctl", "--user", *args], timeout)
+        return out.returncode, (out.stdout or "") + (out.stderr or "")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
 
 
 def _os():
@@ -128,10 +136,6 @@ def is_windows():
     return detect()["os"] == "windows"
 
 
-def is_macos():
-    return detect()["os"] == "macos"
-
-
 def private_dir(path):
     """Make JARVIS's state folder (secrets, tokens, memory, voiceprint) readable by this
     account only. On Linux and macOS that's mode 700 on the folder, which closes every file
@@ -223,3 +227,11 @@ def boot_time():
     except (OSError, ValueError, IndexError, AttributeError, subprocess.SubprocessError):
         pass
     return None
+
+
+def desktop_backend(windows=None):
+    """Desktop action backend, allowing a caller's explicit Windows detection."""
+    if (on_windows() if windows is None else windows):
+        return "windows"
+    session = detect()["desktop"]
+    return "hyprland" if session == "windows" else session
