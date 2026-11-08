@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from .cluster import save_json
+from .gates import CONFIRM_DEFAULT
 
 
 def _devices(config):
@@ -49,9 +50,56 @@ FIELDS = {
                         "words, with a small local model (no tokens).", "bool", None),
     "vault.recall": ("memory", "Use my vault", "Bring relevant notes from your Obsidian vault "
                      "into answers.", "bool", None),
-    "vault.write": ("memory", "Write to my vault", "Allow adding notes when you ask. "
+    # Permissions (David, 2026-11-07): what JARVIS may do on this PC, in one place.
+    "rules.confirm": ("permissions", "Risky actions", "Ask first: risky actions wait in the gate "
+                      "for your OK. Act at once: they run unasked, except the always-ask list below.",
+                      "choice", lambda c: ["ask", "never"]),
+    "actions.enabled": ("permissions", "Act on my computers", "Open and close apps, windows, "
+                        "media, files and terminal commands, and control the desktop. Off: JARVIS "
+                        "only talks and remembers.", "bool", None),
+    "actions.browser": ("permissions", "Use the browser", "Drive Chrome and the JARVIS browser "
+                        "for web tasks. Sending, posting and buying still wait for you.", "bool", None),
+    "actions.grokbot": ("permissions", "Hand tasks to Grok Bot", "Let Grok Bot work inside "
+                        "apps and accounts after its preflight checks.", "bool", None),
+    "vault.write": ("permissions", "Write to my vault", "Allow adding notes when you ask. "
                     "Always additive.", "bool", None),
+    "terminal.sandbox": ("permissions", "Sandbox terminal commands", "Linux: every command "
+                         "runs in bubblewrap with secrets, browser profiles and JARVIS's own "
+                         "files hidden or read-only. Windows has no sandbox.", "bool", None),
+    "lan_mouse.enabled": ("permissions", "Share mouse and keyboard", "Lan Mouse on this PC. "
+                          "Off: the guard never starts it.", "bool", None),
+    "lan_mouse.off_when_apart": ("permissions", "Stop sharing when apart", "Turn Lan Mouse off "
+                                 "when the other laptop isn't on this network.", "bool", None),
 }
+
+# A change to one of these values weakens a safety net: the console must say so and the
+# save must carry confirmed: true (write() refuses it otherwise).
+LOOSENS = {"rules.confirm": "never", "terminal.sandbox": False, "lan_mouse.off_when_apart": False}
+DEFAULTS = {"rules.confirm": CONFIRM_DEFAULT, "actions.enabled": True, "actions.browser": True,
+            "actions.grokbot": True, "terminal.sandbox": True, "lan_mouse.enabled": True,
+            "lan_mouse.off_when_apart": True, "vault.write": False}
+# Restart-free in this process but built once in the voice listener's brain.
+LISTENER_RESTART = ("routing.brain", "memory.semantic", "actions.enabled", "actions.browser",
+                    "actions.grokbot")
+# What no setting can change (gates.hard_deny and rules.always_ask), shown read-only.
+NEVER = ["Type passwords, 2FA codes or card numbers",
+         "Delete or wipe your home, projects, vault or system folders",
+         "Edit its own code, config, keys or state",
+         "Change your shell, Hyprland or startup files",
+         "Reach your private accounts' credentials or browser profiles",
+         "Talk out loud on a node PC (only the main speaks)"]
+
+
+def permissions(config):
+    """Read-only facts for the Permissions page."""
+    rules = config.get("rules") or {}
+    from .platforms import on_windows
+    return {"always_ask": list(rules.get("always_ask") or ["money", "messages"]),
+            "never": NEVER, "sandbox_here": not on_windows(),
+            "stop": ["Super+Shift+Esc or `jarvis control stop` stops desktop control",
+                     "Disconnect or closing the tab ends remote control and releases held keys",
+                     "Ctrl+Shift+Super+Alt releases Lan Mouse; `jarvis lanmouse stop` turns it off",
+                     "`jarvis sleep --no-suspend` pauses all of JARVIS on this PC"]}
 VOICE_THRESHOLD = (0.20, 0.60)
 
 
@@ -109,7 +157,7 @@ def read(config, state):
     saved = _SAVED_CLUSTER.get(str(state))
     if saved:  # show what was saved, not the running value, or a save looks like it failed
         config = {**config, "cluster": {**(config.get("cluster") or {}), **saved}}
-    defaults = {"voice.near_miss": BORDERLINE, "cluster.tunnel": "reverse"}
+    defaults = {"voice.near_miss": BORDERLINE, "cluster.tunnel": "reverse", **DEFAULTS}
     fields = []
     for path, (section, label, help_, kind, extra) in FIELDS.items():
         item = {"path": path, "section": section, "label": label, "help": help_, "kind": kind,
@@ -118,6 +166,8 @@ def read(config, state):
             item["choices"] = extra(config)
         elif kind == "number":
             item["min"], item["max"], item["step"] = extra
+        if path in LOOSENS:
+            item["loosens"] = LOOSENS[path]
         fields.append(item)
     try:
         threshold = json.loads(_voiceprint(state).read_text(encoding="utf-8"))["threshold"]
@@ -129,7 +179,8 @@ def read(config, state):
                       "kind": "number", "value": threshold, "min": VOICE_THRESHOLD[0],
                       "max": VOICE_THRESHOLD[1], "step": 0.01, "disabled": threshold is None})
     from .platforms import label
-    return {"fields": fields, "machines": machines(config, state), "this_os": label()}
+    return {"fields": fields, "machines": machines(config, state), "this_os": label(),
+            "permissions": permissions(config)}
 
 
 def _node_rows(state):
@@ -198,8 +249,9 @@ def _valid(config, path, value):
     return int(value) if float(low).is_integer() and float(value).is_integer() else round(float(value), 3)
 
 
-def write(config, path, state, changes):
-    """Apply {path: value} after validating every change; nothing is saved if one is bad."""
+def write(config, path, state, changes, confirmed=False):
+    """Apply {path: value} after validating every change; nothing is saved if one is bad.
+    A change that loosens a safety net (LOOSENS) needs confirmed=True."""
     if not isinstance(changes, dict) or not changes:
         raise ValueError("Send at least one setting to change.")
     clean, threshold = {}, None
@@ -220,6 +272,9 @@ def write(config, path, state, changes):
         return node
     # Saving a value it already has (a slider dropped back) changes nothing to restart for.
     changed = [k for k in clean if current(k) != clean[k]]
+    risky = [k for k in changed if k in LOOSENS and clean[k] == LOOSENS[k]]
+    if risky and confirmed is not True:
+        raise ValueError(f"{FIELDS[risky[0]][1]}: this weakens a safety net. Confirm it in the console.")
     if clean:
         with _WRITE_LOCK:  # two rows saved at once must not overwrite each other on disk
             disk = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -242,5 +297,6 @@ def write(config, path, state, changes):
         data["threshold"] = threshold
         save_json(print_path, data)
     return {**read(config, state), "saved": sorted([*clean, *(["voiceprint.threshold"] if threshold else [])]),
-            "restart": [k for k in changed if k.startswith(("cluster.", "voice."))]
+            "restart": [k for k in changed if k.startswith(("cluster.", "voice."))
+                        or k in LISTENER_RESTART]  # the voice listener can't rebuild
                        + (["voiceprint.threshold"] if threshold else [])}

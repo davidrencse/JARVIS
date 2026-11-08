@@ -234,7 +234,10 @@ def _windows_build(path):
     """patched for the JARVIS build: its own bin folder, or the copy `elevate` installed in
     Program Files (audit cluster-06: that one was labelled official)."""
     path = path.lower().replace("/", "\\")
-    home = str(install_dir()).lower().replace("/", "\\").rstrip("\\") + "\\"
+    try:
+        home = str(install_dir()).lower().replace("/", "\\").rstrip("\\") + "\\"
+    except ValueError:  # not Windows, or Program Files unknown: only the bin folder counts
+        home = "\0"
     return "patched" if "\\lan-mouse\\bin\\" in path or path.startswith(home) else "official"
 
 
@@ -451,8 +454,72 @@ def _task_xml(command, arguments, user):
 
 
 def install_dir():
-    """Where elevate() installs the copy the elevated task runs (admin-writable only)."""
-    return Path(os.environ.get("ProgramFiles") or r"C:\Program Files") / "JARVIS Lan Mouse"
+    """Where elevate() installs the copy the elevated task runs (admin-writable only).
+    Windows only; Program Files comes from the shell (SHGetKnownFolderPath), never from the
+    %ProgramFiles% variable, which any process running as David can override in HKCU\\Environment.
+    Off Windows, or if the shell won't say, this raises rather than guess a path."""
+    if os.name != "nt":
+        raise ValueError("Elevated Lan Mouse is a Windows feature.")
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD),
+                    ("d", ctypes.c_ubyte * 8)]
+    # FOLDERID_ProgramFiles {905e63b6-c1bf-494e-b29c-65b732d3d21a}
+    folder_id = GUID(0x905E63B6, 0xC1BF, 0x494E,
+                     (ctypes.c_ubyte * 8)(0xB2, 0x9C, 0x65, 0xB7, 0x32, 0xD3, 0xD2, 0x1A))
+    out = ctypes.c_wchar_p()
+    try:
+        shell = ctypes.windll.shell32
+        shell.SHGetKnownFolderPath.argtypes = [ctypes.POINTER(GUID), wintypes.DWORD,
+                                               wintypes.HANDLE, ctypes.POINTER(ctypes.c_wchar_p)]
+        if shell.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(out)) != 0:
+            raise OSError("SHGetKnownFolderPath failed")
+        base = out.value
+        ctypes.windll.ole32.CoTaskMemFree(out)
+    except Exception as exc:
+        raise ValueError(f"Can't tell where Program Files is, so nothing was installed ({exc}).") from None
+    if not base or not Path(base).is_absolute():
+        raise ValueError("Can't tell where Program Files is, so nothing was installed.")
+    return Path(base) / "JARVIS Lan Mouse"
+
+
+_WRITE_RIGHTS = {"F", "M", "W", "WD", "AD", "WA", "WEA", "DC", "DE", "WDAC", "WO", "GA", "GW"}
+_UNTRUSTED = ("builtin\\users", "nt authority\\authenticated users", "everyone", "users",
+              "authenticated users", "s-1-5-32-545", "s-1-5-11", "s-1-1-0")
+
+
+def writable_by_users(icacls_output, folder, user=None):
+    """Principals (BUILTIN\\Users, Authenticated Users, Everyone, the current user) that icacls
+    says can write or modify `folder`. Empty when only admins/SYSTEM/TrustedInstaller can."""
+    bad, mine = [], (user or "").lower()
+    for line in str(icacls_output).splitlines():
+        line = line.strip()
+        if line.lower().startswith(str(folder).lower()):
+            line = line[len(str(folder)):].strip()
+        for who, perms in re.findall(r"([^\s:()][^:()]*?):((?:\([A-Za-z0-9,]+\))+)", line):
+            who = who.strip()
+            tokens = {t for group in re.findall(r"\(([^)]*)\)", perms) for t in group.split(",")}
+            if "DENY" in tokens or not tokens & _WRITE_RIGHTS:
+                continue
+            name = who.lower()
+            if name in _UNTRUSTED or (mine and (name == mine or name.split("\\")[-1] == mine.split("\\")[-1])):
+                bad.append(who)
+    return bad
+
+
+def _verify_locked_down(home):
+    """Raise unless only admins can write `home` (the elevated task runs what's in it)."""
+    done = _run("icacls", str(home), timeout=30)
+    if done.returncode:
+        raise RuntimeError("icacls couldn't read the install folder's permissions: "
+                           + (done.stderr.strip()[-200:] or "no detail"))
+    user = os.environ.get("USERNAME", "")
+    bad = writable_by_users(done.stdout, home, user)
+    if bad:
+        raise RuntimeError(f"{home} is writable by {', '.join(sorted(set(bad)))}; refusing to run "
+                           "anything from it elevated. The elevated tasks were removed.")
 
 
 def _is_admin():
@@ -481,6 +548,11 @@ def elevate(state=None):
     if was_running:
         stop()  # its exe in `home` may be in use
     _shutil.copytree(Path(binary).parent, home, dirs_exist_ok=True)
+    try:
+        _verify_locked_down(home)
+    except Exception:
+        unelevate()  # never leave a task pointing at a folder users can write
+        raise
     exe = home / Path(binary).name
     vbs = home / "start-elevated.vbs"
     log = home / "daemon.log"
@@ -640,13 +712,14 @@ def peer_nearby(config=None, status=None, nets=None):
     host = cur.rsplit(":", 1)[0].strip("[]") if cur else ""
     if host and _in(host, nets):  # this computer's own subnets, never "any private address"
         return {"near": True, "peer": name, "why": f"{name} is on this network ({host})."}
+    if host:  # online and Tailscale reaches it elsewhere: that beats a configured address,
+        # which a spoofed mDNS answer on café Wi-Fi could have planted (audit 2026-11-07)
+        return {"near": False, "peer": name, "why": f"{name} is on another network ({host})."}
     lan = sorted(ip for ip in ips if _in(ip, nets) and not ip.startswith("100."))
     if lan:  # the IP watcher only writes addresses it just found
         return {"near": True, "peer": name, "why": f"{name} has an address on this network ({lan[0]})."}
     if not p.get("Online"):
         return {"near": False, "peer": name, "why": f"{name} is offline and not on this network."}
-    if host:
-        return {"near": False, "peer": name, "why": f"{name} is on another network ({host})."}
     return {"near": None, "peer": name, "why": f"Tailscale hasn't talked to {name} lately; can't tell."}
 
 
