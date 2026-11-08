@@ -29,7 +29,7 @@ function start(host) {
   const canvas = host.querySelector("canvas");
   const tip = host.querySelector(".board-tip");
   const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
-  const esc = (v) => (window.JarvisEsc ? window.JarvisEsc(String(v)) : String(v).replace(/[&<>"]/g, ""));
+  const esc = window.JarvisEsc;
   let renderer;
   try {
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -184,7 +184,7 @@ function start(host) {
     state.devices = (o.devices || []).map((d) => ({ name: d.hostname || d.id, here: !!d.here, online: d.here || !!(nodes[d.id] && nodes[d.id].online) }));
     health();
   }
-  const api = (path) => (window.Jarvis && window.Jarvis.api ? window.Jarvis.api(path) : fetch(path).then((r) => r.json()));
+  const api = (path) => window.Jarvis.api(path);  // app.js loads first on the console
   const loadCards = async () => { try { for (const c of await api("/api/system/components")) cards[c.id] = c; health(); } catch (e) {} };
   (async () => { try { setOverview(await api("/api/overview")); } catch (e) {} })();
   loadCards(); setInterval(() => { if (!document.hidden) loadCards(); }, 30000);

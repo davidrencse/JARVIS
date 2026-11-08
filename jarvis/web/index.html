@@ -60,11 +60,6 @@
       <h1 class="page-h" id="page-title">Console</h1>
       <div class="title-sub">
         <span class="date-chip"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-calendar"/></svg><span id="clock-date"></span></span>
-        <div class="tabs range" role="radiogroup" aria-label="Timeline range">
-          <span class="tabs-pill" aria-hidden="true"></span>
-          <button type="button" role="radio" data-range="day" aria-checked="true">Day</button>
-          <button type="button" role="radio" data-range="week" aria-checked="false">Week</button>
-        </div>
       </div>
     </div>
     <nav class="crumbs sr" aria-label="Location"><span id="crumb-view">Console</span></nav>
@@ -360,6 +355,7 @@
           <button type="button" role="tab" id="st-tab-calls" aria-controls="st-panel-calls" data-sec="calls"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-mic"/></svg><span>Calls</span></button>
           <button type="button" role="tab" id="st-tab-intelligence" aria-controls="st-panel-intelligence" data-sec="intelligence"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-sparkles"/></svg><span>Intelligence</span></button>
           <button type="button" role="tab" id="st-tab-memory" aria-controls="st-panel-memory" data-sec="memory"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-database"/></svg><span>Memory</span></button>
+          <button type="button" role="tab" id="st-tab-permissions" aria-controls="st-panel-permissions" data-sec="permissions"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-circle-check"/></svg><span>Permissions</span></button>
           <button type="button" role="tab" id="st-tab-input" aria-controls="st-panel-input" data-sec="input"><svg class="i i-sm" aria-hidden="true"><use href="icons.svg?v=2#i-keyboard"/></svg><span>Input</span></button>
         </div></nav>
         <div class="st-main">
@@ -431,6 +427,13 @@
             <header class="st-head"><h2>Memory</h2><p>What JARVIS remembers and where it looks.</p></header>
             <div class="st-stat" id="st-stat-memory" aria-live="polite"></div>
             <div class="st-group" id="st-rows-memory" aria-live="polite"><p class="st-loading">Loading settings</p></div>
+          </section>
+
+          <section class="st-panel" id="st-panel-permissions" role="tabpanel" aria-labelledby="st-tab-permissions" data-sec="permissions" tabindex="-1" hidden>
+            <header class="st-head"><h2>Permissions</h2><p>What JARVIS may do on this computer. Turning something off takes effect at once; loosening a safety net asks you first.</p></header>
+            <div class="st-stat" id="st-stat-permissions" aria-live="polite"></div>
+            <div class="st-group" id="st-rows-permissions" aria-live="polite"><p class="st-loading">Loading settings</p></div>
+            <div id="st-perm-info"></div>
           </section>
 
           <section class="st-panel" id="st-panel-input" role="tabpanel" aria-labelledby="st-tab-input" data-sec="input" tabindex="-1" hidden>
@@ -519,7 +522,6 @@
 <div class="toast" id="toast" role="status" hidden></div>
 <div class="sr" id="announce" role="status" aria-live="polite"></div>
 
-<script src="console.js"></script>
 <script src="graph.js"></script>
 <script src="voice.js"></script>
 <script src="voicesetup.js"></script>
@@ -539,7 +541,6 @@
 <script src="remote.js"></script>
 <script src="boardfield.js"></script>
 <script src="wheel.js"></script>
-<script src="layout.js"></script>
 <script src="gate.js"></script>
 <script src="cockpit.js"></script>
 <script src="settings.js"></script>

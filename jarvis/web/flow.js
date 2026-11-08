@@ -189,7 +189,6 @@
     hidden = false; pinned = true; store.set("jarvis.flow.pin", true);
     draw(); sync();
   }
-  window.JarvisFlow = { replay };
 
   // ---------- layout: staircase, one row per node in tree order, indented by depth ----------
   function layout(t) {
