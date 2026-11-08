@@ -26,7 +26,7 @@ from . import __version__
 from .deploy import code_fingerprint
 from .release import served_code
 from .fsio import atomic_write
-from .cluster_store import BULK, Broker, CAPABILITIES, TERMINAL
+from .cluster_store import BULK, Broker, CAPABILITIES, OWNER_TOKEN, TERMINAL
 from .topology import DEFAULT_PORT, endpoint, identity, is_node, request_from
 
 _HUBS = {}
@@ -218,7 +218,7 @@ class Client:
         if owner:
             if self.local != self.main:
                 raise ValueError("Only the configured main PC can use its owner credential.")
-            path = self.state / "cluster-owner.token"
+            path = self.state / OWNER_TOKEN
             if not path.is_file():
                 raise ValueError("Start JARVIS on the main PC first (jarvis cluster serve).")
             self.token = path.read_text(encoding="ascii").strip()
@@ -401,8 +401,7 @@ class Hub:
             from .sharedinput import ControllerPause
             pause = ControllerPause(state).set  # David's input stays here while he drives a node
         self.remote = Sessions(on_busy=pause)  # David's remote-control sessions, in memory only
-        if pause is not None:
-            pause(False)  # a pause the last hub left behind (crash, restart) ends now
+        self._pause = pause  # its leftover-pause recovery waits for start(): only the lock holder may
 
     def redeem(self, node, public_key=None, token=None):
         """A newly joined node trades its invite for its own credential: a fresh hub token
@@ -446,15 +445,20 @@ class Hub:
         has changed and settled (release.py), then bring SSH nodes up to it. Nodes only ever
         get code the test suite passed on, never a file saved mid-edit."""
         from . import _under_tests
-        from .release import cut, due
+        from .release import FAST_QUIET, QUIET, cut, due
         if self.stop_event.wait(settle):  # let nodes reconnect and report their code
             return
         auto = (self.config.get("cluster") or {}).get("auto_release", True)
         while True:
             try:
                 # Never under tests: a release runs the whole suite.
-                if auto and not _under_tests() and due(self.state):
-                    report = cut(self.state)
+                quiet = QUIET
+                if auto and not _under_tests():
+                    live = code_fingerprint()  # a node online and behind gets the fast path
+                    if any(n["online"] and n.get("code") != live for n in self.broker.nodes()):
+                        quiet = FAST_QUIET
+                if auto and not _under_tests() and due(self.state, quiet=quiet):
+                    report = cut(self.state, quiet=quiet)
                     print(f"JARVIS: release {report.get('code')}: "
                           f"{'released' if report.get('released') else report.get('note')}", flush=True)
                 self._auto_update(settle=0)
@@ -670,6 +674,10 @@ class Hub:
         except BaseException:
             self._lock = None
             raise RuntimeError("The main runtime is already running for this state directory.") from None
+        if getattr(self, "_pause", None) is not None:
+            # A pause the last hub left behind (crash, restart) ends now. Only after the lock:
+            # a second hub that is about to fail must not adopt and end a live session's pause.
+            self._pause(False)
         _refresh_clipboard(self.state, self.config)  # the hub restarts with every code change here
         try:
             self.server = make_server(self, host, port)
@@ -932,6 +940,11 @@ class ProxyLane:
 
 
 class NodeWorker:
+    def _speaks(self):
+        """'no' when this node's JARVIS is muted (only the main talks), shown in cluster status."""
+        from .speech import may_speak
+        return "yes" if may_speak(self.config) else "no"
+
     def __init__(self, config, state, executor=None):
         if not is_node(config):
             raise ValueError("Run the node agent on a PC other than the configured main.")
@@ -1037,13 +1050,19 @@ class NodeWorker:
         try:
             response = self.client.request("/v1/poll", {"hostname": platform.node(),
                                 "platform": platform.system(), "version": __version__,
-                                "code": self.code, "pulls": "yes" if self._can_pull() else "no"},
+                                "code": self.code, "pulls": "yes" if self._can_pull() else "no",
+                                "speaks": self._speaks()},
                                 timeout=POLL_WAIT + 10)
         except (OSError, ValueError, RuntimeError) as exc:
             self._record(polls_failed=1, outages=0 if self._down else 1,
                          last_error=f"{time.strftime('%H:%M:%S')} {exc}"[:300])
             self._down = True
             raise
+        if not isinstance(response, dict) or not isinstance(response.get("job") or {}, dict):
+            # Not the main's shape (something squatting the tunnel port): fail this poll
+            # instead of crashing the agent on job.get (audit 2026-11-07).
+            self._record(polls_failed=1, last_error=f"{time.strftime('%H:%M:%S')} malformed poll reply")
+            raise ValueError("The main sent a malformed poll reply; ignored.")
         self._record(polls_ok=1, last_ok=time.time())
         self._down = False
         if not getattr(self, "_confirmed", False):
@@ -1173,6 +1192,10 @@ class NodeWorker:
                 delay = 1
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 print(f"JARVIS node: {exc}", flush=True)
+                worked = False
+                delay = min(delay * 2, 15)
+            except Exception as exc:  # a bug in one poll must not end the agent (no supervisor on Windows)
+                print(f"JARVIS node: unexpected {type(exc).__name__}: {exc}", flush=True)
                 worked = False
                 delay = min(delay * 2, 15)
             if not worked:
