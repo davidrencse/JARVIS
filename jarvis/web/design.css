@@ -13,8 +13,6 @@ code { font: inherit; color: var(--gold); }
 
 .top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap;
   padding: 22px 24px 16px; border-bottom: 1px solid var(--line); }
-.crumb { margin: 0 0 6px; font-size: 10.5px; color: var(--dim); letter-spacing: .06em; }
-.crumb a { color: var(--dim); text-decoration: none; } .crumb a:hover { color: var(--text); }
 .top h1 { font-size: 26px; }
 .lede { margin: 4px 0 0; color: var(--dim); max-width: 70ch; }
 .score { display: flex; gap: 10px; font-size: 11px; letter-spacing: .06em; }
@@ -98,7 +96,6 @@ main { padding: 6px 24px 40px; max-width: 1400px; margin: 0 auto; }
 .store .count { color: var(--pink); }
 .store .path { color: var(--faint); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* code map */
 /* live components: title bar + key -> value rows, colour = state only */
 .parts { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr)); gap: 10px; margin-bottom: 16px; }
 .part { border: 1px solid var(--line); background: var(--panel); border-radius: var(--jv-r-sm); padding: 0 0 8px; min-width: 0; }
@@ -154,7 +151,7 @@ main { padding: 6px 24px 40px; max-width: 1400px; margin: 0 auto; }
 /* narrow screens: one column of health checks, so a long fix command scrolls inside its box */
 @media (max-width: 640px) { .checks { grid-template-columns: minmax(0, 1fr); } .check .detail { overflow-wrap: anywhere; } }
 
-/* 01: the rig — the live 3D board (board3d.js, data-mode="full") beside the station rail */
+/* 01: the rig — the live 3D board (board3d.js) beside the station rail */
 .rig { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; align-items: stretch; }
 .board-block .board3d { position: relative; height: min(80vh, 860px); min-height: 420px; background: #060606;
   border: 1px solid var(--line); border-radius: var(--jv-r-sm, 4px); overflow: hidden; }
