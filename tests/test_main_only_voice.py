@@ -74,3 +74,34 @@ class SilentNodeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RealConfigTests(unittest.TestCase):
+    """The repo's own jarvis.config.json: the Dell (by its real hostname) must be silent."""
+
+    def setUp(self):
+        import json
+        path = Path(__file__).resolve().parent.parent / "jarvis.config.json"
+        if not path.exists():
+            self.skipTest("no jarvis.config.json")
+        self.cfg = json.loads(path.read_text(encoding="utf-8"))
+        cluster = self.cfg.get("cluster") or {}
+        if not cluster.get("enabled") or cluster.get("local_device", "auto") != "auto":
+            self.skipTest("config doesn't pick the PC by hostname")
+
+    def test_every_node_hostname_is_silent_and_the_main_talks(self):
+        main = self.cfg["cluster"]["main_device"]
+        for device, info in self.cfg["devices"].items():
+            with self.subTest(device=device), \
+                    mock.patch("socket.gethostname", return_value=info["hostname"]):
+                self.assertEqual(may_speak(self.cfg), device == main)
+
+    def test_node_reports_speaks_no_in_its_check_in(self):
+        from jarvis.cluster import NodeWorker
+        main = self.cfg["cluster"]["main_device"]
+        for device, info in self.cfg["devices"].items():
+            worker = NodeWorker.__new__(NodeWorker)
+            worker.config = self.cfg
+            with self.subTest(device=device), \
+                    mock.patch("socket.gethostname", return_value=info["hostname"]):
+                self.assertEqual(worker._speaks(), "yes" if device == main else "no")

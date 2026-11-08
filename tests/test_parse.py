@@ -49,6 +49,39 @@ class ParserTests(unittest.TestCase):
         got = parse_for("open spotify on my main pc", config, origin="dell")
         self.assertEqual(got["commands"][0]["device"], "zenbook")
 
+    def test_everyday_status_questions_parse(self):
+        """Measured brain fall-throughs (events.jsonl): battery and Wi-Fi questions."""
+        def shape(text):
+            got = parse(text, DEVICES, "zenbook", main="zenbook")
+            self.assertIsNotNone(got["commands"], (text, got["reason"]))
+            return [(c["intent"], c["args"]) for c in got["commands"]]
+        for text in ("what's my battery at", "how much battery do I have left",
+                     "how much battery is left", "how much charge do i have left"):
+            self.assertEqual(shape(text), [("system_status", {"what": "battery"})], text)
+        for text in ("what network am I on", "which network am i connected to",
+                     "what's my network name"):
+            self.assertEqual(shape(text), [("system_status", {"what": "wifi"})], text)
+        # Two questions one read answers: run it once.
+        self.assertEqual(shape("is wifi connected and what network am I on"),
+                         [("system_status", {"what": "wifi"})])
+        self.assertEqual(shape("is wifi connected and how much battery do i have left"),
+                         [("system_status", {"what": "wifi"}), ("system_status", {"what": "battery"})])
+
+    def test_on_spotify_names_the_player_not_a_place(self):
+        got = parse("play music on spotify", DEVICES, "zenbook", main="zenbook")["commands"]
+        self.assertEqual([(c["intent"], c["args"]) for c in got], [("media", {"command": "play"})])
+        # A named song or artist needs a search the registry can't express: the brain's.
+        for text in ("play drake on spotify", "open spotify and play drake", "play something"):
+            got = parse(text, DEVICES, "zenbook", main="zenbook")
+            self.assertIsNone(got["commands"], text)
+            self.assertNotIn("place", got["reason"], text)
+
+    def test_status_near_misses_stay_unparsed(self):
+        for text in ("tell me about the battery industry", "how much battery does a tesla have",
+                     "what's the battery industry at", "what network is the game on tonight",
+                     "what's the network", "how much battery is", "how much space is in the room"):
+            self.assertIsNone(parse(text, DEVICES, "zenbook", main="zenbook")["commands"], text)
+
     def test_close_needs_an_exact_app_name(self):
         for text in ("close the stream", "close sword", "close explore"):
             self.assertIsNone(parse(text, DEVICES, "dell")["commands"], text)
