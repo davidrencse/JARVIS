@@ -56,14 +56,6 @@ def chatgpt_lane(config, base):
                        instructions=INSTRUCTIONS, overrides=['web_search="disabled"'])
 
 
-def infer_with_chatgpt(prompt, config, base):
-    lane = chatgpt_lane(config, base)
-    try:
-        return lane.ask(prompt)
-    finally:
-        lane.close()
-
-
 def assess(request, config, base, infer=None):
     """Return {decision, task, reply, checks}; fail closed on bad inference output."""
     if infer is not None:
