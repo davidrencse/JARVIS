@@ -99,6 +99,16 @@ def now_line():
     return f"Now: {local:%A %Y-%m-%d %H:%M} {local.tzname()} (UTC{local:%z})."
 
 
+def pump_lines(proc, lines):
+    """Forward stdout lines, close the stream and signal EOF even on reader failure."""
+    try:
+        with proc.stdout:
+            for line in proc.stdout:
+                lines.put(line)
+    finally:
+        lines.put(None)
+
+
 def close_process(proc, reader, grace=1.0):
     """Reap a lane's child and let its reader close stdout, including after EOF.
 
@@ -189,14 +199,7 @@ class FastLane:
                                         daemon=True)
         self._reader.start()
 
-    @staticmethod
-    def _pump(proc, lines):
-        try:
-            with proc.stdout:
-                for line in proc.stdout:
-                    lines.put(line)
-        finally:
-            lines.put(None)
+    _pump = staticmethod(pump_lines)
 
     def close(self):
         proc, reader = self.proc, self._reader

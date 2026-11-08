@@ -76,12 +76,15 @@ TRUSTED_LOCAL = {"enabled": True,
 SKIPPABLE = frozenset({"app_exists", "history", "observe", "dedupe"})
 
 
+CONFIRM_DEFAULT = "ask"  # rules.confirm when unset; settings.DEFAULTS and sysview read this
+
+
 def asks(config):
     """rules.confirm in jarvis.config.json: "ask" (default) parks risky actions for David's
     OK; "never" runs them at once (his choice, 2026-11-01). Refusals (passwords, 2FA codes,
     card numbers; agent-origin actions) stay either way: they are not questions (hard_deny).
     Only exactly "never" (whitespace aside) turns asking off; any other value asks."""
-    return str(((config or {}).get("rules") or {}).get("confirm", "ask")).strip() != "never"
+    return str(((config or {}).get("rules") or {}).get("confirm", CONFIRM_DEFAULT)).strip() != "never"
 
 
 _LIVE = {}  # config path -> (mtime, rules.confirm)
@@ -98,7 +101,7 @@ def asks_now(config, state=None):
             cached = _LIVE.get(str(path))
             if not cached or cached[0] != mtime:
                 rules = (json.loads(path.read_text(encoding="utf-8")) or {}).get("rules") or {}
-                _LIVE[str(path)] = cached = (mtime, rules.get("confirm", "ask"))
+                _LIVE[str(path)] = cached = (mtime, rules.get("confirm", CONFIRM_DEFAULT))
             return asks({"rules": {"confirm": cached[1]}})
         except (OSError, ValueError, AttributeError):
             pass  # no file there, or it's mid-edit: the config the gate was built with
@@ -145,18 +148,117 @@ WRAPPERS = frozenset({"sudo", "doas", "command", "builtin", "env", "nice", "ioni
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "busybox", "pwsh", "powershell", "cmd"})
 
 
+# Options of a wrapper that take the next word as their value (`env -u X rm`, `timeout -s KILL 5 rm`):
+# skipping only the dash word would read the value as the command and let the real one through.
+WRAPPER_VALUE_OPTS = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string", "-a", "--argv0"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "exec": frozenset({"-a"}),
+    "ionice": frozenset({"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid", "--pgid", "--uid"}),
+    "chrt": frozenset({"-p"}),
+    "taskset": frozenset({"-p", "-c"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "sudo": frozenset({"-u", "-g", "-C", "-h", "-p", "-r", "-t", "-T", "-U", "-D", "-R", "--user", "--group",
+                       "--close-from", "--host", "--prompt", "--role", "--type", "--command-timeout",
+                       "--other-user", "--chdir", "--chroot"}),
+    "doas": frozenset({"-u", "-C"}),
+    "xargs": frozenset({"-I", "-n", "-P", "-L", "-s", "-d", "-E", "-a", "--max-args", "--max-procs",
+                        "--max-lines", "--max-chars", "--delimiter", "--arg-file"}),
+    "setsid": frozenset(), "nohup": frozenset(), "time": frozenset({"-f", "-o", "--format", "--output"}),
+}
+SHELL_KEYWORDS = frozenset({"then", "do", "else", "elif", "if", "while", "until", "!"})
+
+
+def _base(word):
+    return re.sub(r"\.exe$", "", word.replace("\\", "/").rsplit("/", 1)[-1].lower())
+
+
 def _command_name(values):
-    """(index, name) of the word that really runs: wrappers, their options and VAR=x skipped,
-    paths cut to the program's name (/usr/bin/rm -> rm, rm.exe -> rm)."""
-    i = 0
+    """(index, name) of the word that really runs: wrappers, their options (and those options'
+    values) and VAR=x skipped, paths cut to the program's name (/usr/bin/rm -> rm, rm.exe -> rm).
+    Name is "" when nothing is left to run."""
+    i, wrapper = 0, None
     while i < len(values):
         word = values[i]
-        base = re.sub(r"\.exe$", "", word.replace("\\", "/").rsplit("/", 1)[-1].lower())
-        if base in WRAPPERS or word.startswith("-") or re.fullmatch(r"\w+=.*|\d+[smhd]?", word):
+        base = _base(word)
+        if base in WRAPPERS:
+            wrapper = base
+            i += 1
+            continue
+        if word.startswith("-"):
+            i += 2 if word in WRAPPER_VALUE_OPTS.get(wrapper, ()) else 1
+            continue
+        if re.fullmatch(r"\w+=.*|\d+(?:\.\d+)?[smhd]?|0x[0-9a-f]+|[0-9,-]+", word, re.I):
             i += 1
             continue
         return i, base
     return len(values), ""
+
+
+def _split_string(values):
+    """The command text `env -S 'rm -rf ~'` / `env --split-string=...` runs, else None."""
+    for k, word in enumerate(values):
+        if _base(word) != "env":
+            continue
+        for j in range(k + 1, len(values)):
+            v = values[j]
+            if not v.startswith("-"):
+                if re.fullmatch(r"\w+=.*", v):
+                    continue
+                break
+            if v in ("-S", "--split-string"):
+                return values[j + 1] if j + 1 < len(values) else ""
+            if v.startswith("--split-string="):
+                return v.split("=", 1)[1]
+            if re.fullmatch(r"-[a-zA-Z]*S.+", v):
+                return v[v.index("S") + 1:]
+    return None
+
+
+def _git_discards(args):
+    """Why this git command (the words after `git`) throws away uncommitted work, or None.
+    Global options (-C dir, -c k=v, --git-dir x) are skipped to find the subcommand."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        i += 2 if args[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path") else 1
+    if i >= len(args):
+        return None
+    sub, rest = args[i], args[i + 1:]
+    why = "JARVIS doesn't run git commands that discard uncommitted work"
+    flags = [a for a in rest if a.startswith("-") and a != "--"]
+    plain = [a for a in rest if not a.startswith("-")]
+    if sub in ("checkout", "reset") and any(re.fullmatch(r"-[a-zA-Z]*p[a-zA-Z]*|--patch", f) for f in flags):
+        return why
+    if sub == "checkout":
+        if "--" in rest or any(re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*|--force|--ours|--theirs|--overwrite-ignore|"
+                                            r"--discard-changes", f) for f in flags):
+            return why
+        makes = any(re.fullmatch(r"-[a-zA-Z]*[bB][a-zA-Z]*|--orphan", f) for f in flags)
+        # `checkout <branch>` has one name; a second (or ".", a glob, an existing path) is a pathspec
+        if len(plain) > (2 if makes else 1) or any(a == "." or re.search(r"[*?\[]", a) or
+                                                    (not makes and os.path.exists(a)) for a in plain):
+            return why
+    if sub == "restore":
+        staged_only = any(f in ("--staged", "-S") for f in flags) and \
+            not any(f in ("--worktree", "-W") for f in flags)
+        if not staged_only:
+            return why
+    if sub == "switch" and any(re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*|--force|--discard-changes", f) for f in flags):
+        return why
+    return None
+
+
+_HOME_NAMES = r"\$\{?env:(?:USERPROFILE|HOME)\}?|%(?:USERPROFILE|HOMEPATH|HOME)%|\$\{?HOME\}?"
+
+
+def _unresolved(word, command):
+    """True when a write target still holds a variable, % or ( after the ones this check fills in
+    (home, $PWD, and bash VAR= assigned in the same command) are taken out."""
+    assigned = set(re.findall(r"(?:^|[\s;&])([A-Za-z_]\w*)=", command))
+    text = re.sub(_HOME_NAMES + r"|\$\{?PWD\}?|\$env:PWD", "", word, flags=re.I)
+    text = re.sub(r"\$\{?(\w+)\}?", lambda m: "" if m.group(1) in assigned else m.group(0), text)
+    return bool(re.search(r"[$%`(]", text))
 
 
 def _vault_paths(config):
@@ -216,10 +318,11 @@ _SHELL = r"(?:bash|sh|zsh|dash|ksh|fish|pwsh|powershell|cmd)(?:\.exe)?"
 _LOOPBACK = (r"(?:localhost|0\.0\.0\.0|(?:0*127|0+177|0x0*7f)(?:\.(?:0x[0-9a-f]+|\d+)){1,3}|"
              r"21(?:3\d|4[0-7])\d{6}|0+17[0-7]{9}|0x0*7f[0-9a-f]*|"
              r"\[?(?:(?:0{1,4}(?::0{1,4}){0,5})?::0*1|(?:0{1,4}:){7}0{0,3}1)\]?)")
-LOCAL_CONSOLE = re.compile(r"(?<![\w.])" + _LOOPBACK + r"(?![\w.])|(?:(?<=//)|(?<=@))0+(?=[:/\s]|$)|"
+# A trailing dot or a wildcard-DNS suffix still resolves to loopback: localhost., 127.0.0.1.nip.io.
+LOCAL_CONSOLE = re.compile(r"(?<![\w.])" + _LOOPBACK + r"(?!\w|\.\d)|(?:(?<=//)|(?<=@))0+(?=[:/\s]|$)|"
                            r"/api/(?:confirm|ask|settings|send|remote)\b|\bX-JARVIS\b", re.I)
 
-CONSOLE_PORTS = (7777, 7780)  # the console's and the hub's default ports; cluster.listen_port too
+CONSOLE_PORTS = (7777, 7780, 7779, 7778)  # console, hub, grokbot RELAY_PORT/TUNNEL_PORT; cluster.listen_port too
 _CONSOLE_WHY = "JARVIS doesn't let commands talk to its own console or hub on this computer"
 
 
@@ -333,6 +436,10 @@ STRUCTURAL = [
                 r"\b(?:copy-item|cpi|copy|cp|move-item|mi|mv|move)\b[^;&|\n]*?\s(?!-)[^\s;&|]+\s+"
                 r"\$\{?profile\b(?:\.\w+)*\}?(?:\s+-\S+)*\s*(?:$|[;&|\n)])", re.I),
      "JARVIS doesn't write the PowerShell profile"),
+    # a write whose path comes from a subexpression: Set-Content -Path (Join-Path ~\Documents 'x') -Value hi
+    (re.compile(r"\b(?:set-content|sc|add-content|ac|out-file|tee-object|new-item|ni|copy-item|cpi|move-item|mi|"
+                r"rename-item|ren)\b(?:[^;&|\n()]*?\s-(?:destination|path|literalpath|filepath)\s*:?\s*|\s+)\(", re.I),
+     "JARVIS can't tell where a write lands when its path comes from a subexpression; name it plainly"),
     (re.compile(r"\bgit\b[^;&|\n]*(?:\bconfig\b(?![^;&|\n]*--get)[^;&|\n]*|\s-c\s*)(?:core\.(?:fsmonitor|hookspath|"
                 r"sshcommand|pager|editor|askpass|gitproxy)|sequence\.editor|include(?:if)?\.|credential\.helper|"
                 r"diff\.external|filter\.\S+\.(?:clean|smudge|process)|alias\.\S*(?:\s+|=)['\"]?!)", re.I),
@@ -354,7 +461,7 @@ HOME_DIRS = re.compile(r"^(?:/home/[^/]+|/Users/[^/]+|/root|[a-z]:/users/[^/]+)/
 # Where a written file runs later on its own (autostart, PATH, git hooks): never written by the
 # brain (defence in depth next to the sandbox; the only barrier on Windows/macOS).
 PERSIST = re.compile(r"/(?:\.local/bin|\.local/share/systemd|\.config/systemd|\.config/autostart|\.gitconfig|"
-                     r"\.config/git|\.local/share/applications|library/launchagents|"
+                     r"\.config/git|\.git/hooks|\.git/config|\.local/share/applications|library/launchagents|"
                      r"appdata/roaming/microsoft/windows/start menu/programs/startup)(?:/|$)", re.I)
 # Shell/desktop startup files and the PowerShell profile run in every new shell (audit 2026-11-07).
 # Judged on written paths only: reading or git-inspecting dotfiles (`awk 1 ~/.bashrc`, `git status`
@@ -460,7 +567,7 @@ def _home_variants(command, config):
         found = re.match(r"([A-Za-z]:[\\/]Users[\\/][^\\/]+)", str(path))
         if found:
             homes.add(found.group(1))
-    names = r"\$\{?env:(?:USERPROFILE|HOME)\}?|%(?:USERPROFILE|HOMEPATH|HOME)%|\$\{?HOME\}?"
+    names = _HOME_NAMES
     # Left to right, each use filled in from the assignments before it, never into an
     # assignment's own value (audit 2026-11-04: `export PATH=$PATH:/x` doubled on every pass
     # until MemoryError). The filled text is capped: None means too big to judge, refuse.
@@ -562,7 +669,14 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
         if not words:
             return None
         values = [v for v, _ in words]
+        inner_env = _split_string(values)
+        if inner_env:  # env -S 'rm -rf ~': the value is a command line, judged like bash -c
+            found = _terminal_denial({**(args or {}), "command": inner_env}, config, base, depth + 1)
+            if found:
+                return found
         at, name = _command_name(values)
+        if not name and _base(values[0]) in WRAPPERS - SHELL_KEYWORDS:
+            return "JARVIS can't tell which command that wrapper runs; write it plainly"
         values = values[at:] or values
         if name in SHELLS or name == "eval":  # `bash -c "rm -rf ~"`: judge the inner command
             # From the raw text: the parsed words have lost PowerShell/cmd backslashes.
@@ -613,12 +727,19 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
         # $VAR here would be filled from JARVIS's own environment ($PWD): the filled-in variants judge those.
         plainargs = [v for v in values[1:] if not v.startswith("-") and not re.fullmatch(r"/[a-zA-Z]{1,8}", v)
                      and not re.search(r"[$%`]", v)]
+        # A destination built from a $variable or (subexpression) can't be read here: refuse.
+        dests = [v for v in values[1:] if not v.startswith("-") and not re.fullmatch(r"/[a-zA-Z]{1,8}", v)]
+        if (name in WRITE_DEST and dests[-1:] or name in WRITE_ALL and dests) and \
+                any(_unresolved(d, command) for d in (dests[-1:] if name in WRITE_DEST else dests)):
+            return "JARVIS can't tell where that write lands (variable or subexpression); name the path plainly"
         if name in WRITE_DEST and plainargs:
             wrote.append(plainargs[-1])
         if name in WRITE_ALL or name == "sed" and any(re.match(r"-\w*i|--in-place", v) for v in values[1:]):
             wrote += plainargs
         for k, v in enumerate(values[1:-1], 1):  # -t dir, -Destination x, curl -o x, dd of=x
             if re.fullmatch(r"-t|--target-directory|-destination|-o|--output|--output-document|-d|-P", v, re.I):
+                if _unresolved(values[k + 1], command) and name in WRITE_DEST | WRITE_ALL:
+                    return "JARVIS can't tell where that write lands (variable or subexpression); name the path plainly"
                 if not re.search(r"[$%`]", values[k + 1]):
                     wrote.append(values[k + 1])
         wrote += [v.split("=", 1)[1] for v in values[1:]
@@ -649,6 +770,10 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
                     re.search(r"(?:^|/)(?:\.jarvis|jarvis\.config\.json|JARVIS\.md|\.ssh|\.codex|\.claude|"
                               r"\.gnupg)(?:/|$)|/JARVIS/jarvis(?:/|$)", path, re.I):
                 return "JARVIS's own config, state and keys are off limits"
+        if name == "git":
+            found = _git_discards(values[1:])
+            if found:
+                return found
         if name == "git" and "clean" in values and any(re.fullmatch(r"-\w*f\w*|--force", v) for v in values):
             if _under(here, repo_s) or here == home or any(_under(here, v) for v in vaults):
                 return "git clean would delete JARVIS's or the vault's untracked files"
@@ -695,11 +820,16 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
                     return "icacls/takeown can't change the permissions of home, JARVIS or the vault"
         if name in RM_NAMES:
             # -Path:C:\x / -LiteralPath:x carry their target inside the option.
-            targets += [v.split(":", 1)[1] for v in values[1:] if re.match(r"-\w+:.", v)]
+            switch = r"-(?:r\w*|fo\w*|wh\w*|conf\w*|inc\w*|exc\w*):"  # -Recurse:$true is not a path
+            targets += [v.split(":", 1)[1] for v in values[1:]
+                        if re.match(r"-\w+:.", v) and not re.match(switch, v, re.I)]
             targets += [w.strip("'\"").split(":", 1)[1].strip("'\"") for w in step.split()[1:]
-                        if re.match(r"-\w+:.", w.strip("'\""))]  # -Path:C:\x keeps its backslashes raw
+                        if re.match(r"-\w+:.", w.strip("'\"")) and not re.match(switch, w.strip("'\""), re.I)]
+            # -Recurse:$true / -r:$true; only an explicit false value is not recursive, `:$x` counts
+            bare = [re.sub(r":(?!(?:\$false|false|0)$).*$", "", v) if re.match(r"-[a-zA-Z]+:", v) else v
+                    for v in values[1:]]
             recursive = any(re.fullmatch(r"-[a-zA-Z]*[rR][a-zA-Z]*|--r\w*|-recurse\w*|/s", v, re.I)
-                            or v == "--no-preserve-root" for v in values[1:])
+                            or v == "--no-preserve-root" for v in bare)
             if recursive or name in ("rmdir", "rd"):
                 guarded = [repo_s, home, "/"] + vaults
                 if unknown and any(not t.startswith(("/", "~")) and not re.match(r"[A-Za-z]:", t) for t in targets):
@@ -728,11 +858,12 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
 
     unknown = False  # a cd/pushd into a place this check can't resolve (glob, variable)
     pieces, seps, at = [], [], 0
-    for m in SEPARATORS.finditer(command):
-        pieces.append(command[at:m.start()])
+    split_text = command.replace(">|", ">")
+    for m in SEPARATORS.finditer(command.replace(">|", ">")):  # `>|` is a redirect, not a pipe
+        pieces.append(split_text[at:m.start()])
         seps.append(m.group(0))
         at = m.end()
-    pieces.append(command[at:])
+    pieces.append(split_text[at:])
     seps.append("")
     # Folders the shell may be in. A cd that fails (`cd /nonexistent; rm -rf x`), runs in a
     # pipeline or subshell, or is backgrounded leaves it where it was, so every cd adds a

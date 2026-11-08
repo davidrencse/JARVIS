@@ -34,3 +34,12 @@ def atomic_write(path, data, mode=None, newline=None, fsync=False, prepare=None)
     finally:
         temporary.unlink(missing_ok=True)
     return path
+
+
+def read_json(path, default=None):
+    """Read UTF-8 JSON, returning `default` for missing or malformed files."""
+    import json
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
