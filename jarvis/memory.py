@@ -12,12 +12,12 @@ import json
 import math
 import re
 import secrets
-import sqlite3
 import threading
 import time
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from .store import connect_database
 
 KIND = re.compile(r"[a-z][a-z0-9_-]{0,23}")
 PROFILE_LIMIT = 40  # profile facts sent with each new thread (oldest dropped past this)
@@ -129,7 +129,6 @@ class _Vectors:
         self.buf = None     # (capacity, dim) float32; rows [0, len(ids)) are valid
 
 
-
 # The recall item holding conversation() lines; a model lane drops the lines its own thread
 # already holds (ThreadRecall), so these two must agree on the format.
 CONVERSATION = "Recent conversation, oldest first (any channel):"
@@ -211,15 +210,8 @@ class Memory:
                   id TEXT PRIMARY KEY, model TEXT NOT NULL, vec BLOB NOT NULL);
             """)
 
-    @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        return connect_database(self.path)
 
     def add(self, kind, body, title="", tags=(), source="owner", importance=0.5,
             meta=None, links=()):

@@ -72,6 +72,18 @@ def _flat(text):
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
 
 
+def _site_word(host):
+    """The site's own label ("wikipedia" for en.wikipedia.org, "spotify" for
+    open.spotify.com); None when it is too short to tell windows apart."""
+    labels = host.split(".")
+    if len(labels) > 1:
+        labels.pop()  # the TLD
+    if len(labels) > 1 and labels[-1] in ("co", "com", "org", "net", "ac", "gov", "edu"):
+        labels.pop()  # bbc.co.uk
+    word = labels[-1]
+    return word if len(word) >= 3 else None
+
+
 def predicate_for(command):
     """The predicate that proves `command` worked, or None when its effect can't be seen
     as a window or through the native playback/volume state APIs."""
@@ -86,8 +98,8 @@ def predicate_for(command):
         host = (urlsplit(args["url"]).hostname or "").lower()
         if not host:
             return None
-        word = TITLE_WORDS.get(host) or host.removeprefix("www.").split(".")[0]
-        return {"kind": "title", "text": word}
+        word = TITLE_WORDS.get(host) or _site_word(host)
+        return {"kind": "title", "text": word} if word else None
     if intent == "media":
         command = str(args.get("command", "")).lower().replace("-", "_")
         return {"kind": "playback", "command": command} if command else None
@@ -244,12 +256,7 @@ def _run(*args, timeout=5):
 
 
 def backend():
-    """Which desktop family to drive. A non-Windows os.name never maps to the Windows
-    backend: it falls back to Hyprland, the original non-Windows behaviour."""
-    if on_windows():
-        return "windows"
-    desktop = platforms.detect()["desktop"]
-    return "hyprland" if desktop == "windows" else desktop
+    return platforms.desktop_backend(on_windows())
 
 
 NO_WINDOW_TOOL = ("window control needs wmctrl (X11) or a supported compositor "
