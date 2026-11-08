@@ -18,7 +18,7 @@ from pathlib import Path
 STATIONS = [
     {"id": "hear", "title": "Hear", "verb": "listens",
      "plain": "The listener records your voice through PipeWire, checks it is you against "
-              "your voiceprint, and turns the speech into text with Whisper on this laptop.",
+              "your voiceprint, and turns the speech into text with Parakeet (Whisper as backup) on this laptop.",
      "modules": ["listen", "fragments", "onboard", "daemon", "overlay", "voice_eval"]},
     {"id": "decide", "title": "Decide", "verb": "routes",
      "plain": "Simple rules, no AI, pick the cheapest way to answer: the clock or your vault "
@@ -49,7 +49,7 @@ STATIONS = [
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay.",
-     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "release", "node", "platforms", "autostart", "settings"]},
+     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "release", "node", "platforms", "autostart", "settings", "rest"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",
@@ -132,7 +132,7 @@ def checks(console):
     deps = [m for m in ("numpy", "sounddevice", "faster_whisper", "sherpa_onnx", "kokoro_onnx")
             if not _has(m)]
     out.append(_check("hear", "Voice packages installed", not deps,
-                      "numpy, sounddevice, Whisper, speaker ID and Kokoro are importable" if not deps
+                      "numpy, sounddevice, Parakeet/Whisper, speaker ID and Kokoro are importable" if not deps
                       else "missing: " + ", ".join(deps),
                       "uv pip install --python .venv/bin/python -e '.[voice]'"))
     enrolled = (voice_dir / "voiceprint.json").is_file()
@@ -374,11 +374,11 @@ def components(console):
                      [["engine", "none"], ["why", why]], "Only the pattern refusals protect this computer.")
 
     def _gates():
-        from .gates import asks_now
+        from .gates import CONFIRM_DEFAULT, asks_now
         rules = config.get("rules") or {}
         always = rules.get("always_ask", ["money", "messages"])
         return _card("gates", "Gates", "decide", "ok",
-                     [["confirm", rules.get("confirm", "ask")], ["always ask", ", ".join(always) or "nothing"],
+                     [["confirm", rules.get("confirm", CONFIRM_DEFAULT)], ["always ask", ", ".join(always) or "nothing"],
                       ["asks now", "yes" if asks_now(config, state) else "no (full auto)"],
                       ["hard refusals", "credentials, wipes, own files"]],
                      "What runs unasked, and what never runs.")

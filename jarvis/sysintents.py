@@ -28,7 +28,7 @@ from . import platforms
 BRIGHTNESS_STEP = 10
 SCREENSHOT_ROOTS = ("Pictures", "Downloads", "Desktop", "Documents")
 SCREENSHOT_SUFFIXES = (".png", ".jpg", ".jpeg")
-STATUS_WHAT = ("battery", "wifi", "bluetooth", "windows", "all")
+STATUS_WHAT = ("battery", "wifi", "bluetooth", "windows", "disk", "all")
 MAX_WINDOWS = 15
 MAX_REMINDER_MINUTES = 24 * 60
 MAX_REMINDERS = 20
@@ -133,6 +133,10 @@ def screenshot_path(path=None, home=None, now=None):
     if not any(target == root or root in target.parents for root in roots) or target in roots:
         return None, ("I only save screenshots under Pictures, Downloads, Desktop or Documents; "
                       f"{target} is outside those.")
+    from .gates import _abs, _under, _vault_paths, local_config
+    for vault in _vault_paths(local_config()):
+        if _under(str(target).replace("\\", "/"), _abs(vault, "/")):
+            return None, "The Obsidian vault is read-only; I won't save a screenshot there."
     if target.suffix.lower() not in SCREENSHOT_SUFFIXES:
         return None, "Screenshots are saved as .png, .jpg or .jpeg."
     if target.exists():
@@ -212,7 +216,8 @@ def _battery(root=None):
 def _wifi():
     if not shutil.which("nmcli"):
         return False, "Wi-Fi status needs nmcli (NetworkManager)."
-    out = _run("nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi")
+    # --rescan no: the cached scan answers in ~0.1 s; a plain `dev wifi` rescans (5-8 s).
+    out = _run("nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi", "list", "--rescan", "no")
     if out.returncode:
         return False, out.stderr.strip() or "nmcli failed."
     for line in out.stdout.splitlines():
@@ -254,13 +259,26 @@ def _windows():
     return True, f"{len(shown)} windows open: " + "; ".join(names) + more + "."
 
 
+def _disk(path=None):
+    """Free space on the drive holding the home folder (shutil, no subprocess)."""
+    try:
+        usage = shutil.disk_usage(path or Path.home())
+    except OSError as exc:
+        return False, f"Couldn't read disk space: {exc}"
+    gb = 1024 ** 3
+    return True, (f"{usage.free / gb:.0f} GB free of {usage.total / gb:.0f} GB "
+                  f"({usage.free * 100 // max(usage.total, 1)} percent free).")
+
+
 def system_status(spec):
     try:
         what = str(_spec(spec).get("what") or "all").strip().lower()
     except ValueError:
         what = str(spec).strip().lower() or "all"
     if what not in STATUS_WHAT:
-        return False, "Status takes battery, wifi, bluetooth, windows or all."
+        return False, "Status takes battery, wifi, bluetooth, windows, disk or all."
+    if what == "disk":  # any OS: no subprocess, so it works on the Windows nodes too
+        return _disk()
     if not _linux():
         return _unsupported("System status")
     readers = {"battery": _battery, "wifi": _wifi, "bluetooth": _bluetooth, "windows": _windows}
@@ -440,7 +458,6 @@ def weather(spec, config=None, fetch=None):
 
 BT_ACTIONS = ("on", "off", "scan", "list", "connected", "connect", "disconnect", "pair", "forget")
 BT_NEEDS_NAME = ("connect", "disconnect", "pair", "forget")
-BT_ASK = ("pair", "forget")  # security decisions: registry.risk() parks them for David's OK
 MAC = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\Z")
 SCAN_SECONDS = 8
 SEEN_TTL = 300  # pair only a device a scan saw in the last five minutes
