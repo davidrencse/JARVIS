@@ -587,6 +587,45 @@ class VoiceWorkflowTests(Temp):
                                             offer, waiting=False), ["close word", "Yes."])
 
     @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_a_near_miss_jarvis_yes_never_approves_a_confirmation(self):
+        # Audit 2026-11-07: a TV or roommate saying "Jarvis, yes" scored as a near miss.
+        heard = {"tv": "Jarvis, yes."}
+        score = {"tv": (False, 0.2)}
+        offer = {"tier": "simple", "reply": "ok"}
+        self.assertEqual(self._reply_window(["tv", KeyboardInterrupt], heard, score, offer,
+                                            waiting=True), [])
+        # Nothing waiting: a near miss with the wake word still gets its request through.
+        self.assertEqual(self._reply_window(["tv", KeyboardInterrupt], heard, score, offer,
+                                            waiting=False), ["yes."])
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_a_near_miss_bare_jarvis_opens_no_window(self):
+        # A stranger's bare "Jarvis" must not let David's next words in without the name.
+        heard = {"tv": "Jarvis.", "david": "close word"}
+        score = {"tv": (False, 0.2), "david": (True, 0.7)}
+        offer = {"tier": "simple", "reply": "ok"}
+        self.assertEqual(self._reply_window(["tv", "david", KeyboardInterrupt], heard, score,
+                                            offer), [])
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_follow_up_window_never_approves_a_confirmation(self):
+        heard = {"wake": "Jarvis.", "yes": "Yes."}
+        score = {"wake": (True, 0.7), "yes": (True, 0.7)}
+        offer = {"tier": "simple", "reply": "ok"}
+        self.assertEqual(self._reply_window(["wake", "yes", KeyboardInterrupt], heard, score,
+                                            offer, waiting=True), [])
+        self.assertEqual(self._reply_window(["wake", "yes", KeyboardInterrupt], heard, score,
+                                            offer, waiting=False), ["Yes."])
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
+    def test_a_near_miss_must_open_with_jarvis(self):
+        heard = {"tv": "Stop it, Jarvis.", "near": "Jarvis, stop it."}
+        score = {"tv": (False, 0.2), "near": (False, 0.2)}
+        offer = {"tier": "simple", "reply": "ok"}
+        self.assertEqual(self._reply_window(["tv", "near", KeyboardInterrupt], heard, score,
+                                            offer), ["stop it."])
+
+    @unittest.skipUnless(HAVE_NUMPY, "needs the [voice] extra: pip install numpy")
     def test_reply_window_survives_a_near_miss_and_skips_failures(self):
         heard = {"ask": "Jarvis, check the laptop", "tv": "turn it up", "yes": "Then check it."}
         score = {"ask": (True, 0.6), "tv": (False, 0.2), "yes": (True, 0.6)}
