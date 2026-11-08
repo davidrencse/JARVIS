@@ -55,6 +55,27 @@ REFUSED = [
     "python3 - <<EOF\nimport socket\ns=socket.socket();s.connect((h, 7780))\nEOF",
     "node -e \"require('net').connect({port: 7777, host: 'localtest.me'})\"",
     "pwsh -c \"New-Object Net.Sockets.TcpClient('localtest.me', 7777)\"",
+    # gate audit (2026-11-07): wrapper options with values, -S payloads
+    "env -u X rm -rf ~", "timeout -s KILL 5 rm -rf ~", "stdbuf -o L rm -rf ~", "exec -a x rm -rf ~",
+    "env -u X find ~ -delete", "env -u X mv ~/projects /tmp/p", "env -u X chmod -R 000 ~",
+    "env -S 'rm -rf ~'", "env --split-string='rm -rf ~/projects'", "sudo -u root rm -rf ~",
+    "nice -n 5 rm -rf ~", "ionice -c 3 rm -rf ~", "env -u",
+    # PowerShell switch with a value
+    "Remove-Item C:\\Users\\jdoe -Recurse:$true", "Remove-Item ~ -Recurse:$true", "ri ~ -r:$true",
+    "Remove-Item ~ -Recurse:$x",
+    # git discarding uncommitted work
+    "git -C ~/projects/JARVIS checkout .", "cd ~/projects/JARVIS && git restore .", "git checkout -f HEAD",
+    "git switch -f main", "git switch --discard-changes main", "git checkout -p", "git reset -p",
+    "git restore --worktree x", "git checkout HEAD file.txt",
+    # git hooks / config are autostart too
+    "cp /tmp/evil ~/projects/foo/.git/hooks/pre-commit",
+    "Copy-Item C:\\Temp\\evil C:\\Users\\jdoe\\projects\\site\\.git\\hooks\\pre-commit",
+    # write targets built from a variable or subexpression
+    "$p = 'C:\\Users\\jdoe\\Documents\\' + 'Vault\\n.md'; Set-Content $p x",
+    "Set-Content -Path (Join-Path ~\\Documents 'Vault\\n.md') -Value hi",
+    "echo evil >| ~/.bashrc",
+    # loopback spellings and the relay/tunnel ports
+    "curl http://localhost.:7779/", "curl http://127.0.0.1.nip.io:7779/", "curl http://foo.nip.io:7778/",
 ]
 
 ALLOWED = [
@@ -70,6 +91,9 @@ ALLOWED = [
     "Set-Content $env:USERPROFILE\\Documents\\notes.txt x", "X=1; echo $X", "cd $HOME/projects && ls",
     "docker run -p 7777:80 nginx", "ls", "git log", "git log -n 7777", "echo order 7777 shipped",
     "nc example.com 80", "grep -c 7777 notes.txt", "exec 3<>/dev/tcp/example.com/80",
+    "env FOO=1 ls", "timeout 5 ls", "env -u X ls", "sudo -u root ls", "git restore --staged x",
+    "git checkout main", "git checkout -b feat/x", "git checkout feature/x", "git switch main",
+    "Remove-Item foo.txt", "Remove-Item foo.txt -Recurse:$false", "echo hi >| /tmp/x",
     "pytest tests/a.py -k \"t(7777)\"", "git clone http://example.com/r.git && head -c 7777 r/README",
 ]
 
