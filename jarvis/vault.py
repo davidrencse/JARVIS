@@ -172,11 +172,12 @@ def links_in(text):
 
 def split_frontmatter(text):
     """(fields, body). A small YAML subset: scalars, [inline, lists] and - item lists."""
-    match = re.match(r"﻿?---\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|$)", text, re.S)
+    # (?:...)?? lets an empty block (---/---) end at its own closing line, not a later rule.
+    match = re.match(r"﻿?---\r?\n(?:(.*?)\r?\n)??---[ \t]*(?:\r?\n|$)", text, re.S)
     if not match:
         return None, text
     fields, key = {}, None
-    for line in match.group(1).splitlines():
+    for line in (match.group(1) or "").splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         item = re.match(r"^\s+-\s+(.*)$", line)
@@ -283,9 +284,6 @@ class Vault:
         self.state.mkdir(parents=True, exist_ok=True)
         self.db_path = self.state / "vault.sqlite3"
         self.audit_path = self.state / "vault-writes.jsonl"
-        self.calendar = self.settings.get("calendar", "calendar.md")
-        # Generated files: the vault says hand edits there are overwritten.
-        self.protected = {p.lower() for p in self.settings.get("protected", [self.calendar])}
         self._lock, self._refreshed = threading.Lock(), 0.0
         self._labels = None  # (index key, labels()) cache
         with self.connect() as db:
@@ -532,11 +530,6 @@ class Vault:
         results.sort(key=lambda r: r["score"], reverse=True)
         return results[:limit]
 
-    def _labels_or_none(self, word):
-        try:
-            return self.labels().get(word, (None, None))
-        except Exception:
-            return (None, None)
 
     def read(self, ref, max_chars=12000):
         path = self.resolve(ref)
@@ -813,10 +806,21 @@ class Vault:
         with open(self.audit_path, "a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    @property
+    def calendar(self):  # read live: a config change applies without a restart
+        return self.settings.get("calendar", "calendar.md")
+
+    @property
+    def protected(self):
+        """Generated files: the vault says hand edits there are overwritten. Read live, so
+        adding a note to vault.protected guards it at once (audit 2026-11-07)."""
+        return {p.lower() for p in self.settings.get("protected", [self.calendar])}
+
     @staticmethod
     def _touch(text, day):
         """Set frontmatter `updated:` to today, keeping the note's quoting style."""
-        match = re.match(r"﻿?---\r?\n.*?\r?\n(?=---)", text, re.S)
+        # The closing line must be exactly "---"; an empty block (---/---) closes at once.
+        match = re.match(r"﻿?---\r?\n(?:.*?\r?\n)??(?=---[ \t]*\r?$)", text, re.S | re.M)
         if not match:
             return text
         head, rest = text[:match.end()], text[match.end():]
