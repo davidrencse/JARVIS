@@ -5,9 +5,9 @@
 (() => {
   const box = document.getElementById("ear"), canvas = document.getElementById("ear-wave");
   if (!box || !canvas || !window.Jarvis) return;
-  const BARS = 24, FAST = 110, SLOW = 3000;
+  const BARS = 24, FAST = 110, SLOW = 3000, IDLE = 1000;
   const bars = new Array(BARS).fill(0);
-  let floor = 0.004, state = "off", timer = null, busy = false;
+  let floor = 0.004, state = "off", timer = null, busy = false, drawn = "";
 
   // Same curve as the voice setup orb (voicesetup.js levelOf): quiet speech still shows.
   const height = (rms) => Math.min(1, Math.pow(Math.max(0, rms) * 14, 0.6));
@@ -22,7 +22,10 @@
     box.setAttribute("title", label);
   }
 
-  function draw() {
+  function draw(force) {
+    const key = state + bars.join();
+    if (force !== true && key === drawn) return;
+    drawn = key;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const w = canvas.clientWidth, h = canvas.clientHeight;
     if (!w || !h) return;
@@ -47,7 +50,7 @@
   async function poll() {
     timer = null;
     if (busy) return schedule(FAST);
-    if (document.hidden) return schedule(SLOW);
+    if (document.hidden || !box.getClientRects().length) return schedule(IDLE);
     busy = true;
     let r = null;
     try { r = await window.Jarvis.api("/api/voice/level"); } catch { r = null; }
@@ -73,7 +76,7 @@
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && timer != null) { clearTimeout(timer); timer = null; poll(); }
   });
-  window.addEventListener("resize", draw);
-  draw();
+  window.addEventListener("resize", () => draw(true));
+  draw(true);
   poll();
 })();

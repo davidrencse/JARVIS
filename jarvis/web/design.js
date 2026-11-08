@@ -194,7 +194,7 @@ function renderSetup() {
   const s = data.setup;
   const claude = Object.entries(s.claude || {}).map(([k, v]) => `${k} ${v}`).join(" / ");
   $("setup").innerHTML = [["brain", `${s.brain} · ${s.chat_model}`], ["claude tiers", claude], ["voice", `${s.voice} (${s.kokoro_voice})`],
-    ["speech-to-text", s.stt], ["python", s.python], ["platform", s.platform]]
+    ["speech-to-text", s.stt_engine && s.stt_engine !== "whisper" ? `${s.stt_engine} (whisper ${s.stt} backup)` : s.stt], ["python", s.python], ["platform", s.platform]]
     .map(([k, v]) => `<span>${esc(k)} <b>${esc(v)}</b></span>`).join("");
 }
 /* ---------- 04a: the live components, one card each ---------- */
