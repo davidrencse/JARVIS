@@ -44,6 +44,8 @@ SYSTEM_ACTIONS = ("brightness", "screenshot", "system_status", "workspace", "loc
 ACTIONS = ("open_app", "open_url", "list_apps", "open_page", "focus_window", "close_app", "media",
            "volume", "scroll", "browse", "observe", "input_info", "screen", "lan_mouse", "terminal", "clipboard",
            "computer", "spotify", "app_ui", *SYSTEM_ACTIONS)
+# Fast, idempotent actions give up on a node sooner than the 45 s default.
+NODE_TIMEOUT = {"focus_window": 8}
 # The argument each action's tool takes.
 ARG = {"open_app": "name", "list_apps": "query", "open_url": "url", "open_page": "page",
        "focus_window": "name", "close_app": "name", "media": "command", "volume": "level",
@@ -229,11 +231,13 @@ class Remote:
                 payload = {"action": action, "arg": arg}
                 if local != main:
                     result = Client(self.config, self.state).request("/v1/control", {
-                        "node": target, "kind": "desktop", "payload": payload}, timeout=50)
+                        "node": target, "kind": "desktop", "payload": payload},
+                        timeout=NODE_TIMEOUT.get(action, 45) + 5)
                 elif target == main:
                     return run_here(action, arg, self.tools)
                 else:
-                    result = dispatch(self.config, self.state, target, "desktop", payload)
+                    result = dispatch(self.config, self.state, target, "desktop", payload,
+                                      **({"timeout": NODE_TIMEOUT[action]} if action in NODE_TIMEOUT else {}))
                 return bool(result.get("ok")), str(result.get("text", ""))
             except NodeOffline as exc:
                 # Only a pre-dispatch offline verdict permits another transport.
