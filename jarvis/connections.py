@@ -88,5 +88,10 @@ def act(config, state, body):
         raise ValueError(f"{part} can't {action} here.")
     if action in ("stop", "restart"):
         daemon.stop(state)
-    result = daemon.start(state) if action != "stop" else {"stopped": True}
+    if action == "restart":  # stop only signals: wait for the old listener to let go, or start sees it
+        import time
+        deadline = time.monotonic() + 10
+        while daemon._pid(state) and time.monotonic() < deadline:
+            time.sleep(0.2)
+    result = daemon.start(state, config) if action != "stop" else {"stopped": True}
     return {"ok": True, "result": result, "voice": _voice(state)}

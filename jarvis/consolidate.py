@@ -27,7 +27,6 @@ MAX_CHARS = 40_000       # conversation text per call; older-first, the rest wai
 KNOWN_CHARS = 12_000     # known items shown to the model
 MAX_ITEMS = 20
 FIRST_LOOKBACK_DAYS = 7  # how far back the very first run reads
-TIMEOUT = 180
 
 INSTRUCTIONS = """You are JARVIS's memory consolidator. You never talk to David and you have
 no tools. You read David's conversations with JARVIS (his assistant) and what JARVIS

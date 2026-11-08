@@ -689,3 +689,49 @@ def stop_everywhere(config, state):
             pass
     threading.Thread(target=relay, name="control-stop-relay", daemon=True).start()
     return result
+
+
+def relay_stop(config, state, timeout=6.0, remote=None):
+    """Best-effort: tell every other computer to stop control. Each call runs in its own
+    thread and `timeout` bounds the whole relay, so a slow or offline node never holds up the
+    caller. Returns {"reached": [...], "failed": [...]}; never raises."""
+    reached, failed = [], []
+    try:
+        if remote is None:
+            from .remote import Remote
+            remote = Remote(config, state)
+        others = [d for d in remote.names() if d != remote.here()]
+    except Exception:
+        return {"reached": reached, "failed": failed}
+    lock = threading.Lock()
+
+    def one(device):
+        try:
+            result = remote.call(device, "computer", json.dumps({"action": "stop"}))
+            good = bool(result[0]) if isinstance(result, (tuple, list)) and result else bool(result)
+        except Exception:
+            good = False
+        with lock:
+            (reached if good else failed).append(device)
+
+    threads = [threading.Thread(target=one, args=(d,), name="control-stop-relay", daemon=True)
+               for d in others]
+    for t in threads:
+        t.start()
+    deadline = time.time() + timeout
+    for t in threads:
+        t.join(max(0.0, deadline - time.time()))
+    with lock:
+        done = set(reached) | set(failed)
+        return {"reached": list(reached), "failed": list(failed) + [d for d in others if d not in done]}
+
+
+def stop_all(config, state, timeout=6.0, remote=None):
+    """Stop here first (always, whatever the relay does), then relay to the other computers."""
+    ok, text = stop(state)
+    relay = relay_stop(config, state, timeout=timeout, remote=remote)
+    if relay["reached"]:
+        text += " Also stopped on: " + ", ".join(relay["reached"]) + "."
+    if relay["failed"]:
+        text += " Not reached: " + ", ".join(relay["failed"]) + "."
+    return ok, text
