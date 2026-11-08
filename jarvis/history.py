@@ -16,11 +16,11 @@ Arguments stay here, in SQLite on the main PC; nothing is written to the vault.
 
 import json
 import re
-import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
+
+from .store import connect_database
 
 AGENT_ORIGINS = frozenset({"agent", "system"})
 FAILED = ("pre_effect_failure", "partial_effect", "uncertain", "unconfirmed")
@@ -66,15 +66,8 @@ class History:
                   origin TEXT NOT NULL, action TEXT NOT NULL, hash TEXT NOT NULL);
             """)
 
-    @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        return connect_database(self.path)
 
     # -- writing --------------------------------------------------------------------------
     @staticmethod

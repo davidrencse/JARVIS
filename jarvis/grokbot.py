@@ -54,6 +54,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from .fsio import read_json as _json
 from .platforms import NO_WINDOW, on_windows
 
 HOME = Path.home()
@@ -243,13 +244,6 @@ def _same_host(a, b):
 def _quiet(command, **kw):
     return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True, **kw)
-
-
-def _json(path):
-    try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
 
 
 def _alive(pid):
