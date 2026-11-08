@@ -30,6 +30,7 @@ CLIP_BYTES = 32 * 1024 * 1024  # clipsync.MAX_BYTES; a clipboard copy never need
 CHUNK = 2 * 1024 * 1024  # raw bytes per cluster job; base64 keeps it under the bulk cap
 UPLOAD_ID = re.compile(r"[a-f0-9]{32}")
 PART = ".jarvis-upload-{}.part"
+RESERVE = 2 * 1024 ** 3  # an upload may never leave less than this free in the drop folder
 NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. ()+,@-]{0,199}")
 
 
@@ -207,6 +208,10 @@ def validate(payload):
         raise ValueError("Invalid transfer offset.")
     if not isinstance(data, str) or len(data) > (CHUNK * 4) // 3 + 4:
         raise ValueError("Invalid transfer chunk.")
+    declared = payload.get("size")
+    if declared is not None and (not isinstance(declared, int) or isinstance(declared, bool)
+                                 or not 0 <= declared <= MAX_BYTES):
+        raise ValueError("Invalid declared size.")
     if payload.get("dest", "drop") == "drop":
         if not isinstance(payload.get("name"), str) or not 0 < len(payload["name"]) <= 255:
             raise ValueError("Invalid file name.")
@@ -222,6 +227,16 @@ def _sweep(folder, hours=24):
                 part.unlink()
         except OSError:
             pass
+
+
+def _check_space(folder, incoming, declared=0):
+    """Refuse an upload that would leave under RESERVE free (or under declared size + RESERVE)."""
+    free = shutil.disk_usage(folder).free
+    if free - max(incoming, declared) < RESERVE:
+        raise RuntimeError(
+            f"Not enough free space here: {free // 1024 ** 2} MB free, "
+            f"{max(incoming, declared) // 1024 ** 2} MB incoming, and {RESERVE // 1024 ** 3} GB "
+            "must stay free. Nothing was received.")
 
 
 def _land(part, folder, name):
@@ -271,6 +286,7 @@ def run_here(payload, state=None):
     part = folder / PART.format(payload["upload"])
     if payload["offset"] == 0:
         _sweep(folder)
+        _check_space(folder, len(data), payload.get("size") or 0)
         mode = "xb"
     else:
         mode = "ab"
@@ -281,6 +297,11 @@ def run_here(payload, state=None):
         if have != payload["offset"]:
             part.unlink(missing_ok=True)
             raise ValueError("A chunk of that upload went missing; send the file again.")
+        try:
+            _check_space(folder, len(data))
+        except RuntimeError:
+            part.unlink(missing_ok=True)  # the disk filled up mid-upload: give the space back
+            raise
     if payload["offset"] + len(data) > (MAX_BYTES if payload.get("dest", "drop") == "drop"
                                          else CLIP_BYTES):
         part.unlink(missing_ok=True)
@@ -353,7 +374,7 @@ def call(config, state, device, payload, timeout=120):
 def push(config, state, device, source, size, name=None, dest="drop", kind=None):
     """Stream `source` (a binary file object of `size` bytes) to `device` in chunks."""
     upload, offset, result = uuid.uuid4().hex, 0, None
-    extra = {"name": name} if dest == "drop" else {"dest": "clipboard", "kind": kind}
+    extra = {"name": name, "size": size} if dest == "drop" else {"dest": "clipboard", "kind": kind}
     while True:
         data = source.read(CHUNK)
         last = offset + len(data) >= size or len(data) < CHUNK

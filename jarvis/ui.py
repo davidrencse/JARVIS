@@ -25,11 +25,13 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .credits import Credits
 from .events import Bus, Turn, Watcher
+from .fsio import read_json as _read_json
 from .memory import Memory
 from .probe import Prober
 from .store import Store, lanes_from
@@ -88,6 +90,33 @@ _MODULES = {}  # str(path) -> ((mtime_ns, size), text, node or None, import targ
 _MODULES_LOCK = threading.Lock()
 
 
+class _Ttl:
+    """Tiny thread-safe TTL cache. Only successful results are stored, never exceptions."""
+
+    def __init__(self, clock=time.monotonic):
+        self._clock, self._lock, self._items = clock, threading.Lock(), {}
+
+    def get(self, key, ttl, compute):
+        now = self._clock()
+        with self._lock:
+            hit = self._items.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+        value = compute()  # outside the lock: it can take a second and must not block other keys
+        with self._lock:
+            self._items[key] = (self._clock(), value)
+        return value
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+
+
+_LINES = {}  # str(path) -> ((mtime_ns, size), line count), so /api/tree rereads only changed files
+_LINES_LOCK = threading.Lock()
+_EXT_USERS = {}  # one entry: (hash of every module's text) -> {ext_id: [users]}
+
+
 def _parse_module(path):
     """(text, graph node, relative-import targets) for one module; re-parsed only when it changed."""
     key = str(path)
@@ -125,6 +154,7 @@ class Console:
         if is_node(config):
             raise ValueError("A node uses the main PC's console proxy, not a local JARVIS brain.")
         self.config, self.base, self.state = config, Path(base), Path(state).resolve()
+        self.ttl = _Ttl()  # slow read-only endpoints; any POST clears it
         self.store = Store(self.state, lanes_from(config))
         from .memory import semantic_recall
         self.memory = Memory(self.state, semantic=semantic_recall(config))
@@ -166,6 +196,31 @@ class Console:
             self.watcher.stop()
         if self._lane:
             self._lane.close()
+
+    def settings_snapshot(self):
+        from .memory import semantic_recall
+        acts = {k: v for k, v in (self.config.get("actions") or {}).items()
+                if k in ("enabled", "browser", "grokbot")}
+        return (self.config.get("routing", {}).get("brain", "chatgpt"), semantic_recall(self.config), acts)
+
+    def settings_applied(self, before):
+        """A saved brain or recall-mode change takes effect now, not at the next restart."""
+        brain, semantic, acts = self.settings_snapshot()
+        if brain != before[0] or acts != before[2]:  # the brain's tools are built with it
+            with self._lane_lock:
+                lane, self._lane = self._lane, None  # rebuilt lazily by lane()
+            if lane:
+                try:
+                    lane.close()
+                except Exception:
+                    pass
+            self.bus.publish("brain.state", self.brain())
+        if semantic != before[1]:
+            self.memory = Memory(self.state, semantic=semantic)
+            if self.watcher and hasattr(self.watcher, "memory"):
+                self.watcher.memory = self.memory
+            if semantic:
+                self.memory.warm_vectors()
 
     def lane(self):
         """The conversation brain the voice listener and `jarvis chat` use, kept warm."""
@@ -631,9 +686,17 @@ class Console:
             for target in imports:
                 if (package / f"{target}.py").is_file() and target != name:
                     edges.append({"src": f"mod:{name}", "dst": f"mod:{target}", "rel": "imports"})
+        # The regex sweep over every module is the slow part; redo it only when some text changed.
+        stamp = tuple((m, hash(t)) for m, t in sources.items())
+        if _EXT_USERS.get("stamp") != stamp:
+            _EXT_USERS["stamp"] = None
+            _EXT_USERS["users"] = {
+                # ui.py holds this pattern table itself, so it would match everything.
+                e[0]: [m for m, text in sources.items() if m != "ui" and re.search(e[3], text)]
+                for e in EXTERNALS}
+            _EXT_USERS["stamp"] = stamp
         for ext_id, label, kind, pattern in EXTERNALS:
-            # ui.py holds this pattern table itself, so it would match everything.
-            users = [m for m, text in sources.items() if m != "ui" and re.search(pattern, text)]
+            users = _EXT_USERS["users"][ext_id]
             if users:
                 nodes.append({"id": ext_id, "label": label, "kind": kind})
                 edges += [{"src": f"mod:{m}", "dst": ext_id, "rel": "uses"} for m in users]
@@ -702,7 +765,21 @@ class Console:
         return {"nodes": nodes, "edges": edges}
 
     def tree(self):
-        """Project layout with sizes and module summaries."""
+        """Project layout with sizes and module summaries (cached 30 s)."""
+        return self.ttl.get("tree", 30, self._tree)
+
+    def _tree(self):
+        def lines(child, st):
+            stamp, key = (st.st_mtime_ns, st.st_size), str(child)
+            with _LINES_LOCK:
+                hit = _LINES.get(key)
+            if hit and hit[0] == stamp:
+                return hit[1]
+            n = child.read_text(encoding="utf-8").count("\n") + 1
+            with _LINES_LOCK:
+                _LINES[key] = (stamp, n)
+            return n
+
         def walk(path, depth=0):
             entries = []
             for child in sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower())):
@@ -715,10 +792,11 @@ class Console:
                         entries.append({"name": child.name, "dir": True,
                                         "children": walk(child, depth + 1)})
                 else:
-                    info = {"name": child.name, "dir": False, "bytes": child.stat().st_size}
+                    st = child.stat()
+                    info = {"name": child.name, "dir": False, "bytes": st.st_size}
                     if child.suffix in (".py", ".md", ".js", ".css", ".html", ".json", ".toml"):
                         try:
-                            info["lines"] = child.read_text(encoding="utf-8").count("\n") + 1
+                            info["lines"] = lines(child, st)
                         except (UnicodeDecodeError, OSError):
                             pass
                     entries.append(info)
@@ -1189,13 +1267,6 @@ def _plan_view(record, full=False):
             "memory_id": record.get("memory_id"), "steps": steps}
 
 
-def _read_json(path, default):
-    try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return default
-
-
 def _hw_model(hw):
     computer = hw.get("computer") or {}
     return computer.get("Model") or hw.get("model")
@@ -1244,7 +1315,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
+        if "Cache-Control" not in (headers or {}):
+            self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
         for name, value in (headers or {}).items():
             self.send_header(name, str(value))
         if disposition:
@@ -1360,7 +1432,12 @@ class Handler(BaseHTTPRequestHandler):
             import sys
             import traceback
             traceback.print_exception(exc, file=sys.stderr)
-            message = "Something went wrong \u2014 see the JARVIS log."
+            if isinstance(exc, RuntimeError) and str(exc):  # written for David to read
+                message = str(exc)
+            elif isinstance(exc, OSError):  # no errno text or file names: they carry paths
+                message = "Couldn't reach a file or device it needed \u2014 see the JARVIS log."
+            else:
+                message = "Something went wrong \u2014 see the JARVIS log."
         else:
             message = str(exc) or type(exc).__name__
         self._send(status, {"error": message}, close=close)
@@ -1396,10 +1473,11 @@ class Handler(BaseHTTPRequestHandler):
             "/api/grokbot": lambda: c.grokbot().status(),
             "/api/agent-browser": c.agent_screen,
             "/api/history/commands": lambda: c.command_history(query.get("limit", 12)),
-            "/api/input/shared": c.shared_input,
+            "/api/input/shared": lambda: c.ttl.get("shared", 12, c.shared_input),
             "/api/connections": c.connections,
-            "/api/peripherals": lambda: __import__("jarvis.peripherals", fromlist=["overview"]).overview(
-                c.config, c.base / "jarvis.config.json", c.state),
+            "/api/peripherals": lambda: c.ttl.get("peripherals", 12, lambda: __import__(
+                "jarvis.peripherals", fromlist=["overview"]).overview(
+                    c.config, c.base / "jarvis.config.json", c.state)),
             "/api/probe": lambda: c.prober.get(refresh=query.get("refresh") == "1"),
             "/api/usage": lambda: c.credits.claude_hourly(int(query.get("hours", 24))),
             "/api/inbox": lambda: c.inbox(query.get("device")),
@@ -1461,8 +1539,18 @@ class Handler(BaseHTTPRequestHandler):
         target = (WEB / name).resolve()
         if WEB not in target.parents or not target.is_file() or target.suffix not in TYPES:
             return self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+        if target.suffix == ".woff2":
+            return self._send(HTTPStatus.OK, target.read_bytes(), TYPES[target.suffix], cache=True)
+        # Live on reload, but revalidated: an unchanged file answers 304 with no body.
+        st = target.stat()
+        etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+        tags = [t.strip() for t in (self.headers.get("If-None-Match") or "").split(",")]
+        validators = {"ETag": etag, "Last-Modified": self.date_time_string(st.st_mtime)}
+        if etag in tags or "*" in tags or any(t.startswith("W/") and t[2:] == etag for t in tags):
+            return self._send(HTTPStatus.NOT_MODIFIED, b"", TYPES[target.suffix],
+                              headers={**validators, "Cache-Control": "no-cache"})
         self._send(HTTPStatus.OK, target.read_bytes(), TYPES[target.suffix],
-                   cache=target.suffix == ".woff2")  # the icon sprite changes with the UI
+                   headers={**validators, "Cache-Control": "no-cache"})
 
     def do_POST(self):
         if not self._allowed() or self.headers.get("X-JARVIS") != "1":
@@ -1475,6 +1563,7 @@ class Handler(BaseHTTPRequestHandler):
         if length < 0:
             return self._send(HTTPStatus.BAD_REQUEST, {"error": "Bad Content-Length."})
         c = self.console
+        c.ttl.clear()  # any action may change peripherals or shared input; the next GET recomputes
         if url.path == "/api/kb/upload":  # streamed to the knowledge inbox
             self.connection.settimeout(60)  # a stalled client can't pin this thread
             stream = _Counted(self.rfile)
@@ -1521,8 +1610,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.connection_action(body))
             if url.path == "/api/settings":
                 from .settings import write
-                return self._send(HTTPStatus.OK, write(c.config, c.base / "jarvis.config.json",
-                                                       c.state, body.get("changes")))
+                before = c.settings_snapshot()
+                try:
+                    return self._send(HTTPStatus.OK, write(c.config, c.base / "jarvis.config.json",
+                                                           c.state, body.get("changes"),
+                                                           confirmed=body.get("confirmed") is True))
+                finally:
+                    c.settings_applied(before)
             if url.path == "/api/agent/session":
                 return self._send(HTTPStatus.OK, c.agent().session())
             if url.path == "/api/agent/voice":
@@ -1547,7 +1641,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(HTTPStatus.GONE, {"error": str(exc)})
             if url.path == "/api/peripherals":
                 from .peripherals import act
-                return self._send(HTTPStatus.OK, act(c.config, c.base / "jarvis.config.json", c.state, body))
+                try:
+                    result = act(c.config, c.base / "jarvis.config.json", c.state, body)
+                finally:
+                    c.ttl.clear()  # again after: a GET during the action may have cached the old state
+                return self._send(HTTPStatus.OK, result)
             if url.path == "/api/fs/copy":
                 return self._send(HTTPStatus.OK, c.fs_copy(body))
             if url.path == "/api/overlay":
