@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from .platforms import NO_WINDOW
-from .fastlane import SENTENCE_END, close_process, now_line, subscription_env
+from .fastlane import SENTENCE_END, close_process, now_line, pump_lines, subscription_env
 from .memory import ThreadRecall
 
 # David's own Codex loads ~400 tools from plugins and connectors (gmail.delete_emails,
@@ -254,14 +254,7 @@ class ChatGPTLane:
                                      "capabilities": {"experimentalApi": bool(self.tools)}})
         self._send({"jsonrpc": "2.0", "method": "initialized"})
 
-    @staticmethod
-    def _pump(proc, lines):
-        try:
-            with proc.stdout:
-                for line in proc.stdout:
-                    lines.put(line)
-        finally:
-            lines.put(None)
+    _pump = staticmethod(pump_lines)
 
     def _send(self, message):
         try:
@@ -901,6 +894,9 @@ class ConfirmGate:
 
     def call(self, name, args):
         from .gates import hard_deny
+        # `spec` is the internal remote.run_here channel: the executor runs it in place of
+        # the other keys. A model must not supply it, or the gate judges "ls" and runs "rm".
+        args = {k: v for k, v in (args or {}).items() if k != "spec"}
         refusal = hard_deny(name, args or {}, self.config)
         if refusal:  # not a question: refused under rules.confirm "ask" and "never" alike
             return False, f"Refused: {refusal}. Tell David plainly; do not retry or work around it."
