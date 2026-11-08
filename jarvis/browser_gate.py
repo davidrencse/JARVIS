@@ -74,7 +74,6 @@ FENCE = re.compile(r"^```.*$", re.M)
 SHARED_SUFFIXES = ("github.io", "vercel.app", "netlify.app", "pages.dev", "herokuapp.com",
                    "web.app", "firebaseapp.com", "blogspot.com", "workers.dev", "onrender.com",
                    "glitch.me")
-VERBS = ("click", "type", "press", "select", "dialog", "other")
 
 
 def _tool(params):
@@ -447,7 +446,7 @@ def judge(params):
                    f"{name} {shown}", checked=False)
     if not hit[1]:  # the snapshot shows it without a name: nothing says what it commits
         return out(f"{name} on {described[:30] or 'an unnamed element'} (no label)", "low",
-                   f"{name} an element the page didn't name ({ref})")
+                   f"{name} an element the page didn't name ({ref})", checked=False)
     return None
 
 
