@@ -94,6 +94,7 @@ OBJECT_LEAD = re.compile(r"^(?:the|my|a|an)\s+")
 OBJECT_TAIL = re.compile(r"\s+(?:app|application|program)$")
 SITE_TAIL = re.compile(r"\s+(?:website|site|web ?page|\.com)$")
 
+SPOTIFY_HINT = re.compile(r"(?:^|\s+)(?:on|in|with|using)\s+spotify\Z")
 MEDIA_OBJECTS = {"", "it", "music", "the music", "song", "the song", "this song", "track",
                  "the track", "this track", "spotify", "playback"}
 LIKED = re.compile(r"(?:(?:a|some|any|one)\s+(?:song|track|tune)s?\s+|something\s+|"
@@ -160,8 +161,9 @@ SYSTEM = (
      lambda m: ("screenshot", {"window": True})),
     (re.compile(r"(?:take\s+(?:a\s+)?)?screen\s?shot(?:\s+of\s+(?:my|the)\s+(?:screen|desktop))?\Z"),
      lambda m: ("screenshot", {})),
-    (re.compile(r"(?:how\s+much\s+battery(?:\s+(?:do\s+i\s+have|is\s+left|left|have\s+i\s+got))?|"
-                r"what(?:'s|\s+is)\s+(?:my|the)\s+battery(?:\s+(?:level|percentage|percent|status))?|"
+    (re.compile(r"(?:how\s+much\s+(?:battery|charge)(?:\s+(?:(?:do\s+i\s+have|have\s+i\s+got)(?:\s+left)?|"
+                r"is\s+left|left))?|what(?:'s|\s+is)\s+(?:my|the)\s+battery(?:\s+(?:level|percentage|percent|"
+                r"status))?(?:\s+at)?|"
                 r"(?:check|show)\s+(?:my\s+)?battery(?:\s+level)?|battery\s+(?:level|status|"
                 r"percentage)|(?:is|am)\s+(?:my\s+(?:laptop|battery)|it|i)\s+charging)\Z"),
      lambda m: ("system_status", {"what": "battery"})),
@@ -169,10 +171,18 @@ SYSTEM = (
                 r"what(?:'s|\s+is)\s+(?:my|the)\s+wi-?fi(?:\s+(?:network|name|ssid))?|"
                 r"which\s+wi-?fi(?:\s+network)?\s+am\s+i\s+(?:on|connected\s+to)|"
                 r"am\s+i\s+connected\s+to\s+wi-?fi|is\s+(?:the\s+|my\s+)?wi-?fi\s+(?:on|connected|"
-                r"working))\Z"), lambda m: ("system_status", {"what": "wifi"})),
+                r"working)|(?:what|which)\s+(?:wi-?fi\s+)?network\s+am\s+i\s+(?:on|connected\s+to)|"
+                r"what(?:'s|\s+is)\s+my\s+(?:wi-?fi\s+)?network(?:\s+name)?)\Z"),
+     lambda m: ("system_status", {"what": "wifi"})),
     (re.compile(r"(?:is\s+(?:the\s+|my\s+)?bluetooth\s+(?:on|off|enabled|active)|"
                 r"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?bluetooth\s+status)\Z"),
      lambda m: ("system_status", {"what": "bluetooth"})),
+    (re.compile(r"(?:how\s+much\s+(?:free\s+)?(?:disk\s+|storage\s+|drive\s+)?space\s+(?:do\s+i\s+have|is\s+(?:there|left)|"
+                r"have\s+i\s+got)(?:\s+left)?(?:\s+on\s+my\s+(?:disk|drive|laptop|pc))?|"
+                r"how\s+much\s+(?:free\s+)?(?:disk|storage)\s+(?:space\s+)?(?:is\s+)?(?:left|free)|"
+                r"(?:check|show)\s+(?:my\s+)?(?:free\s+)?(?:disk|storage)\s+space|"
+                r"(?:free|disk)\s+(?:disk\s+)?space)\Z"),
+     lambda m: ("system_status", {"what": "disk"})),
     (re.compile(r"(?:(?:what|which)\s+(?:apps|windows|programs|applications)\s+(?:do\s+i\s+have\s+|"
                 r"are\s+)?(?:open|running)(?:\s+right\s+now)?|(?:list|show)\s+(?:my\s+)?open\s+"
                 r"(?:windows|apps))\Z"), lambda m: ("system_status", {"what": "windows"})),
@@ -535,10 +545,6 @@ def _device(phrase, aliases, typos=True):
     return hits.pop() if len(hits) == 1 and None not in hits else None
 
 
-RELATIVE = {"main", "default", "main default", "default main", "primary", "other",
-            "the other one", "other one", "other pc", "other laptop"}
-
-
 PLACE_NOUNS = {"laptop", "computer", "pc", "machine"}
 
 
@@ -730,6 +736,7 @@ def _command(clause, catalog):
             return _command({**clause, "object": " ".join(words[:-1])}, catalog)
         raise Unsure(f"don't know {obj!r}")
     if verb == "play":
+        obj = SPOTIFY_HINT.sub("", obj)  # "play music on spotify": the player, not a place
         if LIKED.match(obj):
             return {"intent": "spotify_play", "args": {"target": "liked"}}
         if obj in MEDIA_OBJECTS:
@@ -761,6 +768,10 @@ def _merge(commands):
     out = []
     for command in commands:
         prev = out[-1] if out else None
+        if command["intent"] == "system_status" and any(
+                c["intent"] == "system_status" and c["args"] == command["args"]
+                and c["device"] == command["device"] for c in out):
+            continue  # "is wifi connected and what network am i on": one read answers both
         if prev and prev["intent"] == "open_url" and command["intent"] == "scroll" \
                 and command["args"].get("mode") != "stop" and _compatible(prev, command):
             # "go to yt shorts and start scrolling": scroll the page just opened, once it is.
