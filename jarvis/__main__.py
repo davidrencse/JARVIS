@@ -183,6 +183,12 @@ def main():
     sub.add_parser("brain-tools", help="The brain's tools as an MCP server on stdio (for a Claude brain)")
     bp = sub.add_parser("browser-proxy", help="A JARVIS browser behind its click gate, on stdio (for a Claude brain)")
     bp.add_argument("server", help="chrome, playwright or agent_browser")
+    sl = sub.add_parser("sleep", help="Pause JARVIS on this PC and suspend it; it all comes back on wake")
+    sl.add_argument("--no-suspend", action="store_true", help="only pause JARVIS (undo with `jarvis wake`)")
+    sl.add_argument("--action", default="suspend-then-hibernate",
+                    choices=("suspend", "suspend-then-hibernate", "hibernate", "hybrid-sleep"))
+    sl.add_argument("--restore-after", type=float, default=None, help=argparse.SUPPRESS)
+    sub.add_parser("wake", help="Bring back what `jarvis sleep` paused")
     st = sub.add_parser("selftest", help="Live checks with PASS/WARN/FAIL flags")
     st.add_argument("suite", choices=("keyboard",))
     st.add_argument("--capture", action="store_true",
@@ -193,10 +199,30 @@ def main():
     args = parser.parse_args()
     from .platforms import private_dir
     private_dir(args.state)  # tokens, keys and memory live here: this account only
+    if args.command in ("sleep", "wake"):  # needs no config: it stops and starts user services
+        from . import rest
+        try:
+            if args.command == "wake":
+                emit(rest.wake(args.state))
+            elif args.restore_after is not None:  # the transient unit armed by `jarvis sleep`
+                emit(rest.after_suspend(args.state, args.restore_after))
+            else:
+                emit(rest.sleep(args.state, Path(args.config).resolve().parent, action=args.action,
+                                suspend=not args.no_suspend))
+        except (RuntimeError, ValueError) as exc:
+            print(f"JARVIS: {exc}", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "control":  # the desktop control fail-safe (control.py): needs no config or identity
         from . import control
         if args.action == "stop":
-            ok, text = control.stop(args.state)
+            ok, text = control.stop(args.state)  # here first: nothing below may undo or delay it
+            try:
+                cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+                ok2, text2 = control.stop_all(cfg, args.state)  # re-stops here (harmless), then relays
+                ok, text = ok and ok2, text2
+            except Exception:  # no config or no cluster: this computer is stopped, that's all
+                pass
         elif args.action == "resume":
             ok, text = control.resume(args.state)
         else:
@@ -446,7 +472,7 @@ def main():
                 return 0 if result["state"] == "finished" else 1
     except KeyboardInterrupt:
         return 130
-    except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+    except (ValueError, LookupError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f"JARVIS: {exc}", file=sys.stderr)
         return 1
     return 0
@@ -662,6 +688,22 @@ def render_agenda(agenda, view="agenda"):
     return "\n".join(out)
 
 
+def parser_route(text, config):
+    """The route dict when the strict parser resolves `text`, else None. Executes nothing."""
+    from .parse import parse_for
+    from .topology import enabled, identity
+    try:
+        here = identity(config)[0] if enabled(config) else next(iter(config.get("devices") or {}), None)
+        commands = parse_for(text, config, here)["commands"] if here else None
+    except Exception:
+        return None
+    if not commands:
+        return None
+    summary = "; ".join(f"{c['intent']} {json.dumps(c.get('args') or {}, ensure_ascii=False)} on {c.get('device')}"
+                        for c in commands)
+    return {"tier": "simple", "reasons": [f"parser: {summary}"], "parser": commands}
+
+
 def cognition(args, config, base):
     from .topology import is_node
     node = is_node(config)
@@ -678,6 +720,10 @@ def cognition(args, config, base):
     memory = None if node else Memory(args.state, semantic=semantic_recall(config))
     if args.command == "route":
         from .assistant import decide
+        parsed = parser_route(args.text, config)  # dry run: the parser only reads
+        if parsed:
+            emit(parsed)
+            return
         route = decide(args.text, config, conversational=True, state=args.state)
         if route["tier"] == "medium":
             from .router import grok_first

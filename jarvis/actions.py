@@ -44,6 +44,7 @@ from .platforms import NO_WINDOW, on_windows
 from . import platforms
 from .remote import SYSTEM_ACTIONS
 from .showcase import PAGES
+from .sysintents import STATUS_WHAT
 
 MACHINE = platforms.label()  # e.g. "Windows 11", "Arch Linux (Hyprland)", "macOS"
 
@@ -164,6 +165,7 @@ class DesktopTools:
         """remote: a remote.Remote, which adds a `device` argument for the other laptop.
         config/state: for app_ui's confirmations (rules.always_ask) and logs."""
         self._apps, self._loaded, self.cache_seconds = [], 0.0, cache_seconds
+        self._refreshing = threading.Lock()  # one background refresh at a time
         self.remote, self.config, self.state = remote, config, state
 
     def specs(self):
@@ -305,7 +307,7 @@ class DesktopTools:
                  path={"type": "string"}, window={"type": "boolean"}),
             tool("system_status", "Read-only: battery percent and charging, Wi-Fi network, "
                  "Bluetooth on/off, open windows (class and title, up to 15).",
-                 what={"type": "string", "enum": ["battery", "wifi", "bluetooth", "windows", "all"]}),
+                 what={"type": "string", "enum": list(STATUS_WHAT)}),
             tool("workspace", "Switch to workspace number n (Hyprland).", ["n"],
                  n={"type": "integer", "minimum": 1, "maximum": 99}),
             tool("bluetooth", "Bluetooth: on/off, scan (about 8 s, then discovery is stopped), list "
@@ -326,7 +328,16 @@ class DesktopTools:
 
     def call(self, name, args):
         """Returns (success, text) — text goes back to ChatGPT."""
+        if name not in {spec["name"] for spec in self._specs()}:
+            # remote.call also runs executors that are not brain tools (lan_mouse, clipboard...)
+            return False, f"Not a JARVIS tool: {name}."
         device = args.get("device")
+        if not device and self.remote:
+            # A request from a node acts on that node unless it names another laptop.
+            from .topology import ORIGIN
+            origin = ORIGIN.get()
+            if origin and origin != self.remote.here():
+                device = origin
         if device and self.remote:
             from .remote import ARG
             arg = str(args.get(ARG.get(name, ""), ""))
@@ -401,21 +412,35 @@ class DesktopTools:
 
     # -- apps ------------------------------------------------------------------------
     def apps(self):
-        if not self._apps or time.time() - self._loaded > self.cache_seconds:
-            if not on_windows():
-                self._apps = macos_apps() if _backend() == "macos" else desktop_entries()
-                self._loaded = time.time()
-                return self._apps
+        """Installed apps. Once a list exists an expired cache returns it at once and a single
+        background thread refreshes it (stale-while-revalidate); the first build is synchronous."""
+        if not self._apps:
+            self._rebuild()
+        elif time.time() - self._loaded > self.cache_seconds and self._refreshing.acquire(blocking=False):
+            threading.Thread(target=self._refresh, daemon=True, name="apps-refresh").start()
+        return self._apps
+
+    def _refresh(self):
+        try:
+            self._rebuild()
+        except Exception:
+            pass  # keep the old list; the next expired call tries again
+        finally:
+            self._refreshing.release()
+
+    def _rebuild(self):
+        if not on_windows():
+            apps = macos_apps() if _backend() == "macos" else desktop_entries()
+        else:
             out = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
                  "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"],
                 capture_output=True, text=True, encoding="utf-8", timeout=30,
                 creationflags=NO_WINDOW)
             data = json.loads(out.stdout or "[]")
-            self._apps = [a for a in (data if isinstance(data, list) else [data])
-                          if a.get("Name") and a.get("AppID")]
-            self._loaded = time.time()
-        return self._apps
+            apps = [a for a in (data if isinstance(data, list) else [data])
+                    if a.get("Name") and a.get("AppID")]
+        self._apps, self._loaded = apps, time.time()
 
     def match(self, query, limit=1):
         query = re.sub(r"\s+", " ", query.lower().strip())
@@ -700,12 +725,7 @@ def _flat(text):
 
 
 def _backend():
-    """The desktop family driving this machine: windows, hyprland, sway, x11, gnome, kde,
-    macos, wayland or none. A non-Windows os.name never means the Windows backend."""
-    if on_windows():
-        return "windows"
-    desktop = platforms.detect()["desktop"]
-    return "hyprland" if desktop == "windows" else desktop
+    return platforms.desktop_backend(on_windows())
 
 
 def open_windows():
@@ -910,10 +930,11 @@ def close_app(name):
     if how == "title" and len(hits) > 1:
         return False, ("Several windows match: " + "; ".join(w["title"] for w in hits[:5])
                        + ". Which one?")
-    if how == "title" and hits:  # a browser tab titled "Spotify Wrapped" is not the Spotify app
+    if how == "title" and hits:  # a tab or terminal titled "Spotify Wrapped" is not the Spotify app
         from .observe import is_browser
         if is_browser(hits[0].get("app")):
             return False, f"{name} isn't running."
+        return False, f"{name} isn't running (only a window titled like it is open)."
     if not hits:
         return False, f"No open window matches {name!r}."
     closed = [w for w in hits if _close(w)]
