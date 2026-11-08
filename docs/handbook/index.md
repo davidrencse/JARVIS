@@ -11,6 +11,7 @@ Written 2026-11-07, after the overhaul in [audit-2026-11.md](audit-2026-11.md).
 | [cluster.md](cluster.md) | Main and nodes, the hub, tunnels, `cluster update` |
 | [operations.md](operations.md) | Restarts, fail-safes, troubleshooting |
 | [audit-2026-11.md](audit-2026-11.md) | What the overhaul changed and why |
+| [perf-2026-11.md](perf-2026-11.md) | Performance pass, dedup review, and activation steps |
 
 Deeper reference: [architecture guide](../architecture-guide.md), `jarvis-memory/`, `JARVIS.md`.
 

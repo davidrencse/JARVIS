@@ -21,6 +21,22 @@ User units seen in `~/.config/systemd/user`: `jarvis-voice`, `jarvis-cluster`,
 
 `lan-mouse.service` stays disabled; the guard starts and stops it. Do not enable it.
 
+## Sleeping the main
+
+```fish
+.venv/bin/python -m jarvis sleep              # pause JARVIS, suspend; everything returns after the wake
+.venv/bin/python -m jarvis sleep --no-suspend # only pause JARVIS
+.venv/bin/python -m jarvis wake               # bring back what sleep paused
+```
+
+`sleep` stops the voice listener, hub, clipboard and Lan Mouse (IP watcher first), and for
+the night any user service holding a hard sleep lock (the Instabox listener blocks every
+suspend otherwise). A transient `jarvis-wake-*` unit restarts exactly those after the wake,
+even if the terminal is closed. If logind still refuses, everything comes straight back.
+Nodes stay on: they retry every 15 s and reconnect on their own; the Dell's guard turns its
+Lan Mouse off while the main is gone. Closing the lid also suspends (logind ignores app
+locks for the lid), but then JARVIS is frozen rather than paused.
+
 ## Cluster update
 
 ```sh

@@ -103,7 +103,6 @@ He answers in the console gate or by saying "Jarvis, yes".
 - **Console layout:**
   - It is a fixed grid in `cockpit.css` (rail tabs / pipeline + trace / assistant) with the gate
     panel (`gate.js`) at the bottom.
-  - `layout.js` drag-layout no longer applies to the console.
   - Keep existing element IDs: `app.js` and `signals.js` look them up.
 - **`tests/test_web_voice.py`** runs `app.js` in a Node VM with stub elements:
   - Use `setAttribute(...)`, not `el.dataset` or newer DOM APIs.
@@ -170,6 +169,22 @@ He answers in the console gate or by saying "Jarvis, yes".
   - To turn it off, set `lan_mouse.off_when_apart: false` in `jarvis.config.json`.
 - **Fail-safe if the cursor gets stuck** (Hyprland):
   `hyprctl dispatch 'hl.dsp.cursor.move({ x = 960, y = 540 })'`, then restart Lan Mouse on both sides.
+- **Letting the main sleep** (2026-11-07): `jarvis sleep` (`jarvis/rest.py`) stops JARVIS's user
+  units (IP watcher first, then Lan Mouse, clipboard, voice, hub) plus any user unit holding a
+  *block* sleep lock (the Instabox listener), arms a transient `jarvis-wake-*` unit, then runs
+  `systemctl suspend-then-hibernate`; after the wake it restarts exactly what it stopped. A refused
+  suspend restores at once. `--no-suspend` only pauses; `jarvis wake` restores. Nodes stay on,
+  back off to 15 s polls and reconnect; the Dell's guard turns its Lan Mouse off while the main is gone.
+- **Lan Mouse on Windows, injected moves** (2026-11-07): the capture hook ignores software-injected
+  moves at the edge (UAC hand-back, tools) except input-emulation's own peer motion, tagged
+  `dwExtraInfo = PEER_TAG` (0x4A415250). Without that, the Zenbook's touchpad drove the Dell but
+  could never cross back. Dell source: `C:\Users\jdoe\src\lan-mouse-peercross`.
+- **Lan Mouse checks who it connects to** (2026-11-07): the outgoing DTLS side accepts a peer only
+  if its certificate fingerprint is in `authorized_fingerprints` (`src/connect.rs` `verify_peer`), so a
+  spoofed mDNS address can't receive David's input. Both machines run this build.
+- **Settings → Permissions** (`settings.py` FIELDS section "permissions"): rules.confirm, actions.*,
+  vault.write, terminal.sandbox, lan_mouse.*. Changes that loosen a safety net (`LOOSENS`) need
+  `confirmed: true`; always-ask and hard refusals are shown read-only and can't be edited there.
 - **Remote desktop commands** (`jarvis desktop --device <node> terminal`) are cut off after 30 s.
   Keep remote steps short.
 
