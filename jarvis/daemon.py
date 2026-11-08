@@ -204,6 +204,94 @@ def ignored_line(score, limit, audio, near=False):
     return f"ignored another voice (similarity {score_text(score, limit)}{tail})"
 
 
+IDLE_TICK = 30  # s: how often a silent listener looks at its idle timer and warm requests
+IDLE_UNLOAD = 600  # s without speech before the models are freed (voice.idle_unload; 0: never)
+WARM_REQUEST = "warm-request"  # .jarvis/voice/<this>: touched by `jarvis voice start` (start.sh)
+
+
+def _emit(state, kind, **fields):
+    try:
+        from .events import emit
+        emit(state, kind, **fields)
+    except Exception:  # the feed is for the console; never let it break the listener
+        pass
+
+
+def request_warm(state):
+    """Ask a running listener to load its models now (start.sh: JARVIS is about to be used)."""
+    path = Path(state).resolve() / "voice" / WARM_REQUEST
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(time.time()), encoding="utf-8")
+    return path
+
+
+class Idle:
+    """Frees the speech models (Parakeet, Whisper, the voice check, Kokoro) after
+    voice.idle_unload seconds with no speech, and loads them early when start.sh asks
+    (David, 2026-11-07: the listener held ~3.2 GB on a 15 GB laptop). Silero VAD stays:
+    it is what hears the next "Jarvis", and it is tiny. Freed models reload on their own
+    at the next utterance (the first reply after a long quiet is a few seconds slower)."""
+
+    def __init__(self, state, config, stt, ears, clock=time.perf_counter):
+        self.stt, self.ears, self.clock = stt, ears, clock
+        self.after = (config.get("voice") or {}).get("idle_unload", IDLE_UNLOAD)
+        self.warm_path = Path(state).resolve() / "voice" / WARM_REQUEST
+        self.state = state
+        self.last = clock()
+        self.loaded = True  # models may be in memory (lazily loaded) until the first unload
+        self._warm_seen = self._stamp()
+        self.retry_at = None  # a failed unload (Parakeet mid-load) waits before the next try
+
+    def _stamp(self):
+        try:
+            return self.warm_path.stat().st_mtime
+        except OSError:
+            return None
+
+    def heard(self):
+        self.last, self.loaded = self.clock(), True
+
+    def tick(self):
+        stamp = self._stamp()
+        if stamp is not None and stamp != self._warm_seen:
+            self._warm_seen = stamp
+            self.preload()
+            return "warmed"
+        if (self.loaded and isinstance(self.after, (int, float)) and self.after > 0
+                and self.clock() - self.last >= self.after
+                and (self.retry_at is None or self.clock() >= self.retry_at)):
+            return "unloaded" if self.unload() else None
+        return None
+
+    def unload(self):
+        from .listen import give_back_memory
+        from .speech import release_kokoro
+        freed = self.stt.release() if hasattr(self.stt, "release") else False
+        if hasattr(self.ears, "release"):
+            self.ears.release()
+        release_kokoro()
+        give_back_memory()
+        self.loaded = not freed  # a Parakeet load still running: try again in IDLE_TICK s
+        self.retry_at = None if freed else self.clock() + IDLE_TICK
+        if freed:
+            minutes = round(self.after / 60)
+            log(f"idle {minutes} min: speech models unloaded (they reload on the next request)")
+            _emit(self.state, "voice.models", loaded=False)
+        return freed
+
+    def preload(self):
+        self.last, self.loaded = self.clock(), True
+        try:
+            if hasattr(self.ears, "preload"):
+                self.ears.preload()
+            if hasattr(self.stt, "preload"):
+                self.stt.preload()
+            log("speech models loaded (start requested)")
+            _emit(self.state, "voice.models", loaded=True)
+        except Exception as exc:  # missing package or model: the next clip says so plainly
+            log(f"preload failed: {type(exc).__name__}: {exc}")
+
+
 def warm_quietly(lane):
     """Warm the brain. Codex not up yet (at login) or down is no failed turn: logging it
     is enough. Uncaught, it killed the listener at startup until systemd gave up, and a
@@ -236,7 +324,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
     ears, stt = VoicePrint(state, config), Transcriber(config)
     lane = make_lane(config, base, state)
     pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ears")
-    if not ears.path.is_file():  # fail once, clearly, instead of on every utterance
+    checks_voice = (config.get("voice") or {}).get("speaker_check", True) is not False
+    if checks_voice and not ears.path.is_file():  # fail once, clearly, not on every utterance
         log(f"error: {NOT_ENROLLED}")
         raise SystemExit(2)
     lock = InstanceLock(state, wait=15)
@@ -292,6 +381,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 return False
         live = [None]  # the open mic, for the console's level wave (post_levels)
         start_level_poster(state, lambda: live[0])
+        idle = Idle(state, config, stt, ears)
+        stray = None  # a transcription cancel() couldn't stop (CUDA): no unload under it
         while True:
             try:
                 if mic is None:  # device + cutoffs from setup; waits for PipeWire at login
@@ -299,10 +390,19 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                                    on_missing=lambda: emit(state, "voice.mic_missing"))
                     reopen = False
                 live[0] = mic
-                audio = record_utterance(mic=mic)
-                if audio is None:  # silence or a short noise: keep the brain warm
-                    warm_quietly(lane)
+                waited = time.perf_counter()  # its own clock: the turn timing reads monotonic
+                audio = record_utterance(mic=mic, wait_seconds=IDLE_TICK)
+                if audio is None:
+                    # Tick on every empty return, not only after 30 s of silence: a room whose
+                    # fan or TV trips the VAD more often than that never unloaded (2026-11-07,
+                    # 3.5 h quiet, models still in). Its timer only resets on real speech.
+                    if stray is None or stray.done():
+                        stray = None
+                        idle.tick()  # free the models when idle; preload when start.sh asks
+                    if time.perf_counter() - waited < IDLE_TICK - 1:  # a short noise
+                        warm_quietly(lane)  # keep the brain warm
                     continue
+                idle.heard()  # any speech loads what it needs on its own (lazily)
                 # When this utterance began, so a long follow-up still lands in the window.
                 began = time.monotonic() - len(audio) / RATE
                 said_at = time.time() - len(audio) / RATE  # wall clock, before Whisper runs
@@ -333,9 +433,9 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                             head = text.result() if text is not None else stt(clip)
                         except Exception:
                             head = None
-                    if head is None or wake_word(head) is None:
-                        if text is not None:
-                            text.cancel()
+                    if head is None or wake_word(head, closing=False) is None:
+                        if text is not None and not text.cancel():
+                            stray = text  # already running: let it finish before any unload
                         log(ignored_line(score, limit, audio))
                         emit(state, "voice.ignored", score=score)
                         continue
@@ -352,10 +452,17 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                         heard = text.result() if text is not None else stt(audio)
                     finally:
                         stt.need_wake = True
-                request = wake_word(heard)
+                # Not verified as David (a near miss or a stranger let in by "Jarvis"): the
+                # name must open the clip, as voice.md says; "..., Jarvis." from a TV doesn't.
+                unverified = not is_owner and score is not None
+                request = wake_word(heard, closing=not unverified)
                 if getattr(stt, "fuzzy", None) is not None:  # Parakeet heard something like it
                     log(f"wake via whisper: {'yes' if stt.fuzzy else 'no'} "
                         f"(rescued {stt.rescued} of {stt.second_opinions})")
+                if request == "" and not is_owner:  # only David's own "Jarvis" opens a window
+                    log(ignored_line(score, limit, audio, near=True))
+                    emit(state, "voice.ignored", score=score)
+                    continue
                 if request == "":  # a bare "Jarvis" and a pause: the request comes next
                     armed = began + len(audio) / RATE + FOLLOW_UP
                     log(f"wake word ({score}): waiting for the request")
@@ -365,8 +472,18 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 # check itself: a near miss let in by David's earlier clip is not enough.
                 follow_up = False
                 if request is None and follow_up_ok(heard, began, armed, is_owner):
-                    request = heard.strip()  # the rest of "Jarvis, ... <pause> ..."
-                    follow_up = True
+                    if confirmation_words(heard) and confirmation_waiting(config, state):
+                        log("follow-up window: approving or cancelling a confirmation needs \"Jarvis\"")
+                    else:
+                        request = heard.strip()  # the rest of "Jarvis, ... <pause> ..."
+                        follow_up = True
+                # "Jarvis, yes" from a voice the check didn't pass never answers the gate.
+                if request and unverified and confirmation_words(request) \
+                        and confirmation_waiting(config, state):
+                    log(f"near miss ({score}): approving or cancelling a confirmation needs David's voice")
+                    emit(state, "voice.ignored", score=score)
+                    armed = chatting = 0.0
+                    continue
                 # Answering JARVIS ("I can check it if you want." "Then check it.") needs
                 # no wake word, but only a full voice match and a short reply count.
                 # Wall clock: the reply's end is read once, after JARVIS stops talking, and
@@ -391,8 +508,9 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                     # needs no "Jarvis" only if this clip said it (windows never chain).
                     log(f"unclear ({score}): asked to repeat")
                     emit(state, "voice.unclear", score=score)
-                    armed = time.monotonic() + FOLLOW_UP + 3 if may_rearm(follow_up) else 0.0
-                    voice.say(UNCLEAR if may_rearm(follow_up) else WAKE_AGAIN, wait=True)
+                    rearm = is_owner and may_rearm(follow_up)  # only David's clip opens a window
+                    armed = time.monotonic() + FOLLOW_UP + 3 if rearm else 0.0
+                    voice.say(UNCLEAR if rearm else WAKE_AGAIN, wait=True)
                     mic.flush()
                     continue
                 if pending and began < pending[1] and completes_fragment(pending[0], request, understood):
@@ -406,7 +524,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                 if verdict in ("unclear", "incomplete"):
                     log(f"{verdict} ({score}): {request!r}")
                     emit(state, "voice.fragment", verdict=verdict, score=score)
-                    if may_rearm(follow_up):
+                    if is_owner and may_rearm(follow_up):
                         armed = time.monotonic() + FOLLOW_UP + 3
                         pending = (request, armed) if verdict == "incomplete" else None
                         voice.say(ask_back or UNCLEAR, wait=True)
@@ -565,6 +683,22 @@ def level_file(state):
     return state / "voice" / "level.json"
 
 
+LEVEL_IDLE_EVERY = 1.0  # s between posts while no console reads the level (< LEVEL_STALE)
+LEVEL_WATCHED = 5.0     # s: a console read this recently gets the fast wave
+
+
+def watch_file(path):
+    """Touched by each console read of the level, so the listener knows someone is looking."""
+    return path.with_name(path.name + ".watch")
+
+
+def watched(path, now=None):
+    try:
+        return (now or time.time()) - watch_file(path).stat().st_mtime < LEVEL_WATCHED
+    except OSError:
+        return False
+
+
 def post_level(path, peak, now=None):
     """Write one reading atomically (the console must never read half a file)."""
     import json
@@ -582,7 +716,9 @@ def start_level_poster(state, current_mic, every=LEVEL_EVERY):
 
     def run():
         while True:
-            time.sleep(every)
+            # Ten writes a second only while a console reads them; once a second otherwise,
+            # just enough to stay "live" (LEVEL_STALE) when a console opens.
+            time.sleep(every if watched(path) else max(every, LEVEL_IDLE_EVERY))
             mic = current_mic()
             if mic is None:
                 continue
@@ -598,8 +734,13 @@ def level(state, now=None):
     """The listener's latest mic level for the console: {"live": False} when the
     listener is off or hasn't posted lately."""
     import json
+    path = level_file(state)
     try:
-        data = json.loads(level_file(state).read_text(encoding="utf-8"))
+        watch_file(path).touch()  # tells the poster a console is looking (fast wave)
+    except OSError:
+        pass
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
         at, peak = float(data["at"]), float(data["peak"])
     except (OSError, ValueError, KeyError, TypeError):
         return {"live": False}
@@ -614,7 +755,14 @@ def status(state):
     if log_path.is_file():
         # Background voices log a line each and would push everything else out of a plain
         # tail: keep the last lines that say something, and count the ignored ones.
-        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]:
+        with open(log_path, "rb") as fh:  # the tail only: the log grows by MBs over weeks
+            start = max(0, fh.seek(0, os.SEEK_END) - 64 * 1024)
+            fh.seek(max(0, start - 1))
+            data = fh.read()
+            if start:  # unless the cut fell right after a newline, its first line is partial
+                data = data[1:] if data[:1] == b"\n" else data.partition(b"\n")[2]
+            data = data.decode("utf-8", errors="replace")
+        for line in data.splitlines()[-400:]:
             if "ignored another voice" in line:
                 ignored, last_ignored = ignored + 1, line[:16]
             elif line.strip():
@@ -676,10 +824,13 @@ def _wait_listening(state):
             **status(state)}
 
 
-def start(state):
+def start(state, config=None):
     if _pid(state):
-        return {"started": False, **status(state)}
-    if not (Path(state).resolve() / "voice" / "voiceprint.json").is_file():
+        # Already listening: start.sh means JARVIS is about to be used, so load the models now.
+        request_warm(state)
+        return {"started": False, "warming": True, **status(state)}
+    checks_voice = ((config or {}).get("voice") or {}).get("speaker_check", True) is not False
+    if checks_voice and not (Path(state).resolve() / "voice" / "voiceprint.json").is_file():
         return {"started": False, "note": NOT_ENROLLED, **status(state)}
     if _supervised():
         _systemctl("reset-failed", UNIT_NAME)
@@ -750,6 +901,11 @@ def _systemd_autostart(state, enable):
         comment="JARVIS: start the voice listener at login. `jarvis voice autostart off` removes it.",
         after="pipewire.service pipewire-pulse.service",
         service=["RestartPreventExitStatus=2 3",
+                 # At most 3 GB, RAM and swap together (David, 2026-11-07). Loaded it uses
+                 # ~2.6 GB, idle far less (Idle frees the models); past 3 GB systemd stops
+                 # it and Restart= brings it back clean. No MemoryHigh: at 2800M the kernel
+                 # throttled it 2.7 M times and evicted its code pages (CPU burn, no gain).
+                 "MemoryMax=3G", "MemorySwapMax=0",
                  # systemd's PATH lacks ~/.local/bin, where the claude CLI usually lives.
                  f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"',
                  'Environment="PYTHONIOENCODING=utf-8" "PYTHONUNBUFFERED=1"',

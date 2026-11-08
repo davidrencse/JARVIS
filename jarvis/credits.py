@@ -25,6 +25,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .adapters import _SameOriginRedirect
 from .claude_auth import renew_claude_session
 from .fsio import atomic_write
 from .locking import exclusive_lock
@@ -71,15 +72,6 @@ def _now():
 
 def _iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).isoformat() if ts else None
-
-
-class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        # urllib forwards Authorization and key headers on redirect; only follow to the same origin.
-        old, new = urllib.parse.urlparse(req.full_url), urllib.parse.urlparse(newurl)
-        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
-            return None
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 _OPENER = urllib.request.build_opener(_SameOriginRedirect())
@@ -363,8 +355,11 @@ class Credits:
             if remaining in (None, ""):
                 data.pop(provider, None)
             else:
-                data[provider] = {"remaining": float(remaining),
-                                  "total": float(total) if total not in (None, "") else None,
+                rem = float(remaining)
+                tot = float(total) if total not in (None, "") else None
+                if not math.isfinite(rem) or (tot is not None and not math.isfinite(tot)):
+                    raise ValueError("Credit amounts must be finite numbers.")
+                data[provider] = {"remaining": rem, "total": tot,
                                   "unit": str(unit)[:12] or "USD", "note": str(note)[:200],
                                   "updated_at": _now().isoformat()}
             atomic_write(self.manual_path, json.dumps(data, indent=2))
