@@ -517,8 +517,14 @@ class VoicePrint:
         self.last_embedding = None
         self.last_score = self.last_limit = None
 
-    def _embed(self, audio):
-        np = _np()
+    def release(self):
+        """Free the speaker model; the next check loads it again (well under a second)."""
+        self._extractor = None
+
+    def preload(self):
+        self._ensure_extractor()
+
+    def _ensure_extractor(self):
         if self._extractor is None:
             try:
                 import sherpa_onnx
@@ -529,6 +535,11 @@ class VoicePrint:
                                    f"{SPEAKER_MODEL_URL}")
             self._extractor = sherpa_onnx.SpeakerEmbeddingExtractor(
                 sherpa_onnx.SpeakerEmbeddingExtractorConfig(model=str(self.model), num_threads=6))
+        return self._extractor
+
+    def _embed(self, audio):
+        np = _np()
+        self._ensure_extractor()
         stream = self._extractor.create_stream()
         stream.accept_waveform(sample_rate=RATE, waveform=audio)
         stream.input_finished()
@@ -831,6 +842,9 @@ class Parakeet:
             opts = rt.SessionOptions()
             opts.intra_op_num_threads = self.threads
             opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            # No arena: it keeps the peak of the longest clip ever heard (hundreds of MB for
+            # a 20 s clip) for the life of the process; plain malloc gives it back.
+            opts.enable_cpu_mem_arena = False
             model = onnx_asr.load_model(self.name, quantization="int8",
                                         sess_options=opts).with_timestamps()
         except ImportError as exc:
@@ -842,6 +856,15 @@ class Parakeet:
         finally:
             with self._lock:
                 self._loading = None
+
+    def release(self):
+        """Drop the model (it reloads on the next ready()). False while a load is running:
+        that thread would only put it back."""
+        with self._lock:
+            if self._loading is not None:
+                return False
+            self._model = None
+            return True
 
     def ready(self):
         """True once loaded; otherwise starts (or retries) the background load."""
@@ -906,14 +929,15 @@ def plausible(text, seconds):
 WAKE_VARIANTS = ("jovers", "jarbus", "jovis")
 
 
-def wake(text):
-    """assistant.wake_word with Parakeet's variants too: the request, or None."""
+def wake(text, closing=True):
+    """assistant.wake_word with Parakeet's variants too: the request, or None.
+    closing=False: only "Jarvis, ..." at the start counts (an unverified voice)."""
     from .assistant import wake_word
     try:
         from .assistant import WAKE_WORDS
-    except ImportError:  # a stand-in assistant module (tests): its own rule only
-        return wake_word(text or "")
-    return wake_word(text or "", WAKE_WORDS + WAKE_VARIANTS)
+    except ImportError:  # a stand-in assistant module (tests): its own rule, closing form only
+        return wake_word(text or "") if closing else None
+    return wake_word(text or "", WAKE_WORDS + WAKE_VARIANTS, closing=closing)
 
 
 def _edits(a, b):
@@ -1065,7 +1089,29 @@ class Transcriber:
         while len(self._stats) > 8:
             self._stats.pop(next(iter(self._stats)))
 
-    def _whisper(self, audio):
+    def release(self):
+        """Free Whisper and the fast engine; both load again on the next clip. True when
+        everything was freed (False: Parakeet was mid-load and keeps loading)."""
+        self._model, self.device = None, None
+        self._stats.clear()
+        fast = getattr(self.fast, "release", None)
+        return fast() if fast else True
+
+    def loaded(self):
+        return self._model is not None or getattr(self.fast, "_model", None) is not None
+
+    def preload(self):
+        """Load before the first request (start.sh): Parakeet in its background thread,
+        Whisper (the backup and wake-word second opinion) here."""
+        ready = getattr(self.fast, "ready", None)
+        if ready:
+            try:
+                ready()
+            except ImportError:
+                pass
+        self._load_whisper()
+
+    def _load_whisper(self):
         if self._model is None:
             _expose_cuda_dlls()
             try:
@@ -1081,6 +1127,9 @@ class Transcriber:
             except Exception:  # no CUDA runtime: fall back to CPU
                 self._model = WhisperModel("small.en", device="cpu", compute_type="int8")
                 self.device = "cpu"
+
+    def _whisper(self, audio):
+        self._load_whisper()
         try:
             return self._run(audio)
         except RuntimeError as exc:  # missing cuBLAS/cuDNN often surfaces only here
@@ -1129,3 +1178,15 @@ def unsure(stats):
         return stats["logprob"] < PARAKEET_UNSURE_LOGPROB
     logprob, silence = stats["logprob"], stats.get("no_speech") or 0.0
     return logprob < UNSURE_LOGPROB or (silence > UNSURE_NO_SPEECH and logprob < -0.6)
+
+
+def give_back_memory():
+    """After dropping models: collect, then ask glibc to hand freed heap back to the OS
+    (otherwise RSS stays high though nothing uses it)."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):  # not glibc (Windows, macOS, musl)
+        pass
