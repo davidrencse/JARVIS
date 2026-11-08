@@ -119,6 +119,52 @@ class UpdateJobTests(unittest.TestCase):
         self.assertIn("updating its code", self.sent[0]["result"]["error"])
 
 
+class MalformedPollTests(UpdateJobTests):
+    """Audit 2026-11-07: a non-dict poll reply or job crashed the node agent's poll thread."""
+
+    def test_malformed_replies_fail_the_poll_not_the_agent(self):
+        executor = Mock()
+        worker = self.worker("inventory", {}, executor)
+        for reply in ({"job": "x"}, [], "nope", {"job": ["a"]}):
+            worker.client.request = Mock(return_value=reply)
+            with self.subTest(reply=reply), self.assertRaises(ValueError):
+                worker.once()
+        executor.assert_not_called()
+
+    def test_poll_loop_survives_an_unexpected_error(self):
+        worker = self.worker("inventory", {}, Mock())
+        worker._acts_locally = False
+        calls = []
+
+        def once():
+            calls.append(1)
+            if len(calls) == 1:
+                raise AttributeError("boom")
+            worker.stop_event.set()
+            return True
+
+        with patch.object(worker, "once", once), patch.object(worker, "_rejoined", return_value=False), \
+                patch("jarvis.cluster.redeem_invite"), patch.object(worker.stop_event, "wait"):
+            worker._poll_loop()
+        self.assertEqual(len(calls), 2)
+
+
+class HubPauseTests(unittest.TestCase):
+    def test_a_hub_that_fails_its_lock_never_ends_a_live_pause(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        pause = Mock()
+        hub = Hub(configuration(), root, root / "main")
+        hub._pause = pause
+        from jarvis.locking import exclusive_lock
+        (root / "main").mkdir(parents=True, exist_ok=True)
+        with exclusive_lock(root / "main" / "cluster-main.lock"):  # the live hub holds it
+            with self.assertRaises(RuntimeError):
+                hub.start(port=0)
+        pause.assert_not_called()
+
+
 class RedeemKeyTests(unittest.TestCase):
     def test_pending_key_is_on_disk_before_redeem_is_sent(self):
         from jarvis.cluster import PENDING_KEY, redeem_invite
