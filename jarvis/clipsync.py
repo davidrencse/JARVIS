@@ -817,6 +817,25 @@ def _windows_is_python(pid):
         return True
 
 
+def _lock_held(state):
+    """True while a live process holds clipboard.lock (the watcher holds it for its whole life)."""
+    from .daemon import _try_lock
+    path = os.path.join(state, LOCK)
+    if not os.path.isfile(path):
+        return False
+    try:
+        handle = open(path, "a+")
+    except OSError:
+        return False
+    try:
+        _try_lock(handle)
+    except OSError:
+        return True
+    finally:
+        handle.close()
+    return False
+
+
 def _pid(state):
     from .daemon import _alive
     path = os.path.join(state, PID)
@@ -825,7 +844,9 @@ def _pid(state):
             pid = int(f.read().strip())
     except (OSError, ValueError):
         return None
-    if _alive(pid) and _is_watcher(pid):
+    if _alive(pid) and _is_watcher(pid) and (os.path.isdir("/proc") or _lock_held(state)):
+        # Without /proc (Windows) "some Python" is all _is_watcher can tell, and a reused PID
+        # after a reboot is often another pythonw: the watcher also holds clipboard.lock.
         return pid
     try:
         os.remove(path)  # stale: the process is gone or the PID was reused
@@ -964,9 +985,10 @@ def autostart(state, enable):
     path, state = _startup_file(), os.path.abspath(state)
     command = f'"{sys.executable}" -m jarvis --state "{state}" clipboard'
     if os.name != "nt":
+        from .platforms import systemctl_user
+
         def systemctl(*args):
-            return subprocess.run(["systemctl", "--user", *args], capture_output=True,
-                                  timeout=30).returncode == 0
+            return systemctl_user(*args)[0] == 0
         if not enable:
             systemctl("disable", "--now", UNIT_NAME)
             path.unlink(missing_ok=True)
