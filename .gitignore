@@ -10,6 +10,6 @@ __pycache__/
 jarvis.egg-info/
 *.mp3
 .playwright-mcp/
-jarvis.config.json.pre-*
+*.pre-*
 jarvis.prev/
 *.sqlite3
