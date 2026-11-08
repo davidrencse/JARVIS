@@ -29,6 +29,7 @@ from pathlib import Path
 
 from .platforms import NO_WINDOW, on_windows, on_macos
 from . import platforms
+from .cluster_store import OWNER_TOKEN
 
 TIMEOUT = 30          # seconds a command may run
 MAX_OUTPUT = 6000     # characters of output handed back to the brain
@@ -478,10 +479,11 @@ def sandbox(folder=None, repo=None, config=None):
                  *[expand(v) for v in vaults if v], *[expand(p) for p in PROTECT], *hooks):
         if Path(path).exists():
             args += ["--ro-bind", str(path), str(path)]
-    for path in (*HIDDEN, str(repo / ".jarvis")):
+    strays, secrets = _stray_state(repo)
+    for path in (*HIDDEN, str(repo / ".jarvis"), *strays):
         if expand(path).is_dir():
             args += ["--tmpfs", str(expand(path))]
-    for path in HIDDEN_FILES:
+    for path in (*HIDDEN_FILES, *secrets):
         if expand(path).is_file():
             args += ["--ro-bind", "/dev/null", str(expand(path))]
     devices = [*sorted(Path("/dev").glob("hidraw*")), Path("/dev/uinput"), *sorted(Path("/dev").glob("video*"))]
@@ -512,6 +514,36 @@ def sandbox(folder=None, repo=None, config=None):
         return [pasta, "--quiet", "--config-net", "-t", "none", "-u", "none", "-T", "none",
                 "-U", "none", "--no-map-gw", "--", *args, "--"]
     return [*args, "--unshare-net", "--"]
+
+
+# Files that are JARVIS secrets wherever a copy of them lands (audit 2026-11-07: a stray
+# 2.4 GB copy of the repo inside it, "C:\\Program Files/JARVIS Lan Mouse", carried a live
+# .jarvis/ with the code-signing key, tokens and browser cookies the sandbox didn't hide).
+SECRET_NAMES = ("code-signing.key", OWNER_TOKEN, "chrome-extension-token",
+                "secrets.json", "cluster-node.json")
+_SKIP_WALK = {".git", ".venv", "venv", "node_modules", "__pycache__", "target"}
+
+
+def _stray_state(repo, depth=6):
+    """(.jarvis folders, secret files) anywhere under the repo besides repo/.jarvis, found by
+    a bounded walk that skips environments and build output (they hold no state)."""
+    repo = Path(repo)
+    strays, secrets = [], []
+    top = len(repo.parts)
+    for folder, dirs, files in os.walk(repo):
+        here = Path(folder)
+        if len(here.parts) - top >= depth:
+            dirs[:] = []
+        for name in list(dirs):
+            if name == ".jarvis":
+                if here != repo:
+                    strays.append(str(here / name))
+                dirs.remove(name)  # hidden whole (repo/.jarvis already is)
+            elif name in _SKIP_WALK:
+                dirs.remove(name)
+        secrets += [str(here / f) for f in files
+                    if f.startswith("code-signing.key") or f in SECRET_NAMES]
+    return strays, secrets
 
 
 def _kill_tree(proc):

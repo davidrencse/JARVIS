@@ -435,7 +435,9 @@ class Tasks:
                 fresh = put(mark(line, " "), "✅", None)
                 for field, value in next_dates(task, today).items():
                     fresh = put(fresh, {"due": "📅", "scheduled": "⏳", "start": "🛫"}[field], value)
-                added = fresh
+                # The next occurrence is a new task: links and ⛔ dependencies keep pointing
+                # at the one just done, so it gets no copy of its ^block id or 🆔.
+                added = re.sub(r"\s*🆔️?\s*[\w-]+", "", BLOCK_ID.sub("", fresh)).rstrip()
             line = put(mark(line, "x"), "✅", day)
         elif action == "reopen":
             line = put(put(mark(line, " "), "✅", None), "❌", None)
