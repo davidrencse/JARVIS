@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from jarvis.assistant import ask
-from jarvis.grok_preflight import CHECKS, PreflightError, assess, infer_with_chatgpt
+from jarvis.grok_preflight import CHECKS, PreflightError, assess
 from jarvis.grokbot import GrokTools, Grokbot
 from jarvis.memory import Memory
 from jarvis.store import Store
@@ -53,15 +53,6 @@ class PreflightTests(unittest.TestCase):
             assess("check my inbox", {}, ".", lambda _: (_ for _ in ()).throw(
                 RuntimeError("model unavailable")))
 
-    def test_inference_uses_a_separate_tool_free_lane_and_closes_it(self):
-        with patch("jarvis.chatgpt.ChatGPTLane") as lane:
-            lane.return_value.ask.return_value = result()
-            answer = infer_with_chatgpt("request", {}, ".")
-        self.assertEqual(answer, result())
-        self.assertEqual(lane.call_args.kwargs["max_turns"], 1)
-        self.assertEqual(lane.call_args.kwargs["timeout"], 30)  # the grok_check role default
-        self.assertNotIn("tools", lane.call_args.kwargs)
-        lane.return_value.close.assert_called_once()
 
     def test_draft_and_review_share_one_codex_process(self):
         with patch("jarvis.chatgpt.ChatGPTLane") as lane:

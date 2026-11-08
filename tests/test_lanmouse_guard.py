@@ -53,6 +53,13 @@ class PeerNearbyTests(unittest.TestCase):
         cfg = {"clients": [{"hostname": "WinLaptop", "ips": ["172.1.41.40"]}]}
         self.assertIs(near(cfg, ts(online=False))["near"], True)
 
+    def test_a_planted_local_address_never_beats_tailscale_seeing_the_peer_elsewhere(self):
+        # Café Wi-Fi: a spoofed mDNS answer put a local IP in the Lan Mouse config, while
+        # Tailscale reaches the Dell at home. Apart (audit 2026-11-07).
+        cfg = {"clients": [{"hostname": "WinLaptop", "ips": ["172.1.41.66"]}]}
+        self.assertIs(near(cfg, ts(cur="198.51.100.58:55157"))["near"], False)
+        self.assertIs(near(cfg, ts(cur="172.1.41.40:41641"))["near"], True)  # really here
+
     def test_stale_offline_twin_does_not_hide_the_live_peer(self):
         status = {"BackendState": "Running", "Peer": {
             "a": {"HostName": "WinLaptop", "Online": False, "CurAddr": "", "TailscaleIPs": ["100.9.9.9"]},
