@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#121214">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="JARVIS">
+<meta name="color-scheme" content="dark light">
+<title>JARVIS · Mobile</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<link rel="stylesheet" href="porcelain.css">
+<link rel="stylesheet" href="mobile.css">
+</head>
+<body class="mobile-app">
+<div class="mobile-shell">
+  <header class="mobile-header">
+    <div class="mobile-brand"><span class="mobile-mark" aria-hidden="true">J</span><div><b>JARVIS</b><span>PERSONAL COMMAND SYSTEM</span></div></div>
+    <span class="mobile-link-state" id="link-state"><i></i><span>Connecting</span></span>
+  </header>
+  <main id="content">
+    <section class="mobile-view" data-panel="home">
+      <div class="mobile-eyebrow"><span>CONTROL CENTRE / 01</span><span id="mobile-clock">--:--</span></div>
+      <h1>Your world.<br><em>One command away.</em></h1>
+      <p class="mobile-intro">Your machines, agents and everyday tools. Connected through JARVIS.</p>
+      <div class="mobile-hero"><div class="hero-top"><span>NETWORK STATUS</span><span class="live-rail" id="network-label">CHECKING</span></div>
+        <div class="hero-counter"><b id="online-count">—</b><span id="machine-count-label">CONNECTED MACHINES</span></div>
+        <div class="hero-lines"><div><span>CONTROL PLANE</span><b id="brain-state">Checking</b></div><div><span>SYNC</span><b id="sync-time">—</b></div></div>
+        <div class="hero-grid" aria-hidden="true"></div>
+      </div>
+      <div class="section-title"><h2>Machines</h2><button type="button" class="text-action" id="refresh-machines">Refresh ↗</button></div>
+      <div id="machine-list" class="machine-list"><div class="machine-empty">Connecting to JARVIS…</div></div>
+      <div class="quick-actions">
+        <button type="button" data-nav="assistant"><span class="action-icon">⌘</span><b>Ask JARVIS</b><small>Voice & text</small></button>
+        <button type="button" data-nav="remote"><span class="action-icon">▣</span><b>Remote</b><small>Desktop access</small></button>
+      </div>
+    </section>
+    <section class="mobile-view" data-panel="remote" hidden>
+      <div class="mobile-eyebrow">REMOTE OPERATIONS / 02</div><h1>Take control.</h1>
+      <p class="mobile-intro">Choose an enrolled computer to open the existing JARVIS Remote console.</p>
+      <div class="mobile-card"><div class="section-title"><h2>Available nodes</h2><span class="micro-tag">LIVE STATUS</span></div><div id="remote-list" class="machine-list"></div></div>
+      <div class="mobile-notice">The existing remote engine currently supports node computers. Touch-native remote controls and main-PC screen sessions require separate backend work. Nothing here bypasses those restrictions.</div>
+      <a class="primary-action" href="index.html#remote">Open desktop remote console <span>↗</span></a>
+    </section>
+    <section class="mobile-view" data-panel="location" hidden>
+      <div class="mobile-eyebrow">DEVICE INTELLIGENCE / 03</div><h1>Find your machines.</h1>
+      <p class="mobile-intro">Your device location dashboard will report the source and accuracy of each opt-in position.</p>
+      <div class="mobile-map"><div class="map-cross">+</div><span class="map-word">LOCATION FEED</span><div class="map-scan"></div><div class="map-centre">LOCATION UNAVAILABLE<br><small>No enrolled location providers</small></div></div>
+      <div class="mobile-notice">GPS cannot be inferred from a Tailscale address. Device-side location permission, timestamps, accuracy, and retention controls must be implemented before showing positions.</div>
+    </section>
+    <section class="mobile-view" data-panel="camera" hidden>
+      <div class="mobile-eyebrow">VISUAL SYSTEMS / 04</div><h1>See the other side.</h1>
+      <p class="mobile-intro">An encrypted, permission-controlled live camera experience for your computers.</p>
+      <div class="camera-placeholder"><div class="camera-frame"><span>CAM 01</span><span>STANDBY</span></div><div class="camera-core">◉</div><div class="camera-bottom">NO CAMERA SESSION ACTIVE</div></div>
+      <div class="mobile-notice">Camera streams are not yet supported by JARVIS. Each device will need explicit camera enrollment, a visible capture indicator, short-lived sessions, and an immediate stop control.</div>
+    </section>
+    <section class="mobile-view" data-panel="assistant" hidden>
+      <div class="mobile-eyebrow">ASSISTANT / 05</div><h1>Ask anything.</h1>
+      <p class="mobile-intro">Requests are processed by your existing JARVIS pipeline and its safety gates.</p>
+      <div id="conversation" class="conversation" aria-live="polite"><div class="assistant-bubble">JARVIS is ready when the control plane is reachable. What would you like me to do?</div></div>
+      <form id="ask-form" class="ask-form"><label class="sr" for="ask-input">Message JARVIS</label><input id="ask-input" type="text" placeholder="Ask JARVIS…" autocomplete="off" maxlength="2000" required><button type="submit" aria-label="Send request">↑</button></form>
+      <p class="micro-copy" id="ask-status">Commands may require confirmation in the desktop console.</p>
+    </section>
+  </main>
+  <nav class="mobile-nav" aria-label="Mobile sections">
+    <button type="button" data-nav="home" aria-current="page"><span>⌂</span><small>Home</small></button>
+    <button type="button" data-nav="remote"><span>▣</span><small>Remote</small></button>
+    <button type="button" data-nav="location"><span>⌾</span><small>Locate</small></button>
+    <button type="button" data-nav="camera"><span>◎</span><small>Camera</small></button>
+    <button type="button" data-nav="assistant"><span>⌘</span><small>Assistant</small></button>
+  </nav>
+</div>
+<script defer src="mobile.js"></script>
+</body></html>
