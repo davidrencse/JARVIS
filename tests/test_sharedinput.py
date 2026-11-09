@@ -253,7 +253,8 @@ class StatusCostTests(unittest.TestCase):
             fake_os.name = "nt"
             self.assertTrue(si.stop()["stopped"])
         st.assert_called_once()
-        run.assert_called_once()  # taskkill only
+        # taskkill, then one cheap tasklist to confirm the exit (never the slow CIM query)
+        self.assertEqual([c.args[0] for c in run.call_args_list], ["taskkill", "tasklist"])
 
     def test_start_polls_cheaply_on_windows(self):
         calls = []
@@ -363,6 +364,18 @@ class ElevatedTaskTests(unittest.TestCase):
         self.assertIn(("schtasks", "/Run", "/TN", si.ELEVATED_STOP_TASK), calls)
         self.assertTrue(out["stopped"])
 
+    def test_admin_stop_waits_for_the_exit(self):
+        # From an admin terminal taskkill succeeds but returns before the process is gone;
+        # elevate()'s start() right after then saw it "already running" and left it off.
+        calls, run = self.win(set())
+        lingering = iter([True, True, False])
+        self.enter(self.patches(run, [{"running": False, "build": None}]))
+        with mock.patch.object(si, "_run", side_effect=lambda *a, timeout=5: (
+                SimpleNamespace(stdout="", stderr="", returncode=0) if a[0] == "taskkill" else run(*a, timeout=timeout))), \
+                mock.patch.object(si, "_quick_status", side_effect=lambda: {"running": next(lingering)}) as quick:
+            self.assertTrue(si.stop()["stopped"])
+        self.assertEqual(quick.call_count, 3)
+
     def test_elevate_refuses_when_not_admin(self):
         calls, run = self.win(set())
         self.enter(self.patches(run, []))
@@ -379,7 +392,7 @@ class ElevatedTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(si, "_is_admin", return_value=True), \
                 mock.patch.object(si, "install_dir", return_value=Path(tmp)), \
-                mock.patch("shutil.copytree", lambda src, dst, **kw: copied.append((src, dst))), \
+                mock.patch.object(si, "_install_copy", lambda src, dst: copied.append((src, dst))), \
                 mock.patch.object(si, "start", return_value={"started": True}) as start, \
                 mock.patch.object(si, "_binary", return_value=str(Path("/home/u/lm/bin/lan-mouse.exe"))):
             out = si.elevate()
@@ -389,7 +402,7 @@ class ElevatedTaskTests(unittest.TestCase):
         self.assertEqual(out, {"elevated": True, "tasks": [si.ELEVATED_TASK, si.ELEVATED_STOP_TASK], "running": False})
         self.assertEqual(len([c for c in calls if c[:2] == ("schtasks", "/Create")]), 2)
         # The elevated task runs only the admin-only copy, never the user-writable original.
-        self.assertEqual(copied, [(Path("/home/u/lm/bin"), Path(tmp))])
+        self.assertEqual(copied, [(Path("/home/u/lm/bin/lan-mouse.exe"), Path(tmp))])
         self.assertIn(str(Path(tmp) / "lan-mouse.exe"), vbs)
         self.assertNotIn("/home/u/lm", vbs)
 
@@ -400,7 +413,7 @@ class ElevatedTaskTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(si, "_is_admin", return_value=True), \
                 mock.patch.object(si, "install_dir", return_value=Path(tmp)), \
-                mock.patch("shutil.copytree"), \
+                mock.patch.object(si, "_install_copy"), \
                 mock.patch.object(si, "stop") as stop, \
                 mock.patch.object(si, "start", return_value={"started": True}) as start, \
                 mock.patch.object(si, "_binary", return_value=str(Path("/home/u/lm/bin/lan-mouse.exe"))):
@@ -416,6 +429,34 @@ class ElevatedTaskTests(unittest.TestCase):
             self.assertEqual(si._windows_build(r"C:\Users\d\AppData\Local\lan-mouse\bin\lan-mouse.exe"), "patched")
             self.assertEqual(si._windows_build(r"C:\Program Files\Lan Mouse\lan-mouse.exe"), "official")
             self.assertEqual(si._windows_build(r"C:\Program Files\JARVIS Lan Mouse Old\lan-mouse.exe"), "official")
+
+    def test_install_copy_takes_only_the_exe_and_dlls(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as home:
+            src, home = Path(src), Path(home)
+            for name in ("lan-mouse.exe", "lan-mouse.exe.pre-uacfix", "lan-mouse.exe.off", "SDL2.dll"):
+                (src / name).write_text(name)
+            for name in ("lan-mouse.exe.pre-kbdfix", "daemon.log", "start-elevated.vbs"):
+                (home / name).write_text("old")
+            si._install_copy(src / "lan-mouse.exe", home)
+            self.assertEqual(sorted(p.name for p in home.iterdir()),
+                             ["SDL2.dll", "daemon.log", "lan-mouse.exe", "start-elevated.vbs"])
+            self.assertEqual((home / "lan-mouse.exe").read_text(), "lan-mouse.exe")
+
+    def test_elevated_daemon_with_a_hidden_path_still_counts_as_running(self):
+        # An unelevated CIM query returns no ExecutablePath for the elevated daemon.
+        empty = mock.Mock(stdout="", returncode=0)
+        with mock.patch.object(si, "on_windows", return_value=True), \
+                mock.patch.object(si, "_desktop", return_value="windows"), \
+                mock.patch.object(si, "_run", return_value=empty), \
+                mock.patch.object(si, "_quick_status", return_value={"running": True, "build": None}), \
+                mock.patch.object(si, "_task_exists", return_value=True):
+            self.assertEqual(si.lan_mouse_status(), {"running": True, "build": "patched"})
+        with mock.patch.object(si, "on_windows", return_value=True), \
+                mock.patch.object(si, "_desktop", return_value="windows"), \
+                mock.patch.object(si, "_run", return_value=empty), \
+                mock.patch.object(si, "_quick_status", return_value={"running": False, "build": None}):
+            self.assertEqual(si.lan_mouse_status(), {"running": False, "build": None})
 
     def test_task_xml(self):
         xml = si._task_xml("wscript.exe", '"C:\\a&b\\x.vbs"', "PC\\david")

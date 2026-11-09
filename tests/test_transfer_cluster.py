@@ -311,3 +311,129 @@ class LanMouseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FileClipboardFlowTests(Homes):
+    def frame(self, names):
+        return json.dumps({'kind': 'files', 'names': names}).encode()
+
+    def test_receiver_rejects_traversal_absolute_reserved_missing_and_link_names(self):
+        drop = self.local_home / 'JARVIS-Drop'
+        drop.mkdir()
+        outside = self.local_home / 'outside'
+        outside.write_text('keep')
+        (drop / 'link').symlink_to(outside)
+        with mock.patch.object(Path, 'home', return_value=self.local_home), \
+                mock.patch.object(clipsync, 'local_clipboard') as board, \
+                mock.patch.object(clipsync, '_paused', return_value=None):
+            for name in ('../outside', str(outside), r'C:\outside', 'missing', 'link', 'CON'):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    clipsync.apply(self.state, 'files', self.frame([name]))
+            board.assert_not_called()
+
+    def test_receiver_sets_paths_and_names_digest(self):
+        drop = self.local_home / 'JARVIS-Drop'
+        drop.mkdir()
+        (drop / 'a.txt').write_bytes(b'abc')
+        board = FakeBoard([])
+        with mock.patch.object(Path, 'home', return_value=self.local_home), \
+                mock.patch.object(clipsync, 'local_clipboard', return_value=board), \
+                mock.patch.object(clipsync, '_paused', return_value=None):
+            self.assertTrue(clipsync.apply(self.state, 'files', self.frame(['a.txt'])))
+        self.assertEqual(board.written, [('files', [drop / 'a.txt'])])
+        self.assertEqual(clipsync._applied(str(self.state)), clipsync.digest('files', ['a.txt']))
+
+    def test_receiver_pause_still_applies_to_files(self):
+        with mock.patch.object(clipsync, '_paused', return_value='apart'), \
+                mock.patch.object(clipsync, 'local_clipboard') as board:
+            self.assertFalse(clipsync.apply(self.state, 'files', self.frame(['a.txt'])))
+        board.assert_not_called()
+
+    def run_watcher(self, board, config=None, **kwargs):
+        with self.assertRaises(KeyboardInterrupt):
+            clipsync.run_cluster(config or cluster(), str(self.state), board=board, log=lambda _: None,
+                                 **kwargs)
+
+    def test_size_cap_sends_nothing_and_notifies_once_per_copy(self):
+        src = self.root / 'large'
+        src.write_bytes(b'12345')
+        config = cluster()
+        config['clipboard'] = {'files_max_bytes': 4}
+        board = FakeBoard([None, ('files', [str(src)]), ('files', [str(src)])])
+        with mock.patch.object(transfer, 'push') as push, \
+                mock.patch.object(clipsync, '_notify_files_limit') as notify, \
+                mock.patch.object(clipsync, '_paused', return_value=None):
+            self.run_watcher(board, config)
+        push.assert_not_called()
+        notify.assert_called_once()
+
+    def test_drop_folder_bounce_rule_survives_marker_expiry(self):
+        drop = self.local_home / 'JARVIS-Drop'
+        drop.mkdir()
+        src = drop / 'a.txt'
+        src.write_bytes(b'abc')
+        board = FakeBoard([None, ('files', [str(src)])])
+        with mock.patch.object(Path, 'home', return_value=self.local_home), \
+                mock.patch.object(transfer, 'push') as push, \
+                mock.patch.object(clipsync, '_applied', return_value=None), \
+                mock.patch.object(clipsync, '_paused', return_value=None):
+            self.run_watcher(board)
+        push.assert_not_called()
+        self.assertTrue(clipsync.files_in_drop([src], drop))
+        self.assertFalse(clipsync.files_in_drop([src, self.root / 'elsewhere'], drop))
+        self.assertFalse(clipsync.files_in_drop([self.local_home / 'JARVIS-Drop-other' / 'x'], drop))
+
+    def test_paused_files_are_never_pushed(self):
+        src = self.root / 'a.txt'
+        src.write_text('keep')
+        with mock.patch.object(clipsync, '_paused', return_value='apart'), \
+                mock.patch.object(transfer, 'push') as push:
+            self.run_watcher(FakeBoard([None, ('files', [str(src)])]))
+        push.assert_not_called()
+
+    def test_end_to_end_both_roles_chunked_with_collision_and_bounce(self):
+        for local in ('main', 'node'):
+            with self.subTest(local=local):
+                self.calls.clear()
+                src = self.root / f'{local}.txt'
+                src.write_bytes(b'hello file')
+                drop = self.remote_home / 'JARVIS-Drop'
+                drop.mkdir(exist_ok=True)
+                (drop / src.name).write_bytes(b'old')
+                receiver = FakeBoard([])
+                sender = FakeBoard([None, ('files', [str(src)])])
+                targets = []
+                def remote(config, state, device, payload, timeout=120):
+                    targets.append(device)
+                    return self.remote(config, state, device, payload, timeout)
+                with mock.patch.object(Path, 'home', return_value=self.local_home), \
+                        mock.patch.object(transfer, 'CHUNK', 4), \
+                        mock.patch.object(transfer, 'call', remote), \
+                        mock.patch.object(clipsync, 'local_clipboard', return_value=receiver), \
+                        mock.patch.object(clipsync, '_paused', return_value=None):
+                    self.run_watcher(sender, cluster(local))
+                final = f'{local} (2).txt'
+                self.assertEqual(receiver.written, [('files', [drop / final])])
+                self.assertEqual((drop / final).read_bytes(), src.read_bytes())
+                self.assertEqual((drop / src.name).read_bytes(), b'old')
+                self.assertEqual(src.read_bytes(), b'hello file')
+                self.assertEqual(set(targets), {'node' if local == 'main' else 'main'})
+                clipboard = [c for c in self.calls if c.get('dest') == 'clipboard']
+                frame = json.loads(b''.join(base64.b64decode(c['data']) for c in clipboard))
+                self.assertEqual(frame, {'kind': 'files', 'names': [final]})
+                self.assertTrue(all(c.get('kind') == 'files' for c in clipboard))
+                bounce = FakeBoard([None, ('files', [str(drop / final)])])
+                with mock.patch.object(Path, 'home', return_value=self.remote_home), \
+                        mock.patch.object(transfer, 'push') as push, \
+                        mock.patch.object(clipsync, '_paused', return_value=None):
+                    self.run_watcher(bounce)
+                push.assert_not_called()
+
+    def test_failed_file_transfer_never_publishes_clipboard(self):
+        src = self.root / 'a.txt'
+        src.write_bytes(b'abc')
+        with mock.patch.object(transfer, 'push', side_effect=ConnectionError('offline')) as push, \
+                mock.patch.object(clipsync, '_paused', return_value=None):
+            self.run_watcher(FakeBoard([None, ('files', [str(src)])]))
+        self.assertEqual(push.call_count, 1)
+        self.assertEqual(push.call_args.kwargs['dest'], 'drop')

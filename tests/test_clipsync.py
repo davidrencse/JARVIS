@@ -422,3 +422,162 @@ class HandStopTests(unittest.TestCase):
         with mock.patch.object(clipsync, "_run_watcher", return_value="ran") as watch:
             self.assertEqual(clipsync.run({}, self.state), "ran")  # free lock: it runs
         watch.assert_called_once()
+
+
+class FileClipboardTests(unittest.TestCase):
+    def setUp(self):
+        from pathlib import Path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.file = self.root / 'a space é.txt'
+        self.file.write_bytes(b'abc')
+
+    def test_uri_decoding_and_localhost(self):
+        data = ('# comment\r\n' + self.file.as_uri() + '\r\n' +
+                self.file.as_uri().replace('file:///', 'file://localhost/') + '\r\n').encode()
+        self.assertEqual(clipsync.parse_uri_list(data), [str(self.file)] * 2)
+        self.assertEqual(clipsync.select_files(clipsync.parse_uri_list(data)), ([self.file], 3))
+
+    def test_invalid_uris_are_skipped_and_logged(self):
+        for uri in ('file://foreign/tmp/a', 'file:relative', '/tmp/a', 'https://localhost/a',
+                    'file:///tmp/a%00b', 'file:///tmp/a\0b', 'file:////server/a',
+                    'file:///tmp/a%ZZ', 'file:///tmp/a?query', 'file:///tmp/a#fragment'):
+            with self.subTest(uri=uri):
+                log = mock.Mock()
+                self.assertEqual(clipsync.parse_uri_list(uri.encode(), log), [])
+                log.assert_called_once()
+
+    def test_directory_symlinks_relative_nul_unc_device_are_skipped(self):
+        link = self.root / 'link'
+        link.symlink_to(self.file)
+        folder_link = self.root / 'linked-dir'
+        folder_link.symlink_to(self.root, target_is_directory=True)
+        log = mock.Mock()
+        paths = [str(self.root), str(link), str(folder_link / self.file.name), 'relative',
+                 '/tmp/a\0b', '//server/a', r'\\server\share\a', r'\\?\C:\a']
+        self.assertEqual(clipsync.select_files(paths, log=log), ([], 0))
+        self.assertEqual(log.call_count, len(paths))
+
+    def test_hdrop_round_trip(self):
+        paths = [r'C:\Users\jdoe\a space.txt', 'D:\\photos\\日本語.png']
+        packed = clipsync.pack_hdrop(paths)
+        self.assertEqual(struct.unpack('<IiiII', packed[:20]), (20, 0, 0, 0, 1))
+        self.assertTrue(packed.endswith(b'\0\0\0\0'))
+        self.assertEqual(clipsync.unpack_hdrop(packed), paths)
+        for bad in (b'', packed[:-2], struct.pack('<IiiII', 20, 0, 0, 0, 0) + packed[20:]):
+            with self.assertRaises(ValueError):
+                clipsync.unpack_hdrop(bad)
+        with self.assertRaises(ValueError):
+            clipsync.pack_hdrop(['a\0b'])
+
+    def test_cap_includes_all_files_and_allows_boundary(self):
+        other = self.root / 'b'
+        other.write_bytes(b'xy')
+        self.assertEqual(clipsync.select_files([str(self.file), str(other)], 5)[1], 5)
+        with self.assertRaisesRegex(ValueError, 'nothing sent'):
+            clipsync.select_files([str(self.file), str(other)], 4)
+        self.assertEqual(clipsync.FILES_MAX_BYTES, 512 * 1024 * 1024)
+
+    def test_files_digest_is_order_independent(self):
+        self.assertEqual(clipsync.digest('files', ['b', 'a']), clipsync.digest('files', ['a', 'b']))
+        self.assertEqual(clipsync.digest('files', [str(self.file)]),
+                         clipsync.digest('files', [self.file.name]))
+
+    def test_wayland_file_offer_takes_priority_over_text_png(self):
+        board = object.__new__(clipsync.Wayland)
+        offered = {('--list-types',): b'text/uri-list image/png text/plain x-special/gnome-copied-files',
+                   ('--type', 'text/uri-list'): self.file.as_uri().encode()}
+        board._paste = lambda *args: offered.get(args)
+        self.assertEqual(board.read(), ('files', [str(self.file)]))
+        offered[('--list-types',)] += b' x-kde-passwordManagerHint'
+        offered[('--type', 'x-kde-passwordManagerHint')] = b'secret'
+        self.assertIsNone(board.read())
+
+    def test_wayland_browser_image_with_a_web_uri_still_syncs_as_png(self):
+        board = object.__new__(clipsync.Wayland)
+        offered = {('--list-types',): b'text/uri-list image/png text/html',
+                   ('--type', 'text/uri-list'): b'https://example.com/cat.png\r\n',
+                   ('--type', 'image/png'): b'\x89PNG'}
+        board._paste = lambda *args: offered.get(args)
+        self.assertEqual(board.read(), ('png', b'\x89PNG'))
+
+    def test_wayland_writes_crlf_uri_list(self):
+        board = object.__new__(clipsync.Wayland)
+        board.env = {}
+        with mock.patch.object(clipsync.subprocess, 'run') as run:
+            board.write('files', [self.file])
+        self.assertEqual(run.call_args.args[0], ['wl-copy', '--type', 'text/uri-list'])
+        self.assertEqual(run.call_args.kwargs['input'], (self.file.as_uri() + '\r\n').encode())
+
+    def test_windows_writes_hdrop_and_copy_effect(self):
+        board = object.__new__(clipsync.Windows)
+        board._open = mock.Mock()
+        board.u = mock.Mock()
+        board._put = mock.Mock()
+        board.drop_effect = 500
+        paths = [r'C:\JARVIS-Drop\a.txt']
+        board.write('files', paths)
+        self.assertEqual(board._put.call_args_list, [mock.call(15, clipsync.pack_hdrop(paths)),
+                                                   mock.call(500, struct.pack('<I', 1))])
+        board.u.CloseClipboard.assert_called_once()
+
+    def test_windows_reads_hdrop_with_drag_query_and_obeys_secret(self):
+        import ctypes
+        board = object.__new__(clipsync.Windows)
+        board._open = mock.Mock()
+        board.u = mock.Mock()
+        board.ct = ctypes
+        board.secret = [501]
+        board.u.IsClipboardFormatAvailable.side_effect = lambda fmt: fmt == 15
+        paths = [r'C:\a.txt', r'D:\b.txt']
+        def query(handle, index, buf, size):
+            if index == 0xFFFFFFFF:
+                return len(paths)
+            if buf is not None:
+                buf.value = paths[index]
+            return len(paths[index])
+        board.drag_query = query
+        self.assertEqual(board.read(), ('files', paths))
+        board.u.IsClipboardFormatAvailable.side_effect = lambda fmt: fmt in (15, 501)
+        self.assertIsNone(board.read())
+
+
+class DropZoneTests(unittest.TestCase):
+    """The edge drop zone feeds drops into the same path as a file copy."""
+
+    def run_zone(self, lines, code=0, command=(["python3", "dropzone.py", "--edge", "right"], {})):
+        shared, logs = [], []
+
+        class Proc:
+            stdout = iter(lines)
+
+            def wait(self):
+                return code
+        with mock.patch.object(clipsync, "_dropzone_command", return_value=command):
+            clipsync._dropzone({}, ["dell"], lambda kind, data: shared.append((kind, data)),
+                               logs.append, popen=lambda *a, **k: Proc(), sleep=lambda s: None)
+        return shared, logs
+
+    def test_drops_go_through_share_as_files(self):
+        shared, logs = self.run_zone(['{"files": ["/home/u/a.txt", "/home/u/b c.png"]}\n',
+                                      'not json\n', '{"files": []}\n'])
+        self.assertEqual(shared, [("files", ["/home/u/a.txt", "/home/u/b c.png"])])
+        self.assertIn("drop zone on the right edge", logs)
+
+    def test_no_desktop_support_means_no_zone(self):
+        shared, logs = self.run_zone([], command=None)
+        self.assertEqual(shared, [])
+        self.assertTrue(logs[0].startswith("drop zone off"))
+
+    def test_message_keeps_only_absolute_paths(self):
+        from jarvis.dropzone import message
+        self.assertEqual(json.loads(message(["/a/b", "rel", None, "/c"])), {"files": ["/a/b", "/c"]})
+
+    def test_zone_sits_on_the_lan_mouse_edge(self):
+        with mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-1"}), \
+                mock.patch.object(clipsync.os.path, "exists", return_value=True), \
+                mock.patch("jarvis.sharedinput.read_config", return_value={"clients": [{"position": "left"}]}):
+            argv, env = clipsync._dropzone_command({}, ["dell"])
+        self.assertEqual(argv[2:], ["--edge", "left", "--label", "dell"])
+        self.assertIn("gtk4-layer-shell", env["LD_PRELOAD"])

@@ -413,3 +413,28 @@ class DiskStatusTests(unittest.TestCase):
             self.assertEqual([(c["intent"], c["args"]) for c in commands],
                              [("system_status", {"what": "disk"})])
         self.assertIsNone(parse_for("how much space is in the room", config, "zenbook")["commands"])
+
+    def test_status_question_naming_a_pc(self):
+        """"... on this laptop" sent status reads to the brain (9.1 s 11-01, 5.7 s 11-07). This PC
+        answers every status; another PC only disk (a Windows node has no other reader)."""
+        from jarvis.parse import parse_for
+        config = {"devices": {"zenbook": {"hostname": "z", "aliases": ["arch"]},
+                              "dell": {"hostname": "d", "aliases": ["windows"]}}}
+        routed = {
+            "how much free disk space is on this laptop": ("zenbook", "disk"),
+            "how much disk space is left on the dell": ("dell", "disk"),
+            "how many windows do I have open on this laptop": ("zenbook", "windows"),
+            "what apps are open on arch": ("zenbook", "windows"),
+            "how much battery do i have left on this pc": ("zenbook", "battery"),
+        }
+        for text, (device, what) in routed.items():
+            commands = parse_for(text, config, "zenbook")["commands"]
+            self.assertEqual([(c["intent"], c["device"], c["args"]) for c in commands],
+                             [("system_status", device, {"what": what})], text)
+        for text in ("what windows are open on the dell", "how much battery is left on the dell",
+                     "how many apps are on my dell", "what's on my calendar",
+                     "how much disk space is on my della", "take a screenshot on the dell",
+                     # the device carries over to the next clause: still disk-only there
+                     "how much space is left on the dell then what windows are open",
+                     "open chrome on the dell and what apps are open"):
+            self.assertIsNone(parse_for(text, config, "zenbook")["commands"], text)

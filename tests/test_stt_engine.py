@@ -86,11 +86,13 @@ class FastFirstTests(unittest.TestCase):
         self.assertEqual(t.last, {"logprob": -0.1, "no_speech": None, "engine": "parakeet"})
         self.assertFalse(unsure(t.stats(CLIP)))
 
-    def test_parakeet_without_wake_word_falls_to_whisper(self):
+    def test_sure_parakeet_without_wake_word_stands(self):
+        # No Whisper pass for sure words without "Jarvis" (2026-11-08: it held ~600 MB and
+        # rescued 0 wake words); only fuzzy or unsure words get a second opinion.
         t, calls = self.parakeet(("Do I just open chrome", -0.1))
-        self.assertEqual(t(CLIP), "Jarvis, open chrome")
-        self.assertEqual(calls, ["parakeet", "whisper"])
-        self.assertEqual(t.last_engine, "whisper")
+        self.assertEqual(t(CLIP), "Do I just open chrome")
+        self.assertEqual(calls, ["parakeet"])
+        self.assertEqual(t.last_engine, "parakeet")
 
     def test_parakeet_error_falls_back_for_good(self):
         t, calls = self.parakeet(("", None), error=ImportError("no onnx_asr"))
@@ -182,13 +184,11 @@ class FastFirstTests(unittest.TestCase):
 
     def test_no_wake_needed_trusts_sure_parakeet(self):
         t, calls = self.parakeet(("then check it", -0.1))
-        t.need_wake = False
         self.assertEqual(t(CLIP), "then check it")
         self.assertEqual(calls, ["parakeet"])
 
     def test_no_wake_needed_unsure_parakeet_goes_to_whisper(self):
         t, calls = self.parakeet(("then check it", PARAKEET_UNSURE_LOGPROB - 1))
-        t.need_wake = False
         t(CLIP)
         self.assertEqual(calls, ["parakeet", "whisper"])
 
@@ -208,6 +208,30 @@ class FastFirstTests(unittest.TestCase):
         self.assertTrue(plausible("Jarvis open chrome", 1.5))
         self.assertFalse(plausible("", 2))
         self.assertFalse(plausible(" ".join(["word"] * 40), 2))
+
+
+class PreloadTests(unittest.TestCase):
+    def test_cpu_preload_loads_only_parakeet(self):
+        from unittest import mock
+        from jarvis import listen
+        t = Transcriber({})
+        t.fast = mock.Mock()
+        with mock.patch.object(listen, "_has_cuda", return_value=False), \
+                mock.patch.object(t, "_load_whisper") as whisper:
+            t.preload()
+        t.fast.ready.assert_called_once()
+        whisper.assert_not_called()
+
+    def test_preload_without_parakeet_loads_whisper(self):
+        from unittest import mock
+        from jarvis import listen
+        t = Transcriber({})
+        t.fast = mock.Mock(ready=mock.Mock(side_effect=ImportError("no onnx_asr")))
+        with mock.patch.object(listen, "_has_cuda", return_value=False), \
+                mock.patch.object(t, "_load_whisper") as whisper:
+            t.preload()
+        whisper.assert_called_once()
+        self.assertIsNone(t.fast)
 
 
 if __name__ == "__main__":

@@ -82,9 +82,8 @@ class SecondOpinionTests(unittest.TestCase):
         t.fast, t._whisper = fast, whisper
         return t, calls
 
-    def test_fuzzy_goes_to_whisper_even_without_need_wake(self):
+    def test_fuzzy_goes_to_whisper(self):
         t, calls = self.make(("Okay, Javi, open chrome", -0.1), "Okay Jarvis, open chrome")
-        t.need_wake = False
         self.assertEqual(t(CLIP), "Okay Jarvis, open chrome")
         self.assertEqual(calls, ["parakeet", "whisper"])
         self.assertTrue(t.fuzzy)
@@ -109,9 +108,29 @@ class SecondOpinionTests(unittest.TestCase):
         self.assertEqual(calls, ["parakeet"])
         self.assertIsNone(t.fuzzy)
 
+    def test_sure_words_without_the_name_never_load_whisper(self):
+        # Every clip near the mic without "Jarvis" used to go through Whisper as well:
+        # both models stayed loaded (~2 GB) and the listener was OOM-killed at its 3 GB cap.
+        t, calls = self.make(("pass me the salt", -0.1), "unused")
+        self.assertIsNone(wake(t(CLIP)))
+        self.assertEqual(calls, ["parakeet"])
+
+    def test_cpu_whisper_is_dropped_after_a_second_opinion(self):
+        t, calls = self.make(("Okay, Javi, open chrome", -0.1), "Okay Jarvis, open chrome")
+        t.fast._model = object()  # Parakeet is loaded
+        t.device, t._model = "cpu", object()
+        t(CLIP)
+        self.assertIsNone(t._model)
+
+    def test_cpu_whisper_loaded_during_parakeet_warmup_is_dropped(self):
+        t, calls = self.make(("Jarvis, open chrome", -0.1), "unused")
+        t.fast._model = object()
+        t.device, t._model = "cpu", object()  # answered clips while Parakeet loaded
+        self.assertEqual(t(CLIP), "Jarvis, open chrome")
+        self.assertIsNone(t._model)
+
     def test_plain_follow_up_still_trusts_parakeet(self):
         t, calls = self.make(("then check it", -0.1), "unused")
-        t.need_wake = False
         self.assertEqual(t(CLIP), "then check it")
         self.assertEqual(calls, ["parakeet"])
         self.assertIsNone(t.fuzzy)
