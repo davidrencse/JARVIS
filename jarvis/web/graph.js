@@ -48,6 +48,7 @@
     // Reduced motion: lay the graph out off-screen, then draw it once.
     settle() {
       this.raf && cancelAnimationFrame(this.raf); this.raf = 0;
+      if (!this.c.clientWidth) return;  // hidden: resize() settles it once it has a size to fit
       const draw = this.draw; this.draw = () => {};
       while (this.alpha > 0.004) this.step();
       this.draw = draw; this.fit(); this.fitted = true; this.draw();
@@ -89,10 +90,14 @@
       this.c.width = Math.round(r.width * dpr); this.c.height = Math.round(r.height * dpr);
       this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       this.draw();
+      if (this.alpha > 0.004) REDUCE.matches ? this.settle() : this.kick();  // shown: finish the layout
     }
     kick() { if (!this.raf) this.raf = requestAnimationFrame(() => this.tick()); }
     tick() {
       this.raf = 0;
+      // A hidden canvas (another tab) has no size: pause the O(n²) layout until it shows.
+      // 409 memory nodes: 366 steps, 0.27-0.72 s per load with nobody looking (2026-11-08).
+      if (!this.c.clientWidth) return;
       if (this.alpha > 0.004) {
         this.step();
         if (!this.fitted && (this.alpha < 0.35 || this.opts.mini)) this.fit();
@@ -117,7 +122,10 @@
           const len = (this.opts.mini ? 28 : 54) + e.s.r + e.t.r;
           let dx = e.t.x - e.s.x, dy = e.t.y - e.s.y; const d = Math.sqrt(dx * dx + dy * dy) || 1;
           const f = (d - len) / d * 0.06 * a; dx *= f; dy *= f;
-          e.s.vx += dx; e.s.vy += dy; e.t.vx -= dx; e.t.vy -= dy;
+          // Split the pull by degree (as d3-force does): a hub with 195 links took the full
+          // pull of each and overshot, so the layout blew up to ~1e26 px (2026-11-08).
+          const ds = this.deg.get(e.s.id) || 1, dt = this.deg.get(e.t.id) || 1, bs = 2 * dt / (ds + dt);
+          e.s.vx += dx * bs; e.s.vy += dy * bs; e.t.vx -= dx * (2 - bs); e.t.vy -= dy * (2 - bs);
         }
         for (const n of N) {
           n.vx -= n.x * 0.004 * a; n.vy -= n.y * 0.004 * a;
