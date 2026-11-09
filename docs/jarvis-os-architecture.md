@@ -1,5 +1,9 @@
 # JARVIS OS: architecture v2 (design and built status)
 
+> The status below is the 2026-10-26 snapshot. For what changed since, read
+> [handbook/audit-2026-11.md](handbook/audit-2026-11.md) and
+> [handbook/perf-2026-11.md](handbook/perf-2026-11.md).
+
 Status: revised 2026-10-26 after a design review (17 findings; see
 [Review traceability](#review-traceability)). Uncommitted work in progress; the suite is
 green. **Built and verified live** so far: Intent Registry, strict parser, U-gates, the
