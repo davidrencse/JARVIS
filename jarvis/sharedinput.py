@@ -252,9 +252,13 @@ def lan_mouse_status():
                    "Get-CimInstance Win32_Process -Filter \"Name='lan-mouse.exe'\" | "
                    "Select-Object -First 1 -ExpandProperty ExecutablePath", timeout=10)
         path = out.stdout.strip()
-        if not path:
+        if path:
+            return {"running": True, "build": _windows_build(path)}
+        # Windows hides an elevated process's path from an unelevated query: the daemon the
+        # elevated task started read as stopped, and start() launched a second one.
+        if not _quick_status()["running"]:
             return {"running": False, "build": None}
-        return {"running": True, "build": _windows_build(path)}
+        return {"running": True, "build": "patched" if _task_exists(ELEVATED_TASK) else "unknown"}
     for unit, build in (("lan-mouse.service", "patched"), ("lan-mouse-fallback.service", "official")):
         if shutil.which("systemctl") and _run("systemctl", "--user", "is-active", unit).stdout.strip() == "active":
             return {"running": True, "build": build}
@@ -398,15 +402,17 @@ def start():
 def stop(sharing_only=False):
     """Stop Lan Mouse. sharing_only keeps the IP watcher running (the guard lives in it)."""
     if os.name == "nt":
+        import time
         done = _run("taskkill", "/IM", "lan-mouse.exe", "/F", timeout=15)
         if done.returncode and _task_exists(ELEVATED_STOP_TASK):
             # An unelevated taskkill can't end the elevated daemon ("Access is denied").
-            import time
             _run("schtasks", "/Run", "/TN", ELEVATED_STOP_TASK, timeout=15)
-            for _ in range(20):
-                time.sleep(0.25)
-                if not _quick_status()["running"]:
-                    break
+        # Wait for the exit either way: taskkill returns while the process is still going,
+        # and elevate()'s start() right after then saw it "already running" and left it off.
+        for _ in range(20):
+            if not _quick_status()["running"]:
+                break
+            time.sleep(0.25)
     else:
         units = _units()
         if sharing_only:
@@ -537,7 +543,6 @@ def elevate(state=None):
     binary = _binary()
     if not binary:
         raise ValueError("Lan Mouse isn't installed on this computer.")
-    import shutil as _shutil
     import tempfile
     # The task runs elevated with no prompt, so everything it runs must be out of reach of
     # unelevated code: a launcher or exe in %LOCALAPPDATA% could be swapped by any process
@@ -547,7 +552,7 @@ def elevate(state=None):
     was_running = lan_mouse_status()["running"]
     if was_running:
         stop()  # its exe in `home` may be in use
-    _shutil.copytree(Path(binary).parent, home, dirs_exist_ok=True)
+    _install_copy(Path(binary), home)
     try:
         _verify_locked_down(home)
     except Exception:
@@ -573,6 +578,22 @@ def elevate(state=None):
     # or the guard would later read it as a start by hand (audit cluster-07).
     running = (bool(start().get("started")) or lan_mouse_status()["running"]) if was_running else False
     return {"elevated": True, "tasks": [t[0] for t in tasks], "running": running}
+
+
+def _install_copy(binary, home):
+    """Copy only what the daemon runs (its exe and DLLs) into `home`, and drop anything else
+    there but the launcher and log: old builds kept beside the exe (`*.pre-*`, `.off`) were
+    copied along and piled up in Program Files."""
+    import shutil as _shutil
+    keep = {binary.name.lower(), "start-elevated.vbs", "daemon.log"}
+    home.mkdir(parents=True, exist_ok=True)
+    for src in binary.parent.iterdir():
+        if src.is_file() and (src.name.lower() == binary.name.lower() or src.suffix.lower() == ".dll"):
+            _shutil.copy2(src, home / src.name)
+            keep.add(src.name.lower())
+    for old in home.iterdir():
+        if old.is_file() and old.name.lower() not in keep:
+            old.unlink()
 
 
 def unelevate(state=None):

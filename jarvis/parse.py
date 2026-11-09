@@ -177,13 +177,13 @@ SYSTEM = (
     (re.compile(r"(?:is\s+(?:the\s+|my\s+)?bluetooth\s+(?:on|off|enabled|active)|"
                 r"(?:what(?:'s|\s+is)\s+)?(?:the\s+)?bluetooth\s+status)\Z"),
      lambda m: ("system_status", {"what": "bluetooth"})),
-    (re.compile(r"(?:how\s+much\s+(?:free\s+)?(?:disk\s+|storage\s+|drive\s+)?space\s+(?:do\s+i\s+have|is\s+(?:there|left)|"
+    (re.compile(r"(?:how\s+much\s+(?:free\s+)?(?:disk\s+|storage\s+|drive\s+)?space\s+(?:do\s+i\s+have|is(?:\s+(?:there|left|free))?|"
                 r"have\s+i\s+got)(?:\s+left)?(?:\s+on\s+my\s+(?:disk|drive|laptop|pc))?|"
                 r"how\s+much\s+(?:free\s+)?(?:disk|storage)\s+(?:space\s+)?(?:is\s+)?(?:left|free)|"
                 r"(?:check|show)\s+(?:my\s+)?(?:free\s+)?(?:disk|storage)\s+space|"
                 r"(?:free|disk)\s+(?:disk\s+)?space)\Z"),
      lambda m: ("system_status", {"what": "disk"})),
-    (re.compile(r"(?:(?:what|which)\s+(?:apps|windows|programs|applications)\s+(?:do\s+i\s+have\s+|"
+    (re.compile(r"(?:(?:what|which|how\s+many)\s+(?:apps|windows|programs|applications)\s+(?:do\s+i\s+have\s+|"
                 r"are\s+)?(?:open|running)(?:\s+right\s+now)?|(?:list|show)\s+(?:my\s+)?open\s+"
                 r"(?:windows|apps))\Z"), lambda m: ("system_status", {"what": "windows"})),
     (re.compile(r"(?:switch|go|move|jump)\s+to\s+work\s?space\s+(\d{1,2}|one|two|three|four|five|"
@@ -431,6 +431,10 @@ def _parse(text, devices, origin, main, apps):
     if agent:
         commands = [_in_agent_browser(c) for c in commands]
     _assign_devices(commands, origin)
+    for command in commands:  # after assignment: "... on the dell then what windows are open"
+        if (command["intent"] == "system_status" and command["device"] != origin
+                and command["args"].get("what") != "disk"):
+            raise Unsure("another PC answers only disk space here")
     for i, command in enumerate(commands):
         # "close spotify then open spotify" must run in order; plain "and" only when both
         # touch the same app, or both the sound (media/volume: "mute and unmute" ends in
@@ -622,6 +626,20 @@ def _clause(text, aliases, catalog, inherited=None):
             if args.get("name") and _device(args["name"], aliases):  # "connect to my arch linux"
                 raise Unsure(f"{args['name']!r} is a computer here, not a bluetooth device")
             return {"verb": "system", "object": "", "device": device, "system": (intent, args)}
+    # A status read naming a PC ("how much disk space is left on the dell", "how many windows
+    # do I have open on this laptop") went to the brain (9.1 s 11-01, 5.7 s 11-07). Reads only:
+    # this PC answers every status; another answers disk, the one read every OS has.
+    if device is None and "on" in words[1:-1]:
+        cut = len(words) - 1 - words[::-1].index("on")
+        place = _device(" ".join(words[cut + 1:]), aliases, typos=False)
+        for pattern, spec in SYSTEM if place else ():
+            if match := pattern.match(" ".join(words[:cut])):
+                intent, args = spec(match)
+                if intent == "system_status" and (place == aliases.get("here")
+                                                  or args.get("what") == "disk"):
+                    return {"verb": "system", "object": "", "device": place,
+                            "system": (intent, args)}
+                break
     # The verb first, so the "on" in "go on youtube" or "focus on" isn't read as a place.
     verb, rest = _verb(words)
     head = " ".join(words[:words.index("on")] if "on" in words else words)

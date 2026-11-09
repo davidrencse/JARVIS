@@ -1,4 +1,4 @@
-"""Unified clipboard: copy on one laptop, paste on the other. Text and images, both ways.
+"""Unified clipboard: copy on one laptop, paste on the other. Text, images and file copies, both ways.
 
 With the cluster on, each laptop runs its own half (`jarvis clipboard start`, or
 `autostart on`, once on each): it watches the local clipboard and hands every new copy
@@ -12,6 +12,12 @@ strict host-key checking as `jarvis send`): one side runs `jarvis clipboard star
 which opens one SSH session to the peer and sends this very file as the remote half
 (Linux/Wayland peers only). Both halves speak one JSON line per clipboard change.
 
+File copies require the cluster: regular files are staged with transfer.push(dest="drop"),
+then a names-only files frame rides the clipboard channel. clipboard.files_max_bytes
+limits the whole selection (default 512 MiB). The destination file manager copies from
+its local JARVIS-Drop; no source file is moved or removed. Wayland publishes uri-list
+only; Windows publishes CF_HDROP with Preferred DropEffect=COPY.
+
 This module is deliberately stdlib-only with no package imports at the top level,
 because the remote half runs it as a bare script.
 
@@ -23,7 +29,10 @@ import base64
 import glob
 import hashlib
 import json
+import ntpath
 import os
+import re
+import stat
 import shutil
 import struct
 import subprocess
@@ -31,8 +40,12 @@ import sys
 import threading
 import time
 import zlib
+from pathlib import Path
+from urllib.parse import urlsplit, unquote
 
 MAX_BYTES = 32 * 1024 * 1024
+FILES_MAX_BYTES = 512 * 1024 * 1024
+URI_LIST = "text/uri-list"
 TEXT = "text/plain;charset=utf-8"
 TRANSIENT = "jarvis-clip-transient"  # grokbot writes the digest of its temporary paste here
 # Executed by the remote shell: read this module's source from stdin, run its serve().
@@ -43,7 +56,94 @@ BOOTSTRAP = ("python3 -c 'import sys;r=sys.stdin.buffer;g={\"__name__\":\"jarvis
 def digest(kind, data):
     if kind == "text":  # CRLF and LF copies of the same text must hash alike (Windows adds CRs)
         data = data.replace(b"\r\n", b"\n")
+    if kind == "files":
+        data = json.dumps(sorted(Path(p).name for p in data), ensure_ascii=True).encode()
     return hashlib.sha256(kind.encode() + b"\0" + data).hexdigest()
+
+
+def parse_uri_list(data, log=lambda _: None):
+    """Decode only local, absolute file URIs; filesystem checks happen in select_files."""
+    paths = []
+    for line in data.decode("utf-8", errors="strict").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        try:
+            uri = urlsplit(line)
+            if (uri.scheme != "file" or uri.netloc not in ("", "localhost")
+                    or uri.query or uri.fragment or re.search(r"%(?![0-9a-fA-F]{2})", line)):
+                raise ValueError("not a local file URI")
+            path = unquote(uri.path, errors="strict")
+            if not path.startswith("/") or path.startswith("//") or "\0" in path:
+                raise ValueError("not a local absolute path")
+            paths.append(path)
+        except ValueError as exc:
+            log(f"skipped file URI {line!r}: {exc}")
+    return paths
+
+
+def pack_hdrop(paths):
+    """Win32 DROPFILES with fixed-width fields (also testable off Windows)."""
+    if not paths or any(not isinstance(p, str) or not p or "\0" in p for p in paths):
+        raise ValueError("Invalid file list.")
+    return struct.pack("<IiiII", 20, 0, 0, 0, 1) + ("\0".join(paths) + "\0\0").encode("utf-16-le")
+
+
+def unpack_hdrop(data):
+    if len(data) < 24:
+        raise ValueError("Invalid DROPFILES.")
+    offset, _, _, _, wide = struct.unpack("<IiiII", data[:20])
+    if wide != 1 or offset < 20 or offset > len(data) - 4:
+        raise ValueError("Invalid DROPFILES.")
+    text = data[offset:].decode("utf-16-le")
+    if not text.endswith("\0\0"):
+        raise ValueError("Unterminated DROPFILES.")
+    paths = text[:-2].split("\0")
+    if not all(paths):
+        raise ValueError("Empty DROPFILES path.")
+    return paths
+
+
+def select_files(paths, max_bytes=FILES_MAX_BYTES, log=lambda _: None):
+    """Regular local files only; reject links (including parent links/reparse points)."""
+    selected, total = [], 0
+    for raw in dict.fromkeys(paths):
+        path = Path(raw)
+        try:
+            drive, tail = ntpath.splitdrive(raw)
+            if ("\0" in raw or not path.is_absolute() or raw.startswith(("//", "\\\\"))
+                    or (sys.platform == "win32" and (not drive or ":" in tail))):
+                raise ValueError("not a local absolute path")
+            for part in (path, *path.parents):
+                info = part.lstat()
+                if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise ValueError("symlink or reparse point")
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("not a regular file")
+        except (OSError, ValueError) as exc:
+            log(f"skipped file {raw!r}: {exc}")
+            continue
+        selected.append(path)
+        total += info.st_size
+    if total > max_bytes:
+        raise ValueError(f"File clipboard exceeds {max_bytes} bytes ({total} bytes); nothing sent.")
+    return selected, total
+
+
+def files_in_drop(paths, folder):
+    root = Path(folder).resolve()
+    return bool(paths) and all(Path(p).resolve().is_relative_to(root) for p in paths)
+
+
+def file_names(data):
+    """Validate the names-only clipboard frame using transfer's canonical rules."""
+    from .transfer import NAME, safe_name
+    frame = json.loads(data)
+    names = frame.get("names") if isinstance(frame, dict) and frame.get("kind") == "files" else None
+    if (not isinstance(names, list) or not names
+            or any(not isinstance(n, str) or not NAME.fullmatch(n) or safe_name(n) != n for n in names)):
+        raise ValueError("Invalid clipboard file names.")
+    return names
 
 
 # ---- PNG <-> Windows DIB (pure Python, for the image formats screenshots use) -------------
@@ -247,6 +347,10 @@ class Wayland:
         if "x-kde-passwordManagerHint" in types:
             if (self._paste("--type", "x-kde-passwordManagerHint") or b"").strip() == b"secret":
                 return None
+        if URI_LIST in types:  # only local files count: a browser's copied image also lists its URL
+            paths = parse_uri_list(self._paste("--type", URI_LIST) or b"", getattr(self, "log", lambda _: None))
+            if paths:
+                return ("files", paths)
         if "image/png" in types:
             data = self._paste("--type", "image/png")
             return ("png", data) if data else None
@@ -259,7 +363,11 @@ class Wayland:
         return None
 
     def write(self, kind, data):
-        subprocess.run(["wl-copy", "--type", "image/png" if kind == "png" else TEXT],
+        mime = "image/png" if kind == "png" else TEXT
+        if kind == "files":
+            mime = URI_LIST
+            data = ("\r\n".join(Path(p).as_uri() for p in data) + "\r\n").encode()
+        subprocess.run(["wl-copy", "--type", mime],
                        input=data, env=self.env, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=10, check=True)
 
@@ -284,8 +392,8 @@ class Wayland:
 
 
 class Windows:
-    """Win32 clipboard through ctypes: Unicode text, PNG and CF_DIB images."""
-    CF_UNICODETEXT, CF_DIB = 13, 8
+    """Win32 clipboard through ctypes: text, images and CF_HDROP file copies."""
+    CF_UNICODETEXT, CF_DIB, CF_HDROP = 13, 8, 15
 
     def __init__(self):
         import ctypes
@@ -305,6 +413,10 @@ class Windows:
                 (k.GlobalFree, w.HGLOBAL, [w.HGLOBAL])):
             fn.restype, fn.argtypes = res, args
         self.u, self.k = u, k
+        self.drop_effect = u.RegisterClipboardFormatW("Preferred DropEffect")
+        self.drag_query = ctypes.windll.shell32.DragQueryFileW
+        self.drag_query.restype = w.UINT
+        self.drag_query.argtypes = [w.HANDLE, w.UINT, w.LPWSTR, w.UINT]
         self.png = u.RegisterClipboardFormatW("PNG")
         self.secret = [u.RegisterClipboardFormatW(n) for n in (
             "ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore")]
@@ -339,6 +451,16 @@ class Windows:
         try:
             if any(self.u.IsClipboardFormatAvailable(f) for f in self.secret):
                 return None
+            if self.u.IsClipboardFormatAvailable(self.CF_HDROP):
+                handle = self.u.GetClipboardData(self.CF_HDROP)
+                paths = []
+                for i in range(self.drag_query(handle, 0xFFFFFFFF, None, 0)):
+                    size = self.drag_query(handle, i, None, 0) + 1
+                    buf = self.ct.create_unicode_buffer(size)
+                    self.drag_query(handle, i, buf, size)
+                    paths.append(buf.value)
+                if paths:
+                    return ("files", paths)
             if self.u.IsClipboardFormatAvailable(self.CF_UNICODETEXT):
                 raw = self._get(self.CF_UNICODETEXT) or b""
                 text = raw.decode("utf-16-le", errors="replace").split("\0", 1)[0]
@@ -365,7 +487,10 @@ class Windows:
         self._open()
         try:
             self.u.EmptyClipboard()
-            if kind == "png":
+            if kind == "files":
+                self._put(self.CF_HDROP, pack_hdrop([str(p) for p in data]))
+                self._put(self.drop_effect, struct.pack("<I", 1))  # DROPEFFECT_COPY
+            elif kind == "png":
                 self._put(self.png, data)
                 if dib:
                     self._put(self.CF_DIB, dib)
@@ -415,7 +540,7 @@ class Sync:
         except Exception as exc:  # a busy or odd clipboard must not kill the link
             self.log(f"read failed: {exc}")
             return
-        if not item or not item[1] or len(item[1]) > MAX_BYTES:
+        if not item or item[0] not in ("text", "png") or not item[1] or len(item[1]) > MAX_BYTES:
             return
         kind, data = item
         key = digest(kind, data)
@@ -498,14 +623,23 @@ def _paused(state):
 def apply(state, kind, data):
     """Paste a copy that came from the other laptop (the transfer job's last chunk).
     Returns False (not pasted) while sharing is paused here."""
-    if kind not in ("text", "png") or not data or len(data) > MAX_BYTES:
+    if kind not in ("text", "png", "files") or not data or len(data) > MAX_BYTES:
         raise ValueError("Not a clipboard copy.")
     if _paused(state):
         return False
+    key_data = data
+    if kind == "files":
+        from .transfer import drop_folder
+        names = file_names(data)
+        root = drop_folder().resolve()
+        paths = [root / name for name in names]
+        if any(p.is_symlink() or p.resolve().parent != root or not p.is_file() for p in paths):
+            raise ValueError("Clipboard file is missing or outside the drop folder.")
+        key_data, data = names, paths
     if state:  # first, so this machine's watcher sees it as ours, not a new copy
         path = os.path.join(os.path.abspath(state), APPLIED)
         with open(path, "w", encoding="utf-8") as out:
-            json.dump({"digest": digest(kind, data), "at": time.time()}, out)
+            json.dump({"digest": digest(kind, key_data), "at": time.time()}, out)
     local_clipboard().write(kind, data)
     return True
 
@@ -528,13 +662,24 @@ def _applied(state, busy=None):
         return None
 
 
+def _notify_files_limit(message):
+    from .confirm import notify
+    if not notify(message) and sys.platform == "win32" and not os.environ.get("JARVIS_NO_NOTIFY"):
+        # Windows has no notify-send; keep its native message off the watcher thread.
+        import ctypes
+        threading.Thread(target=ctypes.windll.user32.MessageBoxW,
+                         args=(None, message, "JARVIS clipboard", 0x40), daemon=True).start()
+
+
 def run_cluster(config, state, device_name=None, board=None, log=None):
     """Watch this clipboard and push each new copy to the other laptop(s) over the hub."""
     import io
-    from .transfer import peer, peers, push
+    from .transfer import peer, peers, push, drop_folder
     targets = [peer(config, device_name)] if device_name else peers(config)
     board = board or local_clipboard()
     log = log or _log_line(os.path.join(state, "logs", "clipboard.log"))
+    if isinstance(board, (Wayland, Windows)):
+        board.log = log
     last = [None]
     busy = [None]
     paused = [None]
@@ -560,6 +705,16 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
         last[0] = key
         if key == _applied(state, busy[0]):  # the other laptop's copy, just pasted in here
             return
+        share(kind, data)
+
+    lock = threading.Lock()
+
+    def share(kind, data):
+        """Hand one copy (or an edge-zone drop: kind "files") to the other laptop(s)."""
+        with lock:  # the clipboard watcher and the drop zone may both send at once
+            _share(kind, data)
+
+    def _share(kind, data):
         why = _paused(state)
         if why:  # apart or remote control on: this copy stays here
             if why != paused[0]:
@@ -567,22 +722,95 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
             paused[0] = why
             return
         paused[0] = None
+        paths, total = [], len(data)
+        if kind == "files":
+            try:
+                paths, total = select_files(data, config.get("clipboard", {}).get("files_max_bytes", FILES_MAX_BYTES), log)
+            except ValueError as exc:
+                log(str(exc))
+                _notify_files_limit(str(exc))
+                return
+            if not paths or files_in_drop(paths, drop_folder()):
+                return
         began = time.time()
         for target in targets:
             try:
-                push(config, state, target, io.BytesIO(data), len(data), dest="clipboard", kind=kind)
-                log(f"sent {kind} ({len(data)} bytes) to {target}")
+                content = data
+                if kind == "files":
+                    names = []
+                    for path in paths:
+                        with path.open("rb") as source:
+                            result = push(config, state, target, source, path.stat().st_size,
+                                          name=path.name, dest="drop")
+                        names.append(result["sent"])
+                        log(f"sent file {result['sent']} ({path.stat().st_size} bytes) to {target}")
+                    content = json.dumps({"kind": "files", "names": names}).encode()
+                    file_names(content)
+                push(config, state, target, io.BytesIO(content), len(content), dest="clipboard", kind=kind)
+                log(f"sent {kind} ({total} bytes) to {target}")
             except Exception as exc:  # offline peer, hub restarting: skip this copy
                 log(f"not sent to {target}: {exc}")
         busy[0] = (began, time.time())
 
     log(f"linked with {', '.join(targets)} over the cluster")
+    if isinstance(board, Wayland) and config.get("clipboard", {}).get("dropzone", True):
+        threading.Thread(target=_dropzone, args=(config, targets, share, log),
+                         name="dropzone", daemon=True).start()
     while True:
         try:
             board.watch(changed)  # Wayland: returns if wl-paste dies; Windows: runs on
         except Exception as exc:
             log(f"watch failed: {exc}")
         time.sleep(2)
+
+
+DROPZONE_PYTHON = "/usr/bin/python3"  # has PyGObject + gtk4-layer-shell; the venv doesn't
+
+
+def _dropzone_command(config, targets):
+    """argv + env for the edge drop zone, or None when this desktop can't show it.
+    It sits on the edge Lan Mouse crosses to the peer (its configured position)."""
+    from .dropzone import LIB
+    if not (os.path.exists(DROPZONE_PYTHON) and os.path.exists(LIB) and os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    try:
+        from .sharedinput import read_config
+        edge = (read_config().get("clients") or [{}])[0].get("position") or "right"
+    except Exception:
+        edge = "right"
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dropzone.py")
+    env = dict(os.environ, LD_PRELOAD=LIB)
+    return [DROPZONE_PYTHON, script, "--edge", edge, "--label", ", ".join(targets)], env
+
+
+def _dropzone(config, targets, share, log, popen=subprocess.Popen, sleep=time.sleep):
+    """Run the drop zone as this process's child and send what is dropped on it, through
+    the same path as a file copy. Restarted after a crash, at most every 30 s."""
+    command = _dropzone_command(config, targets)
+    if not command:
+        log("drop zone off: needs Wayland, system PyGObject and gtk4-layer-shell")
+        return
+    argv, env = command
+    while True:
+        try:
+            proc = popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, preexec_fn=_die_with_parent)
+        except OSError as exc:
+            log(f"drop zone failed to start: {exc}")
+            return
+        log(f"drop zone on the {argv[3]} edge")
+        for line in proc.stdout:
+            try:
+                paths = json.loads(line).get("files") or []
+            except (ValueError, AttributeError):
+                continue
+            if paths:
+                log(f"dropped {len(paths)} file(s) on the edge zone")
+                share("files", paths)
+        if proc.wait() == 0:
+            return  # closed on purpose
+        log("drop zone exited; restarting in 30 s")
+        sleep(30)
 
 
 # ---- the local half: connect, reconnect, daemon ------------------------------------------
@@ -973,17 +1201,12 @@ def _unit_installed():
 
 
 def _startup_file():
-    from pathlib import Path
-    if os.name != "nt":
-        config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-        return config / "systemd" / "user" / UNIT_NAME
-    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
-            / "Programs" / "Startup" / STARTUP_NAME)
+    from .autostart import startup_file, unit_file
+    return startup_file(STARTUP_NAME) if os.name == "nt" else unit_file(UNIT_NAME)
 
 
 def autostart(state, enable):
     path, state = _startup_file(), os.path.abspath(state)
-    command = f'"{sys.executable}" -m jarvis --state "{state}" clipboard'
     if os.name != "nt":
         from .platforms import systemctl_user
 
@@ -1006,11 +1229,9 @@ def autostart(state, enable):
     if not enable:
         path.unlink(missing_ok=True)
         return {"autostart": False}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "' JARVIS: start the unified clipboard hidden at login. Delete this file to disable.\n"
-        f'CreateObject("WScript.Shell").Run "{(command + " start").replace(chr(34), chr(34) * 2)}"'
-        ", 0, False\n", encoding="ascii")
+    from .autostart import write_launcher
+    write_launcher(path, [sys.executable, "-m", "jarvis", "--state", state, "clipboard", "start"],
+                   "JARVIS: start the unified clipboard hidden at login. Delete this file to disable.")
     return {"autostart": True, "launcher": str(path)}
 
 

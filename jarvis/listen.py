@@ -1019,7 +1019,6 @@ class Transcriber:
         self._model, self.device = None, None
         self._stats = {}
         self.last_engine = None
-        self.need_wake = True  # see _try_fast
         # A fuzzy "Jarvis" from the fast engine went to Whisper: did Whisper hear the wake
         # word? (None: no second opinion was asked.) Counted for the log and the eval.
         self.fuzzy = None
@@ -1034,25 +1033,33 @@ class Transcriber:
         if self.fast is not None and not isinstance(audio, str) and self.device != "cuda":
             text = self._try_fast(audio)
             if text is not None:
+                self._drop_cpu_whisper()  # e.g. loaded while Parakeet was still loading
                 return text
             hint = self._hint
         self.last_engine = "whisper"
         text = self._whisper(audio)
+        self._drop_cpu_whisper()
         if hint:
             self.second_opinions += 1
             self.fuzzy = wake(text) is not None
             self.rescued += self.fuzzy
         return text
 
+    def _drop_cpu_whisper(self):
+        """Once Parakeet is up, CPU Whisper is only a rare second opinion: don't keep its
+        ~600 MB beside Parakeet's ~1.2 GB (the pair hit the listener's 3 GB cap)."""
+        if self.device == "cpu" and getattr(self.fast, "_model", None) is not None:
+            self._model = self.device = None
+
     def _try_fast(self, audio):
         """The fast engine's words, else None (Whisper decides). The engine returns str
         (Moonshine), (text, logprob) (Parakeet), or None (Parakeet still loading).
-        With `need_wake` (the default: the caller needs "Jarvis" in it) words without the
-        wake word go to Whisper too, so a misheard "Jarvis" ("Jovers") is never lost.
-        A caller that needs no wake word (push-to-talk, a follow-up window) sets it False
-        and gets Parakeet's words when they look sure, without a second transcription.
-        Words that only sound like "Jarvis" (fuzzy_wake: "Drivers", "Try this") go to
-        Whisper whatever the caller needs: Parakeet stays confident when it mishears it."""
+        Parakeet's sure words stand, with or without "Jarvis": the caller decides whether
+        the wake word is needed. Words that only sound like "Jarvis" (fuzzy_wake: "Drivers",
+        "Try this") and unsure words go to Whisper: Parakeet stays confident when it
+        mishears the name. Sending every clip without "Jarvis" to Whisper as well kept both
+        models in memory (~2 GB, OOM-killed under the 3 GB cap) and rescued 0 wake words in
+        the voice log (2026-11-08)."""
         self._hint = False
         try:
             out = self.fast(audio)
@@ -1076,7 +1083,7 @@ class Transcriber:
             if fuzzy_wake(text):
                 self._hint = True
                 return None
-            if self.need_wake or engine != "parakeet" or unsure(stats):
+            if engine != "parakeet" or unsure(stats):
                 return None
         # No log probabilities from Moonshine: unsure() sees None and lets it through.
         self.last = stats
@@ -1101,14 +1108,16 @@ class Transcriber:
         return self._model is not None or getattr(self.fast, "_model", None) is not None
 
     def preload(self):
-        """Load before the first request (start.sh): Parakeet in its background thread,
-        Whisper (the backup and wake-word second opinion) here."""
+        """Load before the first request (start.sh): Parakeet in its background thread;
+        Whisper only when it is the engine (no fast engine, or a CUDA GPU). As a CPU second
+        opinion it loads on the rare clip that needs one."""
         ready = getattr(self.fast, "ready", None)
-        if ready:
+        if ready and not _has_cuda():
             try:
                 ready()
+                return
             except ImportError:
-                pass
+                self.fast = None
         self._load_whisper()
 
     def _load_whisper(self):

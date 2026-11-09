@@ -70,13 +70,40 @@ def system():
     return "macos" if sys.platform == "darwin" else "linux"
 
 
+def startup_file(file_name):
+    """An entry in the current user's Windows Startup folder."""
+    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
+            / "Programs" / "Startup" / file_name)
+
+
+def unit_file(file_name):
+    """Where systemd looks for a user unit ($XDG_CONFIG_HOME/systemd/user)."""
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return config / "systemd" / "user" / file_name
+
+
+def write_launcher(target, argv, comment=None, windowless=False):
+    """Write a hidden Windows Startup launcher for argv, run from ROOT. windowless: use
+    pythonw.exe beside python.exe when there is one."""
+    argv = interpreter(argv)
+    windowless_exe = Path(argv[0]).with_name("pythonw.exe")
+    if windowless and Path(argv[0]).name.lower() == "python.exe" and windowless_exe.is_file():
+        argv[0] = str(windowless_exe)
+    line = subprocess.list2cmdline(argv).replace('"', '""')
+    head = "".join(f"' {text}\n" for text in (comment or "").splitlines())
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(head + vbs(line), encoding="utf-8")
+    return target
+
+
 def path(name, title):
     kind = system()
     if kind == "windows":
-        return Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup" / f"{title}.vbs"
+        return startup_file(f"{title}.vbs")
     if kind == "macos":
         return Path.home() / "Library/LaunchAgents" / f"com.jarvis.{name}.plist"
-    return Path.home() / ".config/systemd/user" / f"{name}.service"
+    return unit_file(f"{name}.service")
 
 
 def install(name, title, argv, enable=True):
@@ -89,13 +116,7 @@ def install(name, title, argv, enable=True):
     argv = interpreter(argv)
     if kind == "windows":
         if enable:
-            argv = list(argv)
-            windowless = Path(argv[0]).with_name("pythonw.exe")
-            if Path(argv[0]).name.lower() == "python.exe" and windowless.is_file():
-                argv[0] = str(windowless)
-            line = subprocess.list2cmdline(argv).replace('"', '""')
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(vbs(line), encoding="utf-8")
+            write_launcher(target, argv, windowless=True)
         else:
             target.unlink(missing_ok=True)
     elif kind == "macos":

@@ -353,8 +353,8 @@ def run(config, base, state, hotkey="alt+1", port=7790, opacity=None, hidden=Fal
 
 
 def _startup_file():
-    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
-            / "Programs" / "Startup" / STARTUP_NAME)
+    from .autostart import startup_file
+    return startup_file(STARTUP_NAME)
 
 
 def autostart(state, enable, hotkey="alt+1"):
@@ -366,14 +366,9 @@ def autostart(state, enable, hotkey="alt+1"):
     if not enable:
         path.unlink(missing_ok=True)
         return {"autostart": False}
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    exe = pythonw if pythonw.is_file() else Path(sys.executable)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    command = (f'"{exe}" -m jarvis --state "{Path(state).resolve()}" overlay --hidden '
-               f'--key {parse_hotkey(hotkey)[2].lower()}')
-    path.write_text(
-        "' JARVIS: start the console overlay hidden at login; its hotkey shows it.\n"
-        "' Delete this file to disable.\n"
-        f'CreateObject("WScript.Shell").Run "{command.replace(chr(34), chr(34) * 2)}", 0, False\n',
-        encoding="utf-8")
-    return {"autostart": True, "file": str(path), "command": command}
+    from .autostart import write_launcher
+    argv = [sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()), "overlay",
+            "--hidden", "--key", parse_hotkey(hotkey)[2].lower()]
+    write_launcher(path, argv, "JARVIS: start the console overlay hidden at login; its hotkey "
+                               "shows it.\nDelete this file to disable.", windowless=True)
+    return {"autostart": True, "file": str(path), "command": subprocess.list2cmdline(argv)}

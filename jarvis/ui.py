@@ -948,12 +948,7 @@ class Console:
                     from .daemon import BORDERLINE
                     near = score >= (self.config.get("voice") or {}).get("near_miss", BORDERLINE)
                     owner = near and not wake
-            # Push-to-talk needs no wake word: Parakeet's sure words stand on their own.
-            self._stt.need_wake = wake
-            try:
-                text = self._stt(audio) if owner or near else ""
-            finally:
-                self._stt.need_wake = True
+            text = self._stt(audio) if owner or near else ""
         request = wake_word(text)
         if near and wake:
             owner = request is not None

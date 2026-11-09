@@ -130,6 +130,13 @@ def opens_reply_window(result):
 # is transcribed on the CPU before the wake word can reject it: 603 of 2,259 rejected clips by
 # 2026-10-30 (median 0.205), and none became a request. The voice print's own cutoff is
 # 0.30-0.36, so 0.25 keeps the band just under it and skips Whisper for ~3/4 of the strangers.
+# glibc keeps freed model memory (Whisper load/drop, Parakeet tensors) in its heaps: each
+# CPU Whisper second opinion left ~430 MB behind, and TV voices every few seconds pushed the
+# listener past its 3 GB cap (OOM-killed every 1-3 min, 2026-11-08). Big blocks from mmap and
+# an early trim hand it back: 138 MB left per cycle instead of 456 MB, peak 649 MB not 867 MB.
+# Only glibc reads these; elsewhere they are ignored.
+MALLOC_ENV = {"MALLOC_ARENA_MAX": "2", "MALLOC_MMAP_THRESHOLD_": "131072",
+              "MALLOC_TRIM_THRESHOLD_": "131072"}
 BORDERLINE = 0.25
 # David far from the mic has scored 0.11-0.28, so a clip between this floor and BORDERLINE
 # is not dropped outright: only its opening seconds are transcribed (cheap next to the whole
@@ -343,7 +350,9 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
         # `voice stop` sends SIGTERM, whose default action skips atexit and leaves the pid file.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         # Warm up so the first real request isn't slow: load the speech-to-text engines, cache the ack line.
-        for name, warm in (("speech-to-text", lambda: stt(_np().zeros(16000, dtype="float32"))),
+        # stt.preload, not a silent clip: before Parakeet is ready a clip falls to Whisper,
+        # which then sat in memory beside it.
+        for name, warm in (("speech-to-text", stt.preload),
                            ("speech", lambda: voice.synth(ACK)), ("brain", lambda: warm_quietly(lane))):
             try:  # a failed warm-up costs the first request some speed, never the listener
                 warm()
@@ -355,8 +364,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
             memory.warm_vectors()  # meaning-based recall index, in the background
             from .consolidate import start as consolidate_daily
             consolidate_daily(config, memory, base, log=log)  # memory.consolidate: once a day
-        log(f"JARVIS listening on {stt.device}. Say \"Jarvis, ...\".")
-        emit(state, "voice.ready", device=stt.device)
+        log(f"JARVIS listening on {stt.device or 'cpu'}. Say \"Jarvis, ...\".")
+        emit(state, "voice.ready", device=stt.device or "cpu")
         # voice.speaker_check: false is the off switch for the voice check. Nobody is then
         # taken for David: every request needs "Jarvis", no window opens and nothing is learned.
         speaker_check = (config.get("voice") or {}).get("speaker_check", True) is not False
@@ -445,13 +454,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
                         if text is None:
                             stats_of = clip  # its confidence was stored under the clip it heard
                 if heard is None:
-                    # Inside a follow-up or reply window "Jarvis" is optional, so Parakeet's
-                    # sure words stand without a second pass through Whisper (listen._try_fast).
-                    stt.need_wake = not (began < armed or said_at < chatting)
-                    try:
-                        heard = text.result() if text is not None else stt(audio)
-                    finally:
-                        stt.need_wake = True
+                    heard = text.result() if text is not None else stt(audio)
                 # Not verified as David (a near miss or a stranger let in by "Jarvis"): the
                 # name must open the clip, as voice.md says; "..., Jarvis." from a TV doesn't.
                 unverified = not is_owner and score is not None
@@ -842,7 +845,7 @@ def start(state, config=None):
     logs.mkdir(parents=True, exist_ok=True)
     flags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
              if on_windows() else 0)
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1", **MALLOC_ENV}
     command = [sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()),
                "voice", "listen"]
     command = _detach_from_unit(command)
@@ -868,11 +871,8 @@ def stop(state):
 
 
 def _startup_file():
-    if not on_windows():
-        config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-        return config / "systemd" / "user" / UNIT_NAME
-    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
-            / "Programs" / "Startup" / STARTUP_NAME)
+    from .autostart import startup_file, unit_file
+    return startup_file(STARTUP_NAME) if on_windows() else unit_file(UNIT_NAME)
 
 
 def _systemctl(*args):
@@ -909,6 +909,7 @@ def _systemd_autostart(state, enable):
                  # systemd's PATH lacks ~/.local/bin, where the claude CLI usually lives.
                  f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"',
                  'Environment="PYTHONIOENCODING=utf-8" "PYTHONUNBUFFERED=1"',
+                 "Environment=" + " ".join(f'"{k}={v}"' for k, v in MALLOC_ENV.items()),
                  f"StandardOutput=append:{log}", f"StandardError=append:{log}"]), encoding="utf-8")
     (state / "logs").mkdir(parents=True, exist_ok=True)
     enabled = _systemctl("daemon-reload") and _systemctl("enable", UNIT_NAME)
@@ -922,10 +923,8 @@ def autostart(state, enable):
     if not enable:
         path.unlink(missing_ok=True)
         return {"autostart": False}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    command = f'"{sys.executable}" -m jarvis --state "{Path(state).resolve()}" voice start'
-    path.write_text(
-        "' JARVIS: start the voice listener hidden at login. Delete this file to disable.\n"
-        f'CreateObject("WScript.Shell").Run "{command.replace(chr(34), chr(34) * 2)}", 0, False\n',
-        encoding="ascii")
+    from .autostart import write_launcher
+    write_launcher(path, [sys.executable, "-m", "jarvis", "--state", str(Path(state).resolve()),
+                          "voice", "start"],
+                   "JARVIS: start the voice listener hidden at login. Delete this file to disable.")
     return {"autostart": True, "launcher": str(path)}

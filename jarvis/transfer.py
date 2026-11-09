@@ -215,7 +215,7 @@ def validate(payload):
     if payload.get("dest", "drop") == "drop":
         if not isinstance(payload.get("name"), str) or not 0 < len(payload["name"]) <= 255:
             raise ValueError("Invalid file name.")
-    elif payload.get("dest") != "clipboard" or payload.get("kind") not in ("text", "png"):
+    elif payload.get("dest") != "clipboard" or payload.get("kind") not in ("text", "png", "files"):
         raise ValueError("Invalid transfer destination.")
 
 

@@ -1,4 +1,5 @@
-"""The orchestrator: hard requests are planned, split by difficulty, checked and combined.
+"""The brain planner (orchestrate()): hard requests are planned, split by difficulty, checked
+and combined. Its settings live under the config key `orchestrator` for history's sake.
 
 Most requests never come here: the parser, the registry and the brain lane answer them in
 one go, as before. judge() picks out the few that need several kinds of work ("research X,

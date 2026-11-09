@@ -36,7 +36,7 @@ STATIONS = [
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "sysintents", "control", "app_ui", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "remote_view", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "showcase", "observe", "sharedinput", "peripherals", "connections", "screen"]},
+     "modules": ["actions", "sysintents", "control", "app_ui", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "remote_view", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "dropzone", "showcase", "observe", "sharedinput", "peripherals", "connections", "screen"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by ElevenLabs, falling back to Kokoro, a voice that "
               "runs on this laptop. ElevenLabs' agent also runs live calls from the console.",
