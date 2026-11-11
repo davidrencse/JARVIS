@@ -17,6 +17,7 @@ cluster, or when a node is offline and the peer has an SSH target, the SSH path 
 
 import base64
 import os
+import sys
 import re
 import shutil
 import subprocess
@@ -187,6 +188,22 @@ def drop_folder():
     return folder
 
 
+def desktop_folder():
+    """Resolve the receiving user's Desktop, including Windows folder redirection."""
+    if sys.platform == "win32":
+        import ctypes
+        # CSIDL_DESKTOPDIRECTORY: shell resolves OneDrive/redirected Desktops too.
+        path = ctypes.create_unicode_buffer(32768)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x10, None, 0, path)
+        if result != 0 or not path.value:
+            raise OSError("Cannot locate the Windows Desktop; no file was delivered.")
+        folder = Path(path.value)
+    else:
+        folder = Path.home() / "Desktop"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
 def validate(payload):
     """Refuse anything but the fixed transfer operations (cluster.validate_action)."""
     action = payload.get("action")
@@ -212,7 +229,7 @@ def validate(payload):
     if declared is not None and (not isinstance(declared, int) or isinstance(declared, bool)
                                  or not 0 <= declared <= MAX_BYTES):
         raise ValueError("Invalid declared size.")
-    if payload.get("dest", "drop") == "drop":
+    if payload.get("dest", "drop") in ("drop", "desktop"):
         if not isinstance(payload.get("name"), str) or not 0 < len(payload["name"]) <= 255:
             raise ValueError("Invalid file name.")
     elif payload.get("dest") != "clipboard" or payload.get("kind") not in ("text", "png", "files"):
@@ -263,7 +280,8 @@ def _land(part, folder, name):
 def run_here(payload, state=None):
     """One transfer operation on this machine (a cluster job, or the main serving a node)."""
     validate(payload)
-    folder = drop_folder()
+    folder = (desktop_folder() if payload["action"] == "put" and payload.get("dest") == "desktop"
+              else drop_folder())
     action = payload["action"]
     if action == "inbox":
         entries = []
@@ -302,7 +320,7 @@ def run_here(payload, state=None):
         except RuntimeError:
             part.unlink(missing_ok=True)  # the disk filled up mid-upload: give the space back
             raise
-    if payload["offset"] + len(data) > (MAX_BYTES if payload.get("dest", "drop") == "drop"
+    if payload["offset"] + len(data) > (MAX_BYTES if payload.get("dest", "drop") in ("drop", "desktop")
                                          else CLIP_BYTES):
         part.unlink(missing_ok=True)
         raise ValueError("That is too large to send this way.")
@@ -374,7 +392,10 @@ def call(config, state, device, payload, timeout=120):
 def push(config, state, device, source, size, name=None, dest="drop", kind=None):
     """Stream `source` (a binary file object of `size` bytes) to `device` in chunks."""
     upload, offset, result = uuid.uuid4().hex, 0, None
-    extra = {"name": name, "size": size} if dest == "drop" else {"dest": "clipboard", "kind": kind}
+    if dest not in ("drop", "desktop", "clipboard"):
+        raise ValueError("Invalid transfer destination.")
+    extra = ({"dest": dest, "name": name, "size": size} if dest in ("drop", "desktop")
+             else {"dest": "clipboard", "kind": kind})
     while True:
         data = source.read(CHUNK)
         last = offset + len(data) >= size or len(data) < CHUNK

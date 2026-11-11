@@ -1,8 +1,11 @@
 """The settings the console can change, each with a type and limits.
 
 Only these fields can be written; everything else in jarvis.config.json is edited by hand.
-Saves are atomic (cluster.save_json), and the running console's config is updated in place.
-The speaker-check threshold lives in .jarvis/voice/voiceprint.json, not the config.
+A save takes the managed config lock and patches only the keys it validated onto the file
+as it is on disk (config_lock.patch_config). It does not write a snapshot it read earlier,
+so a main or tunnel change that landed meanwhile stays. The running process is updated in
+place except cluster.* , which applies at restart. The speaker-check threshold lives in
+.jarvis/voice/voiceprint.json, not the config.
 """
 
 import json
@@ -108,6 +111,19 @@ def _get(config, path):
     for key in path.split("."):
         value = (value or {}).get(key) if isinstance(value, dict) else None
     return value
+
+
+def _put(doc, key, value):
+    """Set one dotted key on `doc`. Parents that are missing or not objects are created."""
+    parts = key.split(".")
+    node = doc
+    for part in parts[:-1]:
+        child = node.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            node[part] = child
+        node = child
+    node[parts[-1]] = value
 
 
 _SEEN = {}  # config file -> mtime refresh() last copied from
@@ -219,6 +235,8 @@ def machines(config, state):
     if local and local == main and (Path(state) / "cluster.sqlite3").is_file():
         from .release import served_code
         nodes, code = {n["id"]: n for n in _node_rows(state)}, served_code(state)
+    from .connections import presence, busy_nodes
+    busy = busy_nodes(state)
     out = []
     for key, d in (config.get("devices") or {}).items():
         item = {"id": key, "label": (d or {}).get("label") or key,
@@ -227,7 +245,7 @@ def machines(config, state):
             node = nodes.get(key)
             item["paired"] = bool(node)
             if node:
-                item.update(online=node["online"], seen=node["seen"],
+                item.update(online=node["online"], presence=presence(node["seen"], key in busy), seen=node["seen"],
                             same_code=bool(node.get("code")) and node.get("code") == code)
         out.append(item)
     return out
@@ -256,6 +274,8 @@ def write(config, path, state, changes, confirmed=False):
         raise ValueError("Send at least one setting to change.")
     clean, threshold = {}, None
     for key, value in changes.items():
+        if key == "cluster.main_device":
+            raise ValueError("Moving MAIN is unavailable until safe handoff is implemented. See Connections for readiness.")
         if key == "voiceprint.threshold":
             if isinstance(value, bool) or not isinstance(value, (int, float)) \
                     or not VOICE_THRESHOLD[0] <= value <= VOICE_THRESHOLD[1]:
@@ -276,26 +296,44 @@ def write(config, path, state, changes, confirmed=False):
     if risky and confirmed is not True:
         raise ValueError(f"{FIELDS[risky[0]][1]}: this weakens a safety net. Confirm it in the console.")
     if clean:
-        with _WRITE_LOCK:  # two rows saved at once must not overwrite each other on disk
-            disk = json.loads(Path(path).read_text(encoding="utf-8"))
-            for target in (disk, config):
-                for key, value in clean.items():
-                    if target is config and key.startswith("cluster."):
-                        continue  # a new main or tunnel applies at restart, not mid-request
-                    *parents, leaf = key.split(".")
-                    node = target
-                    for part in parents:
-                        node = node.setdefault(part, {})
-                    node[leaf] = value
-            save_json(path, disk)
-            moved = {k.split(".", 1)[1]: v for k, v in clean.items() if k.startswith("cluster.")}
-            if moved:
-                _SAVED_CLUSTER.setdefault(str(state), {}).update(moved)
+        from .config_lock import ConfigDrift, patch_config
+
+        def change(doc):
+            for key, value in clean.items():
+                _put(doc, key, value)
+
+        # Re-read under the fleet lock and write only these keys. A main or tunnel edit that
+        # landed after this process loaded its copy is not written back. A byte change between
+        # the read and the replace (a same-thread re-entrant writer, or an editor) is retried
+        # against the latest file a few times, then refused.
+        drift = None
+        for _attempt in range(3):
+            try:
+                patch_config(state, path, change, backup="settings")
+            except ConfigDrift as exc:
+                drift = exc
+                continue
+            else:
+                try:
+                    Path(path).chmod(0o600)
+                except OSError:
+                    pass
+                break
+        else:
+            raise drift
+        for key, value in clean.items():
+            if key.startswith("cluster."):
+                continue  # a new tunnel applies at restart, not mid-request
+            _put(config, key, value)
+        moved = {k.split(".", 1)[1]: v for k, v in clean.items() if k.startswith("cluster.")}
+        if moved:
+            _SAVED_CLUSTER.setdefault(str(state), {}).update(moved)
     if threshold is not None:
-        print_path = _voiceprint(state)
-        data = json.loads(print_path.read_text(encoding="utf-8"))
-        data["threshold"] = threshold
-        save_json(print_path, data)
+        with _WRITE_LOCK:  # two threshold saves must not overwrite each other
+            print_path = _voiceprint(state)
+            data = json.loads(print_path.read_text(encoding="utf-8"))
+            data["threshold"] = threshold
+            save_json(print_path, data)
     return {**read(config, state), "saved": sorted([*clean, *(["voiceprint.threshold"] if threshold else [])]),
             "restart": [k for k in changed if k.startswith(("cluster.", "voice."))
                         or k in LISTENER_RESTART]  # the voice listener can't rebuild

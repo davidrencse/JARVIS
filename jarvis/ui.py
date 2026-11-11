@@ -173,6 +173,9 @@ class Console:
     # ---- live: event stream, warm brain, speech ---------------------------------------
     def start_live(self, warm=True):
         """Start relaying shared-state changes, and warm the brain so the first ask is fast."""
+        from .second_brain_runtime import start as archive_start
+        if not getattr(self, "_archive", None):
+            self._archive = archive_start(self.config, self.state)
         vault = self.vault()
         self.watcher = Watcher(self.bus, self.state, self.memory, self.store,
                                vault=vault.root if vault else None).start()
@@ -192,6 +195,10 @@ class Console:
         return self
 
     def close(self):
+        if getattr(self, "_archive", None):
+            from .second_brain_runtime import stop as archive_stop
+            archive_stop(self._archive)
+            self._archive = None
         if self.watcher:
             self.watcher.stop()
         if self._lane:
@@ -351,6 +358,7 @@ class Console:
             "routing": self.config.get("routing", {}),
             "models": self.config.get("models", {}),
             "memory": {**self.memory.stats(), "recent": self.memory.search("", limit=8)},
+            "archive": self.archive_status(),
             "tasks": tasks,
             "orchestration": {"lanes": self.store.lanes},
             "todo": self.task_counts(),
@@ -367,6 +375,14 @@ class Console:
                       for name in ("claude", "codex", "ssh", "tailscale", "lan-mouse")},
         }
 
+    def archive_status(self):
+        """Second-brain archive lifecycle: numbers and a state word only, never record text."""
+        from . import second_brain_runtime
+        try:
+            return self.ttl.get("archive", 5, lambda: second_brain_runtime.status(self.config, self.state))
+        except Exception as exc:  # status must never take the console down
+            return {"state": "unverified", "error": type(exc).__name__}
+
     def devices(self):
         from .topology import enabled, identity
         local = main = None
@@ -378,10 +394,29 @@ class Console:
         # Who this one can send files to: over the cluster, its peers (transfer.peers).
         reachable = ([n for n in self.config.get("devices", {}) if n != local] if local == main
                      else [main]) if main else []
+        nodes = {}
+        if main is not None:
+            try:
+                from .cluster import _HUBS
+                hub = _HUBS.get(str(Path(self.state).resolve()))
+                if hub is not None:
+                    nodes = {n["id"]: n for n in hub.broker.nodes()}
+            except Exception:
+                nodes = {}
+        from . import hostmeter
+        from .connections import presence as node_presence, busy_nodes
+        busy = busy_nodes(self.state)
         out = []
         for name, device in self.config.get("devices", {}).items():
             inv = _read_json(self.state / "inventory" / f"{name}.json", {})
             hw = inv.get("hardware", {}) if isinstance(inv.get("hardware"), dict) else {}
+            node = nodes.get(name) or {}
+            if name == local:
+                presence, here = "online", True
+            elif node:
+                presence, here = node_presence(node.get("seen"), name in busy), False
+            else:
+                presence, here = None, False
             out.append({"id": name, "hostname": device.get("hostname"), "label": device.get("label"),
                         "here": name == local,
                         "role": None if main is None else "main" if name == main else "node",
@@ -393,7 +428,8 @@ class Console:
                         "platform": inv.get("platform"), "collected_at": inv.get("collected_at"),
                         "model": _hw_model(hw), "cpu": _hw_cpu(hw), "ram": _hw_ram(hw),
                         "gpu": inv.get("nvidia") if isinstance(inv.get("nvidia"), str) else None,
-                        "tools": inv.get("tools", {})})
+                        "tools": inv.get("tools", {}),
+                        "meters": hostmeter.summarize(device, inv, node, here=here, presence=presence)})
         return out
 
     def plans(self):
@@ -822,7 +858,7 @@ class Console:
             route["handler"] = "specialist planner"
         return route
 
-    def submit(self, text, tier=None, speak=False, case=None, origin_device=None, write=False):
+    def submit(self, text, tier=None, speak=False, case=None, origin_device=None, write=False, approval_device=None):
         if not isinstance(text, str) or not text.strip():
             raise ValueError("Say or type something for JARVIS to do.")
         if tier not in (None, "", "simple", "medium", "complex"):
@@ -832,6 +868,7 @@ class Console:
                "error": None, "partial": "", "message": None}
         from .topology import ORIGIN
         job["origin_device"] = origin_device or ORIGIN.get()
+        job["approval_device"] = approval_device
         job["write"] = bool(write)
         if case:
             self.case_item(case)
@@ -864,8 +901,8 @@ class Console:
                 voice.put(text)
 
         try:
-            from .topology import request_from
-            with request_from(job.get("origin_device")):
+            from .topology import request_from, approvals_on
+            with request_from(job.get("origin_device")), approvals_on(job.get("approval_device")):
                 result = ask(job["text"], self.store, self.memory, self.config, self.base, tier,
                              write=job.get("write", False),
                              lane=None if job.get("write") else self.lane(),
@@ -1087,6 +1124,43 @@ class Console:
                                                  if k in ("target", "part", "action")})
         return result
 
+    # -- Fleet: guided node onboarding (fleet_management.py). Owner console only; the hub
+    # default-denies /api/fleet* to node tokens and the phone server has no write route.
+    def fleet(self):
+        from . import fleet_management
+        return fleet_management.inventory(self.config, self.state)
+
+    def fleet_vault(self):
+        from . import fleet_management
+        return fleet_management.vault_status(self.config, self.state)
+
+    def fleet_preview(self, body):
+        from . import fleet_management
+        return fleet_management.preview_setup(self.config, self.state, body)
+
+    def fleet_main_preview(self, body):
+        from . import fleet_management
+        return fleet_management.main_transfer(self.config, self.state, body)
+
+    def fleet_main_transfer(self, body):
+        from . import fleet_management
+        return fleet_management.main_transfer_refuse(self.config, self.state, body)
+
+    def fleet_action(self, kind, body):
+        """invite | revoke | capabilities. The reply to an invite holds the secret code: the
+        handler sends it no-store, and only the node and action (never the code) reach the bus."""
+        from . import fleet_management as fm
+        if kind == "invite":
+            result = fm.issue_invite(self.config, self.base / "jarvis.config.json", self.state, body)
+            if result.get("config_changed") and isinstance(self.config.get("devices"), dict):
+                self.config["devices"][result["node"]] = dict(result["device"])
+        elif kind == "revoke":
+            result = fm.revoke_node(self.config, self.state, body, config_path=self.base / "jarvis.config.json")
+        else:
+            result = fm.set_node_capabilities(self.config, self.state, body, config_path=self.base / "jarvis.config.json")
+        self.bus.publish("fleet.changed", {"action": kind, "node": result.get("node")})
+        return result
+
     def shared_input(self):
         """Both computers' screens and Lan Mouse configs, cross-checked (read-only)."""
         from .sharedinput import overview
@@ -1138,6 +1212,8 @@ class Console:
         except LookupError as exc:
             return {"devices": [], "session": None, "why": str(exc), "release": release}
         nodes = {n["id"]: n for n in hub.broker.nodes()}
+        from .connections import presence as node_presence, busy_nodes
+        busy = busy_nodes(self.state)
         from .release import current, release_dir
         # Only a release without remote control blocks it; one merely older than the live
         # tree (cut again automatically once edits settle) still works. Before the first
@@ -1156,12 +1232,15 @@ class Console:
             if name == main:
                 continue
             node = nodes.get(name)
-            online = bool(node and (node.get("online") or hub.alive(name, node)))
+            presence = node_presence((node or {}).get("seen"), name in busy)
+            online = presence == "online"
             why = None
             if node is None:
-                why = "Not paired with this computer (jarvis cluster invite " + name + ")."
+                why = "Not paired with this computer. Open Connections → Connect a computer or server."
             elif "desktop" not in node.get("capabilities", []):
                 why = "Not enrolled for desktop actions."
+            elif presence == "busy":
+                why = "Busy, awaiting contact. Wait for its current job to finish."
             elif not online:
                 why = "Offline: start JARVIS on it and check its link (jarvis cluster doctor)."
             elif node.get("code") != served:
@@ -1175,7 +1254,7 @@ class Console:
                 else:
                     why = "Nodes don't have this computer's latest code yet. Run: jarvis cluster release, then jarvis cluster update " + name
             out.append({"id": name, "label": device.get("label") or name, "online": online,
-                        "ready": why is None, "why": why, "platform": (node or {}).get("platform")})
+                        "presence": presence, "ready": why is None, "why": why, "platform": (node or {}).get("platform")})
         return {"devices": out, "session": hub.remote.current(), "why": None,
                 "release": release}
 
@@ -1333,43 +1412,84 @@ class Handler(BaseHTTPRequestHandler):
         site = self.headers.get("Sec-Fetch-Site")
         return host in self.hosts and site in (None, "same-origin", "none")
 
+    # Rejected-body protocol. A request we refuse still has its body in flight; closing the socket
+    # over unread bytes makes the kernel send a reset, and the client's send fails (BrokenPipe /
+    # ConnectionReset) before it can read our status. So after the error is sent we half-close
+    # (FIN) and read-and-discard the rest, never keeping it, within hard bounds:
+    #   bytes   REJECT_DRAIN_BYTES: MAX_AUDIO + 1 MiB, so any body up to a little over the largest
+    #           accepted JSON/audio body is drained whole and its 413 is always delivered; an
+    #           unauthenticated refusal drains at most REFUSE_DRAIN_BYTES (64 KiB).
+    #   time    REJECT_IDLE_S per read and REJECT_DEADLINE_S in total, so a stalled or dribbling
+    #           client holds a thread for at most REJECT_DEADLINE_S.
+    #   memory  64 KiB per read, nothing retained.
+    #   threads at most DRAINS (8) drains at once; past that the connection just closes.
+    # A declared length beyond the byte bound is still refused up front (nothing is allocated for
+    # it); its client may see a reset instead of the 413. That is the deliberate cost of the cap.
+    REJECT_DRAIN_BYTES = MAX_AUDIO + (1 << 20)
+    REFUSE_DRAIN_BYTES = 64 * 1024
+    REJECT_IDLE_S = 2.0
+    REJECT_DEADLINE_S = 8.0
+    DRAINS = threading.BoundedSemaphore(8)
+
+    def _content_length(self):
+        """The request body length, 0 if none, or None if the framing is unusable: a
+        Transfer-Encoding body (not supported), repeated disagreeing Content-Length headers, or
+        anything but plain ASCII digits (int() also takes '+5', '1_0', unicode digits)."""
+        if self.headers.get("Transfer-Encoding") is not None:
+            return None
+        values = {v.strip() for v in self.headers.get_all("Content-Length") or []}
+        if not values:
+            return 0
+        raw = values.pop()
+        if values or not (raw.isascii() and raw.isdigit()):
+            return None
+        return int(raw) if len(raw) <= 18 else 10 ** 18  # absurd, but never an int() on a huge string
+
     def _refuse(self):
         """403 a POST. A small unread body is drained first: closing a socket with unread
         data makes Windows reset it, and the client sees an abort instead of the 403."""
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if 0 < length <= 65536:
-            try:
-                self.rfile.read(length)
-            except OSError:
-                pass
+        length = self._content_length()
         self.close_connection = True
-        return self._send(HTTPStatus.FORBIDDEN, {"error": "Refused."})
+        try:
+            self._send(HTTPStatus.FORBIDDEN, {"error": "Refused."}, close=True)
+        except OSError:  # the client already left; nothing to tell it
+            return
+        if length:
+            self._drain(length, self.REFUSE_DRAIN_BYTES)
 
-    DRAIN_CAP = 1024 * 1024  # a rejected upload is not worth a thread's time; the connection closes after
-
-    def _drain(self, left):
-        """Read and discard an unread request body (bounded, with an idle timeout, after the
-        error has been sent) so the
-        client receives our error instead of a reset when the connection closes."""
-        if left <= 0:
+    def _drain(self, left, cap=None):
+        """Half-close, then read and discard an unread request body within the bounds above, so
+        the client receives the error we already sent instead of a reset. Never returns data."""
+        self.close_connection = True
+        if left <= 0 or not self.DRAINS.acquire(blocking=False):
             return
         try:
-            self.connection.settimeout(10)
-            left = min(left, self.DRAIN_CAP)
+            try:
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            left = min(left, self.REJECT_DRAIN_BYTES if cap is None else cap)
+            end = time.monotonic() + self.REJECT_DEADLINE_S
             while left > 0:
-                block = self.rfile.read(min(1 << 20, left))
+                wait = end - time.monotonic()
+                if wait <= 0:
+                    break
+                self.connection.settimeout(min(self.REJECT_IDLE_S, wait))
+                block = self.rfile.read1(min(1 << 16, left))
                 if not block:
                     break
                 left -= len(block)
-        except OSError:
+        except OSError:  # includes the idle timeout
             pass
+        finally:
+            self.DRAINS.release()
 
     def _reject_body(self, status, message, length):
         self.close_connection = True
-        self._send(status, {"error": message}, close=True)
+        try:
+            self._send(status, {"error": message}, close=True)
+        except OSError:
+            return
         self._drain(length)
 
     EVENT_STREAMS = threading.BoundedSemaphore(16)  # each stream pins a thread
@@ -1420,6 +1540,10 @@ class Handler(BaseHTTPRequestHandler):
             self.console.bus.unsubscribe(sub)
 
     def _fail(self, exc, close=False):
+        payload = getattr(exc, "payload", None)  # fleet_management.FleetError: a stable code + step
+        if isinstance(payload, dict) and isinstance(getattr(exc, "status", None), int):
+            return self._send(exc.status, payload, close=close,
+                              headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
         status = (HTTPStatus.NOT_FOUND if isinstance(exc, LookupError) else
                   HTTPStatus.BAD_REQUEST if isinstance(exc, ValueError) else
                   HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -1470,6 +1594,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/history/commands": lambda: c.command_history(query.get("limit", 12)),
             "/api/input/shared": lambda: c.ttl.get("shared", 12, c.shared_input),
             "/api/connections": c.connections,
+            "/api/fleet": c.fleet,
+            "/api/fleet/vault": c.fleet_vault,
             "/api/peripherals": lambda: c.ttl.get("peripherals", 12, lambda: __import__(
                 "jarvis.peripherals", fromlist=["overview"]).overview(
                     c.config, c.base / "jarvis.config.json", c.state)),
@@ -1551,12 +1677,10 @@ class Handler(BaseHTTPRequestHandler):
         if not self._allowed() or self.headers.get("X-JARVIS") != "1":
             return self._refuse()
         url = urlparse(self.path)
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = -1
-        if length < 0:
-            return self._send(HTTPStatus.BAD_REQUEST, {"error": "Bad Content-Length."})
+        length = self._content_length()
+        if length is None:  # the body can't be framed, so it can't be drained: answer and close
+            self.close_connection = True
+            return self._send(HTTPStatus.BAD_REQUEST, {"error": "Bad Content-Length."}, close=True)
         c = self.console
         c.ttl.clear()  # any action may change peripherals or shared input; the next GET recomputes
         if url.path == "/api/kb/upload":  # streamed to the knowledge inbox
@@ -1603,6 +1727,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(HTTPStatus.OK, c.voice_setup_action(body))
             if url.path == "/api/connections":
                 return self._send(HTTPStatus.OK, c.connection_action(body))
+            if url.path == "/api/fleet/preview":
+                return self._send(HTTPStatus.OK, c.fleet_preview(body))
+            if url.path == "/api/fleet/main-transfer/preview":
+                return self._send(HTTPStatus.OK, c.fleet_main_preview(body))
+            if url.path == "/api/fleet/main-transfer":
+                return self._send(HTTPStatus.OK, c.fleet_main_transfer(body))
+            if url.path in ("/api/fleet/invite", "/api/fleet/revoke", "/api/fleet/capabilities"):
+                # The invite reply carries a one-time secret: never cached, never stored by the browser.
+                return self._send(HTTPStatus.OK, c.fleet_action(url.path.rsplit("/", 1)[-1], body),
+                                  headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
             if url.path == "/api/settings":
                 from .settings import write
                 before = c.settings_snapshot()

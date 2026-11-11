@@ -707,10 +707,20 @@ def _in(ip, nets):
     return any(addr in n for n in nets)
 
 
+# Tailscale `status --json` reports a phone as OS ios/android. Its cellular address is
+# where the phone is, never proof that the two computers are apart. Same set as phone.MOBILE_OS.
+_PHONE_OS = frozenset({"ios", "android", "ipados"})
+
+
+def _phone_peer(peer):
+    return str((peer or {}).get("OS") or "").strip().lower() in _PHONE_OS
+
+
 def peer_nearby(config=None, status=None, nets=None):
     """{near: True|False|None, peer, why}. Together on any local evidence; apart only on
     positive evidence (online over a public address, or offline with no local sign);
-    None means it can't tell, and the guard then leaves things alone."""
+    None means it can't tell, and the guard then leaves things alone.
+    A phone on the tailnet is ignored: its cellular path is not the other computer."""
     config = read_config() if config is None else config
     clients = (config or {}).get("clients") or []
     if not clients:
@@ -721,7 +731,8 @@ def peer_nearby(config=None, status=None, nets=None):
     if not status or status.get("BackendState", "Running") != "Running":
         return {"near": None, "peer": None, "why": "Tailscale isn't running here."}
     nets = local_networks() if nets is None else nets
-    matches = [p for p in (status.get("Peer") or {}).values()
+    peers = [p for p in (status.get("Peer") or {}).values() if isinstance(p, dict) and not _phone_peer(p)]
+    matches = [p for p in peers
                if str(p.get("HostName") or "").lower() in names or ips & set(p.get("TailscaleIPs") or [])]
     if not matches:
         return {"near": None, "peer": None, "why": "The Lan Mouse peer isn't in the tailnet."}
@@ -826,6 +837,9 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
             memo["stopped_by_guard"], memo["override"] = False, True
     if near is True:
         memo["override"] = False
+    # What this reading saw, for sharing_availability(): the UI says "apart" only while the
+    # guard's timer is still reading, so a dead guard never leaves a stale claim on screen.
+    memo["read_at"], memo["near"], memo["why"] = clock, near, str(reading.get("why") or "")[:200]
     if memo["apart"] >= GUARD_STREAK:
         memo["apart_now"] = True  # read by sharing_paused(): the clipboard follows this too
     elif memo["together"] >= GUARD_STREAK:
@@ -837,6 +851,8 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
         action = "stopped"
         memo["stopped_by_guard"], memo["stopped_at"] = True, clock
     elif (allow_start and memo["together"] >= GUARD_STREAK and memo.get("stopped_by_guard")
+          and not memo.get("override")  # a hand start must not become an automatic start
+          and memo.get("apart_now") is not True  # settled apart: never turn it back on
           and not running and not remote_session_live(state)  # a remote-control session owns this desktop
           and not controlling_remote(state)):  # or David is driving another computer from this one
         action = "started"
@@ -990,7 +1006,10 @@ class ControllerPause:
                                                stopped_at=time.time())
 
     def _apart(self):
-        return apart_now(self.state)
+        # The guard memo, via the one projection: settled apart, or a fresh apart reading.
+        # Unknown (no settled flag) is not apart, so a session end still restores Lan Mouse.
+        avail = sharing_availability(self.state)
+        return avail.get("settled") == "apart" or avail.get("state") == "apart"
 
 
 def update_guard_memo(state, tries=50, **fields):
@@ -1043,6 +1062,108 @@ def sharing_paused(state):
     return None
 
 
+AVAILABILITY_TTL = 300.0  # s: the guard reads every 30-60 s; older than this means it isn't running
+
+
+def sharing_availability(state, now=None):
+    """Is shared mouse/keyboard usable between this computer and its peer right now?
+    Built only from the guard's memo (peer_nearby via guard()): no second network test, and a
+    phone's mobile data never reaches this function. {"state": together|apart|unknown,
+    "settled": the memo's apart_now without the freshness window, "available": True|False|None,
+    "why", "override", "remote": True}. `state` is apart or together only while the guard's
+    timestamp is fresh, so a dead guard cannot leave a stale claim on screen. `settled` is what
+    a restart consults, so a missing timestamp is not treated as together. Remote control is a
+    separate path (hub/tunnel) and stays available whatever this says."""
+    import time
+    clock = time.time() if now is None else now
+    try:
+        memo = json.loads((Path(state) / GUARD_FILE).read_text(encoding="utf-8")) if state else None
+    except (OSError, ValueError):
+        memo = None
+    memo = memo if isinstance(memo, dict) else {}
+    settled = ("apart" if memo.get("apart_now") is True else
+               "together" if memo.get("apart_now") is False else "unknown")
+    out = {"state": "unknown", "settled": settled, "available": None, "remote": True,
+           "override": bool(memo.get("override")),
+           "stopped_by_guard": bool(memo.get("stopped_by_guard")),
+           "why": "Not checked yet: the guard hasn't read the network."}
+    try:
+        age = clock - float(memo.get("read_at"))
+    except (TypeError, ValueError):
+        age = None
+    if age is None and memo.get("apart_now") in (True, False):
+        out["why"] = "The guard's last reading has no timestamp; can't tell if it is current."
+    elif age is not None and (age > AVAILABILITY_TTL or age < -60):
+        out["why"] = "The guard hasn't read the network lately; can't tell."
+    elif memo.get("apart_now") is True:
+        out.update(state="apart", available=False, why=memo.get("why") or "The laptops are apart.")
+    elif memo.get("apart_now") is False:
+        out.update(state="together", available=True, why=memo.get("why") or "The laptops are together.")
+    elif age is not None:
+        out["why"] = memo.get("why") or "Can't tell where the other laptop is."
+    return out
+
+
+APART_START = ("Shared mouse and keyboard stays off while the computers are apart. "
+               "Remote control still works.")
+
+
+def with_switch(sharing, config):
+    """The same projection plus whether lan_mouse.off_when_apart is on (default on)."""
+    out = dict(sharing or {})
+    out["enforced"] = (config or {}).get("lan_mouse", {}).get("off_when_apart", True) is not False
+    return out
+
+
+def start_blocked(state, config=None, now=None):
+    """A sentence when Lan Mouse must not be started, else None.
+    A fresh apart reading always blocks. A recorded hand start also blocks while the settled
+    flag still says apart, so nothing turns it back on from a stale screen. Unknown does not
+    block: a 'can't tell' changes nothing. off_when_apart false blocks nothing."""
+    if not state:
+        return None
+    if config is not None and (config.get("lan_mouse") or {}).get("off_when_apart", True) is False:
+        return None
+    avail = sharing_availability(state, now=now)
+    if avail["state"] == "apart":
+        if avail.get("override"):
+            return ("Lan Mouse was started by hand and the computers are still apart, "
+                    "so it is not turned back on. Remote control still works.")
+        return APART_START
+    if avail.get("settled") == "apart" and avail.get("override"):
+        return ("Lan Mouse was started by hand and the computers still read apart, "
+                "so it is not turned back on. Remote control still works.")
+    return None
+
+
+def present_input_link(level, lines, sharing):
+    """Fold the guard projection into the Machines link text. Does not read the network."""
+    sharing = dict(sharing or {})
+    lines = [str(line) for line in (lines or [])]
+    if sharing.get("enforced") is False or sharing.get("state") not in ("apart", "unknown"):
+        return level, lines, sharing
+    if sharing.get("state") == "unknown":
+        why = sharing.get("why") or "no reading yet"
+        note = f"Can't tell whether the computers are on the same network: {why}"
+        if note not in lines:
+            lines = [note] + lines
+        return level, lines, sharing
+    kept = [line for line in lines if "isn't running" not in line and "isn't holding UDP" not in line]
+    up = any(("Lan Mouse" in line and "are up" in line) or "Lan Mouse is up" in line for line in kept)
+    if up:
+        note = ("The computers are apart. Shared mouse and keyboard is still running and will not "
+                "be started again if it stops. Remote control still works.")
+        if level == "up":
+            level = "warn"
+    else:
+        note = APART_START
+        # "Not running" is expected while apart. Any other line that was already there
+        # (the peer is unreachable, SSH failed) keeps the stronger level.
+        if level == "down" and not kept:
+            level = "warn"
+    return level, [note] + [line for line in kept if line != note], sharing
+
+
 def guard_for(config, state):
     """guard() with this machine's settings: lan_mouse.autostart (default on) brings sharing
     up after each boot once the laptops read together."""
@@ -1059,7 +1180,7 @@ def guard_for(config, state):
     return guard(state, autostart=on, boot=boot, allow_start=enabled)
 
 
-def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None):
+def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None, state=None, config=None):
     """Write this computer's config for one peer; the old file is kept as a dated backup.
     The release shortcut, port and motion_scale already chosen here carry over."""
     import time
@@ -1080,25 +1201,35 @@ def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None):
     path.write_text(text, encoding="utf-8")
     restarted = False
     if lan_mouse_status()["running"]:  # it reads the config only at startup
-        stop()
-        import time as _time
-        for _ in range(20):  # stop() only signals; start() would see the dying daemon and skip
-            if not lan_mouse_status()["running"]:
-                break
-            _time.sleep(0.25)
-        restarted = bool(start().get("started"))
+        # Apart: leave the running daemon. Stopping it here and starting it again would
+        # turn sharing back on while the computers are apart.
+        if not start_blocked(state, config):
+            stop()
+            import time as _time
+            for _ in range(20):  # stop() only signals; start() would see the dying daemon and skip
+                if not lan_mouse_status()["running"]:
+                    break
+                _time.sleep(0.25)
+            restarted = bool(start().get("started"))
     return {"written": str(path), "backup": str(backup) if backup else None, "restarted": restarted}
 
 
 PAIR_KEYS = ("peer_name", "peer_ips", "position", "peer_fingerprint")
 
 
-def control(arg):
+def control(arg, state=None, config=None, now=None):
     """The `lan_mouse` desktop action: (ok, json text). arg: start, stop, status, or
-    {"pair": {peer_name, peer_ips, position, peer_fingerprint}} as JSON."""
+    {"pair": {peer_name, peer_ips, position, peer_fingerprint}} as JSON.
+    A start while the guard's projection says apart is refused. Stop, status and an
+    unknown reading are unchanged. Remote control does not come through here."""
     try:
-        if arg in ("start", "stop"):
-            result = start() if arg == "start" else stop()
+        if arg == "start":
+            blocked = start_blocked(state, config, now=now)
+            if blocked:
+                return False, blocked
+            result = start()
+        elif arg == "stop":
+            result = stop()
         elif arg == "status":
             result = {**lan_mouse_status(), "config": read_config()}
         else:
@@ -1106,7 +1237,7 @@ def control(arg):
             spec = request.get("pair") if isinstance(request, dict) else None
             if not isinstance(spec, dict) or set(spec) != set(PAIR_KEYS):
                 raise ValueError("Use start, stop, status or a pairing request.")
-            result = write_pairing(*(spec[k] for k in PAIR_KEYS))
+            result = write_pairing(*(spec[k] for k in PAIR_KEYS), state=state, config=config)
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
     return True, json.dumps(result)
@@ -1135,7 +1266,7 @@ def pair(config, state, device, position, remote=None):
         raise RuntimeError(f"{device} couldn't write its Lan Mouse config: {text}")
     there = json.loads(text)
     here = write_pairing(theirs["hostname"].split(".")[0], theirs["addresses"], position,
-                         theirs["lan_mouse"]["fingerprint"])
+                         theirs["lan_mouse"]["fingerprint"], state=state, config=config)
     return {"device": device, "position": position, "here": here, "there": there}
 
 
@@ -1242,4 +1373,8 @@ def overview(config, state, remote=None):
                      == _host(client.get("hostname"))), None)
         if peer:
             layout[peer["id"]] = client.get("position")
-    return {"here": here, "devices": devices, "layout": layout, "checks": checks(devices)}
+    sharing = with_switch(sharing_availability(state), config)
+    found = checks(devices)
+    if sharing["state"] == "apart" and sharing.get("enforced") is not False:  # meant to be off: not a fault
+        found = [c for c in found if not (c["level"] == "warn" and "isn't running on" in c["text"])]
+    return {"here": here, "devices": devices, "layout": layout, "checks": found, "sharing": sharing}

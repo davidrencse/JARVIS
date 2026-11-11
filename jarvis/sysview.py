@@ -27,7 +27,7 @@ STATIONS = [
     {"id": "remember", "title": "Remember", "verb": "recalls",
      "plain": "Before answering it gathers what it already knows: your Obsidian notes, wiki "
               "claims with their sources and dates, and past conversations.",
-     "modules": ["vault", "knowledge", "memory", "consolidate", "vault_mcp", "tasks", "history", "embed", "stemming", "situation"]},
+     "modules": ["vault", "knowledge", "memory", "second_brain", "second_brain_queue", "second_brain_runtime", "consolidate", "vault_mcp", "tasks", "history", "embed", "stemming", "situation"]},
     {"id": "think", "title": "Think", "verb": "answers",
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",
@@ -36,7 +36,7 @@ STATIONS = [
     {"id": "act", "title": "Act", "verb": "does",
      "plain": "When you ask it to do something it opens apps and links, or drives its own "
               "Chrome. It asks before buying, posting or sending anything.",
-     "modules": ["actions", "sysintents", "control", "app_ui", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "remote_view", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "dropzone", "showcase", "observe", "sharedinput", "peripherals", "connections", "screen"]},
+     "modules": ["actions", "sysintents", "control", "app_ui", "terminal", "browser_gate", "browser_proxy", "agent_browser", "remote", "remote_view", "camera", "grokbot", "transfer", "storage", "thumbnails", "clipsync", "dropzone", "showcase", "observe", "sharedinput", "peripherals", "connections", "fleet_management", "screen"]},
     {"id": "speak", "title": "Speak", "verb": "replies",
      "plain": "The reply is spoken by ElevenLabs, falling back to Kokoro, a voice that "
               "runs on this laptop. ElevenLabs' agent also runs live calls from the console.",
@@ -44,17 +44,17 @@ STATIONS = [
     {"id": "log", "title": "Log", "verb": "records",
      "plain": "Everything is written down: the conversation in memory, agent runs in the "
               "task ledger, and live events to this console.",
-     "modules": ["store", "events", "locking", "cluster_store", "fsio"]},
+     "modules": ["store", "events", "locking", "config_lock", "cluster_store", "fsio"]},
 ]
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
-     "plain": "Ways in: this console, the jarvis command, the Windows overlay.",
-     "modules": ["ui", "__main__", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "release", "node", "platforms", "autostart", "settings", "rest"]},
+     "plain": "Ways in: this console, the jarvis command, the Windows overlay, the phone app.",
+     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "release", "node", "platforms", "autostart", "settings", "rest"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",
-     "modules": ["devices", "inventory", "probe", "desktop", "selftest", "credits",
-                 "cluster", "topology"]},
+     "modules": ["devices", "inventory", "hostmeter", "probe", "desktop", "selftest", "credits",
+                 "cluster", "topology", "locate"]},
 ]
 # Which station a request's tier lights up, in order.
 PATHS = {

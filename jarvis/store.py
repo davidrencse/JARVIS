@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import second_brain_queue as archive_queue
+
 
 TERMINAL = ("finished", "failed", "timed_out", "interrupted")  # nothing moves these again
 KEEP_DAYS = 90        # finished tasks and their events are pruned after this long
@@ -48,7 +50,7 @@ def lanes_from(config):
 
 
 class Store:
-    def __init__(self, directory, lanes=1):
+    def __init__(self, directory, lanes=1, prune=True):
         self.lanes = max(1, min(int(lanes), MAX_LANES))
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -68,7 +70,9 @@ class Store:
                 CREATE INDEX IF NOT EXISTS tasks_created_at ON tasks(created_at);
                 CREATE INDEX IF NOT EXISTS events_task ON events(task_id, seq);
             """)
-        self.prune_if_due()
+            archive_queue.adopt(db, self.directory, "tasks")
+        if prune:
+            self.prune_if_due()
 
     def prune_if_due(self):
         """At most once a day (stamp file mtime), see prune(). Never raises."""
@@ -84,10 +88,14 @@ class Store:
     def prune(self, days=KEEP_DAYS):
         """Delete finished tasks (and their events) last updated over `days` ago, plus
         events of tasks that no longer exist. Queued or running tasks are never touched.
-        Returns the number of tasks deleted."""
+        Returns the number of tasks deleted. While second-brain write-through capture is on,
+        nothing is deleted (returns 0): a task whose revision is still queued must not vanish,
+        and retention is suspended until the archive read path is accepted (cutover C3)."""
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         marks = ",".join("?" * len(TERMINAL))
         with self.connect() as db:
+            if archive_queue.enabled(db):
+                return 0
             old = f"SELECT id FROM tasks WHERE state IN ({marks}) AND updated_at < ?"
             db.execute(f"DELETE FROM events WHERE task_id IN ({old})", (*TERMINAL, cutoff))
             removed = db.execute(f"DELETE FROM tasks WHERE id IN ({old})",
@@ -106,6 +114,7 @@ class Store:
                        (task_id, json.dumps(spec), "queued", now(), now()))
             db.execute("INSERT INTO events(task_id,at,kind,detail) VALUES(?,?,?,?)",
                        (task_id, now(), "queued", "{}"))
+            archive_queue.capture(db)
         return self.get(task_id)
 
     def get(self, task_id):
@@ -158,6 +167,7 @@ class Store:
                 if changed == 1:
                     db.execute("INSERT INTO events(task_id,at,kind,detail) VALUES(?,?,?,?)",
                                (task_id, now(), state, json.dumps(detail or {})))
+                    archive_queue.capture(db)
                     return
                 # Nothing moved. Tell apart "the lanes are full" from "someone else
                 # already claimed this task", because only the first is worth retrying.
@@ -198,6 +208,7 @@ class Store:
                                     "note": "The process running this task exited without "
                                             "finishing it."})))
                     reaped.append(row["id"])
+            archive_queue.capture(db)
         return reaped
 
     def events(self, task_id):

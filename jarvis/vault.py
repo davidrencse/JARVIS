@@ -48,11 +48,13 @@ from pathlib import Path
 from .fsio import atomic_write
 from .stemming import stem
 
-INDEX_VERSION = "2"  # bump when parsing changes, so existing indexes are rebuilt
+INDEX_VERSION = "3"  # generated personal-record revisions are excluded from ordinary recall
 SKIP_DIRS = {".obsidian", ".git", ".trash", ".claude", "node_modules"}
 # Not knowledge: retired files, Templater templates, drawings. The vault's CLAUDE.md
 # says archive/ is "ignored in normal use"; templates still hold {{placeholders}}.
-UNINDEXED = ("archive/", "templates/", "attachments/")
+# Personal-record revisions have their own validated reader; indexing every revision would
+# duplicate Memory recall and treat historical payloads as ordinary authored knowledge.
+UNINDEXED = ("archive/", "templates/", "attachments/", "reference/jarvis-records/")
 READ_ONLY = ("archive/", "templates/", "attachments/")
 NO_RECALL = ("reference/",)  # long verbatim transcripts: searchable, never auto-injected
 # Root map files: the world brief already carries MEMORY.md, and "memory" in a question
