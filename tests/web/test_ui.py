@@ -1,0 +1,490 @@
+import json
+import tempfile
+import sys
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+from types import ModuleType
+from unittest.mock import MagicMock, patch
+
+from jarvis import credits as credits_mod
+from jarvis.credits import Credits, claude_usage_rows, codex_rate_limits
+from jarvis.ui import Console, Handler
+
+ROOT = Path(__file__).resolve().parents[2]
+# The real config, with keyword-only recall (embeddings load a model; not this file's job).
+CONFIG = {**json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8")),
+          "memory": {"semantic": False}, "decisions": {"shadow": False}}
+CONFIG["routing"] = {**CONFIG.get("routing", {}), "interpreter": False}  # never call ChatGPT from tests
+
+
+class Temp(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+
+
+class CreditTests(Temp):
+    def test_codex_rate_limits_takes_newest_event(self):
+        log = self.base / "rollout.jsonl"
+        older = {"timestamp": "2026-10-20T10:00:00Z", "payload": {"rate_limits": {
+            "primary": {"used_percent": 10.0, "window_minutes": 300, "resets_at": 1}}}}
+        newer = {"timestamp": "2026-10-20T12:00:00Z", "payload": {"info": {}, "rate_limits": {
+            "primary": {"used_percent": 40.0, "window_minutes": 300, "resets_at": 2},
+            "secondary": {"used_percent": 22.0, "window_minutes": 10080, "resets_at": 3}}}}
+        log.write_text("\n".join([json.dumps(older), "not json", json.dumps(newer),
+                                  json.dumps({"type": "other"})]), encoding="utf-8")
+        limits = codex_rate_limits(log)
+        self.assertEqual(limits["primary"]["used_percent"], 40.0)
+        self.assertEqual(limits["secondary"]["used_percent"], 22.0)
+        self.assertEqual(limits["_logged_at"],
+                         datetime(2026, 10, 20, 12, tzinfo=timezone.utc).timestamp())
+
+    def test_claude_rows_and_dedupe(self):
+        now = datetime.now(timezone.utc).isoformat()
+        msg = {"type": "assistant", "timestamp": now, "message": {"id": "m1", "usage": {
+            "input_tokens": 2, "cache_read_input_tokens": 100, "output_tokens": 50}}}
+        log = self.base / "projects" / "p" / "s.jsonl"
+        log.parent.mkdir(parents=True)
+        # Claude Code repeats a message's usage on every content block.
+        log.write_text("\n".join([json.dumps(msg), json.dumps(msg)]), encoding="utf-8")
+        self.assertEqual(claude_usage_rows(log)[0][1:], claude_usage_rows(log)[1][1:])
+        reading = {"facts": [], "meters": []}
+        with patch.object(credits_mod, "HOME", self.base / "home"):
+            (self.base / "home" / ".claude").mkdir(parents=True)
+            (self.base / "projects").rename(self.base / "home" / ".claude" / "projects")
+            Credits(self.base)._claude(reading, ())
+        self.assertEqual(reading["headline"]["value"], 50)
+        self.assertEqual(reading["source"], "local")
+
+    def test_manual_entry_and_unconfigured_states(self):
+        with patch.object(credits_mod, "HOME", self.base / "empty"), \
+                patch.dict("os.environ", {}, clear=True):
+            c = Credits(self.base, CONFIG)
+            readings = {r["id"]: r for r in c.all()}
+            self.assertEqual(readings["zai"]["status"], "unconfigured")
+            self.assertEqual(readings["deepseek"]["headline"], None)
+            c.set_manual("zai", "12.5", total="20", unit="USD", note="coding plan")
+            zai = {r["id"]: r for r in c.all()}["zai"]
+            self.assertEqual((zai["source"], zai["headline"]["value"]), ("manual", 12.5))
+            self.assertEqual(zai["meters"][0]["pct"], 37.5)
+            c.set_manual("zai", "")
+            self.assertEqual({r["id"]: r for r in c.all()}["zai"]["source"], "none")
+            with self.assertRaises(ValueError):
+                c.set_manual("nope", 1)
+
+
+class GraphTests(Temp):
+    def test_system_graph_follows_real_imports(self):
+        console = Console(CONFIG, ROOT, self.base)
+        graph = console.system_graph()
+        edges = {(e["src"], e["dst"]) for e in graph["edges"] if e["rel"] == "imports"}
+        self.assertIn(("mod:assistant", "mod:router"), edges)
+        self.assertIn(("mod:ui", "mod:memory"), edges)
+        uses = {(e["src"], e["dst"]) for e in graph["edges"] if e["rel"] == "uses"}
+        self.assertIn(("mod:speech", "ext:elevenlabs"), uses)
+        self.assertFalse(any(src == "mod:ui" for src, _ in uses))
+        ids = {n["id"] for n in graph["nodes"]}
+        self.assertIn("agent:scout", ids)
+        self.assertTrue(all(e["src"] in ids and e["dst"] in ids for e in graph["edges"]))
+
+    def test_system_graph_reparses_only_changed_modules(self):
+        import os
+        package = self.base / "jarvis"
+        package.mkdir()
+        (package / "alpha.py").write_text('"""Alpha."""\nfrom .beta import x\n', encoding="utf-8")
+        (package / "beta.py").write_text('"""Beta."""\nx = 1\n', encoding="utf-8")
+        console = Console(CONFIG, self.base, self.base)
+        with patch("jarvis.ui.ast.parse", wraps=__import__("ast").parse) as parse:
+            first = console.system_graph()
+            self.assertEqual(parse.call_count, 2)
+            self.assertEqual(console.system_graph(), first)
+            self.assertEqual(parse.call_count, 2)  # unchanged: served from the cache
+            path = package / "beta.py"
+            path.write_text('"""Beta two."""\ndef f(): pass\n', encoding="utf-8")
+            os.utime(path, ns=(1, 1))
+            graph = console.system_graph()
+            self.assertEqual(parse.call_count, 3)  # only the changed module
+            beta = next(n for n in graph["nodes"] if n["id"] == "mod:beta")
+            self.assertEqual((beta["doc"], beta["defs"]), ("Beta two.", ["f"]))
+            (package / "beta.py").unlink()
+            graph = console.system_graph()
+            self.assertEqual([n["id"] for n in graph["nodes"] if n["kind"] == "module"], ["mod:alpha"])
+            self.assertEqual(graph["edges"], [])
+
+    def test_heap_graph_has_items_hubs_and_links(self):
+        console = Console(CONFIG, ROOT, self.base)
+        a = console.memory.add("message", "hello", tags=["inbound", "lan-mouse"])
+        b = console.memory.add("reply", "hi", links=[("answers", a["id"])])
+        graph = console.heap_graph()
+        ids = {n["id"] for n in graph["nodes"]}
+        self.assertTrue({a["id"], b["id"], "kind:message", "tag:lan-mouse"} <= ids)
+        self.assertNotIn("tag:inbound", ids)  # bookkeeping tags would cluster everything
+        self.assertIn((b["id"], a["id"], "answers"),
+                      {(e["src"], e["dst"], e["rel"]) for e in graph["edges"]})
+
+    def test_tree_hides_state_and_secrets(self):
+        names = json.dumps(Console(CONFIG, ROOT, self.base).tree())
+        self.assertNotIn("secrets.json", names)
+        self.assertNotIn('"name": ".jarvis"', names)
+
+
+class SaveKeyTests(Temp):
+    KEY = "sk-test0123456789abcdef"
+
+    def secrets(self):
+        return json.loads((self.base / "secrets.json").read_text(encoding="utf-8"))
+
+    def test_good_key_is_checked_merged_and_masked(self):
+        from jarvis.credits import save_key
+        (self.base / "secrets.json").write_text(json.dumps({"ELEVENLABS_API_KEY": "keep"}))
+        balance = {"is_available": True, "balance_infos": [
+            {"currency": "USD", "total_balance": "4.20", "granted_balance": "0",
+             "topped_up_balance": "4.20"}]}
+        with patch.object(credits_mod, "_get_json", return_value=balance) as call:
+            out = save_key(self.base, "deepseek", CONFIG, secret=lambda _p: f"  {self.KEY}\n")
+        self.assertEqual(call.call_args.args[1]["Authorization"], f"Bearer {self.KEY}")
+        self.assertEqual(self.secrets(), {"ELEVENLABS_API_KEY": "keep", "DEEPSEEK_API_KEY": self.KEY})
+        self.assertEqual((out["status"], out["balance"], out["key"]), ("ok", "4.2 USD balance", "…cdef"))
+        self.assertNotIn(self.KEY, json.dumps(out))
+
+    def test_rejected_or_junk_key_is_not_saved(self):
+        from jarvis.credits import save_key
+        with patch.object(credits_mod, "_get_json",
+                          side_effect=RuntimeError("HTTP 401 from api.deepseek.com — check the key")):
+            with self.assertRaises(ValueError):
+                save_key(self.base, "deepseek", CONFIG, secret=lambda _p: self.KEY)
+        with self.assertRaises(ValueError):
+            save_key(self.base, "deepseek", CONFIG, secret=lambda _p: "short")
+        with self.assertRaises(ValueError):
+            save_key(self.base, "zai", CONFIG, secret=lambda _p: self.KEY)  # no balance endpoint
+        self.assertFalse((self.base / "secrets.json").exists())
+
+    def test_offline_check_still_saves_with_a_note(self):
+        from jarvis.credits import save_key
+        with patch.object(credits_mod, "_get_json",
+                          side_effect=RuntimeError("Couldn't reach api.deepseek.com: timed out")):
+            out = save_key(self.base, "deepseek", CONFIG, secret=lambda _p: self.KEY)
+        self.assertEqual(out["status"], "unchecked")
+        self.assertEqual(self.secrets()["DEEPSEEK_API_KEY"], self.KEY)
+
+
+class CodexStaleTests(Temp):
+    def test_passed_reset_does_not_invent_a_refill(self):
+        sessions = self.base / ".codex" / "sessions" / "2026"
+        sessions.mkdir(parents=True)
+        past, future = time.time() - 60, time.time() + 3600
+        event = {"timestamp": "2026-10-20T12:00:00Z", "rate_limits": {
+            "primary": {"used_percent": 40.0, "window_minutes": 300, "resets_at": past},
+            "secondary": {"used_percent": 22.0, "window_minutes": 10080, "resets_at": future}}}
+        (sessions / "r.jsonl").write_text(json.dumps(event), encoding="utf-8")
+        reading = {"facts": [], "meters": []}
+        with patch.object(credits_mod, "HOME", self.base):
+            Credits(self.base)._codex(reading, ())
+        self.assertEqual(len(reading["meters"]), 1)
+        week = reading["meters"][0]
+        self.assertEqual(week["used"], 22.0)
+        self.assertEqual(reading["headline"]["value"], 78)
+        self.assertIn("current usage unknown", str(reading["facts"]))
+
+
+class InvestigationTests(Temp):
+    def setUp(self):
+        super().setUp()
+        self.c = Console(CONFIG, ROOT, self.base)
+
+    def test_case_capture_link_search_export(self):
+        case = self.c.create_case("Home lab exposure")
+        self.assertEqual(case["slug"], "home-lab-exposure")
+        with self.assertRaises(ValueError):
+            self.c.create_case("home lab  exposure")
+        a = self.c.capture({"text": "22/tcp open ssh OpenSSH 9.6", "kind": "output",
+                            "title": "nmap 10.0.0.5", "importance": 0.9, "tags": ["#nmap"],
+                            "source_url": "https://example.com/scan", "case": case["slug"]})
+        b = self.c.capture({"text": "Router admin panel on 8443", "kind": "finding",
+                            "case": case["slug"]})
+        outside = self.c.capture({"text": "Unrelated grocery note"})
+        self.assertIn("case:home-lab-exposure", a["tags"])
+        self.assertEqual(a["meta"]["source_url"], "https://example.com/scan")
+        with self.assertRaises(ValueError):
+            self.c.capture({"text": "x", "source_url": "javascript:alert(1)"})
+        self.c.memory.link(b["id"], a["id"], "supports")
+        hits = self.c.search({"q": "", "case": case["slug"]})
+        self.assertEqual({h["id"] for h in hits} - {case["id"]}, {a["id"], b["id"]})
+        self.assertEqual([h["id"] for h in self.c.search({"q": "ssh", "min_importance": "0.85"})],
+                         [a["id"]])
+        self.assertEqual(self.c.cases()[0]["items"], 2)
+        graph = self.c.heap_graph(case=case["slug"])
+        ids = {n["id"] for n in graph["nodes"]}
+        self.assertTrue({a["id"], b["id"]} <= ids)
+        self.assertNotIn(outside["id"], ids)
+        md = self.c.export(case["slug"])
+        self.assertTrue(md.startswith("# Home lab exposure"))
+        self.assertIn("Source: https://example.com/scan", md)
+        self.assertIn(f"supports → `{a['id']}`", md)
+        with self.assertRaises(LookupError):
+            self.c.export("nope")
+
+    def test_search_filters_before_the_limit(self):
+        # audit SU-2: filters ran after LIMIT, so chatter hid the few important items
+        facts = [self.c.memory.add("fact", f"fact {n}", importance=0.8)["id"] for n in range(2)]
+        case = self.c.create_case("Old case")
+        old = self.c.capture({"text": "early finding", "kind": "finding", "case": case["slug"]})
+        for n in range(220):
+            self.c.memory.add("message", f"chatter {n}", importance=0.4)
+        hits = self.c.search({"q": "", "limit": "60", "min_importance": "0.6"})
+        self.assertTrue(set(facts) <= {h["id"] for h in hits})
+        self.assertTrue(all(h["importance"] >= 0.6 for h in hits))
+        hits = self.c.search({"q": "", "limit": "60", "case": case["slug"]})
+        self.assertEqual({h["id"] for h in hits} - {case["id"]}, {old["id"]})
+        self.assertEqual(self.c.search({"q": "", "case": "nothing-here"}), [])
+
+    def test_send_file_stages_upload_under_state_not_tmp(self):
+        # audit SU-4: /tmp can be a RAM tmpfs; uploads go to <state>/uploads
+        import io
+        seen = {}
+
+        def fake_send(config, state, path, device, name):
+            seen["path"] = Path(path)
+            seen["data"] = Path(path).read_bytes()
+            return {"sent": name, "bytes": len(seen["data"])}
+        with patch("tempfile.tempdir", str(self.base / "no-such-tmp")), \
+                patch("jarvis.transfer.send_file", side_effect=fake_send):
+            result = self.c.send_file(io.BytesIO(b"hello"), 5, "a.txt")
+        self.assertEqual(result["bytes"], 5)
+        self.assertEqual(seen["data"], b"hello")
+        self.assertTrue(seen["path"].resolve().is_relative_to((self.base / "uploads").resolve()))
+        self.assertFalse(seen["path"].exists())  # cleaned up after sending
+
+    def test_history_pairs_requests_with_replies(self):
+        q = self.c.memory.add("message", "what day is it", tags=["inbound", "simple"])
+        self.c.memory.add("reply", "Tuesday.", links=[("answers", q["id"])], meta={"task": "abc"})
+        self.c.memory.add("message", "unanswered", tags=["inbound", "complex"])
+        hist = self.c.history()
+        self.assertEqual([h["text"] for h in hist], ["what day is it", "unanswered"])
+        self.assertEqual((hist[0]["tier"], hist[0]["reply"]["body"]), ("simple", "Tuesday."))
+        self.assertIsNone(hist[1]["reply"])
+
+    def test_plan_view_reads_real_step_state(self):
+        from jarvis.ui import _plan_view
+        record = {"id": "plan-0000abcd", "goal": "g", "state": "planned",
+                  "subtasks": [{"id": "s1", "specialist": "researcher", "objective": "look",
+                                "acceptance_criteria": ["cites sources"]},
+                               {"id": "s2", "specialist": "reviewer", "objective": "check",
+                                "depends_on": ["s1"]}],
+                  "results": {"s1": {"state": "finished", "answer": "found it"}}, "tasks": {}}
+        view = _plan_view(record, full=True)
+        self.assertEqual([s["state"] for s in view["steps"]], ["finished", "pending"])
+        self.assertEqual(view["steps"][0]["acceptance"], ["cites sources"])
+        self.assertEqual(view["steps"][0]["answer"], "found it")
+
+
+class ListenTests(Temp):
+    """The console mic: always-on clips count only when they start with "Jarvis"."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import numpy
+        except ImportError:
+            self.skipTest("needs the [voice] extra: pip install numpy")
+        self.c = Console(CONFIG, ROOT, self.base)
+        self.c._ears, self.c._stt = MagicMock(), MagicMock(device="cpu")
+        self.clip = numpy.zeros(16000, dtype="<f4").tobytes()
+
+    def hear(self, said, wake, listener=None):
+        self.c._stt.side_effect = lambda audio: said
+        with patch("jarvis.daemon._pid", return_value=listener):
+            return self.c.transcribe(self.clip, wake=wake)
+
+    def test_always_on_drops_anything_not_addressed_to_jarvis(self):
+        r = self.hear("Good. Thank you. Thank you.", wake=True)
+        self.assertEqual((r["text"], r["addressed"]), ("", False))
+        r = self.hear("Jarvis, open up Spotify.", wake=True)
+        self.assertEqual((r["text"], r["addressed"]), ("open up Spotify.", True))
+
+    def test_push_to_talk_needs_no_wake_word(self):
+        self.assertEqual(self.hear("open up Spotify.", wake=False)["text"], "open up Spotify.")
+
+    def test_background_listener_answers_instead_so_nothing_runs_twice(self):
+        r = self.hear("Jarvis, open up Spotify.", wake=True, listener=4242)
+        self.assertEqual((r["text"], r["listener"]), ("", True))
+        self.c._stt.assert_not_called()  # it heard the same words; no second Whisper pass
+        r = self.hear("Jarvis, open up Spotify.", wake=False, listener=4242)
+        self.assertEqual((r["text"], r["listener"], r["addressed"]), ("", True, True))
+        r = self.hear("open up Spotify.", wake=False, listener=4242)  # push-to-talk only
+        self.assertEqual(r["text"], "open up Spotify.")
+
+    def test_parakeet_variant_counts_as_addressed(self):
+        r = self.hear("Jovers, what time is it", wake=True)  # listen.wake: Parakeet's "Jarvis"
+        self.assertEqual((r["text"], r["addressed"]), ("what time is it", True))
+
+
+class SpeakerCheckOffTests(Temp):
+    """voice.speaker_check: false with a voiceprint on disk: it is never consulted."""
+    hear = ListenTests.hear
+
+    def setUp(self):
+        super().setUp()
+        try:
+            import numpy
+        except ImportError:
+            self.skipTest("needs the [voice] extra: pip install numpy")
+        self.c = Console(CONFIG, ROOT, self.base)
+        self.c._ears, self.c._stt = MagicMock(), MagicMock(device="cpu")
+        self.clip = numpy.zeros(16000, dtype="<f4").tobytes()
+        self.c.config = {**self.c.config, "voice": {**(self.c.config.get("voice") or {}),
+                                                    "speaker_check": False}}
+        (self.base / "voice").mkdir(parents=True, exist_ok=True)
+        (self.base / "voice" / "voiceprint.json").write_text("{}")
+        self.c._ears.verify.side_effect = AssertionError("verify must not run with the check off")
+
+    def test_always_on_needs_jarvis_and_never_verifies(self):
+        r = self.hear("Good. Thank you.", wake=True)
+        self.assertEqual((r["text"], r["owner"], r["addressed"]), ("", False, False))
+        r = self.hear("Jarvis, open Spotify", wake=True)
+        self.assertEqual((r["text"], r["addressed"]), ("open Spotify", True))
+        self.c._ears.verify.assert_not_called()
+
+    def test_push_to_talk_still_returns_the_transcript(self):
+        # Differs from the listener (daemon), where the check off means every request needs
+        # "Jarvis": here a key press is deliberate, so the words stand without it.
+        r = self.hear("open up Spotify.", wake=False)
+        self.assertEqual((r["text"], r["owner"], r["addressed"]), ("open up Spotify.", False, False))
+        self.c._ears.verify.assert_not_called()
+
+
+class HttpTests(Temp):
+    def setUp(self):
+        super().setUp()
+        handler = type("H", (Handler,), {"console": Console(CONFIG, ROOT, self.base),
+                                          "hosts": ("127.0.0.1", "localhost")})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def call(self, path, body=None, headers=None):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.url + path, data=data, headers=headers or {},
+                                     method="POST" if data is not None else "GET")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return res.status, res.read()
+        except urllib.error.HTTPError as exc:
+            with exc:  # an HTTPError is the response; closing it keeps the socket from leaking
+                return exc.code, exc.read()
+
+    def test_static_and_traversal(self):
+        status, body = self.call("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"JARVIS", body)
+        self.assertEqual(self.call("/../jarvis.config.json")[0], 404)
+        self.assertEqual(self.call("/%2e%2e/jarvis.config.json")[0], 404)
+
+    def test_post_needs_header_and_host(self):
+        self.assertEqual(self.call("/api/memory", {"text": "x"})[0], 403)
+        self.assertEqual(self.call("/api/overview", headers={"Host": "evil.example"})[0], 403)
+        status, body = self.call("/api/memory", {"text": "remember the console", "tags": ["ui"]},
+                                 {"X-JARVIS": "1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["id"].startswith("note:"))
+
+    def test_ask_runs_in_background(self):
+        fake = {"tier": "simple", "reasons": [], "reply": "It's Tuesday.", "memory": []}
+        with patch("jarvis.assistant.ask", return_value=fake):
+            status, body = self.call("/api/ask", {"text": "what day is it"}, {"X-JARVIS": "1"})
+            self.assertEqual(status, 200)
+            job = json.loads(body)
+            for _ in range(50):
+                job = json.loads(self.call(f"/api/jobs/{job['id']}")[1])
+                if job["state"] != "running":
+                    break
+                time.sleep(0.05)
+        self.assertEqual((job["state"], job["result"]["reply"]), ("done", "It's Tuesday."))
+        self.assertEqual(self.call("/api/jobs/missing")[0], 404)
+        self.assertEqual(self.call("/api/ask", {"text": " "}, {"X-JARVIS": "1"})[0], 400)
+
+    def test_noisy_float32_mic_clip_reaches_local_transcriber(self):
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("needs the [voice] extra: pip install numpy")
+        c = self.server.RequestHandlerClass.console
+        c._stt = MagicMock(device="cpu", return_value="Open my calendar.")
+        rate = 16000
+        t = np.arange(rate, dtype="float32") / rate
+        room = 0.018 * np.sin(2 * np.pi * 70 * t)
+        speech = np.zeros_like(t)
+        speech[rate // 4:rate * 3 // 4] = 0.045 * np.sin(2 * np.pi * 240 * t[rate // 4:rate * 3 // 4])
+        clip = (room + speech).astype("<f4").tobytes()
+        assistant_stub = ModuleType("jarvis.assistant")
+        assistant_stub.wake_word = lambda _text: None
+        with patch.dict(sys.modules, {"jarvis.assistant": assistant_stub}), \
+                patch("jarvis.daemon._pid", return_value=None):
+            status, body = self.call("/api/listen", clip, {"X-JARVIS": "1"})
+        result = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(result["text"], "Open my calendar.")
+        self.assertAlmostEqual(result["seconds"], 1.0)
+        sent_audio = c._stt.call_args.args[0]
+        self.assertEqual(len(sent_audio), rate)
+        self.assertGreater(float(np.sqrt(np.mean(sent_audio ** 2))), 0.01)
+
+
+class DevicesTests(Temp):
+    DEVICES = {
+        "box_a": {"hostname": "a-host", "label": "Box A", "transport": "local"},
+        "box_b": {"hostname": "b-host", "label": "Box B", "transport": "ssh", "target": "me@b"},
+        "box_c": {"hostname": "c-host", "transport": "cluster"},
+    }
+
+    def devices(self, cluster):
+        config = {**CONFIG, "devices": self.DEVICES, "cluster": cluster}
+        console = Console({**CONFIG, "cluster": {"enabled": False}}, ROOT, self.base)
+        console.config = config  # a node can't build a Console; the view only reads config
+        return {d["id"]: d for d in console.devices()}
+
+    def test_cluster_enabled_marks_here_role_and_send(self):
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_a"})
+        self.assertTrue(out["box_a"]["here"])
+        self.assertFalse(out["box_a"]["send"])
+        self.assertEqual(out["box_a"]["role"], "main")
+        self.assertEqual(out["box_a"]["label"], "Box A")
+        self.assertFalse(out["box_b"]["here"])
+        self.assertTrue(out["box_b"]["send"])
+        self.assertEqual(out["box_b"]["role"], "node")
+
+    def test_local_ssh_device_is_not_a_send_target(self):
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_b"})
+        self.assertTrue(out["box_b"]["here"])
+        self.assertFalse(out["box_b"]["send"])
+
+    def test_cluster_disabled_has_no_roles(self):
+        out = self.devices({"enabled": False})
+        for d in out.values():
+            self.assertIsNone(d["role"])
+            self.assertFalse(d["here"])
+        self.assertTrue(out["box_b"]["send"])
+
+    def test_cluster_node_is_sendable_from_the_main(self):
+        # Files ride the cluster link (transfer kind), so a node needs no SSH target.
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_a"})
+        self.assertTrue(out["box_c"]["send"])
+
+    def test_a_node_sends_only_to_the_main(self):
+        out = self.devices({"enabled": True, "main_device": "box_a", "local_device": "box_c"})
+        self.assertTrue(out["box_a"]["send"])
+        self.assertFalse(out["box_b"]["send"])
+        self.assertFalse(out["box_c"]["send"])
+
+
+if __name__ == "__main__":
+    unittest.main()

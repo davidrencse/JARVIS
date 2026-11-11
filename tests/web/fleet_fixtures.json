@@ -1,0 +1,724 @@
+{
+ "owner": {
+  "audience": "owner",
+  "can_write": true,
+  "cluster": {
+   "enabled": true,
+   "local": "main",
+   "main": "main",
+   "local_is_main": true
+  },
+  "profiles": [
+   {
+    "id": "pc",
+    "label": "PC",
+    "about": "A laptop or desktop you use. Gets screens, apps, files and a hardware report by default.",
+    "default_capabilities": [
+     "desktop",
+     "files",
+     "grokbot",
+     "inventory"
+    ],
+    "main_candidate": "later"
+   },
+   {
+    "id": "headless",
+    "label": "Headless computer",
+    "about": "A computer with no screen of its own (home server, mini PC). Inventory only until you grant more.",
+    "default_capabilities": [
+     "inventory"
+    ],
+    "main_candidate": "later"
+   },
+   {
+    "id": "cloud",
+    "label": "Cloud server",
+    "about": "A rented server (for example Oracle Cloud). Inventory only by default, without personal state or MAIN eligibility. Enrollment does not install a gateway service.",
+    "default_capabilities": [
+     "inventory"
+    ],
+    "main_candidate": "never"
+   }
+  ],
+  "capabilities": [
+   {
+    "id": "inventory",
+    "title": "Hardware and status report",
+    "risk": "low",
+    "explain": "Lets the main read CPU, memory, disk and version."
+   },
+   {
+    "id": "files",
+    "title": "Files and clipboard",
+    "risk": "medium",
+    "explain": "Lets the main send and fetch files and share the clipboard."
+   },
+   {
+    "id": "desktop",
+    "title": "Screens, apps and mouse",
+    "risk": "high",
+    "explain": "Lets the main open apps, see the screen and use Lan Mouse."
+   },
+   {
+    "id": "grokbot",
+    "title": "Grok Bot",
+    "risk": "medium",
+    "explain": "Lets the main run Grok Bot browser tasks there."
+   },
+   {
+    "id": "console",
+    "title": "Use the console",
+    "risk": "high",
+    "explain": "Lets that node's console read the main's overview and approve requests."
+   },
+   {
+    "id": "ask",
+    "title": "Ask JARVIS",
+    "risk": "medium",
+    "explain": "Lets that node send requests to the main's brain (spends subscription quota)."
+   },
+   {
+    "id": "camera",
+    "title": "Webcam view",
+    "risk": "high",
+    "explain": "Lets the main look through its webcam, only after `jarvis camera allow on` on that node."
+   },
+   {
+    "id": "locate",
+    "title": "Find where it is",
+    "risk": "high",
+    "explain": "Lets the main ask for the node's location."
+   }
+  ],
+  "devices": [
+   {
+    "id": "main",
+    "label": "Main PC",
+    "role": "main",
+    "profile": "pc",
+    "profile_label": "PC",
+    "platform": null,
+    "main_eligible": false,
+    "main_eligible_why": "This is the current main.",
+    "status": "main",
+    "online": true,
+    "seen": null,
+    "capabilities": []
+   },
+   {
+    "id": "dell",
+    "label": "Dell",
+    "role": "node",
+    "profile": "pc",
+    "profile_label": "PC",
+    "platform": null,
+    "main_eligible": "blocked",
+    "main_eligible_why": "Possible later; safe handoff is not built yet.",
+    "status": "online",
+    "online": true,
+    "seen": 1794416170.3410263,
+    "capabilities": [
+     {
+      "id": "desktop",
+      "title": "Screens, apps and mouse",
+      "risk": "high",
+      "explain": "Lets the main open apps, see the screen and use Lan Mouse.",
+      "default": true
+     },
+     {
+      "id": "files",
+      "title": "Files and clipboard",
+      "risk": "medium",
+      "explain": "Lets the main send and fetch files and share the clipboard.",
+      "default": true
+     },
+     {
+      "id": "grokbot",
+      "title": "Grok Bot",
+      "risk": "medium",
+      "explain": "Lets the main run Grok Bot browser tasks there.",
+      "default": true
+     },
+     {
+      "id": "inventory",
+      "title": "Hardware and status report",
+      "risk": "low",
+      "explain": "Lets the main read CPU, memory, disk and version.",
+      "default": true
+     }
+    ],
+    "step": "Connected.",
+    "invite_expires": null,
+    "code_ok": null,
+    "hostname": "dell-host",
+    "active_jobs": 0,
+    "address": "10.1.2.3"
+   },
+   {
+    "id": "oracle1",
+    "label": "Oracle Cloud",
+    "role": "node",
+    "profile": "cloud",
+    "profile_label": "Cloud server",
+    "platform": null,
+    "main_eligible": false,
+    "main_eligible_why": "Inventory only by default and never becomes the main.",
+    "status": "invite_pending",
+    "online": false,
+    "seen": null,
+    "capabilities": [
+     {
+      "id": "inventory",
+      "title": "Hardware and status report",
+      "risk": "low",
+      "explain": "Lets the main read CPU, memory, disk and version.",
+      "default": true
+     }
+    ],
+    "step": "Run the join command on the node before the invite expires.",
+    "invite_expires": 1794419775.340904,
+    "code_ok": null,
+    "hostname": "oracle1",
+    "active_jobs": 0,
+    "address": null
+   },
+   {
+    "id": "spare",
+    "label": "Spare laptop",
+    "role": "node",
+    "profile": "pc",
+    "profile_label": "PC",
+    "platform": null,
+    "main_eligible": "blocked",
+    "main_eligible_why": "Possible later; safe handoff is not built yet.",
+    "status": "not_enrolled",
+    "online": false,
+    "seen": null,
+    "capabilities": [],
+    "step": "Create an invite for this node.",
+    "invite_expires": null,
+    "code_ok": null,
+    "hostname": null,
+    "active_jobs": 0,
+    "address": null
+   }
+  ],
+  "actions": [
+   {
+    "id": "preview",
+    "support": "supported",
+    "why": "Shows exactly what an invite would change. Changes nothing.",
+    "method": "POST",
+    "path": "/api/fleet/preview"
+   },
+   {
+    "id": "invite",
+    "support": "supported",
+    "why": "Creates a one-time invite code (24 h).",
+    "method": "POST",
+    "path": "/api/fleet/invite",
+    "owner_only": true,
+    "secret_in_reply": true
+   },
+   {
+    "id": "revoke",
+    "support": "supported",
+    "why": "Cuts a node off: credential and SSH key.",
+    "method": "POST",
+    "path": "/api/fleet/revoke",
+    "owner_only": true,
+    "needs_confirm": true
+   },
+   {
+    "id": "capabilities",
+    "support": "supported",
+    "why": "Changes what an enrolled node may do. The credential stays the same.",
+    "method": "POST",
+    "path": "/api/fleet/capabilities",
+    "owner_only": true
+   },
+   {
+    "id": "main_transfer_preview",
+    "support": "supported",
+    "why": "Shows readiness and why a transfer is blocked.",
+    "method": "POST",
+    "path": "/api/fleet/main-transfer/preview"
+   },
+   {
+    "id": "main_transfer",
+    "support": "blocked",
+    "why": "Safe main handoff is not built yet (see missing checks).",
+    "method": "POST",
+    "path": "/api/fleet/main-transfer"
+   },
+   {
+    "id": "cloud_provisioning",
+    "support": "unsupported",
+    "why": "JARVIS does not create cloud servers or install an OS. Create the server yourself, then add it as a node."
+   },
+   {
+    "id": "setup_guide",
+    "support": "guide",
+    "why": "Step-by-step instructions to run on the new machine."
+   }
+  ],
+  "guide": [
+   {
+    "id": "choose",
+    "title": "Choose a profile",
+    "who": "you",
+    "body": "PC (has a screen), headless computer, or cloud server. Cloud servers get inventory only."
+   },
+   {
+    "id": "preview",
+    "title": "Preview",
+    "who": "console on the main",
+    "body": "Shows what the invite changes: one device entry, one restricted SSH key, one 24-hour credential."
+   },
+   {
+    "id": "invite",
+    "title": "Create the invite",
+    "who": "console on the main",
+    "body": "You get one code. It is a password for that node: copy it once, never paste it into chat."
+   },
+   {
+    "id": "join",
+    "title": "Join on the new machine",
+    "who": "you, on the node",
+    "body": "Run the join command from the preview in that machine's JARVIS folder."
+   },
+   {
+    "id": "verify",
+    "title": "Check the link",
+    "who": "console on the main",
+    "body": "The node turns Online. Then review its capabilities; sensitive ones stay off until you grant them."
+   }
+  ],
+  "checked_at": 1794416175.3410895
+ },
+ "vault": {
+  "checked_at": 1794416175.3531728,
+  "network": false,
+  "archive": {
+   "enabled": false,
+   "stage": "c2-transitional",
+   "state": "disabled",
+   "gate": "disabled",
+   "running_here": false,
+   "archive_pending": null,
+   "archive_held": null,
+   "archive_errors": null,
+   "capture_enabled": false,
+   "capture_complete": false,
+   "archive_unreconciled": null,
+   "archive_source_gone": null,
+   "oldest_pending_age_s": null,
+   "last_success": null,
+   "queue": "no-state",
+   "drain_failures": 0,
+   "has_error": false
+  },
+  "vault": {
+   "configured": false,
+   "exists": false,
+   "write_enabled": false,
+   "is_git": false
+  },
+  "git": null,
+  "visibility": {
+   "value": "unknown",
+   "note": "Whether the repo is private needs a network call, which status never makes. Check it once on GitHub."
+  },
+  "problems": [
+   "No vault is configured."
+  ]
+ },
+ "preview": {
+  "node": "oracle2",
+  "label": "Oracle 2",
+  "profile": "cloud",
+  "os": "linux",
+  "ready": true,
+  "problems": [],
+  "checks": [
+   {
+    "id": "cluster",
+    "state": "ok",
+    "why": "Cluster is on."
+   },
+   {
+    "id": "is_main",
+    "state": "ok",
+    "why": "This is the main PC."
+   },
+   {
+    "id": "tunnel_forward",
+    "state": "ok",
+    "why": "Nodes dial the main (forward tunnel)."
+   },
+   {
+    "id": "sshd",
+    "state": "ok",
+    "why": "This PC's SSH server answers on port 22."
+   },
+   {
+    "id": "addresses",
+    "state": "unknown",
+    "why": "The main's addresses are collected when the invite is made."
+   }
+  ],
+  "steps": [
+   {
+    "id": "ready",
+    "title": "Main is ready",
+    "kind": "auto",
+    "state": "done"
+   },
+   {
+    "id": "invite",
+    "title": "Create the invite",
+    "kind": "action",
+    "action": "invite",
+    "state": "todo"
+   },
+   {
+    "id": "join",
+    "title": "Run the join command on the node",
+    "kind": "guide",
+    "state": "todo"
+   },
+   {
+    "id": "contact",
+    "title": "Node connects",
+    "kind": "auto",
+    "state": "todo"
+   },
+   {
+    "id": "capabilities",
+    "title": "Review capabilities",
+    "kind": "action",
+    "action": "capabilities",
+    "state": "todo"
+   }
+  ],
+  "link": "not_enrolled",
+  "capabilities": [
+   {
+    "id": "inventory",
+    "title": "Hardware and status report",
+    "risk": "low",
+    "explain": "Lets the main read CPU, memory, disk and version.",
+    "default": true
+   }
+  ],
+  "needs_acknowledge": [],
+  "would_change": {
+   "config": "Adds devices.oracle2 (profile cloud) after a backup",
+   "authorized_keys": "Adds one restricted key for oracle2: forwards to the hub only, no shell",
+   "credential": "Creates one hub credential valid 24 hours or until first use",
+   "network": "Nothing opens; no new port"
+  },
+  "addresses": [],
+  "node_commands": [
+   {
+    "label": "Join (shell, in the JARVIS folder)",
+    "command": ".venv/bin/python -m jarvis cluster join \"<INVITE CODE>\""
+   },
+   {
+    "label": "Check",
+    "command": ".venv/bin/python -m jarvis cluster doctor"
+   }
+  ],
+  "limits": [
+   "JARVIS does not create servers or install an operating system."
+  ],
+  "mutated": false
+ },
+ "preview_exists": {
+  "node": "dell",
+  "label": "dell",
+  "profile": "pc",
+  "os": "windows",
+  "ready": false,
+  "problems": [
+   {
+    "code": "node_enrolled",
+    "why": "dell already has a live credential. Revoke it first; inviting again would silently cut it off."
+   }
+  ],
+  "checks": [
+   {
+    "id": "cluster",
+    "state": "ok",
+    "why": "Cluster is on."
+   },
+   {
+    "id": "is_main",
+    "state": "ok",
+    "why": "This is the main PC."
+   },
+   {
+    "id": "tunnel_forward",
+    "state": "ok",
+    "why": "Nodes dial the main (forward tunnel)."
+   },
+   {
+    "id": "sshd",
+    "state": "ok",
+    "why": "This PC's SSH server answers on port 22."
+   },
+   {
+    "id": "addresses",
+    "state": "unknown",
+    "why": "The main's addresses are collected when the invite is made."
+   }
+  ],
+  "steps": [
+   {
+    "id": "ready",
+    "title": "Main is ready",
+    "kind": "auto",
+    "state": "done"
+   },
+   {
+    "id": "invite",
+    "title": "Create the invite",
+    "kind": "action",
+    "action": "invite",
+    "state": "done"
+   },
+   {
+    "id": "join",
+    "title": "Run the join command on the node",
+    "kind": "guide",
+    "state": "done"
+   },
+   {
+    "id": "contact",
+    "title": "Node connects",
+    "kind": "auto",
+    "state": "done"
+   },
+   {
+    "id": "capabilities",
+    "title": "Review capabilities",
+    "kind": "action",
+    "action": "capabilities",
+    "state": "todo"
+   }
+  ],
+  "link": "online",
+  "capabilities": [
+   {
+    "id": "desktop",
+    "title": "Screens, apps and mouse",
+    "risk": "high",
+    "explain": "Lets the main open apps, see the screen and use Lan Mouse.",
+    "default": true
+   },
+   {
+    "id": "files",
+    "title": "Files and clipboard",
+    "risk": "medium",
+    "explain": "Lets the main send and fetch files and share the clipboard.",
+    "default": true
+   },
+   {
+    "id": "grokbot",
+    "title": "Grok Bot",
+    "risk": "medium",
+    "explain": "Lets the main run Grok Bot browser tasks there.",
+    "default": true
+   },
+   {
+    "id": "inventory",
+    "title": "Hardware and status report",
+    "risk": "low",
+    "explain": "Lets the main read CPU, memory, disk and version.",
+    "default": true
+   }
+  ],
+  "needs_acknowledge": [],
+  "would_change": {
+   "config": "Adds devices.dell (profile pc) after a backup",
+   "authorized_keys": "Adds one restricted key for dell: forwards to the hub only, no shell",
+   "credential": "Creates one hub credential valid 24 hours or until first use",
+   "network": "Nothing opens; no new port"
+  },
+  "addresses": [],
+  "node_commands": [
+   {
+    "label": "Join (PowerShell, in the JARVIS folder)",
+    "command": ".venv\\Scripts\\python.exe -m jarvis cluster join \"<INVITE CODE>\""
+   },
+   {
+    "label": "Check",
+    "command": ".venv\\Scripts\\python.exe -m jarvis cluster doctor"
+   }
+  ],
+  "limits": [],
+  "mutated": false
+ },
+ "main_preview": {
+  "status": "blocked",
+  "support": "blocked",
+  "mutated": false,
+  "target": "dell",
+  "readiness": [
+   {
+    "id": "known_device",
+    "state": "ok",
+    "why": "In the config."
+   },
+   {
+    "id": "not_current_main",
+    "state": "ok",
+    "why": "Different from the current main."
+   },
+   {
+    "id": "not_cloud",
+    "state": "ok",
+    "why": "Not a cloud server."
+   },
+   {
+    "id": "online",
+    "state": "ok",
+    "why": "Connected now."
+   }
+  ],
+  "missing": [
+   {
+    "id": "authority_store",
+    "why": "A durable authority record (who is MAIN, with an epoch) that survives restarts. Today the main is only cluster.main_device in a config file."
+   },
+   {
+    "id": "authority_lease",
+    "why": "A single compare-and-swap lease so two machines can never both act as MAIN."
+   },
+   {
+    "id": "fencing",
+    "why": "The old main must be fenced: stop writing, drain, and acknowledge before the new one starts."
+   },
+   {
+    "id": "target_ack",
+    "why": "The target must prove it has the data and acknowledge the new epoch."
+   },
+   {
+    "id": "executor_guards",
+    "why": "Every effect (jobs, memory, vault, queue) must check the epoch before it runs."
+   },
+   {
+    "id": "fresh_owner_proof",
+    "why": "A fresh passkey or equivalent owner proof for this one action; phone pairing is not fleet admin."
+   },
+   {
+    "id": "checkpoint_barrier",
+    "why": "Plans, runs and knowledge snapshots must be checkpointed so nothing is lost mid-move."
+   }
+  ],
+  "phases": [
+   "Check target readiness",
+   "Fence the current main",
+   "Copy and verify state",
+   "Switch the authority epoch",
+   "Start the new main",
+   "Confirm and re-pair nodes"
+  ],
+  "risks": [
+   "Two machines acting as the main could both write memory and run jobs.",
+   "Editing cluster.main_device by hand moves no data and fences nothing."
+  ],
+  "why": "Safe main handoff (leases, fencing, owner proof) is not implemented, so nothing was changed."
+ },
+ "vault_active": {
+  "checked_at": 1794416175,
+  "network": false,
+  "archive": {
+   "enabled": true,
+   "stage": "c2-transitional",
+   "state": "pending",
+   "gate": "open",
+   "running_here": true,
+   "archive_pending": 3,
+   "archive_held": 0,
+   "archive_errors": 0,
+   "capture_enabled": true,
+   "capture_complete": true,
+   "archive_unreconciled": 0,
+   "archive_source_gone": 0,
+   "oldest_pending_age_s": 240,
+   "last_success": 1794415000,
+   "queue": "ok",
+   "drain_failures": 0,
+   "has_error": false
+  },
+  "vault": {
+   "configured": true,
+   "exists": true,
+   "write_enabled": false,
+   "is_git": true
+  },
+  "git": {
+   "available": true,
+   "branch": "main",
+   "detached": false,
+   "remote": {
+    "name": "origin",
+    "provider": "github",
+    "host": "github.com",
+    "repo": "owner/notes-vault",
+    "credentials_embedded": false
+   },
+   "upstream_set": true,
+   "ahead": 0,
+   "behind": 0,
+   "ahead_behind_as_of": "last fetch",
+   "last_fetch_at": 1794300000,
+   "dirty": {
+    "staged": 0,
+    "modified": 2,
+    "untracked": 40,
+    "conflicted": 0
+   },
+   "clean": false,
+   "connected": "remote configured"
+  },
+  "visibility": {
+   "value": "unknown",
+   "note": "Whether the repo is private needs a network call, which status never makes. Check it once on GitHub."
+  },
+  "problems": []
+ },
+ "invite_ok": {
+  "ok": true,
+  "node": "oracle2",
+  "profile": "cloud",
+  "label": "Oracle 2",
+  "capabilities": [
+   "inventory"
+  ],
+  "addresses": [
+   "main.example.net"
+  ],
+  "expires_at": 4102444800,
+  "expires": "in 30 min",
+  "code": "jarvis-invite-1:PLACEHOLDER",
+  "secret": true,
+  "node_commands": [
+   {
+    "label": "Join (run on the new computer)",
+    "command": ".venv/bin/python -m jarvis cluster join \"<INVITE CODE>\""
+   },
+   {
+    "label": "Check it connected",
+    "command": ".venv/bin/python -m jarvis cluster doctor"
+   }
+  ],
+  "config_changed": true,
+  "device": {
+   "id": "oracle2"
+  },
+  "next": "Run the join command on the node.",
+  "step": "join"
+ }
+}
