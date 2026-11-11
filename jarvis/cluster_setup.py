@@ -19,6 +19,7 @@ the same file on every machine and never holds a secret.
 
 import base64
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -109,7 +110,8 @@ def init(config, path, state, device=None, autostart=True):
                     listen_port=port, main_url=f"http://127.0.0.1:{port}")
     proposed = {**config, "devices": devices, "cluster": settings}
     identity(proposed)  # fails before saving if the hostname is ambiguous
-    save_json(path, proposed)
+    from .config_lock import save_delta
+    save_delta(state, path, config, proposed, backup="cluster-init")
     report = {"main_device": device, "hostname": host, "hub": f"127.0.0.1:{port}",
               "tunnel": settings["tunnel"]}
     if settings["tunnel"] == "forward":
@@ -333,6 +335,104 @@ def decode(value):
     return note
 
 
+class InviteIncomplete(RuntimeError):
+    """An invite stopped after a side effect. retryable is true only when this attempt's
+    new credential and key were removed or put back. It is false when cleanup could not
+    prove it still owned them: the caller must not try the same request again."""
+
+    def __init__(self, message, *, retryable):
+        super().__init__(message)
+        self.retryable = bool(retryable)
+
+
+def _public_invite_error(exc):
+    """A message safe to show. Never the private key, the code, or a token."""
+    text = str(exc or "").strip()
+    if (not text or "PRIVATE KEY" in text or "BEGIN OPENSSH" in text or "BEGIN " in text
+            or PREFIX in text):
+        return "The invite could not be created."
+    return text[:300]
+
+
+def _node_snapshot(state, node):
+    """The node's credential row before this attempt, or None. Raw column values."""
+    with Broker(state).db() as db:
+        row = db.execute("SELECT token_hash, capabilities, seen, info, invite_expires "
+                         "FROM nodes WHERE id=?", (node,)).fetchone()
+    if row is None:
+        return None
+    return {key: row[key] for key in ("token_hash", "capabilities", "seen", "info", "invite_expires")}
+
+
+def _same_row(left, right):
+    if left is None or right is None:
+        return left is None and right is None
+    return all(left.get(key) == right.get(key)
+               for key in ("token_hash", "capabilities", "seen", "info", "invite_expires"))
+
+
+def _restore_node(state, node, prior, attempt_hash):
+    """Undo this attempt's node row only when that row is still the one we wrote.
+    Returns False when the row is not ours: the caller must not claim the invite was atomic."""
+    current = _node_snapshot(state, node)
+    if not attempt_hash:
+        return _same_row(current, prior)
+    if current is None:
+        return prior is None
+    if current.get("token_hash") != attempt_hash:
+        return False
+    with Broker(state).db() as db:
+        if prior is None:
+            db.execute("DELETE FROM nodes WHERE id=? AND token_hash=?", (node, attempt_hash))
+        else:
+            db.execute("UPDATE nodes SET token_hash=?, capabilities=?, seen=?, info=?, invite_expires=? "
+                       "WHERE id=? AND token_hash=?",
+                       (prior["token_hash"], prior["capabilities"], prior["seen"], prior["info"],
+                        prior["invite_expires"], node, attempt_hash))
+        left = db.execute("SELECT token_hash FROM nodes WHERE id=?", (node,)).fetchone()
+    if prior is None:
+        return left is None
+    return left is not None and left["token_hash"] == prior["token_hash"]
+
+
+def _node_key_lines(node, path):
+    mark = " " + MARK + node
+    return [line.rstrip() for line in _key_lines(path) if line.rstrip().endswith(mark)]
+
+
+def _restore_key(node, public, prior_lines, path):
+    """Remove only the key line this attempt added. An existing line is put back.
+    Returns False when a line for this node is present that this attempt does not own."""
+    parts = str(public or "").split()
+    if len(parts) < 2:
+        return False
+    bits = f"{parts[0]} {parts[1]}"
+    mark = " " + MARK + node
+    prior = [line.rstrip() for line in (prior_lines or [])]
+    try:
+        with _keys_locked(path):
+            lines = [line.rstrip() for line in _key_lines(path) if line.strip()]
+            ours, foreign, rest = [], [], []
+            for line in lines:
+                if not line.endswith(mark):
+                    rest.append(line)
+                elif f" {bits} " in f" {line} ":
+                    ours.append(line)
+                else:
+                    foreign.append(line)
+            if not ours:
+                return foreign == prior
+            if foreign and foreign != prior:
+                return False  # another key for this node: not ours to delete or replace
+            _write_keys(path, rest + prior)
+            after = [line.rstrip() for line in _key_lines(path) if line.strip() and line.rstrip().endswith(mark)]
+            if any(f" {bits} " in f" {line} " for line in after):
+                return False
+            return after == prior
+    except OSError:
+        return False
+
+
 def invite(config, path, state, node, extra=(), capabilities=None, output=None):
     """Pair a new node: one restricted SSH key + one hub credential, as a single code."""
     local, main = identity(config)
@@ -340,6 +440,10 @@ def invite(config, path, state, node, extra=(), capabilities=None, output=None):
         raise ValueError("Create invites on the main PC.")
     if not node or not DEVICE_ID.fullmatch(node) or node == main:
         raise ValueError("Name the node, e.g. jarvis cluster invite dell.")
+    # Same ledger as the console. A different node id is not stopped, and this does not
+    # freeze every invite. Checked again under the lock, after the signing key is made.
+    from .fleet_management import assert_node_admitted
+    assert_node_admitted(state, node)
     from .cluster_tunnel import mode
     if mode(config) != "forward":
         raise ValueError('Invites make forward links (the node dials the main). Set '
@@ -353,36 +457,137 @@ def invite(config, path, state, node, extra=(), capabilities=None, output=None):
     found = addresses(config, main, extra)
     if not found:
         raise ValueError("No address found for this PC; pass --address IP_OR_NAME.")
-    key = host_key()
     caps = sorted(capabilities or NODE_DEFAULT)
-    devices = dict(config.get("devices") or {})
-    if node not in devices:
-        devices[node] = {"label": node}
-        save_json(path, {**config, "devices": devices})
-    port = int((config.get("cluster") or {}).get("listen_port") or DEFAULT_PORT)
+    # The slow, side-effect-free material is made first, outside the config lock: the
+    # signing key, the host key and the node's key pair. A failure here changes nothing that
+    # belongs to this node. An existing code-signing key is left as it is.
+    signing = code_key(state)
+    host = host_key()
     private, public = keypair(node)
+    keys_path = _authorized_keys()
+    from .config_lock import config_mutation
+    with config_mutation(state):  # re-entrant: the console invite already holds it
+        return _invite_locked(config, path, state, node, caps, found, target,
+                              signing, host, private, public, keys_path)
+
+
+def _role_guard(node):
+    """Refuse unless the config on disk still says this PC is the main and links forward."""
+    def check(doc):
+        from .cluster_tunnel import mode
+        local, main = identity(doc)
+        if local != main:
+            raise ValueError("This PC is no longer the main; nothing was changed.")
+        if node == main:
+            raise ValueError("The main can't be invited.")
+        if mode(doc) != "forward":
+            raise ValueError("The tunnel is no longer forward; nothing was changed.")
+    return check
+
+
+def _ensure_invite_holds(state, path, node, public, prior_lines, keys_path, prior_row, token):
+    """Re-read role and admission after a step that can itself write the config.
+
+    A settings save on this thread re-enters the config lock and can change the tunnel
+    after the first guard. Do not enroll, and do not return a code, if the file no longer
+    allows the invite. Compensation restores only this attempt's row and key. Jobs are
+    settled only after a code exists, so a finished job is never resurrected here."""
+    from .config_lock import read_config
+    from .fleet_management import assert_node_admitted, note_uncertain_attempt
+    reason = None
     try:
-        keys_file = authorize(node, public, port)
-    except PermissionError:
-        raise ValueError(f"Can't write {_authorized_keys()}. On Windows, admin accounts' SSH keys "
-                         "live there: run this invite in an administrator terminal.") from None
-    # Rotates any earlier credential for this node. The node trades this one for its own
-    # on joining (cluster.redeem_invite), so the code is single-use as well as short-lived.
-    token = Broker(state).enroll(node, caps, invite_ttl=INVITE_TTL)
-    me = devices.get(main) or {}
-    code = encode({"v": 1, "node_id": node, "main_device": main, "user": getpass.getuser(),
-                   "addresses": found, "host_key": key, "port": port, "token": token,
-                   "key": private, "capabilities": caps, "code_key": code_key(state),
-                   "main": {k: me[k] for k in ("hostname", "label", "aliases") if k in me}})
-    report = {"invited": node, "capabilities": caps, "addresses": found,
-              "authorized_keys": keys_file, "expires": "in 24 hours, or once used"}
-    if target is not None:
-        save_json(target, {"code": code})  # 0600, like any credential
-        report["invite_file"] = str(target)
-    report.update(code=code, next=f"On {node}, in its JARVIS folder: jarvis cluster join \"<code>\". "
-                  f"The code is a password for {node}; a new invite or "
-                  f"jarvis cluster revoke {node} cancels it.")
-    return report
+        _role_guard(node)(read_config(path))
+        assert_node_admitted(state, node)
+    except ValueError as exc:
+        reason = exc
+    if reason is None:
+        return
+    attempt = hashlib.sha256(token.encode()).hexdigest() if isinstance(token, str) and token else None
+    node_ok = _restore_node(state, node, prior_row, attempt)
+    key_ok = _restore_key(node, public, prior_lines, keys_path)
+    if node_ok and key_ok:
+        raise InviteIncomplete(str(reason), retryable=True) from reason
+    try:
+        note_uncertain_attempt(state, node)
+    except (OSError, ValueError):
+        pass
+    raise InviteIncomplete(
+        "The invite stopped after a credential change and the cleanup could not be verified. "
+        "It was not atomic. Retrying this request would not be safe.",
+        retryable=False) from reason
+
+
+def _invite_locked(config, path, state, node, caps, found, target, signing, host, private,
+                   public, keys_path):
+    """The part of an invite that changes things. Runs under the managed config lock, on the
+    config as it is on disk now (a role or tunnel flip while the keys were made is seen)."""
+    from .config_lock import patch_config, read_config
+    from .fleet_management import assert_node_admitted, note_uncertain_attempt
+    disk = read_config(path)
+    _role_guard(node)(disk)
+    assert_node_admitted(state, node)
+    local, main = identity(disk)
+    prior_row = _node_snapshot(state, node)
+    prior_lines = _node_key_lines(node, keys_path)
+    token = None
+    try:
+        if node not in (disk.get("devices") or {}):
+            def add(doc):
+                doc.setdefault("devices", {}).setdefault(node, {"label": node})
+            disk, _ = patch_config(state, path, add, guard=_role_guard(node))
+        devices = disk.get("devices") or {}
+        port = int((disk.get("cluster") or {}).get("listen_port") or DEFAULT_PORT)
+        try:
+            keys_file = authorize(node, public, port, path=keys_path)
+        except PermissionError:
+            raise ValueError(f"Can't write {keys_path}. On Windows, admin accounts' SSH keys "
+                             "live there: run this invite in an administrator terminal.") from None
+        # A same-thread settings save during authorize can flip the tunnel after the guard.
+        _ensure_invite_holds(state, path, node, public, prior_lines, keys_path, prior_row, None)
+        # Rotates any earlier credential for this node. The node trades this one for its own
+        # on joining (cluster.redeem_invite), so the code is single-use as well as short-lived.
+        token = Broker(state).enroll(node, caps, invite_ttl=INVITE_TTL, settle_jobs=False)
+        _ensure_invite_holds(state, path, node, public, prior_lines, keys_path, prior_row, token)
+        me = devices.get(main) or {}
+        code = encode({"v": 1, "node_id": node, "main_device": main, "user": getpass.getuser(),
+                       "addresses": found, "host_key": host, "port": port, "token": token,
+                       "key": private, "capabilities": caps, "code_key": signing,
+                       "main": {k: me[k] for k in ("hostname", "label", "aliases") if k in me}})
+        report = {"invited": node, "capabilities": caps, "addresses": found,
+                  "authorized_keys": keys_file, "expires": "in 24 hours, or once used"}
+        if target is not None:
+            save_json(target, {"code": code})  # 0600, like any credential
+            report["invite_file"] = str(target)
+        # The rotation is final now. Only from here are jobs still running under the old
+        # credential marked uncertain, so a rolled-back invite never had to "restore" a job
+        # (and a job that finished meanwhile is never resurrected). Best effort: the old
+        # credential is already dead, so such a job can't report back either way.
+        try:
+            Broker(state).settle_rotated(node)
+        except Exception:  # noqa: BLE001 - the invite itself succeeded
+            pass
+        report.update(code=code, next=f"On {node}, in its JARVIS folder: jarvis cluster join \"<code>\". "
+                      f"The code is a password for {node}; a new invite or "
+                      f"jarvis cluster revoke {node} cancels it.")
+        return report
+    except InviteIncomplete:
+        raise
+    except Exception as exc:
+        # Roll back only a row or key line this attempt still owns. Never delete a
+        # credential or key that was already there, and never delete one we no longer own.
+        attempt = hashlib.sha256(token.encode()).hexdigest() if isinstance(token, str) and token else None
+        node_ok = _restore_node(state, node, prior_row, attempt)
+        key_ok = _restore_key(node, public, prior_lines, keys_path)
+        if node_ok and key_ok:
+            raise InviteIncomplete(_public_invite_error(exc), retryable=True) from exc
+        try:
+            note_uncertain_attempt(state, node)
+        except (OSError, ValueError):
+            pass
+        raise InviteIncomplete(
+            "The invite stopped after a credential change and the cleanup could not be verified. "
+            "It was not atomic. Retrying this request would not be safe.",
+            retryable=False) from exc
 
 
 def revoke(state, node):
@@ -511,7 +716,8 @@ def join(config, path, state, note, autostart=True, start=True, wait=25):
                 "listen_port": note["port"], "main_url": f"http://127.0.0.1:{note['port']}"}
     proposed = {**config, "devices": devices, "cluster": settings}
     identity(proposed)
-    save_json(path, proposed)
+    from .config_lock import save_delta
+    save_delta(state, path, config, proposed, backup="cluster-join")
     report = {"joined": node, "main_device": main, "addresses": targets}
     if autostart:
         from .cluster_cli import autostart as role_autostart
@@ -580,7 +786,9 @@ def leave(config, path, state):
             report[f"{name}_autostart_error"] = str(exc)
     for name in ("cluster-node.json", "cluster-node.key"):
         (state / name).unlink(missing_ok=True)
-    save_json(path, {**config, "cluster": {**(config.get("cluster") or {}), "enabled": False}})
+    from .config_lock import patch_config
+    patch_config(state, path, lambda doc: doc.setdefault("cluster", {}).update(enabled=False),
+                 backup="cluster-leave", create=True)
     report["next"] = f"Restart or stop this PC's node agent. On the main: jarvis cluster revoke {node}"
     return report
 

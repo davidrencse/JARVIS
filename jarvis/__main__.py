@@ -72,6 +72,15 @@ def main():
     lm.add_argument("--output", help="config: write here instead of printing")
     ct = sub.add_parser("control", help="Desktop control (mouse/keyboard): stop, resume, status")
     ct.add_argument("action", choices=("stop", "resume", "status"))
+    ph = sub.add_parser("phone", help="The phone app over Tailscale: on, off, status, pair, list, revoke")
+    ph.add_argument("action", choices=("on", "off", "status", "pair", "list", "revoke"))
+    ph.add_argument("value", nargs="?", help="revoke: a phone id from `jarvis phone list`, or all")
+    ph.add_argument("--name", help="pair: what to call this phone")
+    ph.add_argument("--allow-desktop", action="store_true",
+                    help="pair: let a computer pair instead of a phone (testing only)")
+    cam = sub.add_parser("camera", help="Whether the phone may view this PC's webcam: allow on|off, status")
+    cam.add_argument("action", choices=("allow", "status"))
+    cam.add_argument("value", nargs="?", choices=("on", "off"), help="allow: on or off")
     dk = sub.add_parser("desktop", help="Open an app or link here (the other laptop calls this)")
     from .remote import ACTIONS
     dk.add_argument("action", choices=ACTIONS)  # focus_window was missing, so SSH callers failed
@@ -168,6 +177,14 @@ def main():
     vt.add_argument("--kind", default="note", choices=("note", "project", "person"))
     vt.add_argument("--limit", type=int, default=8)
     vt.add_argument("--write", action="store_true", help="mcp: also offer log/capture/append")
+    ar = sub.add_parser("archive", help="Obsidian second-brain archive: status, sync, drain, validate, verify, restore, overflow")
+    ar.add_argument("action", choices=("status", "sync", "drain", "validate", "restore", "verify", "overflow"))
+    ar.add_argument("--apply", action="store_true", help="sync: write (default is a dry run)")
+    ar.add_argument("--files", action="store_true", help="sync: plans/runs/knowledge only (allowed while capture is active)")
+    ar.add_argument("--rescan", action="store_true", help="drain: first re-queue every current record (verifies publication)")
+    ar.add_argument("--limit", type=int, default=100, help="drain: events per run")
+    ar.add_argument("--target", help="restore: a new or empty folder")
+    ar.add_argument("--mib", type=int, help="overflow: explicit limit in MiB (17–64); 0 disables it")
     cr = sub.add_parser("credits", help="Provider balances; `credits key deepseek` stores a key")
     cr.add_argument("action", nargs="?", default="show", choices=("show", "key"))
     cr.add_argument("provider", nargs="?", help="key: provider id, e.g. deepseek")
@@ -240,12 +257,26 @@ def main():
             if result is not None:
                 emit(result)
             return 0
+        if args.command == "phone":  # the pairing code is printed by phone.pair_cli, never emitted
+            from . import phone
+            emit(phone.cli(args, config, args.state))
+            return 0
+        if args.command == "camera":  # this PC's own consent: works on the main and on nodes
+            from . import camera
+            if args.action == "allow":
+                if args.value not in ("on", "off"):
+                    raise ValueError("Usage: jarvis camera allow on|off")
+                camera.set_allowed(args.state, args.value == "on")
+                emit({"allowed": camera.allowed_here(args.state), **camera.status(config, args.state)})
+            else:
+                emit(camera.status(config, args.state))
+            return 0
         if enabled(config):
             identity(config)
         else:
             config["devices"] = devices_here(config.get("devices", {}))
         if is_node(config) and args.command in ("add", "runs", "show", "plan", "engineer", "run",
-                "mem", "orchestrate", "kb", "vault", "tasks", "task", "credits", "grokbot", "route",
+                "mem", "orchestrate", "kb", "vault", "archive", "tasks", "task", "credits", "grokbot", "route",
                 "send", "fetch", "inbox"):
             raise ValueError("This PC is a proxy node. Use the main console or jarvis ask for shared state and control.")
         if args.command == "doctor":
@@ -343,7 +374,7 @@ def main():
                 else:
                     emit(sharedinput.guard_for(config, args.state))
             elif args.action in ("start", "stop", "status"):
-                ok, text = sharedinput.control(args.action) if here else \
+                ok, text = sharedinput.control(args.action, state=args.state, config=config) if here else \
                     remote.call(args.device, "lan_mouse", args.action)
                 if not ok:
                     raise RuntimeError(text)
@@ -437,6 +468,11 @@ def main():
             return kb_command(args, config)
         elif args.command == "vault":
             return vault_command(args, config)
+        elif args.command == "archive":
+            from .second_brain_runtime import cli as archive_cli
+            result, code = archive_cli(args, config, args.state)
+            emit(result)
+            return code
         elif args.command in ("tasks", "task"):
             return task_command(args, config)
         elif args.command in ("send", "fetch", "inbox"):

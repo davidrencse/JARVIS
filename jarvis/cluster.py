@@ -39,13 +39,27 @@ FRESH = 10  # seconds after a check-in that a node counts as alive between polls
 # The console API a node (with "console") may reach on the main; the owner token, held only
 # by the main's own windows, reaches all of it. Left out on purpose: settings, files, screen,
 # memory, uploads, plan runs and Grokbot commands (its /terminal opens a shell here), so a
-# compromised node can't use the main to take over the cluster.
-NODE_API_READ = frozenset({"/api/events", "/api/overview", "/api/confirm", "/api/history",
-                           "/api/history/commands", "/api/cases", "/api/route", "/api/tree",
+# compromised node can't use the main to take over the cluster. Also left out, because their
+# bodies carry other requests' text, replies, recalled memory or task evidence: /api/events,
+# /api/history*, /api/cases, /api/tasks/*, /api/plans/*. What remains is metadata (status, usage,
+# repo layout) plus the two views below. Read-only does not mean content-free.
+NODE_API_READ = frozenset({"/api/overview", "/api/confirm", "/api/route", "/api/tree",
                            "/api/specialists", "/api/graph/system", "/api/usage", "/api/credits",
                            "/api/voice", "/api/agent", "/api/grokbot"})
-NODE_API_READ_UNDER = ("/api/jobs/", "/api/tasks/", "/api/plans/")  # + one id segment
+NODE_API_READ_UNDER = ("/api/jobs/",)  # + one id segment; only the node's own job (node_job)
+# Routes a node reads through an allowlist of top-level fields: the full body also holds memory
+# excerpts, task and plan text, config and other origins' confirmation outcomes.
+NODE_API_FIELDS = {
+    "/api/overview": ("version", "now", "cluster", "devices", "routing", "models", "brain",
+                      "live", "voice", "tools"),
+    "/api/confirm": ("pending", "grants"),  # pending is already scoped to the caller's origin
+}
 NODE_API_SUBMIT = frozenset({"/api/ask", "/api/listen", "/api/confirm"})  # also needs "ask"
+# Job kinds refused on /v1/action and /v1/control for every caller, the owner token too (so is
+# "remote"): only in-process callers (the console, the phone server) start them, through
+# Hub.remote_open or Hub.dispatch. No shell or agent holding a credential opens a camera or a fix.
+IN_PROCESS_ONLY = {"camera": "Only the main's console or phone can turn a camera on.",
+                   "locate": "Only the main's console or phone can ask where a computer is."}
 
 
 def _name(node, config):
@@ -200,6 +214,43 @@ class HubRefused(RuntimeError):
         self.status = status
 
 
+class LocalClient:
+    """What a session on the main itself uses in place of a node's Client: the same
+    /v1/remote/* requests, answered in this process by Hub.session_call. A refusal comes back
+    as HubRefused with the status the HTTP route would give (404, 403, 400), so the session
+    ends at once: a bare PermissionError is an OSError, which would read as a lost link."""
+
+    def __init__(self, hub):
+        self.hub, self.main = hub, hub.main
+
+    def request(self, path, body=None, timeout=45):
+        try:
+            return self.hub.session_call(self.hub.main, path, {} if body is None else body)
+        except PermissionError as exc:
+            raise HubRefused(f"Main PC refused the request: {exc}", 403) from None
+        except LookupError as exc:
+            raise HubRefused(f"Main PC refused the request: {exc}", 404) from None
+        except (ValueError, TypeError) as exc:
+            raise HubRefused(f"Main PC refused the request: {exc}", 400) from None
+
+
+def _screen_here(state):
+    """(ok, why): can a session drive this computer's own screen now?"""
+    from .control import _stopped
+    if _stopped(state):
+        return False, "Desktop control is stopped on this computer (jarvis control resume)."
+    try:
+        from . import control, platforms
+        if platforms.detect()["os"] == "macos":
+            return False, "Remote control isn't built for macOS computers yet."
+        control.backend()  # LookupError when this desktop has no injector
+    except LookupError as exc:
+        return False, f"Remote control can't run on this computer: {exc}"
+    from .remote_view import desktop_problem
+    problem = desktop_problem()
+    return (False, problem) if problem else (True, None)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None  # credentials must never follow redirects
@@ -333,6 +384,25 @@ def node_api(path, post, caps):
         raise PermissionError(f"Nodes can't use {path} on the main PC.")
 
 
+def node_job(console, node, path):
+    """A node may poll only jobs its own requests started (submit() stamps origin_device); a
+    plan run, another node's job or the main's own turn holds text the node never sent."""
+    try:
+        job = console.job(path.rsplit("/", 1)[-1])
+    except LookupError:
+        job = None
+    if not job or job.get("origin_device") != node:
+        raise PermissionError(f"Nodes can't use {path} on the main PC.")
+
+
+def node_fields(path, body):
+    """Cut a node's copy of a route down to NODE_API_FIELDS (nothing nested is kept by name)."""
+    keep = NODE_API_FIELDS.get(path)
+    if keep is None or not isinstance(body, dict):
+        return body
+    return {key: body[key] for key in keep if key in body}
+
+
 def validate_action(kind, payload):
     if not isinstance(payload, dict):
         raise ValueError("Node payload must be an object.")
@@ -353,6 +423,12 @@ def validate_action(kind, payload):
         validate(payload)
     elif kind == "remote":  # David's remote-control session (remote_view.py)
         from .remote_view import validate
+        validate(payload)
+    elif kind == "camera":  # a live webcam view for David's phone or console (camera.py)
+        from .camera import validate
+        validate(payload)
+    elif kind == "locate":  # where this computer is (locate.py)
+        from .locate import validate
         validate(payload)
     elif kind != "inventory":
         raise ValueError("Nodes execute only desktop, inventory, or Grokbot operations, and file transfers.")
@@ -376,6 +452,12 @@ def execute_local(kind, payload, config, state):
     if kind == "remote":
         from .remote_view import run
         return run(payload, config, state)
+    if kind == "camera":
+        from .camera import run
+        return run(payload, config, state)
+    if kind == "locate":
+        from .locate import run_here
+        return run_here(payload, config, state)
     from .grokbot import Grokbot
     return Grokbot(config, state).send(payload["text"], device=identity(config)[0])
 
@@ -402,6 +484,9 @@ class Hub:
             pause = ControllerPause(state).set  # David's input stays here while he drives a node
         self.remote = Sessions(on_busy=pause)  # David's remote-control sessions, in memory only
         self._pause = pause  # its leftover-pause recovery waits for start(): only the lock holder may
+        # Sessions whose target is the main itself (run in this process): id -> kind. Tracked
+        # here, not read from remote_view._ACTIVE, which is per process, not per hub.
+        self._here, self._here_lock = {}, threading.Lock()
 
     def redeem(self, node, public_key=None, token=None):
         """A newly joined node trades its invite for its own credential: a fresh hub token
@@ -528,6 +613,8 @@ class Hub:
         if node == self.main:
             if kind == "remote":
                 raise ValueError("Remote control is for another computer, not the main itself.")
+            if kind == "camera":  # the main's own camera runs through remote_open(allow_main=True)
+                raise ValueError("The main's camera opens through its own session, not a job.")
             return execute_local(kind, payload, self.config, self.state)
         status = next((n for n in self.broker.nodes() if n["id"] == node), None)
         capability = ("files" if kind in ("storage", "transfer") else
@@ -572,17 +659,26 @@ class Hub:
                 self._condition.wait(remaining)
         raise RuntimeError(f"Main stopped while waiting for {job_id}; action outcome is uncertain.")
 
-    def remote_open(self, node, quality="medium"):
-        """Open a remote-control session on `node` for the console: register it, then hand
-        the node its signed start job. The node answers at once and streams on its own."""
-        if node == self.main or node not in self.config.get("devices", {}):
+    def remote_open(self, node, quality="medium", *, kind="screen", opener="console", allow_main=False):
+        """Open a session on `node`: register it, then hand the node its signed start job (a
+        `remote` job for kind "screen", a `camera` job for "camera"). The node answers at once
+        and streams on its own. opener: "console" or "phone:<id>" (a phone's screen session
+        makes the target show a notification). allow_main=True (the phone server only): the
+        main itself may be the target, run in this process (_open_here)."""
+        if node not in self.config.get("devices", {}) or (node == self.main and not allow_main):
             raise ValueError("Pick one of your other computers.")
-        session = self.remote.open(node, quality, pending=True)
+        if kind not in ("screen", "camera"):
+            raise ValueError("Session kind must be screen or camera.")
+        if node == self.main:
+            return self._open_here(quality, kind, opener)
+        session = self.remote.open(node, quality, pending=True, kind=kind, opener=opener)
         # key: the session's secret, only ever in this signed job; the node checks every reply's MAC
         payload = {"op": "start", "session": session["id"], "quality": quality,
                    "key": self.remote.key(session["id"])}
+        if kind == "screen" and opener != "console":
+            payload["by"] = "phone"
         try:
-            result = self.dispatch(node, "remote", payload, timeout=20)
+            result = self.dispatch(node, "remote" if kind == "screen" else "camera", payload, timeout=20)
         except TimeoutError:  # dispatch's own text is about jobs; the session is closed, so retry is right
             why = (f"{_name(node, self.config)} didn't answer within 20 s. "
                    "Check it's awake, then press Connect again.")
@@ -601,9 +697,168 @@ class Hub:
             raise RuntimeError(why)
         return self.remote.get(session["id"])
 
-    def remote_close(self, session_id):
-        """End a session here at once; the node hears it on its next frame or input poll."""
-        return self.remote.close(session_id, "Disconnected.")
+    def remote_close(self, session_id, opener=None):
+        """End a session here at once; the node hears it on its next frame or input poll.
+        opener: only a session that opener opened (another's reads as unknown); None: any."""
+        return self.remote.close(session_id, "Disconnected.", opener=opener)
+
+    def _open_here(self, quality, kind, opener):
+        """A session on the main itself: the same code a node runs, in this process, talking to
+        this hub through LocalClient. The hub's ControllerPause owns the main's Lan Mouse, so
+        the screen session leaves it alone (lan_mouse=False)."""
+        session = self.remote.open(self.main, quality, pending=True, kind=kind, opener=opener)
+        sid = session["id"]
+        payload = {"op": "start", "session": sid, "quality": quality, "key": self.remote.key(sid)}
+        self._prune_here()
+        with self._here_lock:
+            self._here[sid] = kind
+        try:
+            if kind == "screen":
+                from . import remote_view
+                if opener != "console":
+                    payload["by"] = "phone"
+                result = remote_view.run(payload, self.config, self.state, client=LocalClient(self),
+                                         lan_mouse=False)
+            else:
+                from . import camera
+                result = camera.run(payload, self.config, self.state, client=LocalClient(self))
+        except Exception as exc:
+            with self._here_lock:
+                self._here.pop(sid, None)
+            self.remote.close(sid, str(exc)[:300] or "The session didn't start.")
+            raise
+        try:
+            self.remote.touch(sid)  # the opener waited on this request: it's watching
+        except LookupError:
+            pass
+        if not (result or {}).get("ok"):
+            with self._here_lock:
+                self._here.pop(sid, None)
+            why = (result or {}).get("text") or "This computer didn't start the session."
+            self.remote.close(sid, why)
+            raise RuntimeError(why)
+        return self.remote.get(sid)
+
+    def _local_session(self, sid, kind):
+        from . import camera, remote_view
+        if kind != "screen":
+            return camera._ACTIVE.get(sid)
+        # an ended session still retrying refused ups counts: shutdown must let go of them
+        return remote_view._ACTIVE.get(sid) or remote_view._LATE.get(sid)
+
+    def _prune_here(self):
+        with self._here_lock:
+            for sid, kind in list(self._here.items()):
+                if self._local_session(sid, kind) is None:
+                    self._here.pop(sid, None)
+
+    def _end_here(self, why, wait=3):
+        """End every session whose target is the main itself, here and now: keys and buttons
+        come up and ffmpeg stops before the hub goes (a node would hear it on its next poll;
+        the main's own sessions die with this process, so they can't wait for one)."""
+        with self._here_lock:
+            here, self._here = dict(self._here), {}
+        sessions = [s for s in (self._local_session(sid, kind) for sid, kind in here.items()) if s is not None]
+        for session in sessions:
+            session.end(why)
+        for sid in here:
+            try:
+                self.remote.close(sid, why)  # wakes a held input poll at once
+            except (LookupError, ValueError):
+                pass
+        for session in sessions:
+            session.join(wait)
+
+    def session_frame(self, session_id, after, opener):
+        """The opener's newest frame past `after`: (seq, jpeg, width, height), or None when none
+        came within the hold. Raises remote_view.Ended (gone), LookupError (unknown, or another
+        opener's)."""
+        return self.remote.wait_frame(session_id, after, opener=opener)
+
+    def session_input(self, session_id, events, opener):
+        """Queue the opener's input events; returns how many were queued. remote_view.WrongKind
+        (a ValueError) for a camera session, LookupError for another opener's."""
+        return self.remote.push(session_id, events, opener=opener)
+
+    def sessions(self, opener):
+        """Views of every session `opener` opened that the hub still knows (ended ones say why)."""
+        return self.remote.views(opener)
+
+    def session_view(self, session_id, opener):
+        """One of the opener's sessions (LookupError for another opener's)."""
+        return self.remote.get(session_id, opener=opener)
+
+    def session_node_ago(self, session_id, opener=None):
+        """Seconds since the target last sent a frame or keep-alive (for a 204's X-Node-Ago)."""
+        return self.remote.node_ago(session_id, opener=opener)
+
+    def end_opener(self, opener, why="That phone was signed out, so its sessions ended."):
+        """End every live session one opener opened (a phone revoked or logged out)."""
+        return self.remote.end_opener(opener, why)
+
+    def target_caps(self, device_id):
+        """What a session can do with one computer now: {"remote", "camera", "locate"} ->
+        (ok, why). The main has no capability row: remote needs its desktop backend, camera its
+        own consent, ffmpeg and a camera, and locate is always on. A node must be paired, online,
+        on the main's code and enrolled for the capability (desktop/camera/locate); its own
+        camera consent is only known when a start asks it."""
+        def every(ok, why):
+            return {k: (ok, why) for k in ("remote", "camera", "locate")}
+        if device_id not in self.config.get("devices", {}):
+            return every(False, "Unknown computer.")
+        if device_id == self.main:
+            from . import camera
+            try:
+                cam = camera.ready(self.config, self.state)
+            except Exception as exc:  # one broken probe must not blank the device list
+                cam = (False, f"Couldn't check the camera: {exc}")
+            return {"remote": _screen_here(self.state), "camera": cam, "locate": (True, None)}
+        status = next((n for n in self.broker.nodes() if n["id"] == device_id), None)
+        if status is None:
+            return every(False, f"Not paired with this computer (jarvis cluster invite {device_id}).")
+        if not (status.get("online") or self.alive(device_id, status)):
+            return every(False, "Offline: start JARVIS on it and check its link (jarvis cluster doctor).")
+        if status.get("code") != served_code(self.state):
+            return every(False, f"Runs older JARVIS code. Run: jarvis cluster update {device_id}")
+        caps = set(status.get("capabilities") or ())
+        grant = (f" Grant it on the main: jarvis cluster caps {device_id} --capability ... (list every "
+                 "capability it should keep; the command replaces the set).")
+        return {"remote": (True, None) if "desktop" in caps else (False, "Not enrolled for desktop actions." + grant),
+                "camera": (True, None) if "camera" in caps else (False, "Not enrolled for the camera." + grant),
+                "locate": (True, None) if "locate" in caps else (False, "Not enrolled for locate." + grant)}
+
+    def session_call(self, node, path, data, caps=None):
+        """A computer's request about its own live session: /v1/remote/frame (a frame, a
+        keep-alive, or {"end": why}) or /v1/remote/input (its input poll). Answered here for both
+        callers: the HTTP handler (a node; caps = its capabilities) and LocalClient (the main
+        itself; caps None, it has no capability row). The capability must fit the session's
+        kind: desktop for a screen session, camera for a camera session."""
+        import base64
+        if not isinstance(data, dict):
+            raise ValueError("Cluster body must be an object.")
+        sid = data.get("session")
+        if caps is not None:
+            if not caps & {"desktop", "camera"}:
+                raise PermissionError("This node isn't enrolled for desktop actions.")
+            if self.remote.kind(node, sid) == "camera":
+                if "camera" not in caps:
+                    raise PermissionError("This node isn't enrolled for the camera.")
+            elif "desktop" not in caps:
+                raise PermissionError("This node isn't enrolled for desktop actions.")
+        if path == "/v1/remote/frame" and data.get("end") is not None:
+            return self.remote.node_end(node, sid, data["end"])
+        if path == "/v1/remote/input":
+            return self.remote.seal(sid, "input", self.remote.take_input(
+                node, sid, data.get("after", 0), stop_event=self.stop_event))
+        if path != "/v1/remote/frame":
+            raise LookupError("Unknown session endpoint.")
+        jpeg = None
+        if data.get("jpeg") is not None:
+            if not isinstance(data["jpeg"], str):
+                raise ValueError("Frame must be base64 text.")
+            jpeg = base64.b64decode(data["jpeg"], validate=True)
+        return self.remote.seal(sid, "frame", self.remote.frame(
+            node, sid, jpeg, data.get("width"), data.get("height")))
 
     def _asks(self):
         while not self.stop_event.is_set():
@@ -678,6 +933,11 @@ class Hub:
             # A pause the last hub left behind (crash, restart) ends now. Only after the lock:
             # a second hub that is about to fail must not adopt and end a live session's pause.
             self._pause(False)
+        try:  # the last main process died mid-session on this computer itself: let go of its keys
+            from .remote_view import recover
+            recover(self.state)
+        except Exception as exc:  # never keeps the hub down
+            print(f"JARVIS: remote-control recovery: {exc}", flush=True)
         _refresh_clipboard(self.state, self.config)  # the hub restarts with every code change here
         try:
             self.server = make_server(self, host, port)
@@ -710,6 +970,8 @@ class Hub:
         return self
 
     def close(self):
+        if getattr(self, "_here", None):  # first: the main's own sessions let go while the hub answers
+            self._end_here("JARVIS on the main stopped.")
         self.stop_event.set()
         self.remote.close_all("JARVIS on the main stopped.")  # nodes let go on their next poll
         with self._condition:
@@ -748,12 +1010,25 @@ def make_server(hub, host, port):
         def do_POST(self):
             self._request(True)
 
+        _node_path = None
+
+        def _send(self, status, body, *args, **kwargs):
+            # A node's answer: top-level fields only (see NODE_API_FIELDS); errors pass through.
+            if self._node_path and status == 200 and isinstance(body, dict):
+                body = node_fields(self._node_path, body)
+            return super()._send(status, body, *args, **kwargs)
+
         def _request(self, post):
             try:
+                self._node_path = None  # one handler serves a whole keep-alive connection
                 if self.path.startswith("/api/"):
                     self.node_id, caps = hub.authenticate(self.headers, "console")
                     if "owner" not in caps:
-                        node_api(urlparse(self.path).path, post, caps)
+                        path = urlparse(self.path).path
+                        node_api(path, post, caps)
+                        if not post and path.startswith("/api/jobs/"):
+                            node_job(hub.console, self.node_id, path)
+                        self._node_path = None if post else path
                     with request_from(self.node_id):
                         return Handler.do_POST(self) if post else Handler.do_GET(self)
                 node, caps = hub.authenticate(self.headers)
@@ -795,7 +1070,7 @@ def make_server(hub, host, port):
                     return self._send(200, hub.redeem(node, data.get("public_key"), data.get("token")))
                 if self.path == "/v1/poll" and "owner" not in caps:
                     hub.broker.heartbeat(node, data)
-                    kinds = caps & {"desktop", "inventory", "grokbot"}
+                    kinds = caps & {"desktop", "inventory", "grokbot", "camera", "locate"}
                     if "desktop" in caps:
                         kinds |= {"remote"}
                     if "files" in caps:
@@ -831,22 +1106,9 @@ def make_server(hub, host, port):
                     return self._send(200, {"job": job, "main_device": hub.main,
                                              "code": served_code(hub.state)})
                 if self.path in ("/v1/remote/frame", "/v1/remote/input") and "owner" not in caps:
-                    if "desktop" not in caps:
+                    if not caps & {"desktop", "camera"}:  # before any session lookup: no id oracle
                         raise PermissionError("This node isn't enrolled for desktop actions.")
-                    sid = data.get("session")
-                    if self.path == "/v1/remote/frame" and data.get("end") is not None:
-                        return self._send(200, hub.remote.node_end(node, sid, data["end"]))
-                    if self.path == "/v1/remote/input":
-                        return self._send(200, hub.remote.seal(sid, "input", hub.remote.take_input(
-                            node, sid, data.get("after", 0), stop_event=hub.stop_event)))
-                    jpeg = None
-                    if data.get("jpeg") is not None:
-                        import base64
-                        if not isinstance(data["jpeg"], str):
-                            raise ValueError("Frame must be base64 text.")
-                        jpeg = base64.b64decode(data["jpeg"], validate=True)
-                    return self._send(200, hub.remote.seal(sid, "frame", hub.remote.frame(
-                        node, sid, jpeg, data.get("width"), data.get("height"))))
+                    return self._send(200, hub.session_call(node, self.path, data, caps))
                 if self.path == "/v1/result" and "owner" not in caps:
                     with hub._condition:
                         hub.broker.finish(data.get("id"), node, data.get("result"), bool(data.get("failed")))
@@ -859,6 +1121,13 @@ def make_server(hub, host, port):
                         # (jarvis send / clipboard sync), but nothing else.
                         (self.path == "/v1/control" and "files" in caps and
                          data.get("kind") == "transfer" and data.get("node") == hub.main)):
+                    # Sessions and locating start only in-process (the console and the phone
+                    # server call the hub directly): never over HTTP, not even with the owner token.
+                    kind = data.get("kind")
+                    if kind == "remote":
+                        raise PermissionError("Only the main's console can start remote control.")
+                    if kind in ("camera", "locate"):
+                        raise PermissionError(IN_PROCESS_ONLY[kind])
                     if self.path == "/v1/control" and "owner" not in caps:
                         # A node is never the owner: it may not run things on the main (only
                         # hand it a transfer) nor start a shell anywhere.
@@ -868,8 +1137,6 @@ def make_server(hub, host, port):
                         if (data.get("kind") == "desktop" and isinstance(payload, dict)
                                 and payload.get("action") == "terminal"):
                             raise PermissionError("Nodes can't run terminal commands.")
-                        if data.get("kind") == "remote":
-                            raise PermissionError("Only the main's console can start remote control.")
                     timeout = data.get("timeout", 45)
                     if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 1800:
                         raise ValueError("Action timeout must be 1-1800 seconds.")
@@ -1047,12 +1314,19 @@ class NodeWorker:
             else:
                 self._send_result(note["message"])
                 self._record(results_resent=1)
+        body = {"hostname": platform.node(),
+                "platform": platform.system(), "version": __version__,
+                "code": self.code, "pulls": "yes" if self._can_pull() else "no",
+                "speaks": self._speaks()}
         try:
-            response = self.client.request("/v1/poll", {"hostname": platform.node(),
-                                "platform": platform.system(), "version": __version__,
-                                "code": self.code, "pulls": "yes" if self._can_pull() else "no",
-                                "speaks": self._speaks()},
-                                timeout=POLL_WAIT + 10)
+            from .hostmeter import cached_sample
+            reading = cached_sample()
+            if isinstance(reading, dict):
+                body["meters"] = reading
+        except Exception:
+            pass  # a meter failure must not stop the node from polling
+        try:
+            response = self.client.request("/v1/poll", body, timeout=POLL_WAIT + 10)
         except (OSError, ValueError, RuntimeError) as exc:
             self._record(polls_failed=1, outages=0 if self._down else 1,
                          last_error=f"{time.strftime('%H:%M:%S')} {exc}"[:300])
@@ -1228,7 +1502,11 @@ class NodeWorker:
                     self._poll_loop()
                 finally:
                     from .remote_view import end_all
-                    end_all()  # a restart or stop never leaves David's keys held down
+                    try:
+                        end_all()  # a restart or stop never leaves David's keys held down
+                    finally:
+                        from .camera import end_all as end_cameras
+                        end_cameras()  # nor the camera on: ffmpeg stops with the agent
         if self.restarting:
             self.respawn()
 

@@ -138,6 +138,16 @@ def _tree_lines(node, app, depth=0, out=None):
     return out
 
 
+def _has_controls(node):
+    if not isinstance(node, dict) or "hidden" in (node.get("states") or []):
+        return False
+    roles = {"button", "textfield", "textbox", "entry", "searchbox", "link", "hyperlink",
+             "menuitem", "tab", "slider", "checkbox", "combobox", "listitem", "row"}
+    if node.get("ref_id") and str(node.get("role") or "").lower() in roles and "disabled" not in (node.get("states") or []):
+        return True
+    return any(_has_controls(child) for child in node.get("children") or [])
+
+
 def _clip(lines, more):
     text, kept = "", 0
     for line in lines:
@@ -265,11 +275,31 @@ def act(spec, state=None, config=None, cli=None, ask=None):
             args = ["snapshot", "--app", app, "-i", "--compact"]
             if spec.get("root"):
                 args += ["--root", str(spec["root"])]
-            env = cli(args)
+            # Spotify can create its window several seconds before its controls.
+            # Poll only transient startup states, never repeat a modifying action.
+            wait = spec.get("wait_ready", 10 if "spotify" in app.casefold() else 0)
+            if isinstance(wait, bool) or not isinstance(wait, (int, float)) or not 0 <= wait <= 15:
+                raise ValueError("wait_ready must be between 0 and 15 seconds")
+            deadline = time.monotonic() + wait
+            while True:
+                _check(state, action, spec, config)
+                remaining = deadline - time.monotonic()
+                env = (_cli(args, timeout=max(1, min(TIMEOUT, remaining)))
+                       if cli is _cli and wait else cli(args))
+                data = env.get("data") or {}
+                lines = _tree_lines(data.get("tree") or {}, app) if env.get("ok") else []
+                error = env.get("error") or {}
+                transient = env.get("ok") or (isinstance(error, dict) and error.get("code") in
+                                               ("APP_NOT_FOUND", "WINDOW_NOT_FOUND", "NO_WINDOW"))
+                remaining = deadline - time.monotonic()
+                ready = _has_controls(data.get("tree") or {}) if wait else bool(lines)
+                if ready or not transient or remaining <= 0 or spec.get("root"):
+                    break
+                time.sleep(min(0.5, remaining))
             if not env.get("ok"):
                 return False, _error(env)
-            data = env.get("data") or {}
-            lines = _tree_lines(data.get("tree") or {}, app)
+            if wait and not ready and not spec.get("root"):
+                return False, f"{app} is still loading: no enabled interactive controls appeared within {wait:g} seconds. Retry snapshot before trying input."
             _log(state, {"action": action, "app": app, "lines": len(lines)})
             return True, _clip(lines, "Snapshot a region with root=<ref>, or use find.") or \
                 "No interactive elements visible."

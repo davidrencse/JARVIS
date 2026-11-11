@@ -22,11 +22,60 @@ class _Body:
         return block
 
 
+STOP_GRACE = 15.0  # s a SIGTERM'd main gets to close its runtime before it is cut off
+
+
+def close_on_sigterm():
+    """systemd stops jarvis-cluster (so does `jarvis sleep`) with SIGTERM, whose default action
+    skips every `finally`: Runtime.close never ran, and keys or buttons a phone session on the
+    main held stayed down until the next start. Raise SystemExit instead, so serve()'s finally
+    closes the runtime. A close that hangs is cut off after STOP_GRACE, as SIGTERM used to cut
+    it at once. Returns what puts the default back, or None when nothing was set (not the main
+    thread, or a handler someone else set)."""
+    import os
+    import signal
+    import sys
+    import threading
+
+    def stop(*_):
+        timer = threading.Timer(STOP_GRACE, os._exit, args=(0,))
+        timer.daemon = True
+        timer.start()
+        sys.exit(0)
+
+    try:
+        if signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL:
+            return None
+        signal.signal(signal.SIGTERM, stop)
+    except (ValueError, OSError, AttributeError):
+        return None
+
+    def restore():
+        try:
+            if signal.getsignal(signal.SIGTERM) is stop:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
+    return restore
+
+
 class Runtime:
-    def __init__(self, console=None, hub=None, worker=None):
-        self.console, self.hub, self.worker = console, hub, worker
+    def __init__(self, console=None, hub=None, worker=None, phone=None):
+        self.console, self.hub, self.worker, self.phone = console, hub, worker, phone
+        self.untrap = None  # close_on_sigterm's undo, on the main
 
     def close(self):
+        # Closing already: a second SIGTERM ends the process at once, as it always did.
+        if self.untrap:
+            self.untrap()
+            self.untrap = None
+        # The phone server first: no phone request may arrive while the hub is going away.
+        if self.phone:
+            try:
+                self.phone.close()
+            except Exception:
+                pass
+            self.phone = None
         if self.worker:
             self.worker.close()
         if self.hub:
@@ -204,7 +253,15 @@ def local_server(config, base, state, port, overlay=None):
             console.overlay = overlay
         handler = type("MainConsoleHandler", (Handler,), {
             "console": console, "hosts": ("127.0.0.1", "localhost", "::1")})
-        return ConsoleServer(("127.0.0.1", port), handler), runtime
+        server = ConsoleServer(("127.0.0.1", port), handler)
+        # Only here, next to the in-process hub: the phone app needs it. Off or unable to
+        # bind, phone.start says so in the log and returns None; the console comes up anyway.
+        from . import phone
+        runtime.phone = phone.start(config, state, console=console, hub=hub)
+        # A systemd stop then runs Runtime.close too, not only Ctrl+C: the hub lets go of the
+        # main's own sessions first.
+        runtime.untrap = close_on_sigterm()
+        return server, runtime
     except BaseException:
         runtime.close()
         raise

@@ -1,5 +1,6 @@
 """Explicit setup, pairing, revocation and startup for the main/node topology."""
 
+import hashlib
 import json
 import re
 import subprocess
@@ -49,20 +50,39 @@ def roles(config):
                         for key, device in (config.get("devices") or {}).items()}}
 
 
-def set_main(config, path, device):
-    """Make one configured machine the main; every other machine becomes a node."""
-    devices = config.get("devices") or {}
+def _known_device(devices, device):
     if not device:
         raise ValueError("Usage: jarvis cluster main DEVICE_ID  (one of: " + ", ".join(devices) + ")")
     if device not in devices:
         raise ValueError(f"No device '{device}'. Configured: {', '.join(devices)}.")
-    proposed = {**config, "cluster": {**(config.get("cluster") or {}), "main_device": device}}
-    save_json(path, proposed)
+
+
+def _main_saved(proposed):
     return {**roles(proposed), "next": "Copy this jarvis.config.json to every machine (or "
             "commit it), restart `jarvis cluster run` on the new main and `jarvis cluster node` "
             "on the others, and restart the voice listener on both (`jarvis voice stop` then "
             "`jarvis voice start`, or `systemctl --user restart jarvis-voice`) so only the new "
             "main talks. See docs/architecture-guide.md#main-and-nodes."}
+
+
+def set_main(config, path, device, state=None):
+    """Make one configured machine the main; every other machine becomes a node.
+
+    The write takes the managed config lock (config_lock, `<state>/fleet-manage.lock`) and
+    sets only cluster.main_device on the config file as it is on disk, so a device entry an
+    invite just wrote, or any other edit, is kept. `config` is used only when there is no file.
+    state defaults to `.jarvis` next to the config. The lock is local: it is not a lease and
+    it does not fence the old main."""
+    from .config_lock import patch_config
+    state = Path(state) if state is not None else Path(path).resolve().parent / ".jarvis"
+
+    def change(doc):
+        if not doc:
+            doc.update(json.loads(json.dumps(config)))
+        _known_device(doc.get("devices") or {}, device)
+        doc.setdefault("cluster", {})["main_device"] = device
+    proposed, _ = patch_config(state, path, change, backup="cluster-main", create=True)
+    return _main_saved(proposed)
 
 
 def run(args, config, base):
@@ -75,7 +95,7 @@ def run(args, config, base):
     if action == "roles":
         return roles(config)
     if action == "main":
-        return set_main(config, path, args.value)
+        return set_main(config, path, args.value, state=state)
     if action == "configure":
         settings = dict(config.get("cluster", {}))
         settings.update(enabled=True,
@@ -86,7 +106,13 @@ def run(args, config, base):
         # auto can be used in a shared checkout, but explicit IDs are recommended for nodes.
         local, main = identity(proposed)
         endpoint(proposed)
-        save_json(path, proposed)
+        from .config_lock import save_delta
+
+        def valid(doc):
+            identity(doc)
+            endpoint(doc)
+        proposed, _ = save_delta(state, path, config, proposed, guard=valid, backup="cluster-configure")
+        local, main = identity(proposed)
         return {"configured": True, "local_device": local, "main_device": main,
                 "role": "main" if local == main else "node", "main_url": endpoint(proposed)}
     if action == "init":
@@ -137,7 +163,8 @@ def run(args, config, base):
             raise ValueError("The pairing bundle has no code-signing key; enroll again on the updated main.")
         save_json(state / "cluster-node.json", {"node_id": note["node_id"],
                   "main_device": note["main_device"], "token": token, "code_key": key})
-        save_json(path, proposed)
+        from .config_lock import save_delta
+        save_delta(state, path, config, proposed, backup="cluster-join")
         return {"joined": note["node_id"], "main_device": note["main_device"],
                 "main_url": endpoint(proposed), "next": "jarvis cluster node"}
     if not enabled(config):
@@ -206,20 +233,50 @@ def run(args, config, base):
         output = Path(args.output).expanduser()
         if output.exists():
             raise ValueError("Pairing output already exists; choose a new filename.")
+        # Same receipt file as the console. This id only; a different id is not blocked.
+        from .fleet_management import assert_node_admitted, note_uncertain_attempt
+        assert_node_admitted(state, node)
+        # Signing material before any token or job change. A failure here leaves both alone.
+        signing = code_key(state)
         devices = dict(config.get("devices", {}))
         if node not in devices:
             if not args.hostname:
                 raise ValueError("A new node needs --hostname HOSTNAME.")
             devices[node] = {"hostname": args.hostname, "label": node}
-            config = {**config, "devices": devices}
-            save_json(path, config)
+            from .config_lock import save_delta
+            config, _ = save_delta(state, path, config, {**config, "devices": devices},
+                                   backup="cluster-enroll")
+            devices = dict(config.get("devices", {}))
+            _local, main = identity(config)
         caps = args.capability or sorted(NODE_DEFAULT)
-        token = Broker(state).enroll(node, caps)
         safe = {name: {k: device[k] for k in ("hostname", "label", "aliases") if k in device}
                 for name, device in devices.items()}
-        save_json(output, {"node_id": node, "main_device": main, "main_url": endpoint(config),
-                           "token": token, "capabilities": caps, "devices": safe,
-                           "code_key": code_key(state)})
+        bundle = {"node_id": node, "main_device": main, "main_url": endpoint(config),
+                  "capabilities": caps, "devices": safe, "code_key": signing}
+        from .cluster_setup import _node_snapshot, _restore_node
+        prior = _node_snapshot(state, node)
+        token = Broker(state).enroll(node, caps, settle_jobs=False)
+        bundle["token"] = token
+        try:
+            save_json(output, bundle)
+        except Exception as exc:
+            attempt = hashlib.sha256(token.encode()).hexdigest()
+            if _restore_node(state, node, prior, attempt):
+                output.unlink(missing_ok=True)
+                raise
+            try:
+                note_uncertain_attempt(state, node)
+            except (OSError, ValueError):
+                pass
+            raise ValueError(
+                "Enrollment stopped after a credential change and the cleanup could not be verified. "
+                "It was not atomic. Revoke the node to reconcile it, then enroll again.") from exc
+        # The file holds the new token. Only now are running jobs uncertain. A job that
+        # finished during the write stays done. Best effort: the old token is already dead.
+        try:
+            Broker(state).settle_rotated(node)
+        except Exception:  # noqa: BLE001 - the pairing file is the credential
+            pass
         return {"enrolled": node, "capabilities": caps, "pairing_file": str(output),
                 "next": "Copy this private bundle to the node and run jarvis cluster join FILE."}
     if action == "autostart":

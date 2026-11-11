@@ -244,11 +244,15 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                 # then part of the request happened, and the reply must say so
                 detail = {"lane_error": str(exc)}
                 step("brain", "route", lane_label(lane, text), str(exc), "fail")
-                ran = list(getattr(exc, "tool_log", None) if hasattr(exc, "tool_log")
-                           else getattr(lane, "tool_log", None) or ())
-                if ran:
-                    reply = _partial_reply(ran)
-                    detail.update(state="partial", tools=[[str(t[0]), bool(t[1])] for t in ran])
+                ran = list(exc.tool_log or ()) if hasattr(exc, "tool_log") else _request_tools(lane)
+                # Tools that STARTED but never reported back (Failover records them): the
+                # effect may or may not have happened, so no replay and no claim either way.
+                started = [str(n) for n in (getattr(exc, "tool_unfinished", None) or ())]
+                if ran or started:
+                    reply = _partial_reply(ran, started)
+                    detail.update(state="partial",
+                                  tools=[[str(t[0]), bool(t[1])] for t in ran]
+                                  + [[n, None] for n in started])
                 elif getattr(exc, "spoken", False):
                     # Failover already let part of an answer be heard: answering again
                     # (stand-in or one-shot) would repeat it.
@@ -323,7 +327,8 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
                     origin = ORIGIN.get() or Remote(config, memory.path.parent).here()
                     command = {"id": "c1", "intent": "agent_task", "device": origin,
                                "args": {"text": prepared.get("task") or text}, "depends_on": []}
-                    item = ConfirmQueue(memory.path.parent).park(command, origin, channel)
+                    from .topology import confirmation_station
+                    item = ConfirmQueue(memory.path.parent).park(command, confirmation_station(origin), channel)
                     prepared = {**prepared, "decision": "confirm", "reply": prompt(item)}
                     detail["confirmations"] = [item]
                     result = None
@@ -502,9 +507,10 @@ def _direct_reply(provider, text, recall, config, base, timeout, detail):
             lane.close()
 
 
-def _partial_reply(tool_log):
+def _partial_reply(tool_log, started=()):
     """The brain failed after some tools ran: say what did and didn't happen, instead of
-    claiming nothing was done (a retry would run the done ones again)."""
+    claiming nothing was done (a retry would run the done ones again). `started` are calls
+    that began but never reported back: whether they took effect is unknown."""
     done = [str(t[0]) for t in tool_log if t[1]]
     failed = [str(t[0]) for t in tool_log if not t[1]]
     parts = []
@@ -512,6 +518,9 @@ def _partial_reply(tool_log):
         parts.append(f"{', '.join(dict.fromkeys(done))} ran")
     if failed:
         parts.append(f"{', '.join(dict.fromkeys(failed))} failed")
+    if started:
+        parts.append(f"{', '.join(dict.fromkeys(started))} started but I never saw it finish, "
+                     "so I can't tell whether it happened")
     return (f"I only got partway: {' and '.join(parts)}, then the brain stopped before "
             "finishing. Check the result before asking again, so nothing runs twice.")
 
@@ -629,7 +638,7 @@ def _interpret(text, memory, config, base, channel, on_start, on_sentence, on_st
         lessons = memory.context(text, limit=2, max_chars=600, kinds=("lesson",))
     except Exception:
         lessons = []
-    read = interpret(text, config, base, origin, lessons=lessons)
+    read = interpret(text, config, base, origin, lessons=lessons, recent=_recent_turns(memory, text))
     if read is None:
         return None
     if read["mode"] == "act":
@@ -647,6 +656,18 @@ def _interpret(text, memory, config, base, channel, on_start, on_sentence, on_st
         return _direct_turn(text, memory, channel, on_start, on_sentence, on_step, ask_back,
                             lane="interpreter", reason="interpreter: needs a detail")
     return read["mode"]
+
+
+def _recent_turns(memory, text, minutes=10, limit=6):
+    """The last few turns from every channel, oldest first, for the interpreter to resolve "do
+    that again" or "the dell" against. Never raises; empty when memory has nothing recent."""
+    try:
+        lines = memory.conversation(minutes=minutes, limit=limit + 1)
+    except Exception:
+        return []
+    if lines and lines[-1].startswith("David: ") and lines[-1][7:].strip() == text.strip():
+        lines = lines[:-1]  # this very request, when it was remembered already
+    return lines[-limit:]
 
 
 def _direct_turn(text, memory, channel, on_start, on_sentence, on_step, run, lane, reason):
@@ -789,6 +810,17 @@ def _confirmation_turn(text, memory, config, base, channel, on_start, on_sentenc
             "memory": [inbound["id"], outbound["id"]]}
 
 
+def _request_tools(lane):
+    """Finished tools for this request. turn_log() is that request's snapshot, and an empty
+    list means it finished none. tool_log is only for a lane with no snapshot: it is shared,
+    and the next turn on the lane replaces it."""
+    if hasattr(lane, "turn_log"):
+        snap = lane.turn_log()
+        if snap is not None:
+            return list(snap)
+    return list(getattr(lane, "tool_log", None) or ())
+
+
 def _orchestrated(text, config, base, memory, lane, step, recalled, on_sentence, detail):
     """brain.orchestrate for requests judge() marks as several jobs or hard thinking; None
     (the brain lane answers as before) for the rest, or if the orchestrator itself fails."""
@@ -798,12 +830,32 @@ def _orchestrated(text, config, base, memory, lane, step, recalled, on_sentence,
         return None
     step("judge", "route", "Judge · orchestrate", "; ".join(verdict["reasons"]))
 
+    acted = []  # tools that ran or merely started in a failed step: never to run again below
+
     def run_tools(instruction):
-        return _with_tools(lane, step, lambda: lane.ask(instruction, recalled()))
+        try:
+            reply = _with_tools(lane, step, lambda: lane.ask(instruction, recalled()))
+        except Exception as exc:
+            ran = list(exc.tool_log or ()) if hasattr(exc, "tool_log") else _request_tools(lane)
+            started = [str(n) for n in getattr(exc, "tool_unfinished", None) or ()]
+            acted.append((ran, started))
+            raise
+        else:
+            # A later planner failure must not erase effects from an earlier successful step.
+            # Read the request snapshot, not the shared list the next turn may already own.
+            acted.append((_request_tools(lane), []))
+            return reply
     try:
         out = orchestrate(text, config, base, memory.path.parent, run_tools=run_tools, step=step,
                           recall=recalled())
     except Exception as exc:  # e.g. both providers limited: let the brain lane try
+        ran = [t for log, _ in acted for t in log]
+        started = [n for _, names in acted for n in names]
+        if ran or started:  # ...unless a tool may already have acted: the lane would redo it
+            step("judge", "route", "Judge · orchestrate", f"orchestrator failed: {exc}"[:160], "fail")
+            detail.update(state="partial", tools=[[str(t[0]), bool(t[1])] for t in ran]
+                          + [[n, None] for n in started])
+            return _partial_reply(ran, started)
         step("judge", "route", "Judge · orchestrate", f"orchestrator failed: {exc}"[:160], "fail")
         return None
     detail.update(lane="orchestrator", steps=out["steps"], levels=out["levels"], l3_left=out["l3_left"],

@@ -13,9 +13,11 @@ from pathlib import Path
 
 from .topology import DEVICE_ID
 
-CAPABILITIES = {"desktop", "inventory", "grokbot", "files", "ask", "console"}
+CAPABILITIES = {"desktop", "inventory", "grokbot", "files", "ask", "console", "camera", "locate"}
 # What a new node gets unless more is asked for: work the main sends it. "ask" and
-# "console" let a node drive the main itself, so they are opt-in per node.
+# "console" let a node drive the main itself, so they are opt-in per node. So are "camera"
+# (a live webcam view; the node also needs its own `jarvis camera allow on`) and "locate"
+# (where the computer is): both are about David's privacy, not work the main sends.
 NODE_DEFAULT = frozenset({"desktop", "inventory", "grokbot", "files"})
 TERMINAL = {"done", "failed", "expired", "uncertain"}
 # Job kinds that carry file chunks (transfer.CHUNK raw bytes, base64 in JSON). They may be
@@ -28,6 +30,15 @@ MAX_PAYLOAD, MAX_BULK_PAYLOAD = 65536, 3_000_000
 # runs an action (up to 45 s), so "online" must outlast both, or a busy node looks gone.
 ONLINE = 75
 GRACE = 15  # seconds a running job may report past its deadline before it counts as uncertain
+
+
+def running_ambiguous(deadline, now, grace=GRACE):
+    """True at the instant a running attempt stops counting as busy.
+
+    busy_job keeps the row while ``deadline > now - grace``. The attempt is ambiguous
+    once that instant is reached (``deadline <= now - grace``), including the exact
+    boundary. Callers mark it uncertain and never put it back to pending."""
+    return deadline <= now - grace
 
 
 OWNER_TOKEN = "cluster-owner.token"  # in the state folder; the main's owner credential
@@ -95,9 +106,13 @@ class Broker:
             temp.unlink(missing_ok=True)
         return path.read_text(encoding="ascii").strip()
 
-    def enroll(self, node, capabilities=NODE_DEFAULT, invite_ttl=None):
+    def enroll(self, node, capabilities=NODE_DEFAULT, invite_ttl=None, settle_jobs=True):
         """A fresh credential for `node`. With `invite_ttl` (seconds) it is an invite's:
-        good only until the node redeems it for its own token, and only for that long."""
+        good only until the node redeems it for its own token, and only for that long.
+        settle_jobs=False leaves running jobs alone; the caller must call settle_rotated(node)
+        once the rotation is final. An invite does that after its code exists, and
+        `jarvis cluster enroll` does it after the pairing file is written, so a rolled-back
+        attempt never has jobs to restore. Finished jobs are not updated."""
         if not DEVICE_ID.fullmatch(node):
             raise ValueError("Invalid node ID.")
         caps = set(capabilities)
@@ -111,9 +126,17 @@ class Broker:
                        "invite_expires=excluded.invite_expires",
                        (node, hashlib.sha256(token.encode()).hexdigest(), json.dumps(sorted(caps)),
                         time.time() + invite_ttl if invite_ttl else None))
-            # Rotating credentials never redelivers an action already dispatched.
-            db.execute("UPDATE jobs SET state='uncertain' WHERE node=? AND state='running'", (node,))
+            if settle_jobs:
+                # Rotating credentials never redelivers an action already dispatched.
+                db.execute("UPDATE jobs SET state='uncertain' WHERE node=? AND state='running'", (node,))
         return token
+
+    def settle_rotated(self, node):
+        """After a final credential rotation: a job still running under the old credential is
+        marked uncertain (never redelivered). Finished jobs are never touched."""
+        with self.db() as db:
+            return db.execute("UPDATE jobs SET state='uncertain' WHERE node=? AND state='running'",
+                              (node,)).rowcount
 
     def set_capabilities(self, node, capabilities):
         """Change what an enrolled node may do without rotating its credential."""
@@ -165,7 +188,14 @@ class Broker:
 
     def heartbeat(self, node, info):
         # Never accept agent-provided paths, shell commands, or credentials as config.
+        # `meters` is the only nested object: raw capacities and sizes, checked by hostmeter.accept.
+        info = info if isinstance(info, dict) else {}
         safe = {k: str(info.get(k, ""))[:120] for k in ("hostname", "platform", "version", "code", "pulls", "speaks")}
+        if "meters" in info:
+            from .hostmeter import accept
+            kept = accept(info.get("meters"))
+            if kept is not None:
+                safe["meters"] = kept
         with self.db() as db:
             db.execute("UPDATE nodes SET seen=?,info=? WHERE id=?", (time.time(), json.dumps(safe), node))
 
@@ -182,7 +212,8 @@ class Broker:
 
     def busy_job(self, node, grace=15):
         """The job this node is executing right now, if still inside its deadline plus
-        `grace` seconds (a hung job stops counting as busy). None when idle."""
+        `grace` seconds (a hung job stops counting as busy). None when idle.
+        The cutoff is running_ambiguous: still busy only while deadline > now - grace."""
         with self.db() as db:
             row = db.execute("SELECT id, kind, payload, deadline FROM jobs WHERE node=? AND "
                              "state='running' AND deadline>? ORDER BY created DESC LIMIT 1",
@@ -258,7 +289,13 @@ class Broker:
     def claim(self, node, kinds):
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute("UPDATE jobs SET state='expired' WHERE state='pending' AND deadline<?", (time.time(),))
+            now = time.time()
+            db.execute("UPDATE jobs SET state='expired' WHERE state='pending' AND deadline<?", (now,))
+            # An ambiguous running attempt (deadline + grace already reached) becomes
+            # uncertain before any new row is claimed. Done and uncertain rows are not
+            # updated, so a finished job is never resurrected and an old attempt is never replayed.
+            db.execute("UPDATE jobs SET state='uncertain' WHERE node=? AND state='running' AND deadline<=?",
+                       (node, now - GRACE))
             kinds = sorted(set(kinds))
             if not kinds:
                 return None
@@ -325,9 +362,15 @@ class Broker:
                 raise LookupError("Unknown request.")
             state = row["state"]
             held = self._bulk.get(job_id) if row["kind"] in BULK else None
-            # A running job gets GRACE past its deadline so a result landing just after the
-            # requester gave up is still accepted instead of rejected as "no longer running".
-            late = row["deadline"] + (GRACE if state == "running" else 0) < time.time()
+            # A running job stays acceptable through deadline + grace. At that exact instant
+            # it is ambiguous (the same cutoff as busy_job / claim): uncertain, not replayed.
+            # A pending job is late once its deadline is strictly in the past.
+            if state == "running":
+                late = running_ambiguous(row["deadline"], time.time())
+            elif state == "pending":
+                late = row["deadline"] < time.time()
+            else:
+                late = False
             if state in ("pending", "running") and late:
                 state = "expired" if state == "pending" else "uncertain"
                 # Only if it is still what we read: a result that just landed wins.

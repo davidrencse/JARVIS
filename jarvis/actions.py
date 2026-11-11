@@ -104,7 +104,13 @@ INSTRUCTIONS = (
     "he names one (Arch, ASUS, Linux, Dell, Windows, the other laptop), pass it. open_page "
     "opens JARVIS's own console pages; media and "
     "volume control what is playing. Never say you can't control a laptop: use the tools "
-    "and report what they returned. Your tools are always connected in this conversation: "
+    "and report what they returned. Launch native applications with open_app, never a browser. "
+    "For native app tasks prefer their native tools and app_ui; use computer screenshots, "
+    "keyboard shortcuts and mouse when needed. computer uses the target PC's own backend: "
+    "Hyprland shortcuts on Arch, Windows keys on Dell. Inspect the actual desktop/config "
+    "before choosing custom keybinds; do not assume they match another PC. Avoid launching "
+    "Playwright/Chrome for native app tasks unless a website is genuinely required. "
+    "Your tools are always connected in this conversation: "
     "never call them disabled or unavailable. Questions about the computers' live state "
     "(what's installed, open or playing, files, battery, disk, CPU, network) are answered "
     "by calling a tool, never guessed and never handed back for David to rephrase; if a "
@@ -175,7 +181,7 @@ class DesktopTools:
             known = self.remote.describe() if hasattr(self.remote, "describe") else ", ".join(names)
             for spec in specs:
                 spec["description"] += (f" Optional device: which laptop ({known}); "
-                                        f"leave it out for this one ({self.remote.here() or 'here'}).")
+                                        f"leave it out for the request target (the selected PC; otherwise {self.remote.here() or 'here'}).")
                 spec["inputSchema"]["properties"]["device"] = {"type": "string", "enum": names}
         return specs
 
@@ -235,12 +241,14 @@ class DesktopTools:
                                             "target": {"type": "string"}, "app": {"type": "string"},
                                             "every": {"type": "string"}, "url": {"type": "string"}}}},
             {"type": "function", "name": "spotify",
-             "description": "Play music in the Spotify app. To play a song David names: search "
-                            "https://open.spotify.com/search/<song and artist>/tracks with the browser "
-                            "tools, read the /track/<id> of the best match, then call action play with "
-                            "target track:<id> (album:, playlist:, artist: work the same; liked plays his "
-                            "Liked Songs). It answers with what actually started playing. action search "
-                            "with query opens Spotify's own search page on screen.",
+             "description": "Use the native Spotify app, without opening a browser. For a named song, "
+                            "call action search with the artist and title query, then use app_ui "
+                            "to inspect and activate the matching track in Spotify. If accessibility "
+                            "is unavailable, use computer screenshots and keyboard/mouse on that "
+                            "same device, and verify playback. Never claim search alone played it. "
+                            "When a Spotify URI or link is already known, action play with target "
+                            "track:<id>, album:<id>, playlist:<id>, artist:<id> or liked plays directly. "
+                            "Only use a web browser if the native app cannot complete the task.",
              "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": False,
                              "properties": {"action": {"type": "string", "enum": ["play", "search"]},
                                             "target": {"type": "string"}, "query": {"type": "string"}}}},
@@ -273,7 +281,9 @@ class DesktopTools:
                             "set_value and select take ref and value; wait takes app and text "
                             "(or window) and timeout seconds. Refs come from the latest snapshot "
                             "or find and go stale when the UI changes: snapshot again. If an app "
-                            "shows nothing, use computer instead. Never type passwords or codes.",
+                            "is starting, snapshot with wait_ready=10 waits for interactive controls (Spotify "
+                            "does this by default). Do not treat its initial empty window as failure. "
+                            "After readiness timeout, inspect with computer. Never type passwords or codes.",
              "inputSchema": {"type": "object", "required": ["action"], "additionalProperties": False,
                              "properties": {"action": {"type": "string", "enum": ["windows", "snapshot",
                                             "find", "read", "wait", "click", "toggle", "expand",
@@ -282,7 +292,7 @@ class DesktopTools:
                                             "root": {"type": "string"}, "role": {"type": "string"},
                                             "name": {"type": "string"}, "text": {"type": "string"},
                                             "value": {"type": "string"}, "window": {"type": "string"},
-                                            "timeout": {"type": "integer"}}}},
+                                            "timeout": {"type": "integer"}, "wait_ready": {"type": "number", "minimum": 0, "maximum": 15}}}},
             {"type": "function", "name": "volume",
              "description": "Speaker volume: up, down, mute, unmute, or a level 0-100.",
              "inputSchema": {"type": "object", "required": ["level"], "additionalProperties": False,
@@ -1259,7 +1269,7 @@ def _spotify_player(wait=20.0):
 def spotify(spec):
     """spec: JSON {"action": "play", "target": track:ID | album:ID | playlist:ID | artist:ID |
     an open.spotify.com link | liked} or {"action": "search", "query": "..."} (opens Spotify's
-    own search page for David to see; to pick a track, search open.spotify.com in the browser)."""
+    own search page; select the matching track with app_ui or computer and verify playback)."""
     try:
         args = json.loads(spec) if isinstance(spec, str) and spec.strip().startswith("{") else \
             {"action": "play", "target": str(spec or "")}
@@ -1276,7 +1286,7 @@ def spotify(spec):
         uri = spotify_uri(args.get("target"))
         if not uri:
             return False, ("Give a Spotify track:, album:, playlist: or artist: id (22 characters), an "
-                           "open.spotify.com link, or liked. Find ids by searching open.spotify.com/search/<song>.")
+                           "open.spotify.com link, or liked. For a song name, use action search with query, then select the track in the native app with app_ui or computer.")
     else:
         return False, "spotify action must be play or search."
     backend = _backend()
@@ -1466,9 +1476,22 @@ def _off_limits(url):
     return None
 
 
-# The console (7777) and hub (7780) on this PC; the Playwright browser refuses to request them.
-CONSOLE_ORIGINS = [f"http://{host}:{port}" for port in (7777, 7780)
+# The console (7777), hub (7780) and phone app (7787, jarvis/phone.py) on this PC; the
+# Playwright browser refuses to request them.
+CONSOLE_ORIGINS = [f"http://{host}:{port}" for port in (7777, 7780, 7787)
                    for host in ("127.0.0.1", "localhost", "[::1]", "0.0.0.0")]
+
+
+def blocked_origins(state_dir):
+    """CONSOLE_ORIGINS plus the phone app's tailnet origin (https://<this PC>.ts.net), as
+    jarvis/phone.py last recorded it in .jarvis/phone.json. A file read only, never a
+    lookup; an unreadable file just leaves the loopback list."""
+    try:
+        from .phone import known_origins
+        extra = known_origins(state_dir)
+    except Exception:
+        extra = []
+    return CONSOLE_ORIGINS + [o for o in extra if o not in CONSOLE_ORIGINS]
 
 
 _NETS = {"at": 0.0, "nets": []}
@@ -1602,7 +1625,7 @@ def browser_mcp(state_dir, engines=BROWSER_ENGINES, my_chrome=None):
             # Off-limits hosts blocked in the browser itself too: a redirect (google.com/url?q=)
             # or a clicked "Manage your account" link never names them in a tool argument.
             "args": ["-y", PLAYWRIGHT_MCP, "--extension", "--output-dir", str(output),
-                     "--blocked-origins", ";".join(CONSOLE_ORIGINS + [
+                     "--blocked-origins", ";".join(blocked_origins(state) + [
                          f"https://{h}" for h in (*MY_CHROME_OFF_LIMITS, *_OFF_LIMITS_EXTRA)])],
             "disabled_tools": sorted(BROWSER_BLOCKED),
             **({"env": {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": token}} if token else {}),
@@ -1619,7 +1642,7 @@ def browser_mcp(state_dir, engines=BROWSER_ENGINES, my_chrome=None):
                      "--output-dir", str(output),
                      # Clicked links and page requests to the console; not a full boundary
                      # (redirects pass), so approve_browser checks every address as well.
-                     "--blocked-origins", ";".join(CONSOLE_ORIGINS)],
+                     "--blocked-origins", ";".join(blocked_origins(state))],
             # No uploading local files to sites; no arbitrary page scripts.
             "disabled_tools": sorted(BROWSER_BLOCKED)}
     if "agent-browser" in engines:

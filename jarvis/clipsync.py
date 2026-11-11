@@ -520,6 +520,22 @@ def local_clipboard():
     return Windows() if sys.platform == "win32" else Wayland()
 
 
+def _wait_for_board(log, sleep=time.sleep):
+    """The local clipboard, waiting for the desktop to come up rather than exiting: a unit
+    started at boot runs before Hyprland, and five quick exits made systemd give up."""
+    waited = False
+    while True:
+        try:
+            return local_clipboard()
+        except RuntimeError as exc:
+            if "No Wayland session" not in str(exc):
+                raise
+            if not waited:
+                log("waiting for the desktop session to start")
+                waited = True
+            sleep(10)
+
+
 # ---- the sync loop -----------------------------------------------------------------------
 class Sync:
     """Mirror one clipboard to a peer over a pair of byte streams (one JSON line per copy)."""
@@ -709,12 +725,12 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
 
     lock = threading.Lock()
 
-    def share(kind, data):
+    def share(kind, data, dest="drop"):
         """Hand one copy (or an edge-zone drop: kind "files") to the other laptop(s)."""
         with lock:  # the clipboard watcher and the drop zone may both send at once
-            _share(kind, data)
+            _share(kind, data, dest)
 
-    def _share(kind, data):
+    def _share(kind, data, dest):
         why = _paused(state)
         if why:  # apart or remote control on: this copy stays here
             if why != paused[0]:
@@ -741,9 +757,12 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
                     for path in paths:
                         with path.open("rb") as source:
                             result = push(config, state, target, source, path.stat().st_size,
-                                          name=path.name, dest="drop")
+                                          name=path.name, dest=dest)
                         names.append(result["sent"])
                         log(f"sent file {result['sent']} ({path.stat().st_size} bytes) to {target}")
+                    if dest == "desktop":
+                        log(f"delivered {len(names)} file(s) to {target} Desktop")
+                        continue
                     content = json.dumps({"kind": "files", "names": names}).encode()
                     file_names(content)
                 push(config, state, target, io.BytesIO(content), len(content), dest="clipboard", kind=kind)
@@ -754,7 +773,10 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
 
     log(f"linked with {', '.join(targets)} over the cluster")
     if isinstance(board, Wayland) and config.get("clipboard", {}).get("dropzone", True):
-        threading.Thread(target=_dropzone, args=(config, targets, share, log),
+        def share_drop(kind, data):
+            share(kind, data, dest="desktop")
+
+        threading.Thread(target=_dropzone, args=(config, targets, share_drop, log, board.env),
                          name="dropzone", daemon=True).start()
     while True:
         try:
@@ -767,11 +789,14 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
 DROPZONE_PYTHON = "/usr/bin/python3"  # has PyGObject + gtk4-layer-shell; the venv doesn't
 
 
-def _dropzone_command(config, targets):
+def _dropzone_command(config, targets, session=None):
     """argv + env for the edge drop zone, or None when this desktop can't show it.
-    It sits on the edge Lan Mouse crosses to the peer (its configured position)."""
+    It sits on the edge Lan Mouse crosses to the peer (its configured position).
+    `session` is the clipboard's env, which has the Wayland socket even when this process
+    was started without one (the hub's keep-alive, a boot-time unit)."""
     from .dropzone import LIB
-    if not (os.path.exists(DROPZONE_PYTHON) and os.path.exists(LIB) and os.environ.get("WAYLAND_DISPLAY")):
+    session = dict(os.environ if session is None else session)
+    if not (os.path.exists(DROPZONE_PYTHON) and os.path.exists(LIB) and session.get("WAYLAND_DISPLAY")):
         return None
     try:
         from .sharedinput import read_config
@@ -779,14 +804,14 @@ def _dropzone_command(config, targets):
     except Exception:
         edge = "right"
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dropzone.py")
-    env = dict(os.environ, LD_PRELOAD=LIB)
+    env = dict(session, LD_PRELOAD=LIB)
     return [DROPZONE_PYTHON, script, "--edge", edge, "--label", ", ".join(targets)], env
 
 
-def _dropzone(config, targets, share, log, popen=subprocess.Popen, sleep=time.sleep):
+def _dropzone(config, targets, share, log, session=None, popen=subprocess.Popen, sleep=time.sleep):
     """Run the drop zone as this process's child and send what is dropped on it, through
     the same path as a file copy. Restarted after a crash, at most every 30 s."""
-    command = _dropzone_command(config, targets)
+    command = _dropzone_command(config, targets, session)
     if not command:
         log("drop zone off: needs Wayland, system PyGObject and gtk4-layer-shell")
         return
@@ -794,7 +819,7 @@ def _dropzone(config, targets, share, log, popen=subprocess.Popen, sleep=time.sl
     while True:
         try:
             proc = popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, text=True, preexec_fn=_die_with_parent)
+                         stderr=None, text=True, preexec_fn=_die_with_parent)
         except OSError as exc:
             log(f"drop zone failed to start: {exc}")
             return
@@ -962,8 +987,8 @@ def _run_watcher(config, state, device_name=None):
     if enabled(config):
         with open(os.path.join(state, "clipboard.pid"), "w") as pid:
             pid.write(str(os.getpid()))
-        return run_cluster(config, state, device_name, log=log)
-    device, board, wait = ssh_device(config, device_name), local_clipboard(), 2
+        return run_cluster(config, state, device_name, board=_wait_for_board(log), log=log)
+    device, board, wait = ssh_device(config, device_name), _wait_for_board(log), 2
     targets, turn = _targets(device), 0
     with open(os.path.join(state, "clipboard.pid"), "w") as pid:
         pid.write(str(os.getpid()))

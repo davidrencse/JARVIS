@@ -225,6 +225,7 @@ class ChatGPTLane:
         quiet = () if tools or mcp_servers or not lean else ("features.code_mode_host=false",)
         self.overrides = (*(lean_prompt() if lean else ()), *quiet, *overrides)
         self.tool_log = []  # (tool, success, text) of the current turn
+        self._tool_pending = {}  # call key -> name; starts count even without a completion
         self._mine = threading.local()  # the finished turn's log, per calling thread
         self.on_tool = None  # on_tool(key, name, ok, text); ok None = started (connection tree)
         self.proc = self.lines = self.thread = None
@@ -385,13 +386,30 @@ class ChatGPTLane:
         self.proc = self.thread = self.lines = self._reader = None
         close_process(proc, reader)
 
+    def _remember_turn(self):
+        """Freeze this turn's tool list while the lane lock is held. The tuple is immutable
+        and per thread. The list object is remembered so a merge can prepend onto the list
+        this turn filled, and only while the lane still points at that same list."""
+        owned = self.tool_log if isinstance(getattr(self, "tool_log", None), list) else None
+        self._mine.owned = owned
+        self._mine.log = tuple(owned or ())
+
     def turn_log(self):
-        """The tool calls of this thread's last finished turn, copied while the lane lock was
-        held: tool_log itself is replaced by the next turn, which may be another thread's."""
-        return getattr(self._mine, "log", None)
+        """This thread's last finished turn, copied out of the snapshot. None if this thread
+        has not finished a turn since ask() started. An empty list is a real snapshot: the
+        caller must not fall back to the shared tool_log, which the next turn replaces."""
+        snap = getattr(self._mine, "log", None)
+        if snap is None:
+            return None
+        return list(snap)
+
+    def owned_log(self):
+        """The list object snapshotted for this thread, or None. Not a copy."""
+        return getattr(self._mine, "owned", None)
 
     def ask(self, text, recall=(), on_sentence=None):
         self._mine.log = None
+        self._mine.owned = None
         limited = usage_limit()
         if limited:  # don't spend ~2 s asking a plan that already said no
             # Not self.tool_log: another turn on this lane may be mid-flight and own it.
@@ -400,6 +418,7 @@ class ChatGPTLane:
             raise exc
         with self.lock:
             self.tool_log = []  # a stale log from an earlier turn must not block the retry
+            self._tool_pending = {}
             theirs = []  # an error raised by the caller's own on_sentence is theirs, not the lane's
             if on_sentence:
                 inner = on_sentence
@@ -413,7 +432,7 @@ class ChatGPTLane:
             for attempt in (1, 2):
                 try:
                     result = self._ask(text, recall, on_sentence)
-                    self._mine.log = list(self.tool_log)
+                    self._remember_turn()
                     return result
                 except BaseException as exc:
                     note_usage_limit(exc)
@@ -422,7 +441,11 @@ class ChatGPTLane:
                     # the next turn and Brain.last can be moved by another request. Without
                     # them a limit hit after tools ran looks like "nothing ran" and the
                     # stand-in would run the same side effects again (audit 2026-11-07).
-                    ran = list(self.tool_log)
+                    self._remember_turn()
+                    ran = list(self._mine.log or ())
+                    unfinished = list(dict.fromkeys(self._tool_pending.values()))
+                    if unfinished:
+                        exc.tool_unfinished = unfinished
                     if not hasattr(exc, "tool_log"):
                         try:
                             exc.tool_log = ran
@@ -434,25 +457,32 @@ class ChatGPTLane:
                     if isinstance(exc, MALFORMED) and exc not in theirs:  # odd reply or failed spawn: one error type
                         wrapped = RuntimeError(f"ChatGPT lane failed: {type(exc).__name__}: {exc}")
                         wrapped.tool_log = ran
+                        if unfinished:
+                            wrapped.tool_unfinished = unfinished
                         raise wrapped from exc
                     if (not isinstance(exc, RuntimeError) or attempt == 2
                             or "serverOverloaded" not in str(exc) or not self.fallback):
                         raise
-                    if self.tool_log:
+                    if ran or unfinished:
                         # Tools already ran this turn (a Grok handoff, open_app...): replaying
                         # the turn on the fallback model would run them a second time.
-                        names = ", ".join(sorted({str(t[0]) for t in self.tool_log}))
+                        names = ", ".join(sorted({str(t[0]) for t in ran} | set(unfinished)))
                         stop = RuntimeError(
-                            f"ChatGPT was overloaded after {names} already ran; not repeating "
+                            f"ChatGPT was overloaded after {names} started or ran; not repeating "
                             "it. Check the result and ask again if needed.")
                         stop.tool_log = ran
+                        if unfinished:
+                            stop.tool_unfinished = unfinished
                         raise stop from exc
                     # Model at capacity: swap to the fallback (and back again next time).
                     self.model, self.fallback = self.fallback, self.model
 
     def _tool(self, key, name, ok, text):
         """Log a finished tool call (ok True/False) and tell on_tool; ok None = started."""
-        if ok is not None:
+        if ok is None:
+            self._tool_pending[key] = str(name or "tool")
+        else:
+            self._tool_pending.pop(key, None)
             self.tool_log.append((name, ok, text))
         if self.on_tool:
             try:
@@ -555,15 +585,58 @@ class Brain:
             decider = not _under_tests()
         self.decider = decider
         self._failed_log = None  # the latest failed turn's own tool log (see ask)
+        self._turns = threading.local()  # this thread's published tool snapshot
         self._picked = None  # (text, lane) of the latest pick(): the decider is not free
 
     @property
     def tool_log(self):
         # assistant reads this after a failed turn to say what already ran; only the action
-        # lane has tools.
+        # lane has tools. A failed turn's explicit log wins, including an explicit empty one.
+        # Otherwise this thread's snapshot, never another request's live list.
         if self._failed_log is not None:
             return self._failed_log
+        snap = getattr(self._turns, "log", None)
+        if snap is not None:
+            return list(snap)
         return getattr(self.last, "tool_log", [])
+
+    def turn_log(self):
+        """This thread's published tools for the latest ask, or None before one finishes."""
+        snap = getattr(self._turns, "log", None)
+        if snap is None:
+            return None
+        return list(snap)
+
+    def _publish(self, log):
+        self._turns.log = tuple(log or ())
+
+    def _lane_snapshot(self, lane):
+        """Tools this lane recorded for the turn that just returned. A lane with turn_log
+        never falls back to its shared list: that list may already be the next request's."""
+        if hasattr(lane, "turn_log"):
+            snap = lane.turn_log()
+            return [] if snap is None else list(snap)
+        return list(getattr(lane, "tool_log", None) or ())
+
+    def _merge_first_turn(self, lane, earlier):
+        """Keep the first turn's tools on the lane's own list. A list the lane no longer
+        points at belongs to another turn and is left alone."""
+        if not earlier:
+            return
+        if hasattr(lane, "turn_log"):
+            owned = lane.owned_log() if hasattr(lane, "owned_log") else None
+            current = getattr(lane, "tool_log", None)
+            if isinstance(owned, list) and current is owned:
+                owned[:0] = list(earlier)
+            return
+        log = getattr(lane, "tool_log", None)
+        if isinstance(log, list):
+            log[:0] = list(earlier)
+        else:
+            try:
+                lane.tool_log = list(earlier)
+            except Exception:
+                pass
 
     @property
     def on_tool(self):
@@ -608,46 +681,56 @@ class Brain:
                 on_sentence(sentence)
         ask = (HEARD.format(heard=" ".join(said)) + str(text)) if said else text
         reply = self.act.ask(ask, recall, on_sentence=speak if on_sentence else None)
-        mine = self.act.turn_log() if hasattr(self.act, "turn_log") else None
-        if mine is None:  # a lane without per-turn logs (a stand-in)
-            mine = getattr(self.act, "tool_log", None)
+        mine = self._lane_snapshot(self.act)
         nudge = ungrounded(reply, mine)
+        earlier = []
         if nudge is None:
             if doubted and on_sentence:  # held back, but it stands: say it after all
                 for sentence in doubted:
                     on_sentence(sentence)
+            self._publish(mine)
             return reply
-        earlier = list(mine or ())
+        earlier = list(mine)
         if spoken:
             nudge = HEARD.format(heard=" ".join(spoken)) + nudge
         try:
-            return self.act.ask(nudge + str(text), (), on_sentence=on_sentence)
+            reply = self.act.ask(nudge + str(text), (), on_sentence=on_sentence)
         except Exception as exc:
             # The lane put only the second turn's calls on exc: add the first turn's.
+            # exc.tool_log is a copy, so this does not write into another turn's list.
+            second = list(exc.tool_log or ()) if hasattr(exc, "tool_log") else []
+            merged = earlier + second
             if earlier and hasattr(exc, "tool_log"):
                 try:
-                    exc.tool_log = earlier + list(exc.tool_log or ())
+                    exc.tool_log = merged
                 except Exception:
                     pass
+            self._publish(merged)
             raise
-        finally:  # both turns' calls, also when the second raises: the failed-turn report needs them
-            log = getattr(self.act, "tool_log", None)
-            if earlier and isinstance(log, list):
-                log[:0] = earlier
-            elif earlier:
-                self.act.tool_log = earlier
+        else:
+            # Snapshot the second turn BEFORE the merge mutates a list the lane still owns.
+            second = self._lane_snapshot(self.act)
+            self._publish(earlier + list(second))
+            return reply
+        finally:  # the lane's own list, when it still owns it; never a list rebound to another turn
+            self._merge_first_turn(self.act, earlier)
 
     def ask(self, text, recall=(), on_sentence=None):
         self._failed_log = None
+        self._turns.log = None
         try:
             return self._ask_lanes(text, recall, on_sentence)
         except Exception as exc:
             # This turn's own tool calls, read now: Brain.tool_log follows self.last, which a
             # concurrent request (another console tab) can move before the caller looks
             # (audit 2026-11-01), so the failed-turn report could lose or borrow tools.
+            # An explicit exc.tool_log wins, including an empty one. If the lane set none,
+            # the snapshot published above is this request's; the shared list is not.
             if not hasattr(exc, "tool_log"):
+                published = self.turn_log()
                 try:
-                    exc.tool_log = list(getattr(self.last, "tool_log", None) or ())
+                    exc.tool_log = list(published if published is not None else
+                                        (getattr(self.last, "tool_log", None) or ()))
                 except Exception:
                     pass
             self._failed_log = getattr(exc, "tool_log", None)
@@ -671,6 +754,7 @@ class Brain:
         reply = self.chat.ask(text, recall, on_sentence=speak if on_sentence else None)
         if is_handoff(reply) or is_refusal(reply):
             return self._act(text, recall, on_sentence, said=heard)
+        self._publish(self._lane_snapshot(self.chat))
         return reply
 
     def warm(self):
