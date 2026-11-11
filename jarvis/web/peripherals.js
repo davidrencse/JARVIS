@@ -38,8 +38,12 @@
   }
 
   const word = (text, ok) => `<span class="state-word ${ok === true ? "ok" : ok === false ? "warn" : ""}">${esc(text)}</span>`;
-  const btn = (key, label, attrs, primary) =>
-    `<button type="button" class="pe-btn${primary ? " primary" : ""}" data-key="${esc(key)}" ${attrs} ${view.busy.has(key) ? "disabled aria-busy=\"true\"" : ""}>${esc(view.busy.has(key) ? "Working…" : label)}</button>`;
+  const btn = (key, label, attrs, primary, locked = false) => {
+    const off = view.busy.has(key) || locked;
+    return `<button type="button" class="pe-btn${primary ? " primary" : ""}" data-key="${esc(key)}" ${attrs}${off ? " disabled" : ""}${view.busy.has(key) ? " aria-busy=\"true\"" : ""}>${esc(view.busy.has(key) ? "Working…" : label)}</button>`;
+  };
+  // The guard's projection. A phone's network is not in it. enforced false is the off switch.
+  const heldApart = (sh) => sh.state === "apart" && sh.enforced !== false;
 
   function lanRow(d) {
     const lan = d.lan_mouse;
@@ -47,9 +51,15 @@
                          d.lan_mouse_error && d.lan_mouse_error !== "offline" ? `<p class="pe-err">${esc(d.lan_mouse_error)}</p>` : "");
     const peers = (lan.peers || []).map((p) => `${esc(p.hostname || "?")} on the ${esc(p.position || "?")}`).join(", ");
     const key = `lan:${d.id}`;
-    return row("keyboard", "Mouse & keyboard", word(lan.running ? "running" : "stopped", lan.running),
-      `<p class="pe-note">${peers ? "Paired with " + peers : "Not paired yet"}${lan.build ? ` · <span class="mono">${esc(lan.build)}</span>` : ""}</p>`,
-      btn(key, lan.running ? "Stop" : "Start", `data-do="lan_mouse" data-dev="${esc(d.id)}" data-action="${lan.running ? "stop" : "start"}"`, !lan.running));
+    // The guard's reading only. Apart hides the start; unknown says so and leaves the button.
+    const sh = view.data?.sharing || {};
+    const held = heldApart(sh);
+    const label = held && !lan.running ? "off while apart" : held && lan.running ? "on by hand" : lan.running ? "running" : "stopped";
+    const note = held ? `<p class="pe-note">Unavailable while the laptops are apart${sh.why ? ` (${esc(sh.why)})` : ""}. Remote control still works.${sh.override && lan.running ? " It was started by hand and will not be turned back on if it stops." : ""}</p>`
+      : sh.state === "unknown" ? `<p class="pe-note">Can't tell if the laptops are together: ${esc(sh.why || "no reading yet")}</p>` : "";
+    return row("keyboard", "Mouse & keyboard", word(label, held && !lan.running ? null : lan.running),
+      `<p class="pe-note">${peers ? "Paired with " + peers : "Not paired yet"}${lan.build ? ` · <span class="mono">${esc(lan.build)}</span>` : ""}</p>${note}`,
+      btn(key, lan.running ? "Stop" : "Start", `data-do="lan_mouse" data-dev="${esc(d.id)}" data-action="${lan.running ? "stop" : "start"}"`, !lan.running && !held, held && !lan.running));
   }
 
   function clipRow(d) {
@@ -78,6 +88,8 @@
   function pairBox(o) {
     const others = o.devices.filter((d) => !d.here);
     if (!others.length) return "";
+    if (heldApart(o.sharing || {})) return `<div class="pe-block"><h4>Arrange mouse &amp; keyboard</h4>
+      <p class="pe-note">Hidden while the computers are apart. Remote control still works. It comes back when you're on the same network.</p></div>`;
     // Start from the current arrangement when this computer has exactly one peer.
     const peers = o.devices.find((d) => d.here)?.lan_mouse?.peers || [];
     const side = peers.length === 1 && SIDES.includes(peers[0].position) ? peers[0].position : "right";

@@ -1,0 +1,494 @@
+/* JARVIS console checkpoint skin.
+   Load last on jarvis/web/index.html, after voicesetup.css.
+   Paint only. Do not move nodes, change the cockpit grid, or un-fix the gate:
+   gate.js measures #gate and the prompt stays above it only while that geometry holds.
+   Phone, knowledge.html, and design.html do not load this file. */
+
+/* ---------- tokens (PARITY-DESIGN). --ok / --warn / --alert stay so Connections pills are untouched. ---------- */
+:root {
+  --sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --mono: "Geist Mono", ui-monospace, Consolas, monospace;
+  --dot: "Doto", "Geist Mono", ui-monospace, monospace;
+  --r: 2px;
+  --r-md: 2px;
+  --r-sm: 2px;
+  --ease: cubic-bezier(.16, 1, .3, 1);
+  --t: 180ms;
+  --surface: #141414;
+  --surface-raised: #202020;
+  --needs-wash: rgba(240, 166, 64, .12);
+  --bad-wash: rgba(239, 122, 108, .12);
+}
+:root, :root[data-theme="dark"] {
+  --bg: #000;
+  --ink: #ededed;
+  --ink-2: #a8a8a8;
+  --ink-3: #8a8a8a;
+  --line: rgba(255, 255, 255, .11);
+  --line-2: rgba(255, 255, 255, .22);
+  --line-ctl: rgba(255, 255, 255, .32);
+  --hover: rgba(255, 255, 255, .06);
+  --inv-bg: #ededed;
+  --inv-ink: #000;
+  --needs: #f0a640;
+  --bad: #ef7a6c;
+  --card: transparent;
+  --card-strong: #000;
+  --shadow: none;
+  --sheen: none;
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #fff;
+  --ink: #0a0a0a;
+  --ink-2: #4a4a4a;
+  --ink-3: #6b6b6b;
+  --line: rgba(0, 0, 0, .1);
+  --line-2: rgba(0, 0, 0, .2);
+  --line-ctl: rgba(0, 0, 0, .3);
+  --hover: rgba(0, 0, 0, .05);
+  --inv-bg: #0a0a0a;
+  --inv-ink: #fff;
+  --needs: #9a5600;
+  --bad: #b3261e;
+  --surface: #f3f3f3;
+  --surface-raised: #e8e8e8;
+  --needs-wash: rgba(154, 86, 0, .09);
+  --bad-wash: rgba(179, 38, 30, .08);
+  --card: transparent;
+  --card-strong: #fff;
+  color-scheme: light;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 14px/1.5 var(--sans);
+}
+::selection { background: var(--ink); color: var(--bg); }
+#prompt, #hero-q, textarea, input, select { caret-color: var(--ink); }
+
+/* 2px ink ring. Later, more specific outline:none rules still win for the remote picture. */
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+#hero-search:focus-within,
+.case-switch:focus-within,
+.st-search:focus-within,
+.search-field:focus-within,
+#dock #prompt:focus,
+#dock #prompt:focus-visible,
+#view-console .ck-tabs button:focus-visible,
+#lab-stage:focus-visible,
+#gate :focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+body:has(#view-remote:not([hidden])) .rm-stage:focus-within {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+/* ---------- shell: hairline, Geist, no glass. Rail geometry stays in console.css. ---------- */
+.sidebar,
+.topbar,
+.hdr-pill,
+.round-btn,
+.icon-btn,
+.chip,
+.case-switch,
+#dock,
+#gate {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+.wordmark {
+  font: 500 13px/1 var(--mono);
+  letter-spacing: .2em;
+}
+.page-h {
+  font: 500 22px/1.15 var(--sans);
+  letter-spacing: -.02em;
+}
+.topbar,
+.title-block,
+.topbar-right,
+#hero-search,
+#page-title {
+  min-width: 0;
+}
+.topbar { flex-wrap: wrap; }
+#hero-search {
+  flex: 1 1 8rem;
+  max-width: 280px;
+  min-width: 0;
+  height: 32px;
+  border-radius: 2px;
+  background: transparent;
+}
+.date-chip,
+#clock-date { white-space: normal; overflow-wrap: anywhere; }
+.round-btn,
+.icon-btn,
+.hdr-pill,
+.case-switch { border-radius: 2px; }
+
+/* Live is a filled ink dot. Reconnecting is a dashed hollow dot plus the word. Never green. */
+#live-chip,
+#live-chip.on {
+  height: 32px;
+  padding: 0 8px;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--ink-2);
+  border: 1px solid var(--line-2);
+  font: 400 12px/1 var(--mono);
+  letter-spacing: 0;
+  text-transform: none;
+  transition: none;
+}
+#live-chip.on { color: var(--ink); }
+#live-chip .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: transparent;
+  border: 1.5px solid var(--ink-3);
+}
+#live-chip.on .dot,
+:root[data-theme="light"] #live-chip.on .dot {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+#live-chip:not(.on) .dot {
+  background: transparent;
+  border: 1.5px dashed var(--ink-3);
+}
+@media (prefers-reduced-motion: no-preference) {
+  #live-chip.on .dot { animation: breathe 2.4s var(--ease) infinite; }
+}
+
+/* ---------- cockpit paint. Grid, areas, and heights stay in cockpit.css. ---------- */
+#view-console,
+#view-console .ck-head,
+#view-console .ck-stats,
+#view-console .ck-center,
+#view-console .ck-side,
+#view-console .ck-rail,
+#view-console .ck-box {
+  min-width: 0;
+}
+#view-console .ck-box {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  box-shadow: none;
+}
+#view-console .ck-name {
+  font: 600 15px/1 var(--sans);
+  letter-spacing: .02em;
+}
+#view-console .ck-stats dt,
+#view-console .lab-stats dt {
+  font: 400 12px/1.3 var(--sans);
+  color: var(--ink-3);
+  letter-spacing: 0;
+  text-transform: none;
+}
+#view-console .ck-stats dd {
+  font: 500 16px/1.2 var(--mono);
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+}
+#view-console .ck-funnel { color: var(--ink-2); overflow-wrap: anywhere; }
+#view-console .ck-funnel .needs { color: var(--needs); }
+#view-console .ck-tabs button {
+  font: 500 13px/1 var(--sans);
+  color: var(--ink-3);
+  border-radius: 0;
+}
+#view-console .ck-tabs button[aria-selected="true"] {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+  background: transparent;
+}
+#view-console .ph h2,
+#view-console .ck-subh h3,
+#view-console .tile-h h2 {
+  font-family: var(--sans);
+}
+#view-console .dot-word,
+#view-console .dot-num,
+#view-console .t-stats dd {
+  font-family: var(--mono);
+}
+#view-console .ph-meta,
+#lab-trace-meta {
+  color: var(--ink-3);
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+  overflow-wrap: anywhere;
+}
+#view-console.ck .lab-state {
+  color: var(--ink-2);
+  font: 400 13px/1.4 var(--mono);
+  letter-spacing: 0;
+  text-transform: none;
+  white-space: normal;
+  max-width: calc(100% - 24px);
+  overflow-wrap: anywhere;
+}
+#view-console.ck .lab-state.busy { color: var(--ink); }
+#view-console .lab-steps {
+  font: 400 13px/1.45 var(--sans);
+}
+#view-console .lab-steps .n,
+#view-console .lab-steps .s {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-3);
+}
+#view-console .lab-steps .d { color: var(--ink); overflow-wrap: anywhere; }
+#view-console .lab-steps .run .d,
+#view-console .lab-steps .run .s { color: var(--ink); }
+#view-console .lab-steps .fail .d,
+#view-console .lab-steps .fail .s,
+#view-console .lab-steps .fail .k { color: var(--bad); }
+#trace .step.fail { color: var(--bad); }
+#trace .step.fail .dot {
+  background: var(--bad);
+  border-color: var(--bad);
+  border-style: solid;
+}
+#trace {
+  overflow-x: auto;
+  overflow-y: hidden;
+  color: var(--ink-3);
+  font-family: var(--mono);
+}
+
+/* Assistant. Clear, read-aloud, agent screen, and the thread stay. */
+#view-console .ck-side > .ph h2 { font: 500 13px/1.3 var(--sans); color: var(--ink); }
+#thread .msg-body { color: var(--ink); overflow-wrap: anywhere; }
+#thread .msg.you .msg-body { color: var(--ink-2); }
+#thread .msg.error .msg-body {
+  color: var(--ink);
+  border-left: 1px solid var(--bad);
+}
+#thread .msg-head,
+#thread .msg-head time { color: var(--ink-3); }
+#listener-log { color: var(--ink-3); }
+#listener-log div {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: unset;
+  overflow-wrap: anywhere;
+}
+#view-console .agent-screen,
+#view-console .as-ctl button,
+#view-console .as-frame {
+  border-radius: 2px;
+}
+#view-console .as-url { color: var(--ink-3); }
+
+/* ---------- gate: flat, in its existing fixed slot. Amber marks waiting. Allow is the inverted control. ---------- */
+#gate {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink);
+}
+#gate[data-empty="false"] {
+  border-color: var(--needs);
+  background: var(--bg);
+}
+#gate .gate-title { color: var(--ink-2); font: 500 13px/1.3 var(--sans); }
+#gate[data-empty="false"] .gate-title { color: var(--needs); }
+#gate[data-empty="true"] .gate-title::before {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--ink-3);
+}
+#gate[data-empty="false"] .gate-title::before {
+  background: var(--needs);
+  box-shadow: none;
+}
+#gate .gate-hint {
+  color: var(--ink-3);
+  min-width: 0;
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+#gate .gate-item {
+  background: var(--needs-wash);
+  border: 1px solid var(--needs);
+  border-radius: 2px;
+  padding: 10px 12px;
+  margin: 0 0 8px;
+}
+#gate .gate-what { color: var(--ink); overflow-wrap: anywhere; }
+#gate .gate-meta,
+#gate .gate-clock,
+#gate .gate-recent time,
+#gate .gate-recent .out { color: var(--ink-2); }
+#gate .gate-meta .stakes-high,
+#gate .gate-clock.low,
+#gate .gate-recent .out.expired { color: var(--needs); }
+#gate .gate-recent .out.rejected { color: var(--bad); }
+#gate .gate-recent li { min-width: 0; }
+#gate .gate-recent li > * { min-width: 0; overflow-wrap: anywhere; }
+#gate .gate-grant {
+  border-radius: 2px;
+  color: var(--ink-2);
+  border-color: var(--line-ctl);
+}
+#gate .gate-grant button { border-radius: 2px; color: var(--ink-2); }
+#gate .gate-btn {
+  border-radius: 2px;
+  color: var(--ink);
+  background: var(--bg);
+  border-color: var(--line-ctl);
+}
+#gate .gate-btn.go,
+#gate .gate-btn.go:hover:not(:disabled) {
+  background: var(--inv-bg);
+  border-color: var(--inv-bg);
+  color: var(--inv-ink);
+  filter: none;
+}
+#gate .gate-hist-btn { border-radius: 2px; color: var(--ink-2); }
+#gate .gate-btn:disabled,
+#gate .gate-hist-btn:disabled { opacity: .5; }
+
+/* ---------- Ask dock, on every view. Mic, ear, call, tiers, read-aloud, and send stay. ---------- */
+#dock {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink);
+  min-width: 0;
+}
+html.dock-in-panel #dock {
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+}
+#dock .dock-row,
+#dock .dock-tools,
+#dock #prompt { min-width: 0; }
+#dock .mic,
+#dock .ear,
+#dock #agent-call,
+#dock #speak-toggle,
+#dock .seg,
+#dock #tier-select {
+  border-radius: 2px;
+  border-color: var(--line-2);
+}
+#dock #prompt {
+  border: 1px solid var(--line-ctl);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 40px;
+  font: 400 14px/1.5 var(--sans);
+}
+#dock #prompt::placeholder { color: var(--ink-3); }
+#dock .seg {
+  background: transparent;
+  border-radius: 2px;
+}
+#dock .seg button {
+  color: var(--ink-3);
+  border-radius: 2px;
+  font: 400 13px/1 var(--sans);
+  transition: none;
+}
+#dock .seg button[aria-checked="true"],
+#dock .seg button[aria-pressed="true"] {
+  background: var(--surface-raised);
+  color: var(--ink);
+}
+#dock #tier-select {
+  background: var(--bg);
+  color: var(--ink);
+  border: 1px solid var(--line-2);
+  height: 32px;
+}
+#dock .send {
+  width: 40px;
+  height: 40px;
+  border-radius: 2px;
+  background: var(--inv-bg);
+  color: var(--inv-ink);
+}
+#dock .send:disabled { opacity: .5; }
+#dock .mic[data-mode="blocked"] {
+  color: var(--needs);
+  border-color: var(--needs);
+}
+#dock #speak-toggle[aria-pressed="true"] {
+  background: var(--surface-raised);
+  color: var(--ink);
+}
+
+/* ---------- narrow: keep the controls porcelain was hiding. Do not unhide Remote's own chrome. ---------- */
+@media (max-width: 760px) {
+  #gate[data-empty="true"] .gate-hint { display: block; }
+}
+@media (max-width: 640px) {
+  .sidebar {
+    left: 0;
+    right: 0;
+    width: auto;
+    max-width: 100%;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .sidebar .rail {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    justify-content: flex-start;
+    max-width: 100%;
+  }
+  .sidebar .rail a { flex: 0 0 44px; }
+  #live-chip { display: inline-flex; }
+  #live-chip .chip-label { display: inline; }
+  #time-pill { display: inline-flex; }
+  .case-switch:not([hidden]) { display: flex; }
+  #dock #speak-toggle { display: inline-grid !important; }
+  #hero-search { flex-basis: 100%; max-width: none; }
+}
+@media (max-width: 1180px) {
+  #view-console .ck-stats { justify-content: flex-start; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #live-chip .dot,
+  #view-console .lab-steps .run .s,
+  .msg.streaming .msg-body::after,
+  #view-console .skeleton,
+  .skeleton {
+    animation: none;
+  }
+  #gate,
+  #gate .gate-clock i::after,
+  #dock,
+  #dock .mic,
+  .round-btn {
+    transition: none;
+  }
+}
+
+/* Remote measures its viewport below the compact header. Keep that header on one
+   line so narrow screens never put it over the remote picture. */
+@media (max-width: 640px) {
+  body:has(#view-remote:not([hidden])) .topbar { flex-wrap: nowrap; justify-content: space-between; }
+  body:has(#view-remote:not([hidden])) .topbar :is(.title-sub, .case-switch, #time-pill, #hero-search, #flow-history, #hero-refresh) { display: none; }
+}

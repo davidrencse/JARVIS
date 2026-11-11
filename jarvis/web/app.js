@@ -21,8 +21,36 @@
     let data;
     try { data = await res.json(); }
     catch (e) { if (res.ok) throw new Error("The reply from JARVIS couldn't be read."); data = { error: `HTTP ${res.status}` }; }
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok) throw apiError(res.status, data);
     return data;
+  }
+  // Same Error(message) as before; adds the structured, non-secret parts of the reply so callers can switch on `code`.
+  const ERR_FIELDS = ["code", "retryable", "step", "needs_ack", "missing", "readiness", "phases", "risks", "target", "mutated"];
+  // `code` / `step` are short tokens. An invite secret must not ride on the Error object.
+  function publicToken(v, max) {
+    if (typeof v !== "string" || v.length > max || /jarvis-invite-1:/i.test(v)) return undefined;
+    return v;
+  }
+  function apiError(status, data) {
+    const err = new Error((data && data.error) || `HTTP ${status}`);
+    err.status = status;
+    if (data && typeof data === "object") {
+      const meta = {};
+      ERR_FIELDS.forEach((k) => {
+        if (!(k in data)) return;
+        if (k === "code" || k === "step") {
+          const s = publicToken(data[k], k === "code" ? 64 : 80);
+          if (s) meta[k] = s;
+          return;
+        }
+        meta[k] = data[k];
+      });
+      err.data = meta;
+      if (meta.code) err.code = meta.code;
+      if (typeof data.retryable === "boolean") err.retryable = data.retryable;
+      if (meta.step) err.step = meta.step;
+    }
+    return err;
   }
   const nf = new Intl.NumberFormat();
   function compact(n) {
@@ -324,7 +352,17 @@
   const LEVEL = { up: ["daemons up", "ok"], warn: ["up · with warnings", ""], down: ["down", "warn"] };
   function liveWord(live) {
     if (!live) return `<span class="state-word" title="Not checked yet">checking</span>`;
-    if (live.local) return !live.lan_mouse || live.lan_mouse.running ? `<span class="state-word ok">this device</span>` : `<span class="state-word warn">Lan Mouse off</span>`;
+    if (live.local) {
+      const sh = state.probe?.sharing;
+      if (sh && sh.state === "apart" && sh.enforced !== false) {
+        const on = live.lan_mouse && live.lan_mouse.running;
+        return on ? `<span class="state-word" title="Started by hand while the computers are apart">on by hand</span>`
+          : `<span class="state-word" title="Off while the computers are apart. Remote control still works.">off while apart</span>`;
+      }
+      if (sh && sh.state === "unknown" && live.lan_mouse && !live.lan_mouse.running)
+        return `<span class="state-word warn" title="${esc(sh.why || "Can't tell whether the computers are together.")}">Lan Mouse off</span>`;
+      return !live.lan_mouse || live.lan_mouse.running ? `<span class="state-word ok">this device</span>` : `<span class="state-word warn">Lan Mouse off</span>`;
+    }
     if (!live.reachable) return `<span class="state-word warn" title="${esc(live.error || "")}">unreachable</span>`;
     if (live.ssh === false) return `<span class="state-word warn" title="${esc(live.error || "")}">ssh failed</span>`;
     return `<span class="state-word ok">online</span>`;
@@ -334,7 +372,9 @@
     const lm = live.lan_mouse || {};
     const rows = [];
     if (live.local) {
-      rows.push(["Lan Mouse", lm.running ? `pid ${lm.pid}${lm.listening ? " · UDP 4242" : " · no socket"}` : "not running"]);
+      const sh = state.probe?.sharing;
+      const apart = sh && sh.state === "apart" && sh.enforced !== false;
+      rows.push(["Lan Mouse", lm.running ? `pid ${lm.pid}${lm.listening ? " · UDP 4242" : " · no socket"}` : apart ? "off while apart" : sh && sh.state === "unknown" ? "not running (can't tell if the computers are together)" : "not running"]);
       if (lm.peers?.length) rows.push(["Sending to", lm.peers.join(", ")]);
     } else if (live.ssh) {
       rows.push(["Lan Mouse", lm.running ? `${lm.fallback === "active" ? "fallback build" : "JARVIS build"}${lm.listening ? " · UDP 4242" : " · no socket"}` : `${lm.unit} / ${lm.fallback}`]);
@@ -409,12 +449,36 @@
   }
   $("#probe-refresh").addEventListener("click", () => refreshProbe(true));
 
+  function metersForCard(d, live) {
+    if (d && d.here && d.meters) return d.meters;
+    const known = d && d.meters, probed = live && live.meters;
+    if (probed && probed.blocks) {
+      // An SSH probe that could not read power_supply (bats=missing, or a Windows host seen through the
+      // Linux script) must not replace a valid reading from the node's own overview: keep that battery
+      // with its source and age, and take only the probe's other blocks.
+      const pb = probed.battery && probed.battery.applicability, kb = known && known.battery && known.battery.applicability;
+      if (pb === "unavailable" && kb && kb !== "unavailable") return known;
+      return probed;
+    }
+    return known || null;
+  }
+  function paintMeters(scope) {
+    if (!window.JarvisMeters) return;
+    const devices = state.overview?.devices || [];
+    const live = state.probe?.devices || {};
+    (scope || document).querySelectorAll(".hm-host").forEach((host) => {
+      const id = host.getAttribute("data-hm");
+      const d = devices.find((item) => item.id === id);
+      window.JarvisMeters.render(host, metersForCard(d, live[id]));
+    });
+  }
   function renderMachines(o) {
     const live = state.probe?.devices || {};
     const links = Object.entries(o.desktop).map(([k, v]) => `<div class="machine"><h3>${icon({ input: "keyboard", clipboard: "list-checks", screen_stream: "radio", extended_display: "monitor" }[k] || "activity", "i")}${esc(words(k).replace(/^\w/, (c) => c.toUpperCase()))} ${k === "input" && state.probe ? `<span class="state-word ${(LEVEL[state.probe.input_link.level] || LEVEL.warn)[1]}">${(LEVEL[state.probe.input_link.level] || LEVEL.warn)[0]}</span>` : stateWord(v.status)}</h3><p>${esc(v.candidate || "")}</p></div>`).join("");
     $("#machines").innerHTML = o.devices.map((d) => `<div class="machine"><h3>${icon("laptop-minimal", "i")}${esc(d.hostname || d.id)} ${liveWord(live[d.id])}</h3>
-      <p>${esc([d.model, d.cpu, d.ram].filter(Boolean).join(" · "))}</p>${liveFacts(live[d.id])}</div>`).join("") + links +
+      <p>${esc([d.model, d.cpu, d.ram].filter(Boolean).join(" · "))}</p>${liveFacts(live[d.id])}<div class="hm-host" data-hm="${esc(d.id)}"></div></div>`).join("") + links +
       `<p class="machine mono" style="font-size:11px;color:var(--ink-3);grid-column:1/-1">Machines and input sharing are checked live every minute. Clipboard, screen stream and display come from jarvis.config.json.</p>`;
+    paintMeters($("#machines"));
   }
   function renderHeapFacts(o) {
     $("#heap-facts").innerHTML = `<dt>Items</dt><dd>${o.memory.items}</dd><dt>Links</dt><dd>${o.memory.links}</dd>` +
@@ -630,7 +694,20 @@
       <header>${icon("laptop-minimal", "i")}<div><h3>${esc(c.local)}</h3><p>${esc(d.label || d.hostname || "")}</p></div>${pill(c.role === "main" ? "main · this PC" : "this PC", "ok")}</header>
       <p class="cx-line">${dot(true)}Hub running${c.code ? ` · code <span class="mono">${esc(c.code.slice(0, 8))}</span>` : ""}</p>
       ${hwLine(d) ? `<p class="cx-sub">${hwLine(d)}</p>` : ""}
+      <div class="hm-host" data-hm="${esc(c.local)}"></div>
       ${hwDetails(d)}</article>`;
+  }
+
+  function screenHold(n) {
+    // Busy is not proof the node is online. Screen stays unavailable, and the label says so.
+    const st = n.presence || (n.online ? "online" : "offline");
+    if (st === "busy") return { enabled: false, text: "Busy, awaiting contact" };
+    if (n.online) return { enabled: true, text: "online" };
+    return { enabled: false, text: "offline" };
+  }
+  function clusterNode(id) {
+    const c = conn.data && conn.data.cluster;
+    return ((c && c.nodes) || []).find((n) => n.id === id) || null;
   }
 
   function nodeCard(n, inv) {
@@ -639,17 +716,21 @@
     const failed = (jobs.failed || 0) + (jobs.expired || 0) + (jobs.uncertain || 0);
     const jobLine = [jobs.done ? `${jobs.done} done` : "", failed ? `${failed} failed` : "", n.running ? `${n.running} running` : ""].filter(Boolean).join(" · ") || "no jobs";
     let hint = "";
-    if (!n.online) hint = `Its node agent isn't polling the main. On ${esc(n.hostname || n.id)}, start JARVIS's node agent (or <code>jarvis cluster doctor</code>).`;
+    const st = n.presence || (n.online ? "online" : "offline");
+    const hold = screenHold(n);
+    if (st === "busy") hint = "Running a job, so it isn't checking in. Not proven online until it does.";
+    else if (!n.online) hint = `Its node agent isn't polling the main. On ${esc(n.hostname || n.id)}, start JARVIS's node agent (or <code>jarvis cluster doctor</code>).`;
     else if (!n.code_ok) hint = "Runs older code. It pulls the main's code by itself on its next poll and restarts.";
     return `<article class="cx-node ${n.online ? "on" : "off"}" aria-label="${esc(n.id)}, node">
       <header>${icon("laptop-minimal", "i")}<div><h3>${esc(n.id)}</h3><p>${esc(n.label !== n.id ? n.label : n.hostname || "")}</p></div>
-        ${pill(n.online ? "online" : "offline", n.online ? "ok" : "warn", n.seen ? "last heard " + new Date(n.seen * 1000).toLocaleString() : "")}</header>
-      <p class="cx-line">${dot(n.online)}${n.online ? "Polling now" : "Last heard " + silent(n.silent_for)}${n.platform ? ` · ${esc(n.platform)}` : ""}${n.hostname ? ` · <span class="mono">${esc(n.hostname)}</span>` : ""}</p>
+        ${pill(st === "busy" ? "busy, awaiting contact" : n.online ? "online" : "offline", n.online ? "ok" : "warn", n.seen ? "last heard " + new Date(n.seen * 1000).toLocaleString() : "")}</header>
+      <p class="cx-line">${dot(n.online)}${n.online ? "Polling now" : st === "busy" ? hold.text + " · last heard " + silent(n.silent_for) : "Last heard " + silent(n.silent_for)}${n.platform ? ` · ${esc(n.platform)}` : ""}${n.hostname ? ` · <span class="mono">${esc(n.hostname)}</span>` : ""}</p>
       <div class="cx-chips">${pill(n.code_ok ? "same code" : "older code", n.code_ok ? "ok" : "warn", "node code " + (n.code || "unknown"))}${pill("24 h: " + jobLine, failed ? "warn" : "")}</div>
-      <div class="cx-caps" aria-label="What the main may ask it">${n.capabilities.map((c) => `<span title="${esc(c.does)}">${esc(c.id)}</span>`).join("")}</div>
+      <div class="cx-caps" aria-label="What the main may ask it">${n.capabilities.map((c) => `<span title="${esc(c.does)}">${esc(c.title || c.id)}</span>`).join("")}</div>
       ${hint ? `<p class="cx-hint">${hint}</p>` : ""}
-      <div class="cx-actions"><button type="button" class="cx-btn" data-cx-screen="${esc(n.id)}"${n.online ? "" : " disabled"}>${icon("monitor")}<span>Screen</span></button>
+      <div class="cx-actions"><button type="button" class="cx-btn" data-cx-screen="${esc(n.id)}"${hold.enabled ? "" : " disabled"}${hold.text === "Busy, awaiting contact" ? ` title="${esc(hold.text)}"` : ""}>${icon("monitor")}<span>Screen</span></button>
         <button type="button" class="cx-btn" data-cx-send="${esc(n.id)}">${icon("arrow-up-right")}<span>Send files</span></button></div>
+      <div class="hm-host" data-hm="${esc(n.id)}"></div>
       ${hwDetails(d)}</article>`;
   }
 
@@ -657,7 +738,7 @@
     const c = conn.data?.cluster;
     if (!c) return `<section class="panel cx-panel cx-links"><p class="cx-empty">${conn.error ? "Couldn't read connections: " + esc(conn.error) : "Reading connections…"}</p></section>`;
     if (!c.enabled) return `<section class="panel cx-panel cx-links"><header class="cx-h"><h2>Computers</h2></header>
-      <p class="cx-empty">The cluster isn't set up, so this computer works alone. On the main PC run <code>jarvis cluster init</code>, then <code>jarvis cluster invite NAME</code>.</p></section>`;
+      <p class="cx-empty">The cluster isn't set up, so this computer works alone. On the main PC run <code>jarvis cluster init</code>, then use Connect a computer or server on this page.</p></section>`;
     const nodes = c.nodes || [];
     const online = nodes.filter((n) => n.online).length;
     return `<section class="panel cx-panel cx-links" aria-labelledby="cx-links-h">
@@ -665,7 +746,7 @@
       <div class="cx-map">${hubCard(c, conn.data.here, inv)}
         <div class="cx-wires" aria-hidden="true">${nodes.map((n) => `<i class="${n.online ? "on" : "off"}"></i>`).join("")}</div>
         <div class="cx-nodes">${nodes.map((n) => nodeCard(n, inv)).join("") ||
-          `<p class="cx-empty">No node PCs yet. Run <code>jarvis cluster invite NAME</code> here, then <code>jarvis cluster join CODE</code> on the other computer.</p>`}</div></div></section>`;
+          `<p class="cx-empty">No node PCs yet. Use <a href="#fleet-root">Connect a computer or server</a> below to make an invite, then run the join command it shows on the other computer.</p>`}</div></div></section>`;
   }
 
   function tile(id, iconName, title, on, line, sub, buttons, extra = "") {
@@ -739,6 +820,7 @@
       <div class="cx-pair">${screenPanel(o)}${sendPanel(o)}</div>
       ${agentsPanel(o)}`;
     $$("#view-devices details.cx-more").forEach((el) => { if (open.has(el.closest("[aria-label]")?.getAttribute("aria-label"))) el.open = true; });
+    paintMeters($("#view-devices"));
     wireDropzone(); wireScreen(); wireConnections();
     if (!conn.data && !conn.error && !conn.loading) { conn.loading = true; loadConnections().finally(() => (conn.loading = false)); }
     pollConnections();
@@ -780,13 +862,14 @@
       || o.devices.find((x) => x.here) || o.devices[0];
     if (!d) return "";
     screenView.device = d.id;
+    const awaiting = (clusterNode(d.id) || {}).presence === "busy";
     return `<article class="panel ticks screen-panel"><header class="ph">${icon("monitor")}<h2>Screens</h2><span class="ph-meta mono">view only</span></header>
       <div class="scr-bar">
         <div class="scr-tabs" role="tablist" aria-label="Whose screen">${o.devices.map((x) =>
           `<button type="button" role="tab" data-dev="${esc(x.id)}" aria-selected="${x.id === d.id}">${icon("laptop-minimal")}<span>${esc(x.id)}</span>${x.here ? `<small>this device</small>` : ""}</button>`).join("")}</div>
         <div class="scr-actions">
-          <button class="scr-btn" type="button" id="scr-live" aria-pressed="${screenView.live}"><i aria-hidden="true"></i>Live</button>
-          <button class="scr-btn" type="button" id="scr-refresh">${icon("refresh-cw")}<span>Snapshot</span></button>
+          <button class="scr-btn" type="button" id="scr-live"${awaiting ? " disabled" : ""} aria-pressed="${screenView.live}"><i aria-hidden="true"></i>Live</button>
+          <button class="scr-btn" type="button" id="scr-refresh"${awaiting ? " disabled" : ""}>${icon("refresh-cw")}<span>Snapshot</span></button>
           <button class="scr-btn" type="button" id="scr-full" aria-label="Full screen">${icon("arrow-up-right")}</button></div></div>
       <div class="scr-frame" id="scr-frame"></div></article>`;
   }
@@ -795,15 +878,18 @@
     const shot = screenView.shots[screenView.device];
     const busy = screenView.busy.has(screenView.device);
     frame.classList.toggle("busy", busy);
+    const awaiting = (clusterNode(screenView.device) || {}).presence === "busy";
     frame.innerHTML = (shot ? `<img src="${shot.url}" alt="Screen of ${esc(screenView.device)}">` : "") +
       (screenView.error ? `<div class="scr-empty"><b>Couldn't get ${esc(screenView.device)}'s screen</b><p>${esc(screenView.error)}</p><button class="scr-btn" type="button" data-scr-snap>Try again</button></div>`
         : !shot ? `<div class="scr-empty">${busy ? `<b>Capturing ${esc(screenView.device)}…</b>`
+          : awaiting ? `<b>${esc(screenView.device)}</b><p>Busy, awaiting contact</p>`
           : `<b>${esc(screenView.device)}</b><button class="scr-btn" type="button" data-scr-snap>${icon("monitor")}<span>Show its screen</span></button>`}</div>` : "") +
       (shot ? `<span class="scr-stamp mono">${screenView.live ? `<i aria-hidden="true"></i>` : ""}${esc(screenView.device)} · ${esc(shot.at)}${shot.w ? ` · ${shot.w}×${shot.h}` : ""}${busy ? " · updating…" : ""}</span>` : "");
     frame.querySelector("[data-scr-snap]")?.addEventListener("click", snapScreen);
   }
   async function snapScreen() {
     const device = screenView.device;
+    if ((clusterNode(device) || {}).presence === "busy") { paintScreen(); return; }
     if (screenView.busy.has(device)) return;
     screenView.busy.add(device); screenView.error = ""; paintScreen();
     try {
@@ -842,7 +928,8 @@
       if (b.dataset.dev === screenView.device) return;
       screenView.device = b.dataset.dev; screenView.error = ""; store.set("jarvis.scrdevice", b.dataset.dev);
       $$(".scr-tabs button").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
-      paintScreen(); snapScreen();
+      paintScreen();
+      if ((clusterNode(b.dataset.dev) || {}).presence !== "busy") snapScreen();
     }));
     $("#scr-refresh").addEventListener("click", snapScreen);
     $("#scr-live").addEventListener("click", () => setLive(!screenView.live));

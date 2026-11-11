@@ -22,9 +22,11 @@
 <link rel="stylesheet" href="settings.css">
 <link rel="stylesheet" href="files.css">
 <link rel="stylesheet" href="connections.css">
+<link rel="stylesheet" href="fleet.css?v=2">
 <link rel="stylesheet" href="laptops.css">
 <link rel="stylesheet" href="remote.css">
 <link rel="stylesheet" href="voicesetup.css">
+<link rel="stylesheet" href="checkpoint.css?v=1">
 <script src="theme.js"></script>
 <script src="esc.js"></script>
 </head>
@@ -341,6 +343,7 @@
     </section>
     <section class="view" id="view-devices" data-title="Connections" hidden>
       <div class="devices-grid cx-stack" id="devices-top"></div>
+      <section id="fleet-root" aria-label="Computers and servers"></section>
       <div id="peripherals"></div>
       <div class="devices-grid cx-stack" id="devices-grid"></div>
     </section>
@@ -369,7 +372,7 @@
             <header class="st-head"><h2>Machines</h2><p>Which computer runs JARVIS. Live link state and start/stop controls are in <a class="st-link" href="#devices">Devices</a>.</p></header>
             <div class="st-stat" id="st-stat-machines" aria-live="polite"></div>
             <div class="st-group st-machines" id="st-machines" aria-live="polite"><p class="st-loading">Loading machines</p></div>
-            <p class="st-foot">Add a computer: on the main run <code>jarvis cluster invite &lt;name&gt;</code>, then <code>jarvis cluster join &lt;code&gt;</code> on the new one. <code>jarvis cluster doctor</code> explains any problem.</p>
+            <p class="st-foot">Add a computer: open Connections → Connect a computer or server on the main, then follow the join instructions on the new one. <code>jarvis cluster doctor</code> explains any problem.</p>
             <details class="st-adv">
               <summary>Advanced</summary>
               <div class="st-group" id="st-rows-machines"><p class="st-loading">Loading settings</p></div>
@@ -526,6 +529,7 @@
 <script src="voice.js"></script>
 <script src="voicesetup.js"></script>
 <script src="agent.js"></script>
+<script src="meters.js"></script>
 <script src="app.js"></script>
 <script src="ear.js"></script>
 <script src="agentscreen.js"></script>
@@ -544,6 +548,7 @@
 <script src="gate.js"></script>
 <script src="cockpit.js"></script>
 <script src="settings.js"></script>
+<script src="fleet.js?v=2"></script>
 <script type="module" src="engine3d.js"></script>
 </body>
 </html>

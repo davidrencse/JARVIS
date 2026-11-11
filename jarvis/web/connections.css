@@ -70,6 +70,24 @@
 .cx-tool { font: 11px var(--mono); color: var(--ink-3); border: 1px dashed var(--line-2); padding: 1px 6px; border-radius: var(--r-sm); }
 .cx-tool.ok { color: var(--ink-2); border-style: solid; }
 
+/* Per-machine RAM, swap, disk, CPU and battery. Colour is state only; these stay ink. */
+.hm-host { display: block; min-width: 0; }
+.hm-meters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; margin-top: 10px; min-width: 0; }
+.hm-meter { min-width: 0; border-top: 1px solid var(--line); padding-top: 6px; }
+.hm-meter.wide { grid-column: 1 / -1; }
+.hm-meter h4 { margin: 0 0 4px; font: 500 11px/1.2 var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-3); }
+.hm-row { min-width: 0; }
+.hm-line { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font: 12px/1.35 var(--mono); color: var(--ink); }
+.hm-k { color: var(--ink-3); flex: none; }
+.hm-v { text-align: right; overflow-wrap: anywhere; min-width: 0; }
+.hm-d { margin: 1px 0 0; font: 11px/1.35 var(--mono); color: var(--ink-3); overflow-wrap: anywhere; }
+@media (min-width: 1100px) {
+  .cx-node .hm-meters { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@media (max-width: 360px) {
+  .hm-meters { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* this computer */
 .cx-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
 .cx-tile { border: 1px solid var(--line-2); border-radius: var(--r); padding: 14px 16px; display: flex; flex-direction: column; min-width: 0; }
