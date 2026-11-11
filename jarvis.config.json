@@ -249,5 +249,8 @@
   },
   "lan_mouse": {
     "enabled": true
+  },
+  "second_brain": {
+    "enabled": true
   }
 }
