@@ -80,7 +80,7 @@ He answers in the console gate or by saying "Jarvis, yes".
 - **Python:** use `.venv/bin/python`. It has numpy and the voice deps; bare system `python` doesn't.
 - **Tests** (about 2.5 min, all must pass before you report done):
   `.venv/bin/python -m unittest discover -s tests`
-  - One module: `.venv/bin/python -m unittest tests.test_parse`
+  - One module: `.venv/bin/python -m unittest tests.intelligence.test_parse`
   - Test configs disable semantic, shadow and interpreter.
   - An audit hook in `jarvis/__init__.py` refuses to start `codex`/`claude` under tests (or with
     `JARVIS_NO_MODELS=1`), so the suite never spends quota.
@@ -104,7 +104,7 @@ He answers in the console gate or by saying "Jarvis, yes".
   - It is a fixed grid in `cockpit.css` (rail tabs / pipeline + trace / assistant) with the gate
     panel (`gate.js`) at the bottom.
   - Keep existing element IDs: `app.js` and `signals.js` look them up.
-- **`tests/test_web_voice.py`** runs `app.js` in a Node VM with stub elements:
+- **`tests/web/test_web_voice.py`** runs `app.js` in a Node VM with stub elements:
   - Use `setAttribute(...)`, not `el.dataset` or newer DOM APIs.
   - Run that module after touching `app.js` or `voice.js`.
 - **Check rendered UI, not just code:**
@@ -121,7 +121,7 @@ He answers in the console gate or by saying "Jarvis, yes".
   (`rules.always_ask`, default `["money", "messages"]`; browser clicks and Grok tasks). The
   desktop `computer` tool can't tell what a pixel click buys, so this doesn't cover it.
 - `gates.hard_deny` fails closed on shapes it can't read (substitutions, shells fed text, inline code that
-  deletes, wildcards near protected folders). Add new bypass finds to `tests/test_gates_redteam.py`.
+  deletes, wildcards near protected folders). Add new bypass finds to `tests/security/test_gates_redteam.py`.
 
 ## Input sharing and desktop control
 - **Desktop control (`control.py`, the `computer` tool):** JARVIS sees the screen and uses mouse/keyboard.
@@ -131,7 +131,7 @@ He answers in the console gate or by saying "Jarvis, yes".
   mouse and keyboard from the main, over the existing hub/tunnel (no new port). Job kind `remote`,
   which only the main's console can send; the brain has no tool for it. Ending (Disconnect, closed tab,
   link loss, node `jarvis control stop`, restart) always lets go of held keys and buttons; keep that
-  true. Tests use fake injectors (`tests/test_remote_view.py`).
+  true. Tests use fake injectors (`tests/remote/test_remote_view.py`).
 - **Lan Mouse:**
   - A JARVIS-patched build: source `~/src/lan-mouse-jarvis`, binary `~/.local/bin/lan-mouse-jarvis`,
     user service `lan-mouse`.

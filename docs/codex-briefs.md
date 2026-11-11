@@ -85,7 +85,7 @@ Build:
 
 Rules: no commits/branches/pushes; stdlib only; no API keys or paid APIs. Edit only
 jarvis/confirm.py (new), gates.py, pipeline.py, assistant.py, history.py, ui.py,
-web/flow.js, web/flow.css, and tests/test_confirm.py (new) plus existing tests that you
+web/flow.js, web/flow.css, and tests/security/test_confirm.py (new) plus existing tests that you
 must update because behaviour changed (say which and why). Do not touch actions.py,
 observe.py, cluster*.py or remote.py. Tests use temp dirs and fake remotes only.
 
@@ -138,7 +138,7 @@ Problems:
 2. "play my liked songs" opens spotify:collection:tracks, sleeps a fixed 2 s, then
    presses play. That most likely resumes whatever Spotify last played, not Liked Songs.
 
-Build (edit only jarvis/actions.py and tests/test_executors.py):
+Build (edit only jarvis/actions.py and tests/runtime/test_executors.py):
 1. Make play and pause idempotent on Windows: read the current SMTC playback status
    first (reuse the PowerShell WinRT query pattern from observe._playback_nt, or import
    it), and only press the toggle when the state needs to change. On Linux, playerctl
@@ -152,7 +152,7 @@ Build (edit only jarvis/actions.py and tests/test_executors.py):
    If nothing works reliably without UI automation, say so plainly; don't fake it.
 Free/local only: never the Spotify Web API or any API key.
 
-Rules: no commits/branches/pushes. Edit only jarvis/actions.py and tests/test_executors.py
+Rules: no commits/branches/pushes. Edit only jarvis/actions.py and tests/runtime/test_executors.py
 (tests patch _run/subprocess/time; never press real keys in tests). If pipeline.py must
 change, stop and report what and why instead.
 
@@ -199,7 +199,7 @@ Build:
 
 Rules: no commits/branches/pushes; never print or log the pairing token; no sudo; edit
 only jarvis/cluster*.py, topology.py, remote.py, jarvis.config.json (back it up first as
-jarvis.config.json.pre-cluster-live), docs/, and tests/test_cluster.py /
+jarvis.config.json.pre-cluster-live), docs/, and tests/cluster/test_cluster.py /
 tests/test_remote.py. Do not touch pipeline.py, gates.py, assistant.py or actions.py.
 
 Done when: `jarvis cluster status` on the Zenbook shows connected after a Zenbook
