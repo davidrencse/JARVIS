@@ -178,7 +178,9 @@
   function machineStatus(m) {
     if (m.role === "main") return ["ok", m.this ? "Runs the brain, memory and vault. This PC." : "Runs the brain, memory and vault."];
     if (m.paired === undefined) return ["", m.this ? "This PC. Connects to the main." : "Connects to the main."];
-    if (!m.paired) return ["warn", "Not paired. On the main: jarvis cluster invite " + m.id];
+    if (!m.paired) return ["warn", "Not paired. Open Connections → Connect a computer or server."];
+    // Busy is not offline. The Make-main control stays unavailable either way.
+    if (m.presence === "busy") return ["warn", "Busy, awaiting contact" + (m.seen ? " · last seen " + ago(m.seen) : "")];
     if (!m.online) return ["down", m.seen ? "Offline · last seen " + ago(m.seen) : "Offline · never connected"];
     return m.same_code ? ["ok", "Online · checked in " + ago(m.seen)] : ["warn", "Online · updating to the main's code"];
   }
@@ -190,9 +192,7 @@
     if (!list.length) { box.innerHTML = '<p class="st-empty">No computers configured. Add them under devices in jarvis.config.json.</p>'; return; }
     box.innerHTML = list.map((m) => {
       const main = m.role === "main", [tone, line] = machineStatus(m);
-      const action = main ? "" : confirmFor === m.id
-        ? `<div class="st-confirm"><span>Hand the brain to ${esc(m.label || m.id)}?</span><button type="button" class="st-btn st-btn-strong" data-make-main="${esc(m.id)}">Make main</button><button type="button" class="st-btn" data-cancel>Cancel</button></div>`
-        : `<button type="button" class="st-btn" data-ask-main="${esc(m.id)}">Make main</button>`;
+      const action = main ? "" : '<span class="st-status">MAIN transfer unavailable. See Connections for readiness.</span>';
       return `<div class="st-row st-mc" data-role="${main ? "main" : "node"}">
         <div class="st-label"><b>${esc(m.label || m.id)}<span class="st-badge">${main ? "Main" : "Node"}</span>${m.this ? '<span class="st-badge st-badge-soft">This PC</span>' : ""}</b>
         <small class="st-status" data-tone="${tone}"><i aria-hidden="true"></i>${esc(line)}</small></div>
@@ -276,7 +276,7 @@
     if (ask) { askMain(ask.dataset.askMain); return; }
     if (e.target.closest("[data-cancel]")) { askMain(""); return; }
     const mm = e.target.closest("[data-make-main]");
-    if (mm) { mm.disabled = true; clearTimeout(confirmT); confirmFor = ""; save("cluster.main_device", mm.dataset.makeMain, (byPath("cluster.main_device") || {}).value); return; }
+    if (mm) { toast("MAIN transfer is unavailable. See Connections for readiness."); return; }
     if (e.target.closest("#st-restart-voice")) restartVoice(e.target.closest("button"));
     if (e.target.closest("[data-retry]")) load();
   });

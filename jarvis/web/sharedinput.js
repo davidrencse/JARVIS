@@ -52,12 +52,19 @@
   }
 
   function draw() {
-    const { devices = [], layout = {}, checks = [], here } = data || {};
+    const { devices = [], layout = {}, checks = [], here, sharing = {} } = data || {};
     $("#si-checked").textContent = "Checked " + ago(loadedAt / 1000);
-    $("#si-checks").innerHTML = checks.length ? checks.map((c) => row(c.level, c.text)).join("")
-      : row("warn", "No computers are configured for shared input.");
-    drawLayout(devices, layout, here, checks);
-    drawMachines(devices);
+    // Availability is the guard's projection. "apart" hides the shared screens, "unknown"
+    // says so instead of guessing, "together" draws as before. enforced false is the off switch.
+    const apart = sharing.state === "apart" && sharing.enforced !== false;
+    const lead = apart
+      ? row("warn", `Shared mouse and keyboard is unavailable: ${sharing.why || "the laptops are apart"}. Remote control still works.${sharing.override ? " It was started by hand and will not be turned back on if it stops." : ""}`)
+      : sharing.state === "unknown" ? row("warn", `Can't tell whether the laptops are together: ${sharing.why || "no reading yet"}`) : "";
+    $("#si-checks").innerHTML = lead + (checks.length ? checks.map((c) => row(c.level, c.text)).join("")
+      : row("warn", "No computers are configured for shared input."));
+    if (apart) $("#si-layout").innerHTML = `<p class="si-empty">The laptops are on different networks, so the shared screens are hidden. They return when you're together again. Remote control still works.</p>`;
+    else drawLayout(devices, layout, here, checks);
+    drawMachines(devices, sharing);
   }
 
   function drawLayout(devices, layout, here, checks) {
@@ -110,7 +117,7 @@
     fig.innerHTML = `<svg viewBox="${minX} ${minY} ${maxX - minX} ${maxY - minY}" role="img" aria-label="${esc(boxes.map((b) => `${b.d.label}${b.side ? ` on the ${b.side}` : ""}`).join(", "))}">${svg}</svg>`;
   }
 
-  function drawMachines(devices) {
+  function drawMachines(devices, sharing = {}) {
     const host = (h) => String(h || "").trim().toLowerCase().split(".")[0];
     const byHost = new Map(devices.filter((d) => d.info).map((d) => [host(d.info.hostname), d]));
     $("#si-machines").innerHTML = devices.map((d) => {
@@ -119,7 +126,9 @@
       const facts = [];
       if (!info) facts.push(["Status", d.error || "Not reachable"]);
       else {
-        facts.push(["Lan Mouse", lm.running ? `Running · ${lm.build === "patched" ? "JARVIS build" : "official build"}` : "Stopped"]);
+        const apart = sharing.state === "apart" && sharing.enforced !== false;
+        facts.push(["Lan Mouse", lm.running ? `Running · ${lm.build === "patched" ? "JARVIS build" : "official build"}`
+          : apart ? "Off while apart" : "Stopped"]);
         if (m) facts.push(["Screen", `${m.width}×${m.height}${d.screen_inches ? ` · ${d.screen_inches}″` : ""}${d.ppi ? ` · ${Math.round(d.ppi)} ppi` : ""}`]);
         for (const client of cfg.clients || []) {
           const peer = byHost.get(host(client.hostname));

@@ -35,7 +35,7 @@
   --emph-ink-2: rgba(245, 245, 246, .72);
   --emph-line: rgba(255, 255, 255, .12);
   --emph-sunk: rgba(255, 255, 255, .07);
-  --ok: #2f7a45; --warn: #9a6400; --alert: #c0392f; --info: #5b5b63;
+  --ok: #2a6e3e; --warn: #865700; --alert: #b1342b; --info: #5b5b63;  /* each >= 4.5:1 on bg, card, card-strong, sunk and hover surfaces (tests/web/test_theme_contrast.py) */
   --shadow: 0 1px 0 rgba(255, 255, 255, .9) inset, 0 24px 48px -28px rgba(20, 20, 30, .28);
   --veil: radial-gradient(120% 90% at 40% 0%, rgba(231, 231, 233, 0), rgba(231, 231, 233, .25));
   --sheen: linear-gradient(180deg, rgba(255, 255, 255, .55), rgba(255, 255, 255, 0) 40%);

@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<title>JARVIS</title>
+<meta name="description" content="Your computers from your phone: screens, cameras and Ask JARVIS.">
+<meta name="theme-color" content="#000000">
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="no-referrer">
+<meta name="format-detection" content="telephone=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="JARVIS">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<link rel="preload" href="/fonts/geist.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/fonts/geist-mono.woff2" as="font" type="font/woff2" crossorigin>
+<script src="/theme.js"></script>
+<link rel="stylesheet" href="/phone.css">
+<script src="/meters.js"></script>
+<script src="/phone.js" defer></script>
+</head>
+<body>
+<!-- Lucide v0.544.0 symbols (ISC license) the console's /icons.svg doesn't carry. Same form: viewBox 24, no paint. -->
+<svg class="sprite" aria-hidden="true" focusable="false">
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M13.997 4a2 2 0 0 1 1.76 1.05l.486.9A2 2 0 0 0 18.003 7H20a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h1.997a2 2 0 0 0 1.759-1.048l.489-.904A2 2 0 0 1 10.004 4z" /><circle cx="12" cy="13" r="3" /></symbol>
+  <symbol id="i-smartphone" viewBox="0 0 24 24"><rect width="14" height="20" x="5" y="2" rx="2" ry="2" /><path d="M12 18h.01" /></symbol>
+  <symbol id="i-mouse-pointer" viewBox="0 0 24 24"><path d="M4.037 4.688a.495.495 0 0 1 .651-.651l16 6.5a.5.5 0 0 1-.063.947l-6.124 1.58a2 2 0 0 0-1.438 1.435l-1.579 6.126a.5.5 0 0 1-.947.063z" /></symbol>
+  <symbol id="i-pointer" viewBox="0 0 24 24"><path d="M22 14a8 8 0 0 1-8 8" /><path d="M18 11v-1a2 2 0 0 0-2-2a2 2 0 0 0-2 2" /><path d="M14 10V9a2 2 0 0 0-2-2a2 2 0 0 0-2 2v1" /><path d="M10 9.5V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v10" /><path d="M18 11a2 2 0 1 1 4 0v3a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15" /></symbol>
+  <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></symbol>
+  <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></symbol>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2" ry="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 2v10" /><path d="M18.4 6.6a9 9 0 1 1-12.77.04" /></symbol>
+  <symbol id="i-log-out" viewBox="0 0 24 24"><path d="m16 17 5-5-5-5" /><path d="M21 12H9" /><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /></symbol>
+  <symbol id="i-wifi-off" viewBox="0 0 24 24"><path d="M12 20h.01" /><path d="M8.5 16.429a5 5 0 0 1 7 0" /><path d="M5 12.859a10 10 0 0 1 5.17-2.69" /><path d="M19 12.859a10 10 0 0 0-2.007-1.523" /><path d="M2 8.82a15 15 0 0 1 4.177-2.643" /><path d="M22 8.82a15 15 0 0 0-11.288-3.764" /><path d="m2 2 20 20" /></symbol>
+  <symbol id="i-scan" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2" /><path d="M17 3h2a2 2 0 0 1 2 2v2" /><path d="M21 17v2a2 2 0 0 1-2 2h-2" /><path d="M7 21H5a2 2 0 0 1-2-2v-2" /></symbol>
+  <symbol id="i-share" viewBox="0 0 24 24"><path d="M12 2v13" /><path d="m16 6-4-4-4 4" /><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8" /></symbol>
+  <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7" /><path d="M19 12H5" /></symbol>
+  <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14" /><path d="m12 5 7 7-7 7" /></symbol>
+  <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 5v14" /><path d="m19 12-7 7-7-7" /></symbol>
+  <symbol id="i-delete" viewBox="0 0 24 24"><path d="M10 5a2 2 0 0 0-1.344.519l-6.328 5.74a1 1 0 0 0 0 1.481l6.328 5.741A2 2 0 0 0 10 19h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2z" /><path d="m12 9 6 6" /><path d="m18 9-6 6" /></symbol>
+  <symbol id="i-square-plus" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2" /><path d="M8 12h8" /><path d="M12 8v8" /></symbol>
+</svg>
+
+<!-- Before /phone/api/me answers. -->
+<div class="screen boot" id="boot" role="status" aria-label="Connecting to JARVIS">
+  <div class="brand big"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg><span class="word">JARVIS</span></div>
+  <p class="boot-dots" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></p>
+</div>
+
+<!-- The app couldn't load: no network (Tailscale off) or the server said no. Never the pair screen. -->
+<section class="screen gate" id="down" hidden aria-labelledby="down-h">
+  <div class="gate-in">
+    <div class="brand"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg><span class="word">JARVIS</span></div>
+    <svg class="i gate-ic" aria-hidden="true"><use href="#i-wifi-off"/></svg>
+    <h1 id="down-h" tabindex="-1">Can't reach JARVIS — is Tailscale on?</h1>
+    <p id="down-p" class="lead">Your phone reaches JARVIS through Tailscale. Turn it on, then try again.</p>
+    <button type="button" class="btn strong wide" id="down-retry"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-refresh-cw"/></svg>Try again</button>
+    <p class="fine mono" id="down-when" aria-live="polite"></p>
+  </div>
+</section>
+
+<!-- Pairing: a code from `jarvis phone pair` on the main, then David allows it there. -->
+<section class="screen gate" id="pair" hidden aria-labelledby="pair-h">
+  <div class="gate-in">
+    <div class="brand"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg><span class="word">JARVIS</span></div>
+    <h1 id="pair-h" tabindex="-1">Pair this phone</h1>
+
+    <div id="pair-ios" hidden>
+      <p class="lead">Add JARVIS to your Home Screen, open the icon, then pair. The Home Screen app keeps its own sign-in, so pairing here in Safari wouldn't carry over.</p>
+      <ol class="steps">
+        <li><span class="n mono">1</span><span>Tap <b>Share</b></span><svg class="i" aria-hidden="true"><use href="#i-share"/></svg></li>
+        <li><span class="n mono">2</span><span>Choose <b>Add to Home Screen</b></span><svg class="i" aria-hidden="true"><use href="#i-square-plus"/></svg></li>
+        <li><span class="n mono">3</span><span>Open <b>JARVIS</b> from your Home Screen and pair there</span><svg class="i" aria-hidden="true"><use href="#i-smartphone"/></svg></li>
+      </ol>
+    </div>
+
+    <div id="pair-form" hidden>
+      <p class="lead">On the main computer, run <code>jarvis phone pair</code> and enter the code it prints.</p>
+      <label class="field" for="p-code"><span class="lbl">Pairing code</span>
+        <input id="p-code" class="code" type="text" inputmode="text" maxlength="11" autocomplete="one-time-code"
+               autocapitalize="characters" autocorrect="off" spellcheck="false" enterkeyhint="next"
+               placeholder="XXXX XXXX" aria-describedby="p-msg"></label>
+      <label class="field" for="p-name"><span class="lbl">Name for this phone</span>
+        <input id="p-name" type="text" maxlength="40" autocomplete="off" autocapitalize="words" autocorrect="off"
+               spellcheck="false" enterkeyhint="go"></label>
+      <button type="button" class="btn strong wide" id="p-go"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg>Pair</button>
+      <p class="msg" id="p-msg" role="status"></p>
+    </div>
+
+    <div id="pair-wait" hidden>
+      <p class="needs-line"><i class="ld" data-st="needs" aria-hidden="true"></i><b>Waiting for your OK on the main computer</b></p>
+      <p class="lead">In the terminal running <code>jarvis phone pair</code>, check this phone's name and type <kbd>y</kbd>.</p>
+      <p class="clock mono" aria-hidden="true"><span id="pw-time">waiting 0:00</span><i><b id="pw-bar"></b></i></p>
+      <button type="button" class="btn wide" id="pw-cancel">Cancel</button>
+      <p class="msg" id="pw-msg" role="status"></p>
+    </div>
+  </div>
+</section>
+
+<div class="app" id="app" hidden data-screen="devices">
+  <header class="top">
+    <a class="brand" href="#/devices" aria-label="JARVIS, devices"><svg class="mark" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></svg><span class="word">JARVIS</span></a>
+    <span class="top-main mono" id="main-label"></span>
+    <span class="link" id="link" data-st="live" role="img" aria-label="Link to JARVIS: live">
+      <canvas class="hb" id="hb" width="64" height="18" aria-hidden="true"></canvas>
+      <i class="ld" id="link-dot" aria-hidden="true"></i><span class="mono" id="link-ms" aria-hidden="true">– ms</span>
+    </span>
+  </header>
+  <div class="net" id="net" role="alert" hidden>
+    <svg class="i i-sm" aria-hidden="true"><use href="#i-wifi-off"/></svg>
+    <span>Can't reach JARVIS — is Tailscale on?</span>
+    <button type="button" class="mini" id="net-retry">Retry</button>
+  </div>
+
+  <main class="main" id="main">
+    <!-- Devices: one instrument row per computer. -->
+    <section class="scr" id="s-devices" aria-labelledby="dv-h">
+      <div class="ph"><h1 id="dv-h" tabindex="-1">Your computers</h1><span class="meta mono" id="dv-meta"></span></div>
+      <dl class="strip">
+        <div><dt>Online</dt><dd class="mono" id="st-online">–</dd></div>
+        <div><dt>Sessions</dt><dd class="mono" id="st-sess">–</dd></div>
+      </dl>
+      <p class="section-intro">Choose a computer to control its screen or open its camera.</p>
+      <ul class="rows" id="dv-list" aria-label="Computers"></ul>
+      <p class="empty" id="dv-empty" hidden>No computers yet. Add one from the main computer: open Manage computers for the steps.</p>
+      <a class="manage" id="dv-manage" href="#/fleet"><span class="manage-t"><b>Manage computers</b><small>See what's connected and how to add one</small></span><svg class="i i-sm" aria-hidden="true"><use href="#i-arrow-right"/></svg></a>
+      <div class="sub" id="dv-sess" hidden>
+        <div class="ph sm"><h2>Your sessions</h2></div>
+        <ul class="rows" id="dv-sess-list"></ul>
+      </div>
+    </section>
+
+    <!-- Manage computers: read-only fleet summary and the join guide. Changes are made on the main PC. -->
+    <section class="scr" id="s-fleet" hidden aria-labelledby="fl-h">
+      <a class="back" href="#/devices"><svg class="i i-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg>Devices</a>
+      <div class="ph"><h1 id="fl-h" tabindex="-1">Manage computers</h1><span class="meta mono" id="fl-meta"></span></div>
+      <p class="notice"><span>This phone can look, not change. Adding, changing or removing a computer is finished on the main PC.</span></p>
+      <p class="fine" id="fl-state" role="status"></p>
+      <div class="fl-retry-row" id="fl-retry-row" hidden><button type="button" class="btn" id="fl-retry">Try again</button></div>
+      <ul class="rows" id="fl-list" aria-label="Computers and servers"></ul>
+      <p class="empty" id="fl-empty" hidden>No computers are set up yet. Add one on the main PC, in Connections.</p>
+      <div class="sub" id="fl-guide-wrap" hidden>
+        <div class="ph sm"><h2>Add a computer or server</h2></div>
+        <ol class="fl-guide" id="fl-guide"></ol>
+        <p class="fine">Pairing this phone doesn't give it admin rights, so the steps that change the fleet stay on the main PC. Moving the main to another computer isn't available yet.</p>
+      </div>
+    </section>
+
+    <!-- Ask: through JARVIS's normal pipeline on the main, under David's rules. -->
+    <section class="scr ask" id="s-ask" hidden aria-labelledby="ak-h">
+      <div class="ph"><h1 id="ak-h" tabindex="-1">Ask JARVIS</h1><span class="meta mono" id="ak-meta"></span></div>
+      <label class="ask-target" for="a-target"><span>Send to</span><select id="a-target" aria-describedby="a-target-note"><option value="">Main computer</option></select></label>
+      <p class="fine" id="a-target-note">Actions run on the selected computer. Explicit computer names in your request take priority.</p>
+      <ol class="thread" id="a-thread" aria-live="polite" aria-label="Conversation"></ol>
+      <div class="ask-empty" id="a-empty">
+        <h2>What would you like done?</h2><p>Send a request to JARVIS on your main computer.</p>
+        <p class="fine">Anything that needs your OK waits on the PC. This phone never approves.</p>
+      </div>
+      <div class="ask-bar">
+        <label class="sr" for="a-text">Message to JARVIS</label>
+        <textarea id="a-text" rows="1" maxlength="2000" enterkeyhint="send" autocomplete="off" placeholder="Ask JARVIS…"></textarea>
+        <button type="button" class="send" id="a-send" aria-label="Send to JARVIS"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up"/></svg></button>
+      </div>
+      <p class="fine mono ask-foot"><span id="a-count">0 / 2000</span><span id="a-note" role="status"></span></p>
+    </section>
+
+    <!-- This phone: who it is, theme, sessions, sign out. -->
+    <section class="scr" id="s-phone" hidden aria-labelledby="pn-h">
+      <div class="ph"><h1 id="pn-h" tabindex="-1">Settings</h1></div>
+      <dl class="facts">
+        <div><dt>Name</dt><dd id="pn-name">–</dd></div>
+        <div><dt>Paired</dt><dd id="pn-paired">–</dd></div>
+        <div><dt>JARVIS at</dt><dd id="pn-host">–</dd></div>
+        <div><dt>Main computer</dt><dd id="pn-main">–</dd></div>
+      </dl>
+      <div class="sub">
+        <div class="ph sm"><h2 id="th-h">Theme</h2></div>
+        <div class="seg" role="group" aria-labelledby="th-h">
+          <button type="button" id="th-system" aria-pressed="false">System</button>
+          <button type="button" id="th-light" aria-pressed="false">Light</button>
+          <button type="button" id="th-dark" aria-pressed="false">Dark</button>
+        </div>
+      </div>
+      <div class="sub">
+        <div class="ph sm"><h2>Sessions from this phone</h2></div>
+        <ul class="rows" id="pn-sess"></ul>
+        <p class="empty" id="pn-sess-empty">None running.</p>
+      </div>
+      <div class="sub">
+        <div class="ph sm"><h2>Forget this phone</h2></div>
+        <p class="fine">Signs this phone out and ends its sessions. To use it again, pair it again from the main computer.</p>
+        <button type="button" class="btn danger" id="pn-forget"><svg class="i" aria-hidden="true"><use href="#i-log-out"/></svg><span id="pn-forget-t">Forget this phone</span></button>
+        <p class="msg" id="pn-msg" role="status"></p>
+      </div>
+    </section>
+
+    <!-- One computer: its readings and what this phone may do with it. -->
+    <section class="scr" id="s-device" hidden aria-labelledby="d-h">
+      <a class="back" href="#/devices"><svg class="i i-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg>Devices</a>
+      <div class="ph"><i class="ld" id="d-dot" aria-hidden="true"></i><h1 id="d-h" tabindex="-1">–</h1><span class="meta mono" id="d-sub"></span></div>
+      <div class="notice" id="d-sess" hidden>
+        <span id="d-sess-t"></span>
+        <button type="button" class="mini" id="d-sess-open">Open</button>
+        <button type="button" class="mini" id="d-sess-end">End</button>
+      </div>
+      <ul class="acts" aria-label="Actions">
+        <li><button type="button" class="act" id="d-control" aria-describedby="d-control-why">
+          <svg class="i" aria-hidden="true"><use href="/icons.svg#i-monitor"/></svg>
+          <span class="act-t"><b>Control screen</b><small id="d-control-why">See the screen, drive its mouse and keyboard</small></span>
+          <svg class="i i-sm chev" aria-hidden="true"><use href="/icons.svg#i-chevron-right"/></svg></button></li>
+        <li><button type="button" class="act" id="d-camera" aria-describedby="d-camera-why">
+          <svg class="i" aria-hidden="true"><use href="#i-camera"/></svg>
+          <span class="act-t"><b>View camera</b><small id="d-camera-why">See through its webcam; it shows a notice there</small></span>
+          <svg class="i i-sm chev" aria-hidden="true"><use href="/icons.svg#i-chevron-right"/></svg></button></li>
+      </ul>
+      <p class="msg" id="d-msg" role="status"></p>
+      <!-- Readings sit under Control and Camera. The phone has no separate stats screen. -->
+      <div id="d-meters" class="hm-host"></div>
+      <div class="sub">
+        <div class="ph sm"><h2 id="d-q-h">Picture quality</h2><span class="meta mono">low is fastest on mobile data</span></div>
+        <div class="seg" role="group" aria-labelledby="d-q-h">
+          <button type="button" id="d-q-low" aria-pressed="true">Low</button>
+          <button type="button" id="d-q-medium" aria-pressed="false">Medium</button>
+          <button type="button" id="d-q-high" aria-pressed="false">High</button>
+        </div>
+      </div>
+
+      <details class="device-details"><summary>Computer details</summary>
+      <dl class="facts" id="d-facts">
+        <div id="d-r-status"><dt>Status</dt><dd id="d-status">–</dd></div>
+        <div id="d-r-role"><dt>Role</dt><dd id="d-role">–</dd></div>
+        <div id="d-r-platform"><dt>System</dt><dd id="d-platform">–</dd></div>
+        <div id="d-r-ssid" hidden><dt>Wi-Fi</dt><dd id="d-ssid"></dd></div>
+        <div id="d-r-lan" hidden><dt>LAN</dt><dd id="d-lan"></dd></div>
+        <div id="d-r-ts" hidden><dt>Tailnet</dt><dd id="d-ts"></dd></div>
+      </dl>
+      </details>
+
+    </section>
+
+    <!-- Control: the remote screen, live, with touch, keys and text. -->
+    <section class="scr sess" id="s-control" hidden aria-labelledby="c-h">
+      <header class="sess-top">
+        <button type="button" class="end" id="c-end"><svg class="i i-sm" aria-hidden="true"><use href="#i-power"/></svg>Stop</button>
+        <div class="sess-id"><h1 id="c-h" tabindex="-1">–</h1>
+          <span class="state" id="c-state" data-st="starting"><i class="ld" aria-hidden="true"></i><b id="c-st">Starting…</b></span></div>
+        <div class="readouts mono" aria-hidden="true"><span id="c-fps">– fps</span><span id="c-res">–</span><span id="c-rtt">– ms</span></div>
+      </header>
+      <div class="stage" id="c-stage" role="application" tabindex="-1"
+           aria-label="Remote screen. Tap to click, hold for a right click, drag two fingers to scroll, pinch to zoom.">
+        <div class="layer" id="c-layer"><img class="pic" id="c-img" alt="" draggable="false" hidden></div>
+        <i class="cursor" id="c-cursor" aria-hidden="true" hidden></i>
+        <i class="ring" id="c-ring" aria-hidden="true" hidden></i>
+        <button type="button" class="fit mono" id="c-fit" hidden>Fit</button>
+        <div class="ph-box" id="c-ph"><div><h2 id="c-ph-h">Starting…</h2><p id="c-ph-p"></p>
+          <div class="ph-acts" id="c-ph-acts" hidden><button type="button" class="btn strong" id="c-again">Start again</button><a class="btn" id="c-back" href="#/devices">Back</a></div></div></div>
+      </div>
+      <div class="dock">
+        <div class="ctl">
+          <div class="seg" role="group" aria-label="Touch mode">
+            <button type="button" id="c-direct" aria-pressed="true"><svg class="i i-sm" aria-hidden="true"><use href="#i-pointer"/></svg>Touch</button>
+            <button type="button" id="c-track" aria-pressed="false"><svg class="i i-sm" aria-hidden="true"><use href="#i-mouse-pointer"/></svg>Trackpad</button>
+          </div>
+          <button type="button" class="ico" id="c-type" aria-label="Type on the remote computer"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-keyboard"/></svg></button>
+          <button type="button" class="ico" id="c-keys-btn" aria-expanded="true" aria-controls="c-panel" aria-label="Show keys"><svg class="i" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+        </div>
+        <div class="panel" id="c-panel">
+          <div class="type">
+            <label class="sr" for="c-text">Text to type on the remote computer</label>
+            <input id="c-text" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                   enterkeyhint="send" inputmode="text" placeholder="Type, then Send">
+            <button type="button" class="send" id="c-send" aria-label="Send the text; with nothing typed, press Enter"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up"/></svg></button>
+          </div>
+          <div class="keys" id="c-keys" role="group" aria-label="Keys"></div>
+        </div>
+        <p class="gesture-help">Tap to click · Hold to right-click · Two fingers to scroll</p>
+        <p class="msg" id="c-note" role="status"></p>
+      </div>
+    </section>
+
+    <!-- Camera: a viewfinder on a computer's webcam. View only. -->
+    <section class="scr sess cam" id="s-camera" hidden aria-labelledby="v-h">
+      <header class="sess-top">
+        <button type="button" class="end" id="v-end"><svg class="i i-sm" aria-hidden="true"><use href="#i-power"/></svg>Stop</button>
+        <div class="sess-id"><h1 id="v-h" tabindex="-1">–</h1>
+          <span class="state" id="v-state" data-st="starting"><i class="ld" aria-hidden="true"></i><b id="v-st">Starting…</b></span></div>
+        <span class="mono quality" id="v-q" aria-label="Quality"></span>
+      </header>
+      <div class="stage viewfinder" id="v-stage">
+        <div class="layer"><img class="pic" id="v-img" alt="" draggable="false" hidden></div>
+        <div class="ph-box" id="v-ph"><div><h2 id="v-ph-h">Starting…</h2><p id="v-ph-p"></p>
+          <div class="ph-acts" id="v-ph-acts" hidden><button type="button" class="btn strong" id="v-again">Start again</button><a class="btn" id="v-back" href="#/devices">Back</a></div></div></div>
+        <div class="vf-chrome" id="v-chrome" aria-hidden="true">
+          <i class="tick tl"></i><i class="tick tr"></i><i class="tick bl"></i><i class="tick br"></i><i class="cross"></i>
+          <span class="vf tl mono"><b class="rec"></b>LIVE <span id="v-clock">00:00</span></span>
+          <span class="vf tr mono" id="v-left">15:00 LEFT</span>
+          <span class="vf bl mono" id="v-res">– × –</span>
+          <span class="vf br mono"><span id="v-fps">– FPS</span> · <span id="v-rtt">– MS</span></span>
+        </div>
+      </div>
+      <div class="dock cam-dock">
+        <p class="fine" id="v-note">The camera stays on only while this screen is open, for at most 15 minutes. The computer shows a notice while it runs.</p>
+      </div>
+    </section>
+  </main>
+
+  <nav class="tabs" id="tabs" aria-label="Sections">
+    <a id="tab-devices" href="#/devices"><span class="tab-ic"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-layout-grid"/></svg></span><span>Devices</span></a>
+    <a id="tab-ask" href="#/ask"><span class="tab-ic"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-message-square"/></svg></span><span>Ask</span></a>
+    <a id="tab-phone" href="#/phone"><span class="tab-ic"><svg class="i" aria-hidden="true"><use href="#i-smartphone"/></svg></span><span>Settings</span></a>
+  </nav>
+</div>
+<div class="sr" id="live" aria-live="polite"></div>
+</body>
+</html>

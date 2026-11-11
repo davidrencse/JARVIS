@@ -25,13 +25,17 @@
     <header class="rm-head">
       <h1 class="rm-sr">Remote control of a node computer</h1>
       <div class="rm-devs" id="rm-devs" role="radiogroup" aria-label="Computer to control"></div>
+      <div class="rm-live">
+        <span class="rm-state" id="rm-state" data-st="idle"><i class="rm-dot" aria-hidden="true"></i><b id="rm-st" aria-live="polite">Not connected</b></span>
+        <span class="rm-stats"><span class="rm-m" id="rm-fps">– fps</span><span class="rm-m" id="rm-res">–</span><span class="rm-m" id="rm-age">–</span></span>
+      </div>
       <div class="rm-tools">
         <label class="rm-q"><span>Quality</span>
           <select id="rm-quality" aria-label="Stream quality">
             <option value="low">Low (fastest)</option><option value="medium">Medium</option><option value="high">High (sharpest)</option>
           </select></label>
-        <button type="button" class="cx-btn strong" id="rm-go">Connect</button>
         <button type="button" class="cx-btn" id="rm-fs" aria-label="Fullscreen the remote screen">Fullscreen</button>
+        <button type="button" class="cx-btn strong" id="rm-go">Connect</button>
       </div>
     </header>
     <div class="rm-note" id="rm-note" role="status" hidden></div>
@@ -41,12 +45,10 @@
         <img class="rm-img" id="rm-img" alt="Live screen of the remote computer" draggable="false" hidden>
         <div class="rm-ph" id="rm-ph"></div>
       </div>
+      <div class="rm-fsedge" aria-hidden="true"></div>
+      <button type="button" class="rm-fsx" id="rm-fsx">Exit fullscreen</button>
     </div>
     <footer class="rm-bar">
-      <span class="rm-state" id="rm-state" data-st="idle"><i class="rm-dot" aria-hidden="true"></i><b id="rm-st" aria-live="polite">Not connected</b></span>
-      <span class="rm-m" id="rm-fps">– fps</span>
-      <span class="rm-m" id="rm-res">–</span>
-      <span class="rm-m" id="rm-age">–</span>
       <span class="rm-kb" id="rm-kb" data-on="0">Keyboard: not captured</span>
       <span class="rm-hint" id="rm-hint">Click outside the screen to stop sending keys.</span>
     </footer>`;
@@ -444,7 +446,7 @@
   el.view.addEventListener("keydown", (e) => {
     if (e.isComposing) return;
     // The way out for keyboard users, since Tab is sent to the remote too.
-    if (e.code === "Escape" && e.ctrlKey && e.altKey && e.shiftKey) { e.preventDefault(); e.stopPropagation(); releaseInput(); el.view.blur(); return; }
+    if (e.code === "Escape" && e.ctrlKey && e.altKey && e.shiftKey) { e.preventDefault(); e.stopPropagation(); releaseInput(); el.view.blur(); if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {}); return; }
     // While a session runs, keys never reach the console's own shortcuts (1-9 switch views,
     // Space starts the mic), even before the first frame when they can't be sent yet.
     if (!sess || sess.state === "ended") return;
@@ -478,7 +480,7 @@
     el.kb.setAttribute("data-on", on ? "1" : "0");
     el.kb.textContent = on ? "Keyboard: captured" : "Keyboard: not captured";
     el.hint.textContent = !on ? "Click the screen to send keys." : kbLocked
-      ? "Browser keys like Ctrl+W go to the remote too. Hold Esc to leave fullscreen."
+      ? "Browser keys like Ctrl+W go to the remote too. Hold Esc, point at the top edge, or press Ctrl+Alt+Shift+Esc to leave fullscreen."
       : "Click outside the screen to stop sending keys. Keyboard users: Ctrl+Alt+Shift+Esc.";
   };
   el.view.addEventListener("focus", kbState);
@@ -494,6 +496,7 @@
     if (document.fullscreenElement) document.exitFullscreen?.();
     else if (el.stage.requestFullscreen) el.stage.requestFullscreen().then(() => { kbLock(); el.view.focus({ preventScroll: true }); }).catch((e) => setNote("Fullscreen was refused: " + e.message, "warn"));
   });
+  $("rm-fsx").addEventListener("click", () => { releaseInput(); document.exitFullscreen?.().catch(() => {}); });
   document.addEventListener("fullscreenchange", () => {
     const full = document.fullscreenElement === el.stage;
     el.fs.textContent = full ? "Exit fullscreen" : "Fullscreen";
