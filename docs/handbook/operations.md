@@ -51,9 +51,9 @@ Offline node: say so, leave it, do not retry. Dell: only when David says it is a
 
 ```sh
 .venv/bin/python -m unittest discover -s tests          # about 2.5 min; all must pass
-.venv/bin/python -m unittest tests.test_parse           # one module
-.venv/bin/python -m unittest tests.test_web_voice       # after touching app.js or voice.js
-node tests/web_remote_test.cjs                          # remote.js scenarios
+.venv/bin/python -m unittest tests.intelligence.test_parse           # one module
+.venv/bin/python -m unittest tests.web.test_web_voice       # after touching app.js or voice.js
+node tests/remote/web_remote_test.cjs                          # remote.js scenarios
 ```
 
 The suite never spends quota: an audit hook refuses to start `codex` or `claude` under

@@ -79,5 +79,5 @@ Quality presets: low 960 px / q45 / 6 fps, medium 1280 / q60 / 10, high 1920 / q
 A node crash leaves `remote-session.json` in its state folder; the next start finds it,
 treats the session as dead and cleans up.
 
-Tests use fakes only: `tests/test_remote_view.py`, `tests/test_remote_lifecycle.py`,
-`tests/test_remote_web.py`, and `node tests/web_remote_test.cjs`.
+Tests use fakes only: `tests/remote/test_remote_view.py`, `tests/remote/test_remote_lifecycle.py`,
+`tests/remote/test_remote_web.py`, and `node tests/remote/web_remote_test.cjs`.

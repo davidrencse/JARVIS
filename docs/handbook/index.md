@@ -7,8 +7,11 @@ Written 2026-11-07, after the overhaul in [audit-2026-11.md](audit-2026-11.md).
 |---|---|
 | [voice.md](voice.md) | "Jarvis, ..." doesn't wake, or the wrong voice gets in |
 | [remote-control.md](remote-control.md) | Driving a node's screen from the main's console |
+| [phone.md](phone.md) | The phone app over Tailscale: setup, pairing, camera, locate, turning it off |
 | [input-sharing.md](input-sharing.md) | Lan Mouse, the apart guard, a stuck cursor |
 | [cluster.md](cluster.md) | Main and nodes, the hub, tunnels, `cluster update` |
+| [fleet-ui.md](fleet-ui.md) | Connections and the phone: add a computer, invite codes, archive vs Git |
+| [battery-health.md](battery-health.md) | Battery health, and RAM, swap, disk and CPU, on each computer |
 | [operations.md](operations.md) | Restarts, fail-safes, troubleshooting |
 | [audit-2026-11.md](audit-2026-11.md) | What the overhaul changed and why |
 | [perf-2026-11.md](perf-2026-11.md) | Performance pass, dedup review, and activation steps |

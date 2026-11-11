@@ -14,7 +14,7 @@ Claude Code access tokens expire routinely. JARVIS no longer stops at "sign-in e
 
 What still needs a person: a revoked or logged-out account, or one whose refresh token has expired, needs `claude auth login`. JARVIS reports this clearly; it cannot sign in for you.
 
-Validation: `tests/test_quota_renewal.py` (10 scenarios through the real collector with a fake CLI renewal) and `tests/test_claude_auth.py` (7 scenarios with fake child processes covering protocol, timeout reaping, cooldown, concurrency and redaction). The full suite passed **293 of 293** tests, all 34 Python modules parsed, and all 8 browser JavaScript files passed `node --check`. A live read-only check at **15:30 UTC (11:30 AM EDT)** returned `source=live` for both providers: Claude 27% five-hour / 75% weekly remaining, Codex 0% five-hour / 31% weekly remaining.
+Validation: `tests/runtime/test_quota_renewal.py` (10 scenarios through the real collector with a fake CLI renewal) and `tests/security/test_claude_auth.py` (7 scenarios with fake child processes covering protocol, timeout reaping, cooldown, concurrency and redaction). The full suite passed **293 of 293** tests, all 34 Python modules parsed, and all 8 browser JavaScript files passed `node --check`. A live read-only check at **15:30 UTC (11:30 AM EDT)** returned `source=live` for both providers: Claude 27% five-hour / 75% weekly remaining, Codex 0% five-hour / 31% weekly remaining.
 
 ## Earlier checks (October 21)
 
