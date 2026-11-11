@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en" data-theme="dark" data-state="normal">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>JARVIS UI Checkpoint</title>
+<meta name="description" content="Unapproved design checkpoint: phone Your computers and console cockpit. Mock data only; no network calls.">
+<!--
+  Self-contained on purpose: no external fonts, scripts or requests.
+  Geist / Geist Mono / Doto are named first and used when installed locally;
+  otherwise system fallbacks render. Production loads the real faces.
+-->
+<style>
+:root{
+  --bg:#000; --surface:#141414; --surface-raised:#202020;
+  --ink:#ededed; --ink-2:#a8a8a8; --ink-3:#8a8a8a;
+  --line:rgba(255,255,255,.11); --line-2:rgba(255,255,255,.22); --line-ctl:rgba(255,255,255,.32);
+  --hover:rgba(255,255,255,.06);
+  --inv-bg:#ededed; --inv-ink:#000;
+  --needs:#f0a640; --needs-wash:rgba(240,166,64,.12);
+  --bad:#ef7a6c; --bad-wash:rgba(239,122,108,.12);
+  --sans:"Geist","Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"Geist Mono",ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  --dot:"Doto","Geist Mono",ui-monospace,monospace;
+  --ease:cubic-bezier(.16,1,.3,1); --dur:180ms;
+  --r-console:2px; --r-ctl:12px; --r-card:16px;
+  --gut:22px;
+  --sat:env(safe-area-inset-top,0px); --sab:env(safe-area-inset-bottom,0px);
+  --sal:env(safe-area-inset-left,0px); --sar:env(safe-area-inset-right,0px);
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#fff; --surface:#f3f3f3; --surface-raised:#e8e8e8;
+  --ink:#0a0a0a; --ink-2:#4a4a4a; --ink-3:#6b6b6b;
+  --line:rgba(0,0,0,.1); --line-2:rgba(0,0,0,.2); --line-ctl:rgba(0,0,0,.3);
+  --hover:rgba(0,0,0,.05);
+  --inv-bg:#0a0a0a; --inv-ink:#fff;
+  --needs:#9a5600; --needs-wash:rgba(154,86,0,.09);
+  --bad:#b3261e; --bad-wash:rgba(179,38,30,.08);
+  color-scheme:light;
+}
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+::selection{background:var(--ink);color:var(--bg)}
+button,select,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.num,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+svg.i{width:18px;height:18px;flex:none;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---------- checkpoint chrome (not product UI) ---------- */
+.cp{border-bottom:1px solid var(--line);padding:14px 16px;display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center}
+.cp h1{font-size:15px;font-weight:600;margin:0;letter-spacing:-.01em}
+.cp p{margin:0;color:var(--ink-3);font-size:13px;flex:1 1 260px}
+.cp fieldset{border:0;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.cp legend{float:left;margin-right:6px;color:var(--ink-3);font-size:13px}
+.chip{border:1px solid var(--line-2);background:transparent;border-radius:999px;padding:6px 12px;min-height:32px;font-size:13px}
+.chip[aria-pressed="true"]{background:var(--inv-bg);color:var(--inv-ink);border-color:var(--inv-bg)}
+.chip:hover{background:var(--hover)}
+.chip[aria-pressed="true"]:hover{background:var(--inv-bg)}
+.sec{padding:24px 16px 8px;max-width:1480px;margin:0 auto}
+.sec>h2{font-size:13px;font-weight:500;color:var(--ink-2);margin:0 0 12px}
+.sec>h2 b{color:var(--ink);font-weight:600}
+.mock-note{font-size:12px;color:var(--ink-3);margin:8px 0 0}
+
+/* ---------- state marks (shared) ---------- */
+.dot{width:9px;height:9px;border-radius:50%;flex:none;display:inline-block;border:1.5px solid var(--ink-3)}
+.dot.live{background:var(--ink);border-color:var(--ink)}
+.dot.idle{background:transparent}
+.dot.stale{border-style:dashed}
+.dot.needs{background:var(--needs);border-color:var(--needs)}
+.dot.bad{background:var(--bad);border-color:var(--bad)}
+.dot.busy{background:transparent;border-color:var(--needs);box-shadow:inset 0 0 0 2px var(--bg),inset 0 0 0 5px var(--needs)}
+@media (prefers-reduced-motion:no-preference){
+  .dot.live.breathe{animation:breathe 2.4s var(--ease) infinite}
+  @keyframes breathe{50%{opacity:.45}}
+}
+
+/* ======================= PHONE ======================= */
+.phones{display:flex;flex-wrap:wrap;gap:24px;align-items:flex-start}
+.ph{width:100%;max-width:390px;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:28px;overflow:hidden;
+  display:flex;flex-direction:column;min-height:760px;font-size:16px;position:relative}
+.ph-top{display:flex;align-items:center;gap:10px;padding:calc(10px + var(--sat)) calc(var(--gut) + var(--sar)) 10px calc(var(--gut) + var(--sal));border-bottom:1px solid var(--line)}
+.mark{width:20px;height:20px;flex:none;fill:currentColor}
+.word{font-family:var(--dot);font-weight:700;font-size:17px;letter-spacing:.06em}
+.ph-main{color:var(--ink-3);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.link{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:13px;color:var(--ink-2);white-space:nowrap}
+.net{display:none;align-items:center;gap:10px;margin:10px var(--gut) 0;padding:10px 12px;border:1px solid var(--bad);background:var(--bad-wash);border-radius:var(--r-ctl);font-size:14px}
+.net span{flex:1;min-width:0}
+.net button{border:1px solid var(--line-ctl);background:var(--bg);border-radius:10px;min-height:44px;padding:0 14px;font-weight:500}
+[data-state="offline"] .net{display:flex}
+.ph-body{flex:1;padding:18px var(--gut) 24px;min-width:0}
+.ph h3{font-size:32px;font-weight:600;letter-spacing:-.035em;line-height:1.1;margin:4px 0 6px}
+.ph .lede{color:var(--ink-2);margin:0 0 16px;font-size:15px}
+.strip{display:flex;gap:0;border:1px solid var(--line);border-radius:var(--r-ctl);margin-bottom:16px}
+.strip div{flex:1;padding:10px 14px;min-width:0}
+.strip div+div{border-left:1px solid var(--line)}
+.strip b{display:block;font-family:var(--mono);font-size:20px;font-weight:500;font-variant-numeric:tabular-nums}
+.strip span{font-size:13px;color:var(--ink-3)}
+.dev-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+.dev{display:flex;gap:12px;align-items:flex-start;width:100%;text-align:left;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-card);
+  padding:16px;min-height:96px;transition:background var(--dur) var(--ease)}
+.dev:hover{background:var(--surface-raised)}
+.dev:active{transform:scale(.995)}
+.dev .dot{margin-top:9px}
+.dev-txt{flex:1;min-width:0}
+.dev-name{font-size:19px;font-weight:550;letter-spacing:-.01em;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.role{font-family:var(--mono);font-size:12px;color:var(--ink-3);border:1px solid var(--line-2);border-radius:6px;padding:0 6px}
+.dev-say{color:var(--ink-2);font-size:15px;margin:2px 0 6px;overflow-wrap:anywhere}
+.dev-say.needs{color:var(--needs)}
+.caps{display:flex;gap:12px;color:var(--ink-3);font-size:13px;flex-wrap:wrap}
+.caps span{display:inline-flex;gap:5px;align-items:center}
+.caps svg.i{width:15px;height:15px}
+.chev{color:var(--ink-3);margin-top:6px}
+.manage{display:flex;align-items:center;gap:10px;margin-top:14px;min-height:52px;padding:0 4px;color:var(--ink);text-decoration:none;border-top:1px solid var(--line)}
+.manage small{display:block;color:var(--ink-3);font-size:13px}
+.manage .chev{margin:0 0 0 auto}
+.sess{margin-top:18px}
+.sess h4{font-size:15px;font-weight:600;margin:0 0 6px}
+.sess p{margin:0;color:var(--ink-3);font-size:14px}
+.skel{display:none}
+[data-state="loading"] .skel{display:block}
+[data-state="loading"] .loaded{display:none}
+.sk{background:var(--surface);border:1px solid var(--line);border-radius:var(--r-card);height:96px;margin-bottom:10px;position:relative;overflow:hidden}
+.sk::after{content:"";position:absolute;left:16px;top:20px;width:45%;height:14px;border-radius:4px;background:var(--surface-raised);box-shadow:0 26px 0 -2px var(--surface-raised)}
+@media (prefers-reduced-motion:no-preference){.sk{animation:skp 1.4s ease-in-out infinite}@keyframes skp{50%{opacity:.6}}}
+
+/* device detail */
+.back{display:inline-flex;align-items:center;gap:6px;min-height:44px;background:none;border:0;padding:0;color:var(--ink-2);font-size:15px}
+.d-status{display:flex;gap:8px;align-items:center;color:var(--ink-2);font-size:15px;margin-bottom:16px}
+.act{display:flex;gap:14px;align-items:center;width:100%;text-align:left;min-height:88px;padding:16px 18px;border-radius:var(--r-card);border:1px solid var(--line-ctl);background:var(--bg);margin-bottom:10px}
+.act b{display:block;font-size:17px;font-weight:600}
+.act small{display:block;font-size:14px;color:var(--ink-2)}
+.act.primary{background:var(--inv-bg);color:var(--inv-ink);border-color:var(--inv-bg)}
+.act.primary small{color:inherit;opacity:.78}
+.act svg.i{width:24px;height:24px}
+.act[aria-disabled="true"]{opacity:.5;cursor:not-allowed}
+.why{font-size:14px;color:var(--ink-3);margin:-4px 2px 12px}
+.why.needs{color:var(--needs)}
+.meters{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}
+.m{border:1px solid var(--line);border-radius:var(--r-ctl);padding:12px;min-width:0}
+.m h5{margin:0;font-size:13px;font-weight:500;color:var(--ink-3)}
+.m b{display:block;font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:18px;font-weight:500}
+.m small{color:var(--ink-3);font-size:12px}
+.bar{height:4px;background:var(--line);border-radius:2px;margin-top:8px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--ink)}
+.m.na b{font-family:var(--sans);font-size:15px;color:var(--ink-3);font-weight:500}
+.seg-l{font-size:15px;font-weight:600;margin:0 0 2px}
+.seg-h{font-size:13px;color:var(--ink-3);margin:0 0 8px}
+.seg{display:flex;background:var(--surface);border-radius:var(--r-ctl);padding:4px;gap:4px}
+.seg button{flex:1;min-height:44px;border:0;border-radius:9px;background:transparent;color:var(--ink-2);font-weight:500}
+.seg button[aria-pressed="true"]{background:var(--bg);color:var(--ink);box-shadow:0 0 0 1px var(--line-2)}
+details.facts{margin-top:16px;border-top:1px solid var(--line)}
+details.facts summary{min-height:52px;display:flex;align-items:center;font-weight:500;list-style:none;cursor:pointer}
+details.facts summary::-webkit-details-marker{display:none}
+details.facts summary::after{content:"+";margin-left:auto;color:var(--ink-3);font-family:var(--mono)}
+details.facts[open] summary::after{content:"−"}
+details.facts dl{display:grid;grid-template-columns:auto 1fr;gap:6px 14px;margin:0 0 12px;font-size:14px}
+details.facts dt{color:var(--ink-3)}
+details.facts dd{margin:0;overflow-wrap:anywhere}
+
+/* tab dock */
+.tabs{display:flex;border-top:1px solid var(--line);background:var(--bg);padding:4px calc(8px + var(--sar)) max(4px,var(--sab)) calc(8px + var(--sal))}
+.tabs a{flex:1;min-height:52px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;color:var(--ink-3);text-decoration:none;font-size:12px;border-radius:var(--r-ctl);margin:2px}
+.tabs a[aria-current="page"]{color:var(--ink);background:var(--surface-raised)}
+.tabs a:hover{color:var(--ink)}
+@media (max-width:359px){
+  :root{--gut:16px}
+  .ph h3{font-size:29px}
+  .ph-main{display:none}
+  .meters{grid-template-columns:1fr}
+  .ph{border-radius:0;border-left:0;border-right:0}
+  .sec{padding-left:0;padding-right:0}
+  .sec>h2,.mock-note{padding:0 16px}
+}
+@media (orientation:landscape) and (max-height:520px){
+  .ph{max-width:none;flex-direction:row;flex-wrap:wrap;min-height:0}
+  .ph-top{flex:1 0 100%}
+  .ph .tabs{order:-1;flex-direction:column;width:88px;border-top:0;border-right:1px solid var(--line);padding:8px 4px max(8px,var(--sab)) calc(4px + var(--sal))}
+  .ph .tabs a{flex:0 0 auto}
+  .ph-body{flex:1 1 0}
+  .phones{flex-direction:column}
+}
+
+/* ======================= CONSOLE ======================= */
+.con{border:1px solid var(--line);display:grid;grid-template-columns:196px minmax(0,1fr);background:var(--bg);font-size:14px}
+.con *{border-radius:var(--r-console)}
+.con .dot{border-radius:50%}
+.side{border-right:1px solid var(--line);padding:14px 10px;display:flex;flex-direction:column;gap:2px}
+.c-brand{display:flex;gap:8px;align-items:center;padding:4px 8px 14px;font-family:var(--mono);font-size:13px;letter-spacing:.2em}
+.rail a{display:flex;gap:10px;align-items:center;min-height:36px;padding:0 10px;color:var(--ink-2);text-decoration:none;position:relative}
+.rail a:hover{background:var(--hover);color:var(--ink)}
+.rail a[aria-current="page"]{color:var(--ink)}
+.rail a[aria-current="page"]::before{content:"";position:absolute;left:0;top:8px;bottom:8px;width:1px;background:var(--ink)}
+.rail kbd{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+.prof{margin-top:auto;display:flex;gap:10px;align-items:center;padding:10px 8px 0;border-top:1px solid var(--line)}
+.avatar{width:28px;height:28px;border-radius:50% !important;background:var(--surface-raised);display:grid;place-items:center;font-size:12px}
+.prof small{display:block;color:var(--ink-3);font-size:12px}
+.c-main{min-width:0;display:flex;flex-direction:column}
+.top{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.top h3{font-size:22px;font-weight:500;letter-spacing:-.02em;margin:0;margin-right:auto}
+.tb{display:inline-flex;align-items:center;gap:6px;min-height:32px;padding:0 10px;border:1px solid var(--line-2);background:transparent;color:var(--ink-2);font-size:13px}
+.tb:hover{color:var(--ink);background:var(--hover)}
+.search{min-width:0;flex:0 1 200px;min-height:32px;border:1px solid var(--line-2);background:transparent;padding:0 10px;color:var(--ink-3);font-size:13px;display:flex;align-items:center;gap:6px;overflow:hidden;white-space:nowrap}
+.livechip{display:inline-flex;gap:6px;align-items:center;font-size:13px;color:var(--ink-2);padding:0 4px}
+.reco{display:none}
+[data-state="offline"] .livechip .ok{display:none}
+[data-state="offline"] .reco{display:inline}
+.ck{display:grid;grid-template-columns:minmax(240px,290px) minmax(0,1fr) minmax(280,360px);grid-template-columns:minmax(240px,290px) minmax(0,1fr) minmax(280px,360px);gap:10px;padding:10px;min-height:470px}
+.box{border:1px solid var(--line);min-width:0;display:flex;flex-direction:column}
+.box-h{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);font-size:13px;color:var(--ink-2);font-weight:500}
+.box-h .r{margin-left:auto;font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+.ctabs{display:flex;border-bottom:1px solid var(--line)}
+.ctabs button{flex:1;min-height:36px;background:none;border:0;color:var(--ink-3);font-size:13px;border-bottom:1px solid transparent}
+.ctabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--ink)}
+.mrow{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border-bottom:1px solid var(--line)}
+.mrow .dot{margin-top:6px}
+.mrow b{font-weight:500;display:block}
+.mrow small{color:var(--ink-3);font-size:13px;display:block;overflow-wrap:anywhere}
+.mrow small.needs{color:var(--needs)}
+.mrow .num{margin-left:auto;font-size:12px;color:var(--ink-3)}
+.stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));border-bottom:1px solid var(--line)}
+.stats div{padding:10px 12px;min-width:0}
+.stats div+div{border-left:1px solid var(--line)}
+.stats span{display:block;font-size:12px;color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stats b{font-family:var(--mono);font-weight:500;font-size:16px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.stats b.needs{color:var(--needs)}
+.statel{padding:14px 12px;display:flex;gap:10px;align-items:center;border-bottom:1px solid var(--line);color:var(--ink-2)}
+.statel strong{color:var(--ink);font-weight:500}
+.steps{list-style:none;margin:0;padding:6px 0;font-size:13px}
+.steps li{display:grid;grid-template-columns:16px minmax(0,1fr) auto;gap:10px;align-items:baseline;padding:6px 12px}
+.steps li .num{color:var(--ink-3);font-size:12px}
+.steps li.bad{color:var(--bad)}
+.steps li.bad .num{color:var(--bad)}
+.steps li.cur{color:var(--ink)}
+.steps .tk{width:9px;height:9px;border:1.5px solid var(--ink-3);border-radius:50%;display:inline-block}
+.steps .done .tk{background:var(--ink-3);border-color:var(--ink-3)}
+.steps .cur .tk{border-color:var(--ink);background:var(--ink)}
+.steps .bad .tk{border-color:var(--bad);background:var(--bad)}
+.steps .wait .tk{border-color:var(--needs);background:var(--needs)}
+/* state-variant content: hide what doesn't match, keep each element's own display */
+[data-state="normal"] .v:not(.v-normal),
+[data-state="loading"] .v:not(.v-normal):not(.v-loading),
+[data-state="waiting"] .v:not(.v-waiting),
+[data-state="busy"] .v:not(.v-busy),
+[data-state="offline"] .v:not(.v-offline),
+[data-state="error"] .v:not(.v-error){display:none}
+.thread{flex:1;padding:12px;display:flex;flex-direction:column;gap:10px;overflow:auto;max-height:420px}
+.msg{max-width:88%;padding:8px 10px;border:1px solid var(--line);font-size:13.5px;overflow-wrap:anywhere}
+.msg.me{align-self:flex-end;background:var(--surface)}
+.msg.err{border-color:var(--bad);color:var(--ink)}
+.msg.err b{color:var(--bad);font-weight:500}
+.msg small{display:block;color:var(--ink-3);font-size:12px;margin-top:4px}
+.gate{border-top:1px solid var(--line);padding:10px 16px;display:flex;flex-direction:column;gap:8px}
+.gate-h{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.gate-h b{font-weight:500}
+.gate-h small{color:var(--ink-3);font-size:13px}
+.gate-h .tb{margin-left:auto}
+.ask{border:1px solid var(--needs);background:var(--needs-wash);padding:10px 12px;display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}
+.ask p{margin:0;flex:1 1 260px;min-width:0;overflow-wrap:anywhere}
+.ask p small{display:block;color:var(--ink-2);font-size:13px}
+.btn{min-height:36px;padding:0 12px;border:1px solid var(--line-ctl);background:var(--bg);font-size:13px;display:inline-flex;align-items:center;gap:6px}
+.btn.inv{background:var(--inv-bg);color:var(--inv-ink);border-color:var(--inv-bg)}
+.btn kbd{font-family:var(--mono);font-size:11px;opacity:.7}
+.dock{display:flex;gap:8px;align-items:center;padding:10px 16px 14px;border-top:1px solid var(--line);flex-wrap:wrap}
+.prompt{flex:1 1 240px;min-width:0;min-height:40px;border:1px solid var(--line-ctl);background:var(--bg);padding:0 12px}
+.prompt::placeholder{color:var(--ink-3)}
+.ib{width:40px;height:40px;display:grid;place-items:center;border:1px solid var(--line-2);background:transparent;color:var(--ink-2)}
+.tier{display:flex;border:1px solid var(--line-2)}
+.tier button{min-height:38px;padding:0 10px;border:0;background:none;color:var(--ink-3);font-size:13px}
+.tier button[aria-pressed="true"]{background:var(--surface-raised);color:var(--ink)}
+.send{min-height:40px;padding:0 16px;background:var(--inv-bg);color:var(--inv-ink);border:0;font-weight:500}
+[data-state="busy"] .send{opacity:.5}
+.busy-note{display:none;flex-basis:100%;font-size:13px;color:var(--ink-3)}
+[data-state="busy"] .busy-note{display:block}
+
+@media (max-width:1180px){
+  .con{grid-template-columns:64px minmax(0,1fr)}
+  .side{padding:12px 8px;align-items:center}
+  .c-brand span,.rail a span,.rail kbd,.prof div{display:none}
+  .c-brand{padding:4px 0 12px}
+  .rail a{justify-content:center;padding:0;width:44px;min-height:44px}
+  .rail a[aria-current="page"]{background:var(--inv-bg);color:var(--inv-ink)}
+  .rail a[aria-current="page"]::before{display:none}
+  .ck{grid-template-columns:minmax(0,1fr) minmax(280px,340px)}
+  .ck .b-rail{grid-column:1 / -1;order:3}
+}
+@media (max-width:760px){
+  .ck{grid-template-columns:minmax(0,1fr)}
+  .ck .b-asst{order:1}.ck .b-work{order:2}.ck .b-rail{order:3}
+  .stats{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .stats div:nth-child(4){border-left:0}
+  .stats div:nth-child(n+4){border-top:1px solid var(--line)}
+  .thread{max-height:220px}
+  .search{display:none}
+}
+@media (max-width:640px){
+  .con{grid-template-columns:minmax(0,1fr)}
+  .side{order:2;flex-direction:row;border-right:0;border-top:1px solid var(--line);padding:4px;position:static}
+  .c-brand,.prof{display:none}
+  .rail{display:flex;overflow-x:auto;width:100%;gap:2px}
+  .rail a{flex:0 0 44px}
+  .top .tb .lb{display:none}
+}
+@media (max-width:720px) and (max-height:450px){ .thread{max-height:140px} .ck{min-height:0} }
+@media (prefers-reduced-motion:reduce){*{transition:none !important;animation:none !important}}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-mark" viewBox="0 0 24 24"><path d="M4 4h7v7H4zM13 4h7v3h-7zM13 9h7v2h-7zM4 13h3v7H4zM9 13h11v7H9z"/></symbol>
+  <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></symbol>
+  <symbol id="i-camera" viewBox="0 0 24 24"><path d="M15 10l5-3v10l-5-3z"/><rect x="3" y="6" width="12" height="12" rx="2"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-2.8 1.2V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-2.8-1.2l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.7 1.7 0 0 0 3.2 14H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.2-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.7 1.7 0 0 0 10 3.2V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 2.8 1.2l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0 1.2 2.8H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-7 8 7v9H4z"/></symbol>
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5h6a2 2 0 0 1 2 2v13a2 2 0 0 0-2-2H4zM20 5h-6a2 2 0 0 0-2 2v13a2 2 0 0 1 2-2h6z"/></symbol>
+  <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 3l9 5-9 5-9-5zM3 13l9 5 9-5"/></symbol>
+  <symbol id="i-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v8M9.5 10h4a1.5 1.5 0 0 1 0 3h-3a1.5 1.5 0 0 0 0 3h4"/></symbol>
+  <symbol id="i-db" viewBox="0 0 24 24"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/></symbol>
+  <symbol id="i-net" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="5"/><rect x="3" y="16" width="6" height="5"/><rect x="15" y="16" width="6" height="5"/><path d="M12 8v4M6 16v-4h12v4"/></symbol>
+  <symbol id="i-cast" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="1"/><path d="M9 21h6M10 9l4 2.5-4 2.5z"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></symbol>
+  <symbol id="i-ear" viewBox="0 0 24 24"><path d="M6 9a6 6 0 1 1 12 0c0 3-3 4-3 7a3 3 0 0 1-6 0"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.4 1.4M17.6 17.6L19 19M5 19l1.4-1.4M17.6 6.4L19 5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></symbol>
+</svg>
+
+<header class="cp" role="region" aria-label="Checkpoint controls (not product UI)">
+  <h1>JARVIS UI checkpoint, unapproved</h1>
+  <p>Mock data only. Nothing here talks to JARVIS. Toggles show how each screen states the truth.</p>
+  <fieldset><legend>Theme</legend>
+    <button class="chip" data-theme-set="dark" aria-pressed="true">Dark</button>
+    <button class="chip" data-theme-set="light" aria-pressed="false">Light</button>
+  </fieldset>
+  <fieldset><legend>State</legend>
+    <button class="chip" data-state-set="normal" aria-pressed="true">Normal</button>
+    <button class="chip" data-state-set="loading" aria-pressed="false">Loading</button>
+    <button class="chip" data-state-set="waiting" aria-pressed="false">Waiting for OK</button>
+    <button class="chip" data-state-set="busy" aria-pressed="false">Busy</button>
+    <button class="chip" data-state-set="offline" aria-pressed="false">Offline</button>
+    <button class="chip" data-state-set="error" aria-pressed="false">Error</button>
+  </fieldset>
+</header>
+
+<main>
+<!-- ======================= SCREEN 1: PHONE ======================= -->
+<section class="sec" aria-labelledby="s1">
+  <h2 id="s1"><b>Screen 1, phone:</b> Your computers (#/devices) and one computer (#/device/dell)</h2>
+  <div class="phones">
+
+    <!-- Devices -->
+    <div class="ph" aria-label="Phone mock, Devices tab">
+      <div class="ph-top">
+        <svg class="mark" aria-hidden="true"><use href="#i-mark"/></svg>
+        <span class="word">JARVIS</span>
+        <span class="ph-main">on Arch</span>
+        <span class="link" aria-label="Link to JARVIS">
+          <span class="v v-normal v-waiting v-busy v-error"><span class="dot live breathe" aria-hidden="true"></span></span>
+          <span class="v v-normal v-waiting v-busy v-error num">38 ms</span>
+          <span class="v v-offline"><span class="dot bad" aria-hidden="true"></span></span>
+          <span class="v v-offline">Unreachable</span>
+        </span>
+      </div>
+      <div class="net" role="alert"><span>Lost JARVIS. Showing what it said 2 min ago.</span><button type="button">Retry</button></div>
+      <div class="ph-body">
+        <h3>Your computers</h3>
+        <p class="lede">Choose a computer to control its screen or open its camera.</p>
+        <div class="skel" aria-hidden="true"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>
+        <p class="skel sr" role="status">Loading your computers</p>
+        <div class="loaded">
+          <div class="strip">
+            <div><b class="num">2<span class="v v-offline"> ?</span></b><span>Online now</span></div>
+            <div><b class="num">0</b><span>Sessions</span></div>
+          </div>
+          <ul class="dev-list">
+            <li><button class="dev" type="button">
+              <span class="dot live" aria-hidden="true"></span>
+              <span class="dev-txt">
+                <span class="dev-name">Arch <span class="role">MAIN</span></span>
+                <span class="dev-say v v-normal v-waiting v-busy v-error">Online. Screen and camera ready.</span>
+                <span class="dev-say v v-offline">Last seen online 2 min ago</span>
+                <span class="caps"><span><svg class="i"><use href="#i-monitor"/></svg>Screen</span><span><svg class="i"><use href="#i-camera"/></svg>Camera</span></span>
+              </span>
+              <svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg>
+            </button></li>
+            <li><button class="dev" type="button">
+              <span class="dot busy" aria-hidden="true"></span>
+              <span class="dev-txt">
+                <span class="dev-name">Dell</span>
+                <span class="dev-say needs">Busy, awaiting contact</span>
+                <span class="caps"><span><svg class="i"><use href="#i-monitor"/></svg>Screen</span></span>
+              </span>
+              <svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg>
+            </button></li>
+            <li><button class="dev" type="button">
+              <span class="dot idle" aria-hidden="true"></span>
+              <span class="dev-txt">
+                <span class="dev-name">Zenbook</span>
+                <span class="dev-say">Offline since 09:12</span>
+                <span class="caps"><span>No screen or camera while offline</span></span>
+              </span>
+              <svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg>
+            </button></li>
+          </ul>
+          <a class="manage" href="#fleet-mock" onclick="return false">
+            <span><span>Manage computers</span><small>See what's connected and how to add one</small></span>
+            <svg class="i chev" aria-hidden="true"><use href="#i-chev"/></svg>
+          </a>
+          <div class="sess"><h4>Your sessions</h4><p>None open. Starting one always takes a tap.</p></div>
+        </div>
+      </div>
+      <nav class="tabs" aria-label="Phone sections">
+        <a href="#" aria-current="page" onclick="return false"><svg class="i"><use href="#i-monitor"/></svg>Devices</a>
+        <a href="#" onclick="return false"><svg class="i"><use href="#i-chat"/></svg>Ask</a>
+        <a href="#" onclick="return false"><svg class="i"><use href="#i-gear"/></svg>Settings</a>
+      </nav>
+    </div>
+
+    <!-- Device detail -->
+    <div class="ph" aria-label="Phone mock, one computer">
+      <div class="ph-top">
+        <svg class="mark" aria-hidden="true"><use href="#i-mark"/></svg>
+        <span class="word">JARVIS</span>
+        <span class="ph-main">on Arch</span>
+        <span class="link"><span class="v v-normal v-waiting v-busy v-error"><span class="dot live" aria-hidden="true"></span></span><span class="v v-normal v-waiting v-busy v-error num">38 ms</span><span class="v v-offline"><span class="dot bad" aria-hidden="true"></span></span><span class="v v-offline">Unreachable</span></span>
+      </div>
+      <div class="net" role="alert"><span>Lost JARVIS. Actions wait until it's back.</span><button type="button">Retry</button></div>
+      <div class="ph-body">
+        <button class="back" type="button"><svg class="i"><use href="#i-back"/></svg>Your computers</button>
+        <h3>Dell</h3>
+        <div class="d-status">
+          <span class="v v-normal v-waiting v-error v-offline"><span class="dot live" aria-hidden="true"></span></span>
+          <span class="v v-normal v-waiting v-error">Online, ready</span>
+          <span class="v v-offline">Last reading 2 min ago</span>
+          <span class="v v-busy"><span class="dot busy" aria-hidden="true"></span></span>
+          <span class="v v-busy" style="color:var(--needs)">Busy, awaiting contact</span>
+        </div>
+
+        <button class="act primary" type="button" aria-describedby="why-c">
+          <svg class="i" aria-hidden="true"><use href="#i-monitor"/></svg>
+          <span><b>Control screen</b><small>See the screen, drive its mouse and keyboard</small></span>
+        </button>
+        <p class="why v v-busy needs" id="why-c">Dell hasn't answered the hub yet. Control starts once it does.</p>
+        <p class="why v v-offline">JARVIS is unreachable, so nothing can start.</p>
+
+        <button class="act" type="button" aria-describedby="why-v" aria-disabled="true">
+          <svg class="i" aria-hidden="true"><use href="#i-camera"/></svg>
+          <span><b>View camera</b><small>See through its webcam; it shows a notice there</small></span>
+        </button>
+        <p class="why" id="why-v">Camera not available on this computer.</p>
+
+        <div class="meters" id="d-meters-mock">
+          <div class="m"><h5>RAM</h5><b class="num">9.8 / 16 GB</b><div class="bar"><i style="width:61%"></i></div></div>
+          <div class="m"><h5>CPU</h5><b class="num">12%</b><div class="bar"><i style="width:12%"></i></div></div>
+          <div class="m"><h5>Disk</h5><b class="num">212 / 476 GB</b><div class="bar"><i style="width:45%"></i></div></div>
+          <div class="m na"><h5>Battery</h5><b>Not applicable</b><small>Desktop</small></div>
+          <div class="m na"><h5>Swap</h5><b>Not reported</b></div>
+          <div class="m"><h5>Read</h5><b class="num">14:02:31</b><small class="v v-offline" style="color:var(--needs)">Stale</small></div>
+        </div>
+
+        <p class="seg-l">Picture quality</p>
+        <p class="seg-h">Low is fastest on mobile data</p>
+        <div class="seg" role="group" aria-label="Picture quality">
+          <button type="button" aria-pressed="true">Low</button><button type="button" aria-pressed="false">Medium</button><button type="button" aria-pressed="false">High</button>
+        </div>
+        <details class="facts"><summary>Computer details</summary>
+          <dl><dt>Status</dt><dd>Online</dd><dt>Role</dt><dd>Node</dd><dt>System</dt><dd>Windows 11</dd><dt>LAN</dt><dd class="num">172.1.0.24</dd></dl>
+        </details>
+      </div>
+      <nav class="tabs" aria-label="Phone sections">
+        <a href="#" aria-current="page" onclick="return false"><svg class="i"><use href="#i-monitor"/></svg>Devices</a>
+        <a href="#" onclick="return false"><svg class="i"><use href="#i-chat"/></svg>Ask</a>
+        <a href="#" onclick="return false"><svg class="i"><use href="#i-gear"/></svg>Settings</a>
+      </nav>
+    </div>
+  </div>
+  <p class="mock-note">Not mocked here, kept as today: Ask (Send to, Usage &amp; cost, Decision path, Try again, resume), Settings, read-only Manage computers, Control and Camera sessions, Down and Pair screens. See DESIGN-CHECKPOINT.md §6.</p>
+</section>
+
+<!-- ======================= SCREEN 2: CONSOLE ======================= -->
+<section class="sec" aria-labelledby="s2">
+  <h2 id="s2"><b>Screen 2, console:</b> cockpit (#console)</h2>
+  <div class="con" aria-label="Console mock">
+    <aside class="side">
+      <div class="c-brand"><svg class="mark" aria-hidden="true"><use href="#i-mark"/></svg><span>JARVIS</span></div>
+      <nav class="rail" aria-label="Console sections">
+        <a href="#" aria-current="page" onclick="return false"><svg class="i"><use href="#i-home"/></svg><span>Console</span><kbd>1</kbd></a>
+        <a href="#" onclick="return false" aria-label="Knowledge"><svg class="i"><use href="#i-book"/></svg><span>Knowledge</span><kbd>2</kbd></a>
+        <a href="#" onclick="return false" aria-label="System"><svg class="i"><use href="#i-layers"/></svg><span>System</span><kbd>3</kbd></a>
+        <a href="#" onclick="return false" aria-label="Credits"><svg class="i"><use href="#i-coin"/></svg><span>Credits</span><kbd>4</kbd></a>
+        <a href="#" onclick="return false" aria-label="Memory"><svg class="i"><use href="#i-db"/></svg><span>Memory</span><kbd>5</kbd></a>
+        <a href="#" onclick="return false" aria-label="Files"><svg class="i"><use href="#i-file"/></svg><span>Files</span><kbd>6</kbd></a>
+        <a href="#" onclick="return false" aria-label="Connections"><svg class="i"><use href="#i-net"/></svg><span>Connections</span><kbd>7</kbd></a>
+        <a href="#" onclick="return false" aria-label="Remote"><svg class="i"><use href="#i-cast"/></svg><span>Remote</span><kbd>8</kbd></a>
+        <a href="#" onclick="return false" aria-label="Settings"><svg class="i"><use href="#i-gear"/></svg><span>Settings</span><kbd>9</kbd></a>
+      </nav>
+      <div class="prof"><span class="avatar">D</span><div>David<small>Arch, main</small></div></div>
+    </aside>
+
+    <div class="c-main">
+      <div class="top">
+        <h3>Console</h3>
+        <span class="search"><svg class="i"><use href="#i-search"/></svg>Search memory</span>
+        <span class="livechip"><span class="ok"><span class="dot live breathe" aria-hidden="true"></span> Live</span><span class="reco"><span class="dot stale" aria-hidden="true"></span> Reconnecting</span></span>
+        <button class="tb" type="button"><svg class="i"><use href="#i-clock"/></svg><span class="lb">Replay</span></button>
+        <button class="tb" type="button"><svg class="i"><use href="#i-refresh"/></svg><span class="lb">Recheck</span></button>
+        <button class="tb" type="button" aria-label="Theme: system"><svg class="i"><use href="#i-sun"/></svg></button>
+      </div>
+
+      <div class="ck">
+        <!-- left rail panel -->
+        <section class="box b-rail" aria-label="Rail panel">
+          <div class="ctabs" role="tablist">
+            <button role="tab" aria-selected="true">Machines</button><button role="tab" aria-selected="false">Usage</button><button role="tab" aria-selected="false">Memory</button><button role="tab" aria-selected="false">Activity</button>
+          </div>
+          <div class="mrow"><span class="dot live" aria-hidden="true"></span><div><b>Arch</b><small>Main. Hub, brain, memory</small></div><span class="num v v-normal v-waiting v-busy v-error">0.4 load</span><span class="num v v-offline">?</span></div>
+          <div class="mrow"><span class="dot busy" aria-hidden="true"></span><div><b>Dell</b><small class="needs">Busy, awaiting contact</small></div></div>
+          <div class="mrow"><span class="dot idle" aria-hidden="true"></span><div><b>Zenbook</b><small>Offline since 09:12</small></div></div>
+          <div class="mrow v v-offline"><span class="dot stale" aria-hidden="true"></span><div><small>Machine readings are 2 min old. They refresh when the link is back.</small></div></div>
+        </section>
+
+        <!-- centre: stats + state + trace -->
+        <section class="box b-work" aria-label="Pipeline and trace">
+          <div class="stats">
+            <div><span>Runs today</span><b class="num">41</b></div>
+            <div><span>Memory</span><b class="num">12,804</b></div>
+            <div><span>Machines</span><b class="num">2/3</b></div>
+            <div><span>Voice</span><b class="num">On</b></div>
+            <div><span>Brain</span><b class="num v v-normal v-loading v-offline v-error">Idle</b><b class="num v v-busy">Working</b><b class="num needs v v-waiting">Waiting</b></div>
+          </div>
+          <div class="statel">
+            <span class="v v-normal"><span class="dot live breathe" aria-hidden="true"></span></span><span class="v v-normal">Idle. Waiting for “Jarvis, …”</span>
+            <span class="v v-busy"><span class="dot live" aria-hidden="true"></span></span><span class="v v-busy"><strong>Working</strong>, step 3 of 5, 4.1 s</span>
+            <span class="v v-waiting"><span class="dot needs" aria-hidden="true"></span></span><span class="v v-waiting"><strong>Waiting for your OK</strong> before posting</span>
+            <span class="v v-offline"><span class="dot stale" aria-hidden="true"></span></span><span class="v v-offline">Not live. Reconnecting to JARVIS</span>
+            <span class="v v-error"><span class="dot bad" aria-hidden="true"></span></span><span class="v v-error"><strong>Stopped</strong> at step 4: the browser didn't load</span>
+          </div>
+          <div class="box-h">Trace <span class="r">last request</span></div>
+          <ol class="steps">
+            <li class="done"><span class="tk"></span><span>Heard “open my calendar on the Dell”</span><span class="num">0.0 s</span></li>
+            <li class="done"><span class="tk"></span><span>Parser matched open_app</span><span class="num">0.1 s</span></li>
+            <li class="done"><span class="tk"></span><span>Gates passed</span><span class="num">0.1 s</span></li>
+            <li class="v v-normal v-offline done"><span class="tk"></span><span>Ran on Dell</span><span class="num">1.8 s</span></li>
+            <li class="v v-busy cur"><span class="tk"></span><span>Running on Dell</span><span class="num">…</span></li>
+            <li class="v v-waiting wait"><span class="tk"></span><span>Waiting at gate: post to calendar</span><span class="num">—</span></li>
+            <li class="v v-error bad"><span class="tk"></span><span>Browser did not load (timeout 30 s)</span><span class="num">30.0 s</span></li>
+            <li class="v v-normal v-offline done"><span class="tk"></span><span>Checked screen: calendar open</span><span class="num">2.3 s</span></li>
+          </ol>
+        </section>
+
+        <!-- assistant -->
+        <section class="box b-asst" aria-label="Assistant">
+          <div class="box-h">Assistant <span class="r">Auto</span></div>
+          <div class="thread" aria-live="polite">
+            <div class="msg me">Open my calendar on the Dell</div>
+            <div class="msg v v-normal v-offline">Opened Calendar on the Dell.<small>Ran by parser. No model calls.</small></div>
+            <div class="msg v v-busy">Working on it.</div>
+            <div class="msg v v-waiting">I'd like to add “Dentist, Fri 10:00”. That posts as you, so it waits for your OK below.</div>
+            <div class="msg err v v-error"><b>Didn't finish.</b> The browser on the Dell timed out after 30 s. Nothing was posted.<small>Ask again, or open Remote to look.</small></div>
+          </div>
+        </section>
+      </div>
+
+      <!-- gate: always present -->
+      <section class="gate" aria-label="Approvals">
+        <div class="gate-h">
+          <span class="v v-normal v-busy v-offline v-error"><span class="dot idle" aria-hidden="true"></span></span>
+          <span class="v v-waiting"><span class="dot needs" aria-hidden="true"></span></span>
+          <b class="v v-normal v-busy v-offline v-error">Nothing needs your OK</b>
+          <b class="v v-waiting">1 needs your OK</b>
+          <small>Posts, buys, sends and clicks as you wait here.</small>
+          <button class="tb" type="button">Recent</button>
+        </div>
+        <div class="ask v v-waiting">
+          <p>Post “Dentist, Fri 10:00” to Google Calendar<small>calendar.google.com, from the brain, 12 s ago</small></p>
+          <button class="btn inv" type="button">Allow <kbd>Y</kbd></button>
+          <button class="btn" type="button">Allow on this site 10 min <kbd>A</kbd></button>
+          <button class="btn" type="button">Decline <kbd>N</kbd></button>
+        </div>
+      </section>
+
+      <form class="dock" onsubmit="return false" aria-label="Ask JARVIS">
+        <button class="ib" type="button" aria-label="Microphone"><svg class="i"><use href="#i-mic"/></svg></button>
+        <button class="ib" type="button" aria-label="Wake word listening"><svg class="i"><use href="#i-ear"/></svg></button>
+        <label class="sr" for="p">Ask JARVIS</label>
+        <input class="prompt" id="p" placeholder="Ask JARVIS, or hold Space to talk" autocomplete="off">
+        <div class="tier" role="group" aria-label="Tier"><button type="button" aria-pressed="true">Auto</button><button type="button" aria-pressed="false">Quick</button><button type="button" aria-pressed="false">Tools</button><button type="button" aria-pressed="false">Plan</button></div>
+        <button class="send" type="submit">Send</button>
+        <p class="busy-note">JARVIS is still on the last request. <button class="tb" type="button">Stop waiting</button></p>
+      </form>
+    </div>
+  </div>
+  <p class="mock-note">Every view keeps the Ask dock and gate. Console IDs (#gate, #dock, #prompt, #thread, #lab-steps, #ck-t-*) are named in DESIGN-CHECKPOINT.md §7; this mock does not use them, so it can't collide with production scripts.</p>
+</section>
+</main>
+
+<script>
+(function(){
+  var root=document.documentElement;
+  function press(attr,val){
+    document.querySelectorAll('['+attr+']').forEach(function(b){b.setAttribute('aria-pressed',String(b.getAttribute(attr)===val));});
+  }
+  document.addEventListener('click',function(e){
+    var t=e.target.closest('[data-theme-set],[data-state-set],.seg button,.tier button,.ctabs button');
+    if(!t)return;
+    if(t.hasAttribute('data-theme-set')){var v=t.getAttribute('data-theme-set');root.setAttribute('data-theme',v);press('data-theme-set',v);}
+    else if(t.hasAttribute('data-state-set')){var s=t.getAttribute('data-state-set');root.setAttribute('data-state',s);press('data-state-set',s);
+      document.querySelectorAll('.act').forEach(function(a){var off=s==='offline'||(s==='busy'&&a.classList.contains('primary'));if(off)a.setAttribute('aria-disabled','true');else a.removeAttribute('aria-disabled');});
+      document.querySelector('.act:not(.primary)').setAttribute('aria-disabled','true');}
+    else if(t.parentNode.matches('.seg,.tier')){t.parentNode.querySelectorAll('button').forEach(function(b){b.setAttribute('aria-pressed',String(b===t));});}
+    else {t.parentNode.querySelectorAll('button').forEach(function(b){b.setAttribute('aria-selected',String(b===t));});}
+  });
+  try{ if(matchMedia('(prefers-color-scheme: light)').matches){root.setAttribute('data-theme','light');press('data-theme-set','light');} }catch(_){}
+})();
+</script>
+</body>
+</html>
