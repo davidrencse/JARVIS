@@ -28,7 +28,7 @@ TRAILER_UNSAFE = re.compile(r"\b(?:don'?t|do not|no|wait|actually|cancel|never ?
                             r"open|close|play|pause|go to|launch|start|quit|then)\b")
 FILLER = re.compile(r"\b(?:(?:can|could|would|will) you|please|for me|go ahead and|"
                     r"i want you to|i'?d like you to|just|quickly|real quick|right now|"
-                    r"again|agian|agan)\b")
+                    r"pls|plz|again|agian|agan)\b")
 SPLIT = re.compile(r"(\s*,\s*(?:and\s+)?(?:then\s+)?|\s+and\s+then\s+|\s+then\s+|"
                    r"\s+(?:and\s+)?after that\s+|\s+and\s+|\s+also\s+|\s+plus\s+)")
 # A URL or path ("reddit.com/r/again") is data: filler and joiner words inside it stay.
@@ -62,6 +62,9 @@ APPS = {
     "grok bot": "Grok Bot", "grokbot": "Grok Bot",
     "word": "Word", "microsoft word": "Word", "excel": "Excel", "microsoft excel": "Excel",
     "powerpoint": "PowerPoint", "outlook": "Outlook", "onenote": "OneNote", "teams": "Teams",
+    # Shorthand David types: each is one app and nothing else (no "ps": Photoshop or PowerShell).
+    "calc": "Calculator", "ppt": "PowerPoint", "code": "Visual Studio Code",
+    "vsc": "Visual Studio Code", "term": "Terminal", "ms word": "Word", "ms excel": "Excel",
 }
 BROWSERS = {"Chrome", "Firefox", "Microsoft Edge"}
 SITES = {
@@ -76,6 +79,9 @@ SITES = {
     "youtube shorts": "https://www.youtube.com/shorts", "yt shorts": "https://www.youtube.com/shorts",
     "shorts": "https://www.youtube.com/shorts", "tiktok": "https://www.tiktok.com",
     "instagram reels": "https://www.instagram.com/reels", "reels": "https://www.instagram.com/reels",
+    "gh": "https://github.com", "ig": "https://www.instagram.com",
+    "insta": "https://www.instagram.com", "fb": "https://www.facebook.com",
+    "facebook": "https://www.facebook.com",
 }
 DOMAIN = re.compile(r"(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})(/\S*)?\Z")
 FILE_EXTENSIONS = frozenset(
@@ -302,6 +308,105 @@ def _spelled(text):
     return re.sub(r"(?<![^\s,])[a-z]{4,5}(?![^\s,])", bare, text)
 
 
+SHORTHAND = re.compile(r"(?<![\w/.:@-])(vol|prev|bright|nxt)(?![\w/.:@-])")
+SHORT_WORDS = {"vol": "volume", "prev": "previous", "bright": "brightness", "nxt": "next"}
+# Words that only mean one thing here. A one-edit slip of one reads as it ("volumn", "screnshot");
+# the clause still has to match a whole-clause pattern, so this never widens what runs.
+SPELLED_NOUNS = ("volume", "brightness", "screenshot", "bluetooth", "previous", "workspace")
+
+
+def _shorthand(text):
+    """"vol up", "prev song", "bright up" and slips of the words the system patterns key on."""
+    text = SHORTHAND.sub(lambda m: SHORT_WORDS[m.group(1)], text)
+
+    def noun(match):
+        word = match.group(0)
+        if word in SPELLED_NOUNS or len(word) < 6:
+            return word
+        close = [n for n in SPELLED_NOUNS if _edits(word, n) == 1]
+        return close[0] if len(close) == 1 else word
+    return re.sub(r"(?<![\w/.:@-])[a-z]{6,12}(?![\w/.:@-])", noun, text)
+
+
+# Verbs a slip of the keys is read as: harmless ones only. Never close/quit/delete: a typo must
+# not be what decides to end something (those go to the interpreter, which asks first).
+SLIP_VERBS = ("open", "play", "pause", "launch", "resume", "skip")
+SHORT_SLIPS = {"opn": "open", "oen": "open"}
+REAL_WORDS = frozenset(("lunch", "pays", "plays", "skips", "opens", "paused", "paste"))
+
+
+def _slips(word, verbs):
+    """The verbs `word` is one slip of the keys from: an adjacent swap, a dropped letter (verbs
+    of 5+ letters) or a doubled letter. Never a substitution, so "clone" isn't "close"."""
+    hits = set()
+    for real in verbs:
+        if _edits(word, real) != 1:
+            continue
+        swapped = len(word) == len(real) and sorted(word) == sorted(real)
+        dropped = len(word) == len(real) - 1 and len(real) >= 5
+        doubled = len(word) == len(real) + 1 and any(a == b for a, b in zip(word, word[1:]))
+        if swapped or dropped or doubled:
+            hits.add(real)
+    return hits
+
+
+def _verb_slip(word):
+    """"paly" -> play, "puase" -> pause, "lauch" -> launch, "opn" -> open: a slip of a harmless verb."""
+    if word in VERBS or word in REAL_WORDS or not word.isalpha():
+        return None
+    if word in SHORT_SLIPS:
+        return SHORT_SLIPS[word]
+    if len(word) < 4:
+        return None
+    hits = _slips(word, SLIP_VERBS)
+    return hits.pop() if len(hits) == 1 else None
+
+
+# Verbs whose typo must never run anything: the request goes to the interpreter, which asks
+# "close chrome?" rather than act on a guess (the parser itself never reads these slips).
+RISKY_VERBS = ("close", "quit", "kill", "delete", "remove", "send", "order", "reply", "email",
+               "connect", "disconnect", "pair", "forget", "uninstall", "shutdown", "restart",
+               "reboot", "install", "cancel", "submit", "unpair")
+
+
+def slipped_action(word):
+    """The action verb a lead word looks like a slip of ("clsoe" -> close), else None. For
+    routing only: a request that starts this way is an action asked for with a typo."""
+    word = re.sub(r"[^a-z]", "", str(word).lower())
+    if len(word) < 4 or word in VERBS or word in REAL_WORDS:
+        return None
+    hits = _slips(word, SLIP_VERBS + RISKY_VERBS)
+    return hits.pop() if len(hits) == 1 else None
+
+
+# Short replies that lean on the last turn ("do that again", "same on the dell", "and spotify
+# too", "the other one"). Only the interpreter, which is shown the recent turns, can read them.
+_FOLLOWUP = re.compile(
+    r"^(?:(?:do|try|run|say|play|open|show|send|make)\s+)?(?:(?:it|that|this|them)\s+)?again\b|"
+    r"^(?:do|try|run)\s+(?:it|that|this|the same)(?:\s+(?:thing|again|on|for|there|too))?\b|"
+    r"^(?:same|and|now|also)\b|^(?:on|for|to)\s+the\s+other\b|^the\s+other\b|"
+    r"^undo\b|^not that\b|\b(?:instead|too|as well)$")
+_FOLLOWUP_WORDS = 8
+
+
+def follows_up(text):
+    """True for a short request that only makes sense next to the previous one."""
+    words = _lower(LEAD.sub("", str(text).replace("\u2019", "'"))).strip(" .!?,")
+    return 0 < len(words.split()) <= _FOLLOWUP_WORDS and bool(_FOLLOWUP.search(words))
+
+
+def bare_device(text, config, origin):
+    """The device id when `text` is only a device name ("the dell", "arch one", "on zen"): a
+    reply to "which device?" and nothing else."""
+    words = _lower(LEAD.sub("", str(text).replace("\u2019", "'"))).strip(" .!?,")
+    if not words or len(words.split()) > 4 or origin not in config.get("devices", {}):
+        return None
+    words = re.sub(r"^(?:on|to|for|at|in|use|do it on)\s+", "", words)
+    main = (config.get("cluster") or {}).get("main_device") or origin
+    aliases = _aliases(config.get("devices", {}), origin, main)
+    return _device(words, aliases)
+
+
 def _edits(a, b):
     """Optimal string alignment distance: insertions, deletions, substitutions and
     swaps of two neighbours ("psotify"), each counting one."""
@@ -374,9 +479,9 @@ def _parse(text, devices, origin, main, apps):
     # Whisper hears a spoken "open" as "opened" ("opened spotify here"): the request's first
     # word only. Mid-sentence "opened" and past-tense talk ("opened it yesterday") stay put.
     # "opened up chrome" is the same mishearing of "open up chrome".
-    text = _spelled(re.sub(r"^opened\s+(?!(?:it|that|this|them|those|these|the|my|a|an|"
+    text = _shorthand(_spelled(re.sub(r"^opened\s+(?!(?:it|that|this|them|those|these|the|my|a|an|"
                            r"yesterday|today|earlier|already|last|before|and)\b)", "open ", text,
-                           flags=re.I))
+                           flags=re.I)))
     if not text:
         raise Unsure("nothing left after the wake word")
     agent = bool(AGENT_BROWSER.search(text))
@@ -498,8 +603,15 @@ def _norm(name):
     return re.sub(r"\s+", " ", str(name).strip().lower())
 
 
+class _Aliases(dict):
+    """The alias table, plus `names`: only what a device is actually called (its id, hostname
+    and aliases), not "here" or "the other one": abbreviations read against these alone."""
+    names = {}
+
+
 def _aliases(devices, origin, main):
-    table = {}
+    table = _Aliases()
+    table.names = names = {}
 
     def add(word, device):
         word = _norm(word)
@@ -511,6 +623,10 @@ def _aliases(devices, origin, main):
         add(device.get("hostname", ""), key)
         for alias in device.get("aliases", []):
             add(alias, key)
+        for name in (key, device.get("hostname", ""), *device.get("aliases", [])):
+            name = _norm(name)
+            if name and names.setdefault(name, key) != key:
+                names[name] = None
     for word in ("main", "default", "main default", "default main", "primary"):
         add(word, main)
     for word in ORIGIN_WORDS:
@@ -522,7 +638,42 @@ def _aliases(devices, origin, main):
     return table
 
 
-def _device(phrase, aliases, typos=True):
+# Short words that are something else first: never an abbreviation of a device ("arc" is a browser).
+NOT_ABBREVIATIONS = {"arc", "the", "pc", "my", "one", "new", "old", "all", "app", "web", "any",
+                     "not", "now", "set", "get", "got"}
+
+
+def _abbreviated(word, aliases, avoid=()):
+    """"del" -> dell, "zen" -> zenbook, "win" -> windows laptop: a 3+ letter start of what exactly
+    one device is called. Not when the word is also an app here, or starts two devices' names."""
+    names = getattr(aliases, "names", {})
+    if len(word) < 3 or not word.isalpha() or word in NOT_ABBREVIATIONS or word in avoid \
+            or word in names:
+        return None
+    hits = {device for name, device in names.items()
+            if name.split()[0] != word and name.split()[0].startswith(word)}
+    return hits.pop() if len(hits) == 1 and None not in hits else None
+
+
+def _compact(gram, aliases):
+    """"dellg15" or "g 15" for "dell g15"; "archlnux" for "arch linux" with one slip: the
+    names run together. Exact, or one edit from exactly one device's name (6+ letters)."""
+    names = getattr(aliases, "names", {})
+    squashed = {}
+    for name, device in names.items():
+        squashed.setdefault(name.replace(" ", ""), set()).add(device)
+    gram = gram.replace(" ", "")
+    if gram in squashed:
+        found = squashed[gram]
+    elif len(gram) >= 6 and gram.isalpha():
+        found = {d for key, devices in squashed.items() if len(key) >= 5 and key[0] == gram[0]
+                 and _edits(gram, key) == 1 for d in devices}
+    else:
+        return None
+    return found.pop() if len(found) == 1 and None not in found else None
+
+
+def _device(phrase, aliases, typos=True, avoid=()):
     """The one device a phrase names ("my dell windows 11 pc" -> dell), else None."""
     words = phrase.split()
     hits, i, typed = set(), 0, 0
@@ -535,6 +686,20 @@ def _device(phrase, aliases, typos=True):
                 break
         else:
             if words[i] in DEVICE_NOISE or words[i].isdigit():
+                i += 1
+                continue
+            if typos:  # "dellg15", "g 15", "arch lnux": names run together or slipped
+                for j in range(min(len(words), i + 3), i, -1):
+                    if (found := _compact(" ".join(words[i:j]), aliases)):
+                        hits.add(found)
+                        i = j
+                        break
+                else:
+                    found = None
+                if found:
+                    continue
+            if typos and (found := _abbreviated(words[i], aliases, avoid)):
+                hits.add(found)
                 i += 1
                 continue
             # "deoll", "arhclinux": one edit from exactly one device's name, same first letter.
@@ -617,6 +782,8 @@ def _clause(text, aliases, catalog, inherited=None):
                 break
         else:
             raise Unsure(f"can't tell which PC {text!r} means")
+    if _verb(words)[0] is None and (fixed := _verb_slip(words[0])):
+        words = [fixed, *words[1:]]  # "opn chrome", "paly drake": a harmless verb, one slip away
     for pattern, spec in SCROLL:
         if match := pattern.match(" ".join(words)):
             return {"verb": "scroll", "object": "", "device": device, "scroll": spec(match)}
@@ -650,7 +817,7 @@ def _clause(text, aliases, catalog, inherited=None):
     if device is None and "on" in rest:  # suffix: "open chrome on arch"
         cut = len(rest) - 1 - rest[::-1].index("on")
         tail = " ".join(rest[cut + 1:])
-        found = _device(tail, aliases) if tail else None
+        found = _device(tail, aliases, avoid=catalog) if tail else None
         split = tail.split()
         if not split:
             raise Unsure("on which place?")
@@ -692,11 +859,18 @@ def _app(obj, catalog, typo=True):
     return _typo(name, catalog, 6)
 
 
-def _site(obj):
+def _site(obj, typo=False):
     name = SITE_TAIL.sub("", OBJECT_LEAD.sub("", obj))
     name = re.sub(r"^(?:https?://)?(?:www\.)?([a-z0-9-]+)\.com/?$", r"\1", name)
     if name in SITES and not obj.startswith("http://"):
         return SITES[name]
+    if typo and name.isalpha() and len(name) >= 5:
+        # "yotube", "gogle", "netflx": a one-edit slip of exactly one well-known site. Opening
+        # a page is the mildest action there is; nothing here can close or send anything.
+        close = {SITES[key] for key in SITES if " " not in key and len(key) >= 5
+                 and key[0] == name[0] and _edits(name, key) == 1}
+        if len(close) == 1:
+            return close.pop()
     match = DOMAIN.match(obj)
     if not match:
         return None
@@ -741,7 +915,7 @@ def _command(clause, catalog):
                 and not _app(m.group(1), catalog):
             return {"intent": "open_url", "args": {"url": _site(m.group(1)),
                                                     "browser": _app(m.group(2), catalog)}}
-        app, site = _app(obj, catalog), _site(obj)
+        app, site = _app(obj, catalog), _site(obj, typo=True)
         if app and site:
             raise Unsure(f"{obj!r} is both an app and a site")
         if site:

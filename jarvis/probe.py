@@ -36,6 +36,36 @@ awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} /^SwapTotal/{st=$2} /^SwapFree/{sf=
 IW=$(command -v iw || echo /usr/sbin/iw)
 echo "powersave=$($IW dev wlan0 get power_save 2>/dev/null | awk '{print $NF}')"
 echo "ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+echo "nproc=$(nproc 2>/dev/null | head -c 8)"
+disk=$(stat -fc '%S %b %a' / 2>/dev/null) || disk=""
+if [ -n "$disk" ]; then
+  set -- $disk
+  echo "disk_bsize=$1"
+  echo "disk_blocks=$2"
+  echo "disk_avail=$3"
+fi
+if [ ! -d /sys/class/power_supply ]; then
+  echo "bats=missing"
+else
+  line=""
+  count=0
+  for dir in /sys/class/power_supply/*; do
+    [ -e "$dir/type" ] || continue
+    kind=$(head -c 32 "$dir/type" 2>/dev/null | tr -cd 'A-Za-z')
+    [ "$kind" = "Battery" ] || continue
+    pres=$(head -c 8 "$dir/present" 2>/dev/null | tr -cd '0-9')
+    [ "$pres" = "0" ] && continue
+    name=$(basename "$dir" | head -c 32 | tr -cd 'A-Za-z0-9_.-')
+    [ -n "$name" ] || continue
+    num() { head -c 32 "$1" 2>/dev/null | tr -cd '0-9.-' | head -c 24; }
+    st=$(head -c 32 "$dir/status" 2>/dev/null | tr -cd 'A-Za-z ')
+    piece="$name,$st,$(num "$dir/capacity"),$(num "$dir/energy_full_design"),$(num "$dir/energy_full"),$(num "$dir/charge_full_design"),$(num "$dir/charge_full"),$(num "$dir/cycle_count")"
+    if [ -n "$line" ]; then line="$line;$piece"; else line="$piece"; fi
+    count=$((count + 1))
+    [ "$count" -ge 8 ] && break
+  done
+  if [ -z "$line" ]; then echo "bats=none"; else echo "bats=$(printf '%s' "$line" | head -c 1500)"; fi
+fi
 """
 
 
@@ -140,7 +170,7 @@ def remote_summary(kv):
     total, avail = num("mem_total_kb"), num("mem_avail_kb")
     swap_total, swap_free = num("swap_total_kb"), num("swap_free_kb")
     unit, fallback = kv.get("lm_unit") or "unknown", kv.get("lm_fallback") or "unknown"
-    return {
+    summary = {
         "hostname": kv.get("host"), "ip": kv.get("ip") or None,
         "uptime_s": num("uptime"), "load": num("load"),
         "mem_avail_pct": round(100 * avail / total, 1) if total else None,
@@ -150,6 +180,12 @@ def remote_summary(kv):
                       "running": unit == "active" or fallback == "active",
                       "listening": num("lm_udp") > 0},
     }
+    try:
+        from .hostmeter import from_probe, view
+        summary["meters"] = view(from_probe(kv))
+    except Exception:
+        pass
+    return summary
 
 
 def verdict(local, remote, device_ip, local_name="Dell", remote_name="Zenbook"):
@@ -215,9 +251,9 @@ class Prober:
             results = {name: {"local": name == here, "reachable": name == here or live.get(name, {}).get("online", False),
                              "via": "main" if name == main else "node", **live.get(name, {})}
                        for name in self.config.get("devices", {})}
-            return {"checked_at": time.time(), "devices": results,
+            return self._with_sharing({"checked_at": time.time(), "devices": results,
                     "input_link": {"level": "warn", "lines": [
-                        "Node reachability is reported by authenticated heartbeats. Input sharing is configured separately."]}}
+                        "Node reachability is reported by authenticated heartbeats. Input sharing is configured separately."]}})
         devices = self.config.get("devices", {})
         results, threads = {}, []
 
@@ -254,5 +290,16 @@ class Prober:
                      for line in lines]
         if level == "down":
             lines = [line for line in lines if " daemons are up " not in line and " Lan Mouse is up " not in line]
-        return {"checked_at": time.time(), "devices": results,
-                "input_link": {"level": level, "lines": lines}}
+        return self._with_sharing({"checked_at": time.time(), "devices": results,
+                "input_link": {"level": level, "lines": lines}})
+
+    def _with_sharing(self, payload):
+        """Attach the guard's projection and reword the link from it. No second network test."""
+        from .sharedinput import present_input_link, sharing_availability, with_switch
+        sharing = with_switch(sharing_availability(self.state), self.config)
+        level, lines, sharing = present_input_link(
+            payload["input_link"]["level"], payload["input_link"]["lines"], sharing)
+        payload = dict(payload)
+        payload["input_link"] = {"level": level, "lines": lines}
+        payload["sharing"] = sharing
+        return payload

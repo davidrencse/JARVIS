@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import second_brain_queue as archive_queue
 from .store import connect_database
 
 KIND = re.compile(r"[a-z][a-z0-9_-]{0,23}")
@@ -209,6 +210,7 @@ class Memory:
                 CREATE TABLE IF NOT EXISTS vectors(
                   id TEXT PRIMARY KEY, model TEXT NOT NULL, vec BLOB NOT NULL);
             """)
+            archive_queue.adopt(db, self.path.parent, "memory")
 
     def connect(self):
         return connect_database(self.path)
@@ -257,6 +259,7 @@ class Memory:
                 raise RuntimeError("Could not store the memory item (id clash).")
             for rel, dst in links:
                 self._link(db, item_id, dst, rel)
+            archive_queue.capture(db)   # no-op unless write-through capture is configured
         return self.get(item_id)
 
     def _link(self, db, src, dst, rel):
@@ -272,6 +275,7 @@ class Memory:
             if not db.execute("SELECT 1 FROM items WHERE id=?", (src,)).fetchone():
                 raise ValueError(f"Unknown memory item: {src}")
             self._link(db, src, dst, rel)
+            archive_queue.capture(db)
 
     @staticmethod
     def _row(row, body=True):
@@ -293,6 +297,7 @@ class Memory:
                 return False
             meta = {**json.loads(row["meta"] or "{}"), **extra}
             db.execute("UPDATE items SET meta=? WHERE id=?", (json.dumps(meta), item_id))
+            archive_queue.capture(db)
         return True
 
     def get(self, item_id):
@@ -332,6 +337,7 @@ class Memory:
                        (as_kind, json.dumps(meta), item_id))
             if by:
                 self._link(db, by, item_id, "replaces")
+            archive_queue.capture(db)
         return True
 
     def knowledge(self, kinds=KNOWLEDGE_KINDS, limit=150):
@@ -377,6 +383,7 @@ class Memory:
                 meta["seen"] = int(meta.get("seen", 1)) + 1
                 db.execute("UPDATE items SET meta=?, importance=? WHERE id=?",
                            (json.dumps(meta), min(1.0, row["importance"] + 0.05), target))
+                archive_queue.capture(db)
             state, item_id = "merged", target
         else:
             item = self.add(kind, text, title=text[:80], tags=[kind, source], source=source,

@@ -69,8 +69,10 @@ def overview(config, path, state, remote=None):
             else:
                 entry.update(lan_mouse=None, clipboard=None,
                              lan_mouse_error="offline", clipboard_error="offline")
+    from .sharedinput import sharing_availability, with_switch
     return {"here": here, "main": main, "role": link.get("role"), "ok": link["ok"],
-            "checks": link["checks"], "devices": entries}
+            "checks": link["checks"], "devices": entries,
+            "sharing": with_switch(sharing_availability(state), config)}
 
 
 def act(config, path, state, body, remote=None):
@@ -84,12 +86,20 @@ def act(config, path, state, body, remote=None):
         action = body.get("action")
         if action not in WHATS[do]:
             raise ValueError(f"{do} takes {', '.join(WHATS[do])}.")
+        if do == "lan_mouse" and action == "start":
+            from .sharedinput import start_blocked
+            blocked = start_blocked(state, config)
+            if blocked:
+                raise RuntimeError(blocked)
         report, error = _ask(remote, body.get("device") or None, do, action)
         if error:
             raise RuntimeError(error)
         return report
     if do == "pair":
-        from .sharedinput import pair
+        from .sharedinput import pair, start_blocked
+        blocked = start_blocked(state, config)
+        if blocked:  # pairing restarts a running Lan Mouse; don't do that while apart
+            raise RuntimeError(blocked)
         return pair(config, state, str(body.get("device") or ""), str(body.get("position") or ""), remote)
     if do == "invite":
         from .cluster_setup import invite

@@ -19,8 +19,9 @@ import time
 import uuid
 
 from . import gates
-from .parse import parse_for
+from .parse import bare_device, follows_up, parse_for, slipped_action
 from .remote import Remote
+from .topology import confirmation_station
 
 # Registry intent -> (desktop action, its argument) for the direct executor.
 DIRECT = {"open_app": ("open_app", "name"), "open_url": ("open_url", "url"),
@@ -81,7 +82,14 @@ def needs_agent(text, config, origin):
         return any(c["intent"] not in DIRECT for c in parsed["commands"])
     if not parsed["reason"].startswith("no action verb"):
         return not any(parsed["reason"].startswith(r) for r in CHAT_REASONS)
-    return lead_word(text) in AGENT_VERBS  # "buy...", "reply to...": work, not talk
+    lead = lead_word(text)
+    if lead in AGENT_VERBS:  # "buy...", "reply to...": work, not talk
+        return True
+    # An action with a typo ("clsoe chrome"), a reply that leans on the last turn ("do that
+    # again", "same on the dell") or only names a device (answering "which one?"): the
+    # interpreter reads those with the recent turns, and asks when it can't tell. The parser
+    # itself never acts on any of them.
+    return bool(slipped_action(lead) or follows_up(text) or bare_device(text, config, origin))
 
 
 # Verbs that ask for work the parser has no direct action for. Only used to route a
@@ -249,7 +257,7 @@ def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
                 if command.get("depends_on"):
                     replies.append("Please request that action separately so I can confirm it safely.")
                 else:
-                    item = ConfirmQueue(state).park(command, origin, channel)
+                    item = ConfirmQueue(state).park(command, confirmation_station(origin), channel)
                     pending.append(item)
                     replies.append(prompt(item))
             else:
@@ -269,7 +277,7 @@ def _run_turn(commands, devices, origin, origin_class, remote, app_exists, step,
         from .confirm import ConfirmQueue, prompt
         held, notes, pending, outcomes = {c["id"] for c, _ in blocked}, [], [], {}
         for command, _ in blocked:
-            item = ConfirmQueue(state).park(command, origin, channel)
+            item = ConfirmQueue(state).park(command, confirmation_station(origin), channel)
             pending.append(item)
             notes.append(prompt(item))
             outcomes[command["id"]] = {"id": command["id"], "state": "not_sent", "ok": False,
@@ -347,11 +355,12 @@ def _history(state):
 
 
 def _record(turn, commands, result, started):
-    """Every command, sent or not, with its hops. Recording never fails the turn."""
+    """Record without re-running effects; report a durability fault if recording fails."""
     history = turn["history"]
     if not history:
         return
     total = _ms(started)
+    failures = 0
     for command, outcome in zip(commands, result["outcomes"]):
         hops = [{"name": "parse", "ms": turn["parse_ms"]},
                 {"name": "gates", "ms": result.get("gates_ms", 0)}]
@@ -365,8 +374,13 @@ def _record(turn, commands, result, started):
             outcome["history"] = history.record(
                 turn["request"], command, outcome, turn["text"], turn["origin"],
                 turn["origin_class"], hops, total)
-        except Exception:
-            pass
+        except Exception as exc:
+            failures += 1
+            outcome["history_error"] = type(exc).__name__  # no args, paths or private text
+    if failures:
+        result["recording"] = {"ok": False, "failed": failures}
+        result["reply"] = (result.get("reply", "") + " Command history could not be saved. "
+                           "The action results above still apply; do not repeat them just to save history.").strip()
 
 
 def _blocked_reply(command, verdict):

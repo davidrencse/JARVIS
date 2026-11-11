@@ -152,7 +152,7 @@ def run_here(action, arg, tools=None, config=None, state=None):
         return run(action, arg)
     if action == "lan_mouse":  # start / stop / status / pair this computer's Lan Mouse
         from .sharedinput import control
-        return control(arg)
+        return control(arg, state=state, config=config)
     if action == "clipboard":  # start / stop / status / autostart this computer's clipboard sync
         from .clipsync import control
         return control(arg)
@@ -213,11 +213,13 @@ class Remote:
         if action not in ACTIONS:
             return False, f"Unknown desktop action {action}."
         device = self.resolve(device)
-        from .topology import ORIGIN, enabled, identity
+        from .topology import ORIGIN, Roles, enabled, identity
         if enabled(self.config):
             from .cluster import Client, NodeOffline, dispatch
             local, main = identity(self.config)
-            target = device or ORIGIN.get() or local
+            # local/main come from topology.identity (patchable); Roles only names the legacy target
+            # rule (explicit, else origin, else local). Approval station unused here.
+            target = Roles(local, main, ORIGIN.get(), None).execution_target(device)
             if target not in self.machines:
                 return False, f"Unknown node {target!r}; known: {', '.join(self.names())}."
             if target == local:

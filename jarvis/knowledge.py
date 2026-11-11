@@ -42,6 +42,13 @@ from .fsio import atomic_write
 from .stemming import stem
 from .locking import exclusive_lock
 
+# The answer is phrased from claims given in the prompt, so the CLI needs no tools at all.
+# Project settings only: user-level apiKeyHelper/env could re-enable pay-per-token billing
+# (the same contract as runner.py and fastlane.LEAN_FLAGS). Project settings are still read
+# from the working directory, so this narrows the sources; it does not prove they hold no keys.
+CLAIMS_ONLY_FLAGS = ["--setting-sources", "project", "--no-session-persistence", "--tools", "",
+                     "--strict-mcp-config", "--disable-slash-commands"]
+
 STALE_DAYS = 30
 MAX_CLAIMS_PER_SOURCE = 80
 MAX_NEW_PAGES_PER_SOURCE = 10
@@ -1385,7 +1392,8 @@ class KnowledgeBase:
                   f"Question: {question}")
         try:
             from .fastlane import subscription_env
-            out = subprocess.run([binary, "-p", "--model", self.settings.get("llm_model", "haiku")],
+            out = subprocess.run([binary, "-p", "--model", self.settings.get("llm_model", "haiku"),
+                                  *CLAIMS_ONLY_FLAGS],
                                  input=prompt, capture_output=True, text=True, timeout=120,
                                  encoding="utf-8", env=subscription_env(),
                                  creationflags=NO_WINDOW).stdout.strip()

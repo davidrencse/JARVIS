@@ -25,6 +25,13 @@ Safety:
   (`jarvis control stop` there, or "Jarvis, stop controlling my computer"), or after
   MAX_SESSION. On the node, ending always releases every button and key it held.
 - Every start and end is logged in the node's .jarvis/logs/control.jsonl.
+
+Kinds and openers (for David's phone, phone.py): each hub session has a `kind` ("screen" here,
+"camera" for camera.py's webcam view) and an `opener` ("console", or "phone:<id>"). There is
+one live session per (computer, kind), and a phone can't take one another opener holds (Taken).
+A phone sees only its own sessions: another opener's id reads as unknown. Camera sessions take
+no input (WrongKind) and never pause Lan Mouse. The main itself can be the target too (the
+hub runs the session in-process: cluster.Hub.remote_open(allow_main=True)).
 """
 
 import base64
@@ -62,6 +69,9 @@ KEEP_ENDED = 120     # s an ended session stays readable (so the console can say
 SESSION_RE = re.compile(r"[0-9a-f]{32}")
 CODE_RE = re.compile(r"[A-Za-z0-9]{1,24}")
 BUTTONS = ("left", "right", "middle")
+KINDS = ("screen", "camera")
+OPENER_RE = re.compile(r"console|phone:[A-Za-z0-9_-]{1,64}")
+CAMERA_MAX = 15 * 60  # s a camera session may run (camera.MAX_SESSION ends it on the node too)
 _DPI_AWARE = False
 
 
@@ -92,6 +102,17 @@ def desktop_problem():
 
 class Ended(Exception):
     """The session is over; str() says why."""
+
+
+class WrongKind(ValueError):
+    """A call that doesn't fit the session's kind: a camera session takes no input."""
+    status = 409  # the phone server answers with it (the hub's own routes keep 400)
+
+
+class Taken(RuntimeError):
+    """Someone else (the console or another phone) already has that computer's screen or
+    camera. Only the console may replace another opener's session."""
+    status = 409
 
 
 def _unit(value):
@@ -156,7 +177,7 @@ SWEEP = 5.0  # s between hub expiry checks while a session is live
 
 
 class Sessions:
-    """Every remote session the hub knows about. One live session per node."""
+    """Every remote session the hub knows about. One live session per (node, kind)."""
 
     def __init__(self, clock=time.monotonic, on_busy=None):
         self.clock = clock
@@ -177,12 +198,13 @@ class Sessions:
                     return
 
     def _busy(self):
-        if self._sweeper is None and any(s["state"] != "ended" for s in self._all.values()):
+        live = [s for s in self._all.values() if s["state"] != "ended"]
+        if self._sweeper is None and live:
             self._sweeper = threading.Thread(target=self._sweep, name="remote-sweeper", daemon=True)
             self._sweeper.start()
         if self.on_busy is not None:
-            try:
-                self.on_busy(any(s["state"] != "ended" for s in self._all.values()))
+            try:  # only screen sessions drive a desktop: a camera view never pauses Lan Mouse
+                self.on_busy(any(s["kind"] == "screen" for s in live))
             except Exception:
                 pass
 
@@ -195,11 +217,14 @@ class Sessions:
                 continue
             why = None
             if not s["pending"] and now - s["main_seen"] > MAIN_IDLE:  # pending: Connect still waiting
-                why = "The console stopped watching, so the session ended."
+                who = "console" if s["opener"] == "console" else "phone"
+                why = f"The {who} stopped watching, so the session ended."
             elif s["state"] == "live" and now - s["frame_seen"] > NODE_IDLE:  # frames, not input polls
                 why = f"{s['node']} stopped answering (offline or asleep)."
             elif s["state"] == "starting" and now - s["opened"] > START_GRACE:
-                why = f"{s['node']} never sent its screen."
+                why = f"{s['node']} never sent its {'camera picture' if s['kind'] == 'camera' else 'screen'}."
+            elif s["kind"] == "camera" and now - s["opened"] > CAMERA_MAX:
+                why = "Camera sessions end after 15 minutes; start again to go on."
             elif now - s["opened"] > MAX_SESSION:
                 why = "Sessions end after 4 hours; connect again to go on."
             if why:
@@ -222,24 +247,42 @@ class Sessions:
             raise LookupError("Unknown remote session.")
         return s
 
+    def _owned(self, sid, opener):
+        """The session, if `opener` opened it (None: any opener, the console's own calls).
+        Another opener's session reads as unknown, so a phone can't probe for ids."""
+        s = self._get(sid)
+        if opener is not None and s["opener"] != opener:
+            raise LookupError("Unknown remote session.")
+        return s
+
     @staticmethod
     def view(s):
         return {"id": s["id"], "device": s["node"], "state": s["state"], "error": s["error"],
                 "width": s["width"], "height": s["height"], "frames": s["seq"],
-                "quality": s["quality"], "started": s["wall"]}
+                "quality": s["quality"], "started": s["wall"], "kind": s["kind"], "opener": s["opener"]}
 
-    def open(self, node, quality="medium", pending=False):
+    def open(self, node, quality="medium", pending=False, *, kind="screen", opener="console"):
         """pending=True: the console's start request is still waiting on the node (touch()
-        ends that), so console silence doesn't end the session yet."""
+        ends that), so console silence doesn't end the session yet. A live session of the
+        same kind on that node is replaced, but only the console (or the same opener) may
+        replace one: a phone gets Taken instead of cutting off someone else."""
         if quality not in QUALITY:
             raise ValueError("Quality must be low, medium or high.")
+        if kind not in KINDS:
+            raise ValueError("Session kind must be screen or camera.")
+        if not isinstance(opener, str) or not OPENER_RE.fullmatch(opener):
+            raise ValueError("Unknown session opener.")
         with self._cond:
             self._expire()
-            for s in self._all.values():
-                if s["node"] == node and s["state"] != "ended":
-                    # No busy report here: the new session is inserted next, and a False in
-                    # between would restart the main's Lan Mouse mid-handoff.
-                    self._end(s, "Replaced by a new session.", notify=False)
+            live = [s for s in self._all.values()
+                    if s["node"] == node and s["kind"] == kind and s["state"] != "ended"]
+            if opener != "console" and any(s["opener"] != opener for s in live):
+                raise Taken("Someone else is already watching that camera." if kind == "camera" else
+                            "Someone else is already controlling that computer.")
+            for s in live:
+                # No busy report here: the new session is inserted next, and a False in
+                # between would restart the main's Lan Mouse mid-handoff.
+                self._end(s, "Replaced by a new session.", notify=False)
             now = self.clock()
             sid = secrets.token_hex(16)
             self._all[sid] = {"id": sid, "node": node, "quality": quality, "state": "starting",
@@ -247,7 +290,7 @@ class Sessions:
                               "node_seen": now, "frame_seen": now, "ended_at": None, "seq": 0, "frame": None,
                               "width": 0, "height": 0, "events": [], "eseq": 0,
                               "quiet_released": False, "pending": bool(pending),
-                              "key": secrets.token_hex(16)}
+                              "key": secrets.token_hex(16), "kind": kind, "opener": opener}
             self._busy()
             return self.view(self._all[sid])
 
@@ -260,21 +303,37 @@ class Sessions:
             s["pending"] = False
             s["main_seen"] = self.clock()
 
-    def current(self):
-        """The newest session that isn't over (or the newest ended one, for its reason)."""
+    def current(self, kind="screen", opener="console"):
+        """The newest session that isn't over (or the newest ended one, for its reason). By
+        default only the console's own screen sessions: its take-over offer must never pick
+        up a phone's session or a camera view. None: any kind / any opener."""
         with self._cond:
             self._expire()
-            found = sorted(self._all.values(), key=lambda s: (s["state"] != "ended", s["opened"]))
+            found = sorted((s for s in self._all.values()
+                            if (kind is None or s["kind"] == kind) and (opener is None or s["opener"] == opener)),
+                           key=lambda s: (s["state"] != "ended", s["opened"]))
             return self.view(found[-1]) if found else None
 
-    def get(self, sid):
+    def views(self, opener=None):
+        """Every session `opener` opened that the hub still knows (None: all), oldest first."""
         with self._cond:
             self._expire()
-            return self.view(self._get(sid))
+            return [self.view(s) for s in sorted(self._all.values(), key=lambda s: s["opened"])
+                    if opener is None or s["opener"] == opener]
 
-    def close(self, sid, why="Disconnected."):
+    def get(self, sid, opener=None):
         with self._cond:
-            s = self._get(sid)
+            self._expire()
+            return self.view(self._owned(sid, opener))
+
+    def kind(self, node, sid):
+        """The kind of `node`'s session sid (the hub checks it against the node's capabilities)."""
+        with self._cond:
+            return self._node_session(node, sid)["kind"]
+
+    def close(self, sid, why="Disconnected.", opener=None):
+        with self._cond:
+            s = self._owned(sid, opener)
             self._end(s, why)
             return self.view(s)
 
@@ -283,12 +342,22 @@ class Sessions:
             for s in self._all.values():
                 self._end(s, why)
 
+    def end_opener(self, opener, why):
+        """End every live session `opener` opened (a phone unpaired or signed out)."""
+        with self._cond:
+            ended = []
+            for s in self._all.values():
+                if s["opener"] == opener and s["state"] != "ended":
+                    self._end(s, why)
+                    ended.append(self.view(s))
+            return ended
+
     # console -> hub
     def _queue(self, s, event):
         s["eseq"] += 1
         s["events"].append((s["eseq"], event))
 
-    def push(self, sid, events):
+    def push(self, sid, events, opener=None):
         """Queue David's events for the node. A bad event is dropped on its own, so one odd
         value never costs the batch its key-up. Returns how many were queued."""
         if not isinstance(events, list) or len(events) > MAX_EVENTS:
@@ -301,7 +370,9 @@ class Sessions:
                 continue
         with self._cond:
             self._expire()
-            s = self._get(sid)
+            s = self._owned(sid, opener)
+            if s["kind"] != "screen":
+                raise WrongKind("A camera view takes no mouse or keyboard input.")
             if s["state"] == "ended":
                 raise Ended(s["error"] or "The session ended.")
             s["main_seen"] = self.clock()
@@ -317,13 +388,13 @@ class Sessions:
             self._cond.notify_all()
             return len(clean)
 
-    def wait_frame(self, sid, after, hold=FRAME_HOLD):
+    def wait_frame(self, sid, after, hold=FRAME_HOLD, opener=None):
         """(seq, jpeg, width, height) newer than `after`, or None after `hold` seconds."""
         deadline = self.clock() + hold
         with self._cond:
             while True:
                 self._expire()
-                s = self._get(sid)
+                s = self._owned(sid, opener)
                 s["main_seen"] = self.clock()
                 if s["state"] == "ended":
                     raise Ended(s["error"] or "The session ended.")
@@ -334,12 +405,12 @@ class Sessions:
                     return None
                 self._cond.wait(min(left, 1))
 
-    def node_ago(self, sid):
+    def node_ago(self, sid, opener=None):
         """Seconds since the session's node last sent a frame or a frame keep-alive. Input polls
         don't count: a node whose frame thread is wedged while its input thread still polls
         shows a frozen picture, which must not read as live."""
         with self._cond:
-            return max(0.0, self.clock() - self._get(sid)["frame_seen"])
+            return max(0.0, self.clock() - self._owned(sid, opener)["frame_seen"])
 
     def key(self, sid):
         """The session's secret, sent to the node only inside its signed start job."""
@@ -403,6 +474,8 @@ class Sessions:
         with self._cond:
             self._expire()
             s = self._node_session(node, sid)
+            if s["kind"] != "screen":
+                raise WrongKind("A camera view takes no mouse or keyboard input.")
             s["node_seen"] = self.clock()  # once per poll: a dead socket's wait doesn't count
             s["events"] = [(n, e) for n, e in s["events"] if n > after]
             while True:
@@ -736,6 +809,51 @@ def _log(state, entry):
         pass
 
 
+def notify_here(text, title="JARVIS"):
+    """A desktop notification on this computer, so whoever sits at it sees that David's phone
+    drives the screen or that the camera is on. Best effort and never blocks: it runs on a
+    daemon thread. Silent under tests and with JARVIS_NO_NOTIFY set. True when one was sent."""
+    from . import _under_tests
+    if os.environ.get("JARVIS_NO_NOTIFY") or _under_tests():
+        return False
+    threading.Thread(target=_show_notice, args=(str(title)[:80], str(text)[:300]),
+                     name="jarvis-notice", daemon=True).start()
+    return True
+
+
+# The text rides in environment variables, never in the script, so nothing in it can run.
+_BALLOON = ("Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; "
+            "$n = New-Object System.Windows.Forms.NotifyIcon; "
+            "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+            "$n.BalloonTipTitle = $env:JARVIS_NOTICE_TITLE; $n.BalloonTipText = $env:JARVIS_NOTICE_TEXT; "
+            "$n.Visible = $true; $n.ShowBalloonTip(8000); Start-Sleep -Seconds 9; $n.Dispose()")
+
+
+def _show_notice(title, text, popen=None, run=None, which=None):
+    """notify-send on Linux; on Windows a balloon from a hidden, detached PowerShell (it has
+    no notify-send). Never raises."""
+    import shutil
+    import subprocess
+    from . import platforms
+    which = which or shutil.which
+    try:
+        if platforms.on_windows():
+            flags = platforms.NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            (popen or subprocess.Popen)(
+                [which("powershell") or "powershell", "-NoProfile", "-NonInteractive", "-WindowStyle",
+                 "Hidden", "-Command", _BALLOON],
+                env={**os.environ, "JARVIS_NOTICE_TITLE": title, "JARVIS_NOTICE_TEXT": text},
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                close_fds=True, creationflags=flags)
+            return
+        exe = which("notify-send")
+        if exe:
+            (run or subprocess.run)([exe, "-a", "JARVIS", title, text], timeout=5,
+                                    capture_output=True, check=False)
+    except Exception:
+        pass
+
+
 MARKER = "remote-session.json"  # on the node while a session runs; found at start = it died
 MARKER_TOUCH = 10.0  # s between touches; sharedinput.REMOTE_MARKER_TTL (60 s) makes it stale
 
@@ -749,12 +867,16 @@ class NodeSession:
     LATE_RELEASE_FOR = 600.0  # s a refused up at the end is retried before the marker is left to recover()
 
     def __init__(self, config, state, sid, quality, client=None, injector=None, capture=None, encoder=None,
-                 key=None):
+                 key=None, *, lan_mouse=True, announce=False):
         from .cluster import Client
         self.config, self.state, self.sid, self.quality = config, Path(state), sid, quality
         # From the signed start job: every frame/input reply must carry its MAC, or it came
         # from something squatting the tunnel port, not the hub that opened the session.
         self.key = key
+        # lan_mouse=False: a session on the main itself, where the hub's ControllerPause owns
+        # Lan Mouse (two owners would both stop it and both start it again).
+        self.lan_mouse = lan_mouse
+        self.announce = announce  # a notification here at start and end (a phone opened it)
         self.client = client or Client(config, state)
         self.injector = injector or Injector()
         self.injector.stopped = self._stopped_here
@@ -795,7 +917,8 @@ class NodeSession:
             if not self._lan_mouse_was_running:
                 return
             self._lan_mouse_was_running = False
-            heir = next((s for s in list(_ACTIVE.values()) if s is not self and not s._done), None)
+            heir = next((s for s in list(_ACTIVE.values())
+                         if s is not self and not s._done and getattr(s, "lan_mouse", True)), None)
             if heir is not None:
                 heir._lan_mouse_was_running = True
                 # Its marker must say so now: a crash before its next press still pays it once.
@@ -826,6 +949,9 @@ class NodeSession:
     def join(self, timeout=None):
         for thread in self.threads:
             thread.join(timeout)
+        late = self.release_thread
+        if late is not None and timeout is not None:  # bounded: the retry itself runs up to 10 min
+            late.join(timeout)
 
     def _mark(self, held=(), buttons=()):
         if self._done:  # ended: a late release must not bring back the marker
@@ -876,6 +1002,13 @@ class NodeSession:
         return True
 
     def _release_later(self, last):
+        try:
+            self._retry_release(last)
+        finally:
+            if _LATE.get(self.sid) is self:
+                _LATE.pop(self.sid, None)
+
+    def _retry_release(self, last):
         """The session ended with something still down (the desktop refused the up: locked
         screen, secure desktop). Keep sending only those ups, backing off, until they go
         through; the marker keeps the list meanwhile, so recover() pays it if this process
@@ -885,6 +1018,8 @@ class NodeSession:
         delay, due, outcome = 0.5, began + 0.5, "free"
         while True:
             time.sleep(0.1)
+            if not any(self._held_now()):  # let go elsewhere (end_all / Hub close retried at once)
+                break
             heir = next((s for s in list(_ACTIVE.values()) if s is not self and not s._done), None)
             if heir is not None:
                 if self._hand_to(heir):
@@ -939,10 +1074,10 @@ class NodeSession:
         self._mark(*self._held_now())
         self.injector.on_change = self._mark
         with _LAN_LOCK:  # a session that ended while run() replaced it left its restart to us
-            if _LAN["owed"]:
+            if _LAN["owed"] and self.lan_mouse:
                 _LAN["owed"] = False
                 self._lan_mouse_was_running = True
-        if os.environ.get("JARVIS_NO_MODELS") != "1":  # tests never touch the real Lan Mouse
+        if self.lan_mouse and os.environ.get("JARVIS_NO_MODELS") != "1":  # tests never touch the real Lan Mouse
             self._suspend_lan_mouse()
         self._mark(*self._held_now())  # again: now it records whether Lan Mouse is ours to bring back
         loops = ((self._frames, "remote-frames"), (self._input, "remote-input"), (self._watchdog, "remote-deadman"))
@@ -952,6 +1087,9 @@ class NodeSession:
             self.threads.append(thread)
             thread.start()
         _log(self.state, {"action": "remote_start", "session": self.sid[:8], "quality": self.quality})
+        if self.announce:
+            notify_here("Your phone is viewing and controlling this screen. "
+                        "Run jarvis control stop here to end it.")
         return self
 
     def _guard(self, loop):
@@ -982,6 +1120,7 @@ class NodeSession:
                 self._write_marker(*stuck)  # now lan_mouse:false, the restore has run
             self.release_thread = threading.Thread(target=self._release_later, args=(stuck,),
                                                    name="remote-late-release", daemon=True)
+            _LATE[self.sid] = self  # still owes ups: end_all / Hub close must find it
             self.release_thread.start()
         else:
             self._drop_marker()
@@ -996,6 +1135,8 @@ class NodeSession:
             except Exception:
                 pass
         _log(self.state, {"action": "remote_end", "session": self.sid[:8], "why": self.why})
+        if self.announce:
+            notify_here("Your phone stopped controlling this screen.")
 
     def _drop_marker(self):
         if _ACTIVE.get(self.sid, self) is not self:
@@ -1153,7 +1294,10 @@ def _lan_mouse_back(state):
     together, as ControllerPause does on the main. Never raises."""
     try:
         from . import sharedinput
-        if sharedinput.apart_now(state):
+        avail = sharedinput.sharing_availability(state)
+        # Settled or fresh apart: leave it off and let the guard bring it back once together.
+        # Unknown is not apart, so a session end still restores Lan Mouse.
+        if avail.get("settled") == "apart" or avail.get("state") == "apart":
             sharedinput.update_guard_memo(state, stopped_by_guard=True, override=False, stopped_at=time.time())
         else:
             sharedinput.start()
@@ -1162,13 +1306,16 @@ def _lan_mouse_back(state):
 
 
 _ACTIVE = {}  # session id -> NodeSession, on the node
+_LATE = {}    # session id -> ended NodeSession whose refused ups are still being retried
 _LAN_LOCK = threading.RLock()  # Lan Mouse stop/start around sessions, and its handoff
 _LAN = {"owed": False, "starting": 0}  # owed: stopped by a session that ended mid-replace
 
 
 def end_all(why="JARVIS on this computer is restarting.", wait=3):
-    """End every session here and let go of everything (before a restart)."""
-    sessions = list(_ACTIVE.values())
+    """End every session here and let go of everything (before a restart), including ended
+    sessions whose refused ups are still being retried: end() tries those ups again now,
+    and join() gives the retry `wait` seconds, so they aren't lost with the process."""
+    sessions = list(_ACTIVE.values()) + [s for s in list(_LATE.values()) if s not in _ACTIVE.values()]
     for session in sessions:
         session.end(why)
     for session in sessions:
@@ -1234,7 +1381,9 @@ def recover(state, injector=None):
 
 
 def run(arg, config, state, **kw):
-    """The node's `remote` job: {"op": "start"|"stop", "session", "quality"}."""
+    """The node's `remote` job: {"op": "start"|"stop", "session", "quality", "key", "by"?}.
+    by "phone": David's phone opened it, so this computer shows a notification. The hub also
+    runs it in-process for the main itself (kw: client=LocalClient, lan_mouse=False)."""
     if not isinstance(arg, dict) or arg.get("op") not in ("start", "stop"):
         raise ValueError("Remote job needs op start or stop.")
     sid = arg.get("session")
@@ -1256,6 +1405,7 @@ def run(arg, config, state, **kw):
     from .control import _stopped
     if _stopped(state):
         return {"ok": False, "text": "Desktop control is stopped on this computer (jarvis control resume there)."}
+    kw.setdefault("announce", arg.get("by") == "phone")
     with _LAN_LOCK:
         _LAN["starting"] += 1  # an old session ending now leaves Lan Mouse off for this one
     try:
@@ -1269,7 +1419,7 @@ def run(arg, config, state, **kw):
             # An old session still finishing hands its restart over when it ends; one that
             # already ended left it in _LAN["owed"], which start() picks up.
             for old in list(_ACTIVE.values()):
-                if old is not session and old._lan_mouse_was_running:
+                if old is not session and old._lan_mouse_was_running and session.lan_mouse:
                     old._lan_mouse_was_running = False
                     session._lan_mouse_was_running = True
         session.start()
@@ -1277,7 +1427,8 @@ def run(arg, config, state, **kw):
     finally:
         with _LAN_LOCK:
             _LAN["starting"] -= 1
-            if _LAN["owed"] and not any(not s._done for s in list(_ACTIVE.values())):
+            if _LAN["owed"] and not any(not s._done and getattr(s, "lan_mouse", True)
+                                        for s in list(_ACTIVE.values())):
                 _LAN["owed"] = False  # nothing took it over (the start failed): restore now
                 _lan_mouse_back(state)
 
@@ -1291,5 +1442,7 @@ def validate(payload):
     key = payload.get("key")
     if key is not None and (not isinstance(key, str) or not SESSION_RE.fullmatch(key)):
         raise ValueError("Invalid remote session job.")
-    if set(payload) - {"op", "session", "quality", "key"}:
+    if payload.get("by", "console") not in ("console", "phone"):
+        raise ValueError("Invalid remote session job.")
+    if set(payload) - {"op", "session", "quality", "key", "by"}:
         raise ValueError("Invalid remote session job.")
