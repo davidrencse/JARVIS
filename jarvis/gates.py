@@ -322,7 +322,9 @@ _LOOPBACK = (r"(?:localhost|0\.0\.0\.0|(?:0*127|0+177|0x0*7f)(?:\.(?:0x[0-9a-f]+
 LOCAL_CONSOLE = re.compile(r"(?<![\w.])" + _LOOPBACK + r"(?!\w|\.\d)|(?:(?<=//)|(?<=@))0+(?=[:/\s]|$)|"
                            r"/api/(?:confirm|ask|settings|send|remote)\b|\bX-JARVIS\b", re.I)
 
-CONSOLE_PORTS = (7777, 7780, 7779, 7778)  # console, hub, grokbot RELAY_PORT/TUNNEL_PORT; cluster.listen_port too
+# console, hub, grokbot RELAY_PORT/TUNNEL_PORT, the phone app (phone.py); cluster.listen_port
+# and phone.port too
+CONSOLE_PORTS = (7777, 7780, 7779, 7778, 7787)
 _CONSOLE_WHY = "JARVIS doesn't let commands talk to its own console or hub on this computer"
 
 
@@ -330,10 +332,11 @@ def _console_port(text, config):
     """A command naming the console's or hub's port with any host: a hostname that resolves to
     loopback (localtest.me, *.nip.io) reaches them as well as 127.0.0.1 does."""
     ports = set(CONSOLE_PORTS)
-    try:
-        ports.add(int(((config or {}).get("cluster") or {}).get("listen_port")))
-    except (TypeError, ValueError):
-        pass
+    for section, key in (("cluster", "listen_port"), ("phone", "port")):
+        try:
+            ports.add(int(((config or {}).get(section) or {}).get(key)))
+        except (TypeError, ValueError):
+            pass
     alts = "0*(?:" + "|".join(str(p) for p in sorted(ports)) + r")(?!\d)"
     if re.search(r"[\w\]\-.%]:" + alts, text):
         return True
@@ -346,6 +349,154 @@ def _console_port(text, config):
         return True
     # Inline code with the port as its own literal: ('localtest.me',7777), connect((h, 7780))
     return bool(INLINE_CODE.search(text) and re.search(r"(?:[,(]\s*|\bport\s*[=:]\s*)" + alts + r"\s*[,)}]", text, re.I))
+
+
+# The phone app (phone.py), the webcam and a PC's location (2026-11-08): a brain command must
+# not mint a pairing code (an owner-level key), switch camera consent on, open a webcam or
+# read where a computer is. These are text checks, a speed bump in front of code that runs
+# unsandboxed (Windows, macOS), not a wall: string-built Python still gets past them.
+# The `jarvis` CLI by any spelling (jarvis, jarvis.exe/.cmd/.ps1, python/py -m jarvis), with
+# global options (--state X) before a `phone`/`camera` subcommand, or a subcommand the shell
+# fills in later (a glob, a variable, a brace list).
+JARVIS_CLI = re.compile(
+    r"(?:^|(?<=[\s;&|(`'\"=/\\!{]))(?:jarvis(?:\.exe|\.cmd|\.bat|\.ps1|\.py)?|-[a-z]*m\s*['\"]?jarvis"
+    r"(?:\.__main__)?)['\"]?(?:\s+--?[\w-]+(?:=\S*|\s+(?!--?\w)\S+)?)*"
+    r"(?:\s+['\"]?(?:phone|camera)\b|\s+[^\s;&|]*[*?\[$`{])", re.I)
+JARVIS_FED = re.compile(r"\b(?:xargs|parallel)\b[^|;&\n]*(?:^|[\s/\\'\"])(?:jarvis(?:\.\w+)?|-[a-z]*m\s*jarvis)"
+                        r"(?![\w-])", re.I)
+JARVIS_MODULES = re.compile(r"\bjarvis\s*\.\s*(?:phone|camera|locate)\b|"
+                            r"\bfrom\s+jarvis\s+import\b[^\n;]*\b(?:phone|camera|locate)\b|"
+                            r"\b(?:run_module|import_module|__import__)\s*\(\s*['\"]jarvis", re.I)
+INLINE_RUN = re.compile(r"\b(?:python[\d.]*|py|perl|ruby|node|deno|bun|php|lua)(?:\.exe)?\b[^;&|\n]*"
+                        r"\s-[a-zA-Z]*[ce]\b|<<|\b(?:pwsh|powershell)\b", re.I)
+WEBCAM = re.compile(r"\bff(?:mpeg|play|probe)(?:\.exe)?\b[^;&|\n]*(?:\bdshow\b|\bv4l2?\b|video4linux|"
+                    r"\bavfoundation\b|\bvfwcap\b)|/dev/video\d*|/dev/v4l\b|\bv4l2src\b|"
+                    r"\bv4l2-ctl\b[^;&|\n]*--stream|\bfswebcam\b|\bVideoCapture\s*\(|\b(?:av://)?v4l2://|"
+                    r"\bdshow://", re.I)
+LOCATION = re.compile(r"\bwhere-am-i\b|geoclue-2\.0[/\\]+demos|org\.freedesktop\.GeoClue2|"
+                      r"GeoCoordinateWatcher|System\.Device\.Location|Windows\.Devices\.Geolocation|"
+                      r"\bGeolocator\b", re.I)
+PHONE_PATHS = re.compile(r"/phone/(?:api|pair)\b|/phone/[^\s'\"]*[{\[*?]|__Host-jarvis_phone|"
+                         r"\bjarvis_phone\b", re.I)
+# Serve and Funnel decide who can reach the console and the phone app: never changed by a command.
+# Only `serve status` / `funnel status` (flags around it, nothing else) only looks: a "status"
+# later in the line (--set-path /status, 2>status.log, a comment) publishes all the same.
+_TS_FLAGS = r"(?:\s+--?[\w-]+(?:=\S+)?)*"
+TAILSCALE_PUBLISH = re.compile(r"\btailscale(?:\.exe)?\b[^;&|\n]*?\s(?:serve|funnel)\b"
+                               r"(?!" + _TS_FLAGS + r"\s+status" + _TS_FLAGS + r"\s*(?:$|[;&|\n]))", re.I)
+# PowerShell's backtick and cmd's caret escape the next character: d`show and d^show are dshow,
+# jar^vis is jarvis. Bash reads both literally, so taking them out only ever refuses more.
+_ESCAPE = re.compile(r"[`^](.)", re.S)
+_CONTINUATION = re.compile(r"[\\`^]\r?\n")  # a line continued in bash, PowerShell or cmd
+_CLI_PROGRAM = re.compile(r"(?:.*[/\\])?jarvis(?:\.(?:exe|cmd|bat|ps1|py))?", re.I)
+_MODULE_FLAG = re.compile(r"-[a-z]*m(.*)", re.I)  # python -m X, -Im X, -mX
+_CLI_MODULE = re.compile(r"jarvis(?:\.__main__)?", re.I)
+_UNREADABLE = re.compile(r"[$*?\[{@%`]")  # a variable, glob, brace list or splat the shell fills in
+
+
+def _argv_words(text):
+    """Roughly the words bash, PowerShell or cmd hand a program. Quoted text is one word and
+    joins what touches it ("x y", ph''one). PowerShell's ( ) , and @( split words, with "(" kept
+    as a word of its own (a group's value can't be read here). ; & | and newlines end a command
+    and become ";"."""
+    words, word, quote, started = [], [], None, False
+
+    def end_word():
+        nonlocal word, started
+        if started:
+            words.append("".join(word))
+        word, started = [], False
+
+    for i, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                word.append(ch)
+        elif ch in "'\"":
+            quote, started = ch, True
+        elif ch in ";&|\n" or ch == "(":
+            end_word()
+            words.append("(" if ch == "(" else ";")
+        elif ch.isspace() or ch in ")," or (ch == "@" and text[i + 1:i + 2] == "("):
+            end_word()
+        else:
+            word.append(ch)
+            started = True
+    end_word()
+    return words
+
+
+def _cli_subcommand(rest):
+    """rest: the words after `jarvis` (or `python -m jarvis`). True when its subcommand is phone
+    or camera, or could be. Global options are skipped with their values (--state X,
+    --config 'x y'); a word after an option might be its value or the subcommand, so it is
+    judged as both."""
+    def suspect(word):
+        first = (word.split() or [""])[0].lower()
+        return first in ("phone", "camera") or word == "(" or bool(_UNREADABLE.search(word))
+
+    j = 0
+    while j < len(rest) and rest[j] != ";":
+        word = rest[j]
+        if suspect(word):
+            return True
+        if not word.startswith("-") or word == "-":
+            return False  # the subcommand, and not one of those
+        if "=" in word:
+            j += 1
+            continue
+        value = rest[j + 1] if j + 1 < len(rest) else ";"
+        if value == ";":
+            return False
+        if suspect(value):
+            return True
+        j += 1 if value.startswith("-") else 2
+    return False
+
+
+def _jarvis_cli(text, depth=0):
+    """The jarvis CLI with a phone or camera subcommand anywhere in text, read word by word
+    (bash, PowerShell or cmd). A quoted word holding spaces may be a command for another shell
+    (bash -c '...', -ArgumentList '...'): it is read the same way, a few levels deep."""
+    words = _argv_words(text)
+    for i, word in enumerate(words):
+        rest = None
+        if _CLI_PROGRAM.fullmatch(word):
+            rest = words[i + 1:]
+        else:
+            module = _MODULE_FLAG.fullmatch(word)
+            if module and module.group(1):
+                rest = words[i + 1:] if _CLI_MODULE.fullmatch(module.group(1)) else None
+            elif module and i + 1 < len(words) and _CLI_MODULE.fullmatch(words[i + 1]):
+                rest = words[i + 2:]
+        if rest is not None and _cli_subcommand(rest):
+            return True
+    return depth < 3 and any(_jarvis_cli(w, depth + 1) for w in words if re.search(r"\s", w))
+
+
+def _phone_denial(command):
+    """Why a command reaches for the phone app, the webcam or a computer's location, or None."""
+    plain = re.sub(r"[\\'\"]", "", command)
+    slashed = re.sub(r"['\"]", "", command.replace("\\", "/"))
+    escaped = _ESCAPE.sub(r"\1", command)
+    bare = re.sub(r"[\\'\"]", "", escaped)  # escapes, quotes and backslashes all taken out
+    texts = (command, plain, slashed, bare)
+    if any(JARVIS_CLI.search(t) or JARVIS_FED.search(t) for t in texts) or JARVIS_MODULES.search(command) \
+            or JARVIS_MODULES.search(plain) or _jarvis_cli(escaped) or _jarvis_cli(escaped.replace("\\", "")) \
+            or (INLINE_RUN.search(command) and re.search(r"\bjarvis\b", plain, re.I)
+                and re.search(r"\b(?:phone|camera)\b", plain, re.I)):
+        return "JARVIS doesn't run its own phone or camera commands; David runs them at the PC"
+    if any(WEBCAM.search(t) for t in texts):
+        return "JARVIS doesn't open a webcam from a command"
+    if any(LOCATION.search(t) for t in texts):
+        return "JARVIS doesn't look up where a computer is from a command"
+    unglobbed = re.sub(r"[{}\[\]]", "", plain)
+    if any(PHONE_PATHS.search(t) for t in (command, plain, bare, unglobbed, _url_path_norm(plain), _url_path_norm(bare))):
+        return "JARVIS doesn't let commands talk to its phone app"
+    if any(TAILSCALE_PUBLISH.search(t) for t in texts):
+        return "JARVIS doesn't change what Tailscale serves or publishes"
+    return None
 
 
 NET_TOOL = re.compile(r"(?<![\w.-])(?:nc|ncat|netcat|telnet|socat|openssl|curl|wget|nmap|httpie|http(?!s?://)|xh|"
@@ -607,6 +758,13 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
     command = str((args or {}).get("command") or "")
     if depth > NESTING:
         return "that command nests too deeply for JARVIS to check"
+    # A continued line is one command to the shell (bash \, PowerShell `, cmd ^ before the
+    # newline), but every check here stops at a newline. Judge the joined text both ways:
+    # bash drops the pair, PowerShell and cmd leave a word break.
+    for joined in {_CONTINUATION.sub("", command), _CONTINUATION.sub(" ", command)} - {command}:
+        found = _terminal_denial({**(args or {}), "command": joined}, config, base, depth + 1, expand)
+        if found:
+            return found
     variants = _home_variants(command, config) if expand else []
     if variants is None:
         return "JARVIS can't check that command: its variables grow too large"
@@ -626,6 +784,9 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
             return found
     if SECRET_TEXT.search(command) or SECRET_TEXT.search(str(cwd_arg or "")):
         return "JARVIS never reads or sends login, key or token files"
+    found = _phone_denial(command)  # before read_only: `cat /dev/video0` only "looks"
+    if found:
+        return found
     if terminal.read_only(command, cwd_arg):
         return None
     if CREDENTIAL_CMD.search(command):

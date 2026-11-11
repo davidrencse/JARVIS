@@ -20,6 +20,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import second_brain_queue as archive_queue
 from .store import connect_database
 
 AGENT_ORIGINS = frozenset({"agent", "system"})
@@ -65,6 +66,7 @@ class History:
                   id INTEGER PRIMARY KEY, confirmation TEXT NOT NULL, at REAL NOT NULL,
                   origin TEXT NOT NULL, action TEXT NOT NULL, hash TEXT NOT NULL);
             """)
+            archive_queue.adopt(db, self.path.parent, "history")
 
     def connect(self):
         return connect_database(self.path)
@@ -94,10 +96,14 @@ class History:
             db.executemany("INSERT OR REPLACE INTO hops VALUES(?,?,?,?)",
                            [(cid, h["name"], int(h["ms"]), h.get("state", "done"))
                             for h in hops or ()])
-            db.execute("DELETE FROM hops WHERE command IN (SELECT id FROM commands WHERE at<?)",
-                       (now - KEEP_DAYS * 86400,))
-            db.execute("DELETE FROM commands WHERE at<?", (now - KEEP_DAYS * 86400,))
+            if not archive_queue.enabled(db):
+                # While write-through capture is on, commands/hops are not pruned: a pending or
+                # not-yet-archived record must not disappear (retention resumes with cutover C3).
+                db.execute("DELETE FROM hops WHERE command IN (SELECT id FROM commands WHERE at<?)",
+                           (now - KEEP_DAYS * 86400,))
+                db.execute("DELETE FROM commands WHERE at<?", (now - KEEP_DAYS * 86400,))
             db.execute("DELETE FROM confirmation_audit WHERE at<?", (now - KEEP_DAYS * 86400,))
+            archive_queue.capture(db)
         return cid
 
     # -- the H-checks ---------------------------------------------------------------------

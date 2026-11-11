@@ -101,19 +101,34 @@ def collect():
             "pci": command(["lspci"]),
             "os": read_text("/etc/os-release"),
             "displays": linux_displays(),
-            "batteries": linux_batteries(),
             "kernel": platform.release(),
         }
         data["notes"] = [
             "SSH sessions may not expose Hyprland's session socket.",
-            "Physical memory module speed and battery design capacity require separate verification.",
+            "Battery health is full-charge capacity divided by design capacity when both use the same unit. The charge percent is a separate figure.",
             "Disk sizes are bytes; partitions and physical drives are distinct."
         ]
     else:
         raise ValueError("Inventory currently supports Windows and Linux.")
     data["tools"] = {name: shutil.which(name) is not None for name in
                      ("codex", "claude", "ssh", "tailscale", "sunshine", "moonlight", "lan-mouse")}
+    _attach_meters(data)
     return data
+
+
+def _attach_meters(data):
+    """RAM, swap, disk, CPU and battery, beside the rest of the inventory.
+
+    The Windows query is its own process, so a CIM hang cannot blank the hardware
+    inventory above. Linux battery rows come from that same reading.
+    """
+    from . import hostmeter
+    reading = hostmeter.sample()
+    if data.get("platform") == "Linux" and isinstance(data.get("hardware"), dict):
+        rows = reading.get("battery_rows") if isinstance(reading, dict) else None
+        data["hardware"]["batteries"] = rows if isinstance(rows, list) else linux_batteries()
+    if isinstance(reading, dict):
+        data["meters"] = hostmeter.slim(reading)
 
 
 if __name__ == "__main__":

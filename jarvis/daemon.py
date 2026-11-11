@@ -364,6 +364,8 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
             memory.warm_vectors()  # meaning-based recall index, in the background
             from .consolidate import start as consolidate_daily
             consolidate_daily(config, memory, base, log=log)  # memory.consolidate: once a day
+            from .second_brain_runtime import start as archive_start
+            archive_start(config, state, log=log)  # second_brain.enabled: archive drain; joined at exit
         log(f"JARVIS listening on {stt.device or 'cpu'}. Say \"Jarvis, ...\".")
         emit(state, "voice.ready", device=stt.device or "cpu")
         # voice.speaker_check: false is the off switch for the voice check. Nobody is then

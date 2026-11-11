@@ -463,7 +463,8 @@ def update(config, state, node, rollback=False):
     from .topology import identity
     local, main = identity(config)
     if local != main:
-        raise ValueError("Run jarvis cluster update on the main PC.")
+        raise ValueError(f"This is {local}, a node. Run jarvis cluster update {local} on the main PC ({main}); "
+                         "the node then picks up the new code on its next poll.")
     if node == main:
         raise ValueError("The main PC already runs this code.")
     if not is_ssh_node(config, node):

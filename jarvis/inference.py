@@ -92,21 +92,94 @@ def claude_brain(config, base, state):
                        builtin_tools=("WebSearch", "WebFetch"), permission_mode="dontAsk")
 
 
+class _Request:
+    """One Failover.ask: the names of tools that started on any lane while it ran."""
+    __slots__ = ("tools", "pending")
+
+    def __init__(self):
+        self.tools = []
+        self.pending = {}
+
+
 class Failover:
     """A lane that is ChatGPT while it can be and Claude while ChatGPT is over its limit.
     Same interface as the lanes it wraps (ask, warm, close, pick, tool_log, on_tool)."""
 
     def __init__(self, primary, fallback, name="lane"):
         self.primary, self._make_fallback, self.name = primary, fallback, name
-        self.fallback, self._on_tool = None, None
-        self._local = threading.local()  # .last: per request thread, not shared
+        self.fallback = None
+        # The caller's on_tool (assistant._with_tools sets it): kept here, never on a lane.
+        # Each lane gets _relay_for(lane) instead, which first records "a tool started" for
+        # the request(s) running it and then forwards, so the failover decision below never
+        # depends on an external callback existing or behaving.
+        self._on_tool = getattr(primary, "on_tool", None)
+        self._local = threading.local()  # .last, .requests: per request thread, not shared
+        self._requests = {}  # id(lane) -> in-flight request records (see _Request)
+        self._install(primary)
         # In-flight asks per lane and closes waiting for them: a lane's process (and the
         # browser it holds) must never be killed under another request's turn.
         self._busy, self._deferred, self._guard = {}, [], threading.RLock()
 
+    def _install(self, lane):
+        try:
+            lane.on_tool = self._relay_for(lane)
+        except Exception:  # a lane that cannot take a callback is simply not tracked
+            pass
+
+    def _relay_for(self, lane):
+        def relay(key, name, ok, text):
+            """Lane callback: ok None = a tool started, True/False = it finished. Both mean
+            "something may have happened". Lanes emit on the asking thread, so the request
+            is that thread's; a callback from any other thread is charged to every request
+            running this lane (over-blocking a failover is safe, missing a start is not)."""
+            with self._guard:
+                mine = list(getattr(self._local, "stack", ()))
+                if not mine:
+                    mine = list(self._requests.get(id(lane), ()))
+                for request in mine:
+                    request.tools.append(str(name or "tool"))
+                    call = (id(lane), key)
+                    if ok is None:
+                        request.pending[call] = str(name or "tool")
+                    else:
+                        request.pending.pop(call, None)
+            callback = self._on_tool
+            if callback:
+                try:
+                    callback(key, name, ok, text)
+                except Exception:  # reporting must never fail the turn (lanes do the same)
+                    pass
+        return relay
+
+    def _begin(self):
+        """A request record on this thread's stack (nested asks keep their own)."""
+        request = _Request()
+        stack = getattr(self._local, "stack", None)
+        if stack is None:
+            stack = self._local.stack = []
+        stack.append(request)
+        return request
+
+    def _end(self, request):
+        stack = getattr(self._local, "stack", [])
+        if request in stack:
+            stack.remove(request)
+        with self._guard:
+            for lanes in self._requests.values():
+                if request in lanes:
+                    lanes.remove(request)
+
     def _enter(self, lane):
         with self._guard:
             self._busy[id(lane)] = self._busy.get(id(lane), 0) + 1
+
+    def _track(self, lane, request):
+        """Remember that `request` is running on `lane` (for a callback off the request's thread)."""
+        if request is not None:
+            with self._guard:
+                running = self._requests.setdefault(id(lane), [])
+                if request not in running:
+                    running.append(request)
 
     def _leave(self, lane):
         close = False
@@ -135,9 +208,10 @@ class Failover:
         if not busy:
             self._close_quietly(lane)
 
-    def _run(self, lane, text, recall, on_sentence, entered=False):
+    def _run(self, lane, text, recall, on_sentence, entered=False, request=None):
         if not entered:
             self._enter(lane)
+        self._track(lane, request)
         try:
             return lane.ask(text, recall, on_sentence=on_sentence)
         finally:
@@ -163,16 +237,30 @@ class Failover:
     def tool_log(self):
         return getattr(self.last, "tool_log", [])
 
+    def turn_log(self):
+        """This thread's snapshot of the ask that just returned, or None if it did not.
+        An empty list means that ask finished no tool. It is not the shared tool_log."""
+        snap = getattr(self._local, "log", None)
+        if snap is None:
+            return None
+        return list(snap)
+
+    def _capture(self):
+        """Tools the lane that just answered recorded for this ask. Prefer its snapshot."""
+        lane = self.last
+        if hasattr(lane, "turn_log"):
+            snap = lane.turn_log()
+            if snap is not None:
+                return list(snap)
+        return list(getattr(lane, "tool_log", None) or ())
+
     @property
     def on_tool(self):
         return self._on_tool
 
     @on_tool.setter
     def on_tool(self, fn):
-        self._on_tool = fn
-        for lane in (self.primary, self.fallback):
-            if lane is not None:
-                lane.on_tool = fn
+        self._on_tool = fn  # the lanes keep calling their relay, which forwards to fn
 
     def warm(self):
         from .chatgpt import usage_limit
@@ -186,7 +274,7 @@ class Failover:
                 self._close_when_idle(lane)  # never under a request that is mid-turn
 
     # -- answering ---------------------------------------------------------------------------
-    def _standin(self, enter=False):
+    def _standin(self, enter=False, request=None):
         """The stand-in lane, created once (check and create under the guard). enter=True
         also counts the caller as in flight on it, atomically with the choice, so a
         concurrent retire cannot close it in between."""
@@ -194,7 +282,7 @@ class Failover:
         with self._guard:
             if self.fallback is None:
                 lane = self._make_fallback()
-                lane.on_tool = self._on_tool
+                self._install(lane)
                 self.fallback, created = lane, True
             lane = self.fallback
             if enter:
@@ -207,6 +295,35 @@ class Failover:
         return lane
 
     def ask(self, text, recall=(), on_sentence=None):
+        self._local.log = None  # this ask's snapshot; a nested ask overwrites it when it returns
+        request = self._begin()
+        try:
+            reply = self._ask(request, text, recall, on_sentence)
+        except Exception as exc:
+            # Whatever failed, tell the caller which tools STARTED without a finish line: its
+            # own fallbacks (assistant: one-shot run, runner task) read tool_log, which a
+            # started-only call never reaches, and would run the same effect again.
+            self._mark_unfinished(exc, request)
+            raise
+        else:
+            # After the lane's ask has returned (and released its lock). A later turn may
+            # already have replaced tool_log; the snapshot was taken under that lock.
+            self._local.log = tuple(self._capture())
+            return reply
+        finally:
+            self._end(request)
+
+    @staticmethod
+    def _mark_unfinished(exc, request):
+        unfinished = list(getattr(exc, "tool_unfinished", ()) or ())
+        unfinished.extend(request.pending.values())
+        if unfinished:
+            try:
+                exc.tool_unfinished = list(dict.fromkeys(unfinished))
+            except Exception:
+                pass
+
+    def _ask(self, request, text, recall, on_sentence):
         from .chatgpt import usage_limit
         if not usage_limit():
             spoken = []
@@ -216,13 +333,16 @@ class Failover:
                 on_sentence(sentence)
             try:
                 self.last = self.primary
-                reply = self._run(self.primary, text, recall, speak if on_sentence else None)
+                reply = self._run(self.primary, text, recall, speak if on_sentence else None,
+                                  request=request)
             except Exception as exc:
-                # Only a limit, and only before anything was said: the stand-in may answer
-                # the same question without David hearing half of it twice.
+                # Only a limit, and only before anything was said or any tool even started:
+                # the stand-in may answer the same question without David hearing half of it
+                # twice or an effect running twice. "Started" counts: ChatGPT can die between
+                # item/started and item/completed with the effect already done (P2 fix).
                 ran = exc.tool_log if hasattr(exc, "tool_log") else \
                     getattr(self.primary, "tool_log", None)
-                if not is_limit(exc) or spoken or ran:
+                if not is_limit(exc) or spoken or ran or request.tools:
                     if spoken or is_limit(exc):
                         exc.spoken = True  # the caller must not answer this request again
                     raise
@@ -232,9 +352,9 @@ class Failover:
                 # task. Not before it answered: the limit guess may have lapsed too early.
                 self._retire_standin()
                 return reply
-        lane = self._standin(enter=True)
+        lane = self._standin(enter=True, request=request)
         self.last = lane
-        return self._run(lane, text, recall, on_sentence, entered=True)
+        return self._run(lane, text, recall, on_sentence, entered=True, request=request)
 
     def _retire_standin(self):
         with self._guard:

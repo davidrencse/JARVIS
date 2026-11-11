@@ -10,8 +10,53 @@ from .topology import enabled, identity
 
 # What each capability lets the main ask a node to do, in David's words.
 CAPS = {"desktop": "open apps, screens, Lan Mouse", "files": "files and clipboard",
-        "grokbot": "Grokbot", "inventory": "hardware report", "console": "use the console"}
+        "grokbot": "Grokbot", "inventory": "hardware report", "console": "use the console",
+        "camera": "webcam view (after jarvis camera allow on there)", "locate": "find where it is"}
 HERE = {"voice": ("start", "stop", "restart")}
+
+
+def presence(seen, busy=False, now=None):
+    """The one liveness word every surface shows: online | busy | offline. "online" is proof:
+    the node checked in within cluster_store.ONLINE seconds. "busy" is not proof: the node
+    last checked in longer ago, but the broker still holds a running job inside its deadline
+    (a node runs one job at a time and does not poll meanwhile), so it is awaiting contact.
+    Pure: no I/O, no device poll."""
+    from .cluster_store import ONLINE
+    now = time.time() if now is None else now
+    if seen and now - seen < ONLINE:
+        return "online"
+    return "busy" if busy else "offline"
+
+
+def busy_nodes(state, now=None, grace=15):
+    """Node ids with a running job still inside its deadline (+grace). Read-only look at the
+    broker file (never creates it); empty when it can't be read."""
+    import sqlite3
+    from pathlib import Path
+    path = Path(state) / "cluster.sqlite3"
+    if not path.is_file():
+        return set()
+    now = time.time() if now is None else now
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+    except sqlite3.Error:
+        return set()
+    try:
+        return {row[0] for row in db.execute(
+            "SELECT DISTINCT node FROM jobs WHERE state='running' AND deadline>?", (now - grace,))}
+    except sqlite3.Error:
+        return set()
+    finally:
+        db.close()
+
+
+def _cap_title(cap):
+    """Same vocabulary as the Fleet form; the raw id only if the catalog doesn't know it."""
+    try:
+        from .fleet_management import CAP_INFO
+        return CAP_INFO[cap][0]
+    except (ImportError, KeyError):
+        return cap
 
 
 def _safely(fn, fallback=None):
@@ -29,13 +74,19 @@ def _nodes(config, state, main):
     for node in broker.nodes():
         device = (config.get("devices") or {}).get(node["id"], {})
         seen = node.get("seen")
+        try:
+            busy = bool(broker.busy_job(node["id"]))
+        except Exception:  # a broken job table must not hide the node
+            busy = False
         out.append({
             "id": node["id"], "label": device.get("label") or node["id"],
             "hostname": node.get("hostname") or device.get("hostname"),
             "platform": node.get("platform"), "online": node["online"], "seen": seen,
+            "presence": presence(seen, busy), "busy": busy,
             "silent_for": round(time.time() - seen) if seen else None,
             "code_ok": node.get("code") == code, "code": node.get("code"),
-            "capabilities": [{"id": c, "does": CAPS.get(c, c)} for c in node["capabilities"]],
+            "capabilities": [{"id": c, "title": _cap_title(c), "does": CAPS.get(c, c)}
+                             for c in node["capabilities"]],
             "running": broker.running(node["id"]), "jobs_24h": broker.delivery(node["id"]),
             "address": device.get("lan_ip"),
         })
