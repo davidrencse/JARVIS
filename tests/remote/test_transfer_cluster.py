@@ -357,6 +357,32 @@ class LanMouseTests(unittest.TestCase):
                 sharedinput.pair({}, None, "dell", "right", remote)
 
 
+class PathOpsTests(Homes):
+    """Storage-copy operations: only the main's console may send them, never a node."""
+
+    def test_a_node_may_not_ask_the_main_for_path_operations(self):
+        for payload in ({"action": "tree", "path": "/home/x"},
+                        {"action": "mkdir", "dir": "/home/x", "name": "y"},
+                        {"action": "get", "path": "/home/x/.ssh/id_ed25519", "offset": 0},
+                        {"action": "put", "upload": "a" * 32, "offset": 0, "last": True,
+                         "data": "", "dest": "path", "dir": "/home/x", "name": "y"}):
+            with self.subTest(action=payload["action"]):
+                self.assertTrue(transfer.is_path_op(payload))
+        for payload in ({"action": "inbox"}, {"action": "get", "name": "a.txt", "offset": 0},
+                        {"action": "put", "upload": "a" * 32, "offset": 0, "last": True,
+                         "data": "", "name": "y"}):
+            self.assertFalse(transfer.is_path_op(payload))
+
+    def test_walk_tree_skips_links_and_lists_parents_first(self):
+        (self.root / "t" / "a" / "b").mkdir(parents=True)
+        (self.root / "t" / "a" / "b" / "f.txt").write_text("12345")
+        (self.root / "t" / "link").symlink_to(self.root)
+        tree = transfer.walk_tree(self.root / "t")
+        self.assertEqual(tree["dirs"], [["a"], ["a", "b"]])
+        self.assertEqual(tree["files"], [{"rel": ["a", "b", "f.txt"], "size": 5}])
+        self.assertEqual((tree["skipped"], tree["bytes"]), (1, 5))
+
+
 if __name__ == "__main__":
     unittest.main()
 
