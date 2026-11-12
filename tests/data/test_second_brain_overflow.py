@@ -378,6 +378,59 @@ class Recovery(Bound):
         self.assertEqual(policy["memory"], 64 * 1024)
         self.assertEqual(q.status(self.state)["overflow_max_bytes"], 64 * 1024)
 
+    def _revs(self):
+        return [int(re.search(r"-r(\d{4,})-", path.name)[1]) for path in self.notes()]
+
+    def test_gap_and_corrupt_head_is_not_current_and_rescan_does_not_fill_the_gap(self):
+        """A missing earlier revision must not hide a damaged head, and the repair must
+        not invent that revision. Temp vault, shrunken bound, same shape as the audit."""
+        store, task = self.huge_task()
+        q.set_overflow(self.state, 64 * 1024)
+        self.drain_all()
+        store.transition(task["id"], "queued", "failed", {"why": "stop"})
+        self.drain_all()
+        self.assertEqual(self._revs(), [1, 2])
+        rev1 = next(path for path in self.notes() if "-r0001-" in path.name)
+        rev2 = next(path for path in self.notes() if "-r0002-" in path.name)
+        original = rev2.read_bytes()
+        rev1.unlink()
+        chunk = next(path for path in self.chunks() if "-r0002-" in path.name)
+        damaged = self._damage(chunk, "flip")
+        out = rt.status(self.config(), self.state)
+        self.assertEqual(out["gate"], "ok")
+        self.assertEqual(out["state"], "error")
+        self.assertNotEqual(out["state"], "current")
+        self.assertGreaterEqual(out["archive_chunk_checked"], 1)
+        self.assertGreaterEqual(out["archive_chunk_damaged"], 1)
+        self.assertGreaterEqual(out["archive_revision_conflict"], 1)
+        self.assertNotIn("xxxx", json.dumps(out))
+        q.rescan(self.state)
+        rep = self.drain_all()
+        self.assertEqual((rep["failed"], rep["held"], rep["remaining"]), (0, 0, 0))
+        self.assertGreaterEqual(rep["repaired"], 1)
+        self.assertEqual(self._revs(), [2, 3])          # rev 1 was not synthesized
+        self.assertFalse(any("-r0001-" in path.name for path in self.notes()))
+        self.assertEqual(chunk.read_bytes(), damaged)
+        self.assertEqual(rev2.read_bytes(), original)
+        newest = max(self.notes(), key=lambda path: path.name)
+        parsed = self.brain._load(newest)
+        self.assertTrue(parsed["payload_ok"])
+        self.assertIn("x" * 9000, parsed["payload_text"])
+        with self.assertRaises(sb.SecondBrainError):
+            self.brain.latest(self.rid(task["id"]))     # the gap is still a gap
+        problems = [item["problem"] for item in self.brain.validate()["errors"]]
+        self.assertTrue(any("revision-gap-or-duplicate" in item for item in problems), problems)
+        self.assertTrue(any("chunked-payload" in item for item in problems), problems)
+        again = rt.status(self.config(), self.state)
+        self.assertEqual(again["state"], "conflict")
+        self.assertNotEqual(again["state"], "current")
+        self.assertEqual(again["archive_chunk_damaged"], 0)   # the new head reads back on its own
+        self.assertGreaterEqual(again["archive_revision_conflict"], 1)
+        q.rescan(self.state)
+        second = self.drain_all()
+        self.assertEqual((second["repaired"], second["failed"], second["remaining"]), (0, 0, 0))
+        self.assertEqual(self._revs(), [2, 3])          # a sound head does not grow another revision
+
     def test_oversize_reason_is_counted_as_oversize(self):
         view = rt._sync_view({"ok": True, "written": 1, "unchanged": 0, "repaired": ["tasks/task/1"],
                               "skipped": [{"reason": "oversize: 99 bytes"}, {"reason": "secret-like"}],
