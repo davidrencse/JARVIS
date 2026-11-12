@@ -28,6 +28,7 @@ from jarvis.continuity.integration import (
     ContinuityIntegration,
     IntegrationError,
     IsolatedFleet,
+    _blockers,
     deployment_facts,
     apply_node_seen,
     close_unfenced,
@@ -83,7 +84,9 @@ class ProductionBlocked(unittest.TestCase):
         self.assertFalse(report["activated"])
         self.assertTrue(report["ignored_tuple"])
         ids = {row["id"] for row in report["blockers"]}
-        for blocker in ("gateway_host_unverified", "hub_loopback", "phone_origin_arch_loopback",
+        # The gateway-host blocker tracks whether the real config names an oracle device.
+        self.assertEqual("gateway_host_unverified" in ids, not deployment_facts()["oracle_device"])
+        for blocker in ("hub_loopback", "phone_origin_arch_loopback",
                         "dell_provider_unverified", "luna_grok_unverified", "safety_margin_unmeasured",
                         "windows_clock_untested", "legacy_paths_unfenced", "passkey_verifier_absent",
                         "signature_verifier_absent", "automatic_failover_disabled"):
@@ -100,15 +103,18 @@ class ProductionBlocked(unittest.TestCase):
         self.assertFalse(integration.quiesce_legacy(1)["applied"])
         self.assertFalse(integration.rollback_quiesced("drill", 1)["applied"])
 
-    def test_peers_behave_and_repo_has_no_oracle_gateway(self):
+    def test_peers_behave_and_oracle_gateway_is_recorded(self):
         peers = peer_report()
         for name in ("gateway", "ingress", "runtime", "executor"):
             self.assertTrue(peers[name]["present"], name)
             self.assertTrue(peers[name]["compatible"], (name, peers[name]))
         facts = deployment_facts()
         self.assertTrue(facts["config_read"])
-        self.assertFalse(facts["oracle_device"])
-        self.assertNotIn("oracle", facts["device_ids"])
+        self.assertEqual(facts["oracle_device"], "oracle" in facts["device_ids"])
+        self.assertIn("gateway_host_unverified",
+                      {row["id"] for row in _blockers(dict(facts, oracle_device=False), peers)})
+        self.assertNotIn("gateway_host_unverified",
+                         {row["id"] for row in _blockers(dict(facts, oracle_device=True), peers)})
         self.assertEqual(facts["phone_bind"], "127.0.0.1:7787")
         self.assertFalse(facts["provider_verified"])
         self.assertFalse(facts["windows_clock_tested"])
