@@ -8,7 +8,7 @@ A local assistant and workflow layer for David's ASUS Zenbook (Arch/Hyprland, th
 main) and Dell G15 (Windows 11, a node), with a Python CLI, web console, desktop overlay and voice loop.
 
 See the [workflow review and optimization results](pipeline-architecture-review.md)
-and [independent audit](pipeline-independent-audit.md) for the current architecture,
+for the current architecture,
 measured improvements, verification and prioritized follow-up work. Downloaded
 [architecture skills](../skills/README.md) are available as project-local references.
 
