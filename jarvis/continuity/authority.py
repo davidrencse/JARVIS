@@ -42,6 +42,15 @@ SAFETY_MARGIN = 2.0           # added to every validity wait; measure before tru
 MAX_TICKET_SECONDS = 24 * 3600.0
 TICKET_SKEW = 5.0             # issued_at may be this far in the future (clock skew)
 DEDUP_SECONDS = 90 * 24 * 3600.0
+# Admission ticket fields, in signing order. The one copy: gateway, runtime, executor and
+# integration import it, and each keeps its own validation of the values.
+TICKET_FIELDS = (
+    "admission_id", "target", "operation_id", "attempt_id", "digest", "main",
+    "incarnation", "epoch", "issued_at", "admit_until", "issuer_incarnation",
+)
+# Longest accepted ssh signature armor (a 4096-bit RSA signature fits). Every boundary that
+# checks a ticket signature uses this one cap, so none passes what the gateway would refuse.
+MAX_SIGNATURE = 1800
 
 MODES = ("LEGACY_ACTIVE", "PREPARING_V2", "QUIESCED", "V2_ONLY_NO_MAIN", "V2_ACTIVE",
          "HANDOVER", "ROLLBACK_QUIESCED", "QUARANTINED")

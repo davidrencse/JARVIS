@@ -2,7 +2,7 @@
 
 Implements the ``runtime.py`` facade in
 ``docs/design/mobile-continuity/OPERATIONAL-CONTRACT.md``. This module does not
-activate v2, does not rewrite ``cluster.main_device``, and does not talk to a
+activate v2, does not rewrite the saved cluster role, and does not talk to a
 provider. A managed hub supplies an ``AuthorityPort`` (in tests,
 ``StoreAdapter`` over ``AuthorityStore``) and the booleans for local readiness.
 
@@ -13,7 +13,8 @@ authority is unreachable.
 
 Not operational failover: no gateway is authenticated here, Windows has no
 suspend-aware cache, and the store's safety margin is still the unmeasured
-prototype value.
+prototype value. ``GatewayPort`` speaks the authority client's method names.
+It does not sign, does not enroll, and does not change the authority mode.
 """
 
 import re
@@ -22,7 +23,9 @@ from jarvis.continuity.authority import (
     ACTIONS,
     LEASE_SECONDS,
     PROFILES,
+    MAX_SIGNATURE,
     RENEW_SECONDS,
+    TICKET_FIELDS as _TICKET_FIELDS,
     AuthorityError,
 )
 from jarvis.continuity.clock import CachedAuthority
@@ -43,6 +46,22 @@ _PORT_METHODS = (
 )
 # status() does not return lease_id. The holder must keep the grant response.
 _LEASE_FIELDS = ("holder", "lease_id", "incarnation", "epoch")
+_STEPS = frozenset({"drain", "fence", "grant", "complete", "cancel"})
+_REQUEST_FIELDS = (
+    "client_key", "action", "candidate", "expected_incarnation", "expected_epoch",
+    "expected_policy", "profile",
+)
+# Client failures that mean "do not trust this answer", not an authority decision.
+_LINK_CODES = frozenset({
+    "partition", "unavailable", "no_relay", "redirect", "authority_mismatch",
+    "bad_origin", "refused_bind",
+})
+_CODE = re.compile(r"^[a-z_]{1,40}$")
+# Outbound only. A wider set than the readiness probe, matching the gateway's refusal.
+_WIRE_BANNED = _BANNED | frozenset({
+    "text", "file", "path", "url", "message", "image", "token", "secret",
+    "authorization", "host", "upstream", "payload_body",
+})
 
 
 class LinkError(Exception):
@@ -72,6 +91,37 @@ def _banned(mapping):
 
 def _reason(value):
     return value if _ident_ok(value) else "stopped"
+
+
+def _wire_banned(mapping):
+    return isinstance(mapping, dict) and any(key in mapping for key in _WIRE_BANNED)
+
+
+def _finite_wait(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or value != value or value == float("inf"):
+        return None
+    return value
+
+
+def _from_client(exc):
+    """Map a client refusal onto the port's exceptions. Never a success.
+
+    Transport and mismatched-authority answers become ``LinkError``. A stable
+    authority code keeps its wait when the client actually supplied one. This
+    does not invent a wait the client dropped.
+    """
+    if isinstance(exc, (LinkError, AuthorityError, RuntimeRefusal)):
+        raise exc
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and _CODE.match(code):
+        if code in _LINK_CODES:
+            raise LinkError("partition") from None
+        raise AuthorityError(code, code, _finite_wait(getattr(exc, "wait", None))) from None
+    if isinstance(exc, (TypeError, AttributeError)):
+        raise RuntimeRefusal("bad_request") from None
+    raise LinkError("partition") from None
 
 
 def admission_decision(receipt):
@@ -231,6 +281,135 @@ class StoreAdapter:
 
     def admission(self, admission_id):
         return self.store.admission(admission_id)
+
+
+class GatewayPort:
+    """Authority-client port for ``MainRuntime`` and ``RecoveryOrchestrator``.
+
+    The client is the shape in ``gateway.py`` ``AuthorityClient``: ``status()``,
+    ``renew(holder, lease_id, incarnation, epoch)``, ``release(...)`` returning
+    status, ``acknowledge(mode_version, fenced_epoch, boot_id=None)``,
+    ``readiness(...)``, ``step(...)``, ``transition_request(...)`` without a
+    caller field, and ``consume(ticket, ticket_signature)``.
+
+    This wrapper does not authenticate. The client must already sign, and the
+    gateway must reject a bad signature. Device and installation ids on
+    acknowledge and renew are checked against the client before the call.
+    A missing ticket signature is refused here. ``set_mode`` and ``enroll``
+    are not called. Grant and complete stay separate ``step`` values.
+    """
+
+    def __init__(self, client):
+        required = ("status", "renew", "release", "acknowledge", "readiness",
+                    "step", "transition_request", "consume", "admission")
+        if any(not callable(getattr(client, name, None)) for name in required):
+            raise RuntimeRefusal("bad_request")
+        self._client = client
+
+    def status(self):
+        return self._invoke(self._client.status)
+
+    def renew(self, lease_tuple):
+        self._bound_holder(lease_tuple)
+        return self._invoke(lambda: self._client.renew(
+            lease_tuple["holder"], lease_tuple["lease_id"],
+            lease_tuple["incarnation"], lease_tuple["epoch"]))
+
+    def release(self, lease_tuple):
+        self._bound_holder(lease_tuple)
+        return self._invoke(lambda: self._client.release(
+            lease_tuple["holder"], lease_tuple["lease_id"],
+            lease_tuple["incarnation"], lease_tuple["epoch"]))
+
+    def acknowledge(self, device_id, installation_id, mode_version, fenced_epoch, boot_id=None):
+        if (device_id != getattr(self._client, "device_id", None)
+                or installation_id != getattr(self._client, "installation_id", None)):
+            raise RuntimeRefusal("forbidden")
+        return self._invoke(lambda: self._client.acknowledge(mode_version, fenced_epoch, boot_id))
+
+    def transition_request(self, request):
+        """Owner call. ``caller`` stays off the wire; the client key is the caller."""
+        if not isinstance(request, dict) or _wire_banned(request):
+            raise RuntimeRefusal("bad_request")
+        if any(key not in request for key in _REQUEST_FIELDS):
+            raise RuntimeRefusal("bad_request")
+        if set(request) - set(_REQUEST_FIELDS) - {"caller"}:
+            raise RuntimeRefusal("bad_request")
+        return self._invoke(lambda: self._client.transition_request(
+            request["client_key"], request["action"], request["candidate"],
+            request["expected_incarnation"], request["expected_epoch"],
+            request["expected_policy"], request["profile"]))
+
+    def transition_readiness(self, transition_id, readiness):
+        if not isinstance(readiness, dict) or _wire_banned(readiness):
+            raise RuntimeRefusal("bad_request")
+        control, ai = readiness.get("control_ready"), readiness.get("ai_ready")
+        if not isinstance(control, bool) or not isinstance(ai, bool):
+            raise RuntimeRefusal("bad_request")
+        checkpoint = readiness.get("checkpoint")
+        if checkpoint is not None and not _ident_ok(checkpoint):
+            raise RuntimeRefusal("bad_request")
+        if set(readiness) - {"control_ready", "ai_ready", "checkpoint"}:
+            raise RuntimeRefusal("bad_request")
+
+        def send():
+            if checkpoint is None:
+                return self._client.readiness(transition_id, control, ai)
+            return self._client.readiness(transition_id, control, ai, checkpoint)
+
+        return self._invoke(send)
+
+    def transition_step(self, transition_id, step, canary_ok=None):
+        if step not in _STEPS:
+            raise RuntimeRefusal("bad_request")
+        if step == "complete":
+            if not isinstance(canary_ok, bool):
+                raise RuntimeRefusal("bad_request")
+        elif canary_ok is not None:
+            raise RuntimeRefusal("bad_request")
+        return self._invoke(lambda: self._client.step(transition_id, step, canary_ok))
+
+    def consume(self, ticket=None, *, ticket_signature=None, **fields):
+        """Refuse an unsigned consume. The store-shaped keyword form is not a bypass."""
+        if ticket is not None and fields:
+            raise RuntimeRefusal("bad_request")
+        payload = dict(ticket if ticket is not None else fields)
+        if _wire_banned(payload):
+            raise RuntimeRefusal("bad_request")
+        if ticket_signature is not None:
+            if "ticket_signature" in payload and payload["ticket_signature"] != ticket_signature:
+                raise RuntimeRefusal("bad_request")
+            payload["ticket_signature"] = ticket_signature
+        signature = payload.get("ticket_signature")
+        if not isinstance(signature, str) or "BEGIN SSH SIGNATURE" not in signature:
+            raise RuntimeRefusal("bad_request")
+        if "END SSH SIGNATURE" not in signature or len(signature) > MAX_SIGNATURE or not signature.isascii():
+            raise RuntimeRefusal("bad_request")
+        if any(key not in payload for key in _TICKET_FIELDS):
+            raise RuntimeRefusal("bad_request")
+        if set(payload) - set(_TICKET_FIELDS) - {"ticket_signature"}:
+            raise RuntimeRefusal("bad_request")
+        body = {key: payload[key] for key in _TICKET_FIELDS}
+        return self._invoke(lambda: self._client.consume(body, signature))
+
+    def admission(self, admission_id):
+        if not _ident_ok(admission_id):
+            raise RuntimeRefusal("bad_request")
+        return self._invoke(lambda: self._client.admission(admission_id))
+
+    def _bound_holder(self, lease_tuple):
+        if not isinstance(lease_tuple, dict) or _wire_banned(lease_tuple):
+            raise RuntimeRefusal("bad_request")
+        if any(key not in lease_tuple for key in _LEASE_FIELDS):
+            raise RuntimeRefusal("bad_request")
+        if lease_tuple["holder"] != getattr(self._client, "device_id", None):
+            raise RuntimeRefusal("forbidden")
+
+    def _invoke(self, fn):
+        try:
+            return fn()
+        except Exception as exc:
+            _from_client(exc)
 
 
 class MainRuntime:
@@ -590,7 +769,8 @@ class MainRuntime:
         return "no_main"
 
 
-def _step(ok, phase, code, wait=None, transition=None, lease=None, reason=None, stable_for=0.0):
+def _step(ok, phase, code, wait=None, transition=None, lease=None, reason=None,
+          stable_for=0.0, candidate=None):
     transition = transition or {}
     return {
         "ok": ok, "phase": phase, "code": code, "wait": wait, "reason": reason,
@@ -598,7 +778,7 @@ def _step(ok, phase, code, wait=None, transition=None, lease=None, reason=None, 
         "transition_id": transition.get("transition_id"),
         "transition_state": transition.get("state"),
         "action": transition.get("action"),
-        "candidate": transition.get("candidate"),
+        "candidate": candidate if candidate is not None else transition.get("candidate"),
         "lease": lease,
     }
 

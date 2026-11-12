@@ -12,14 +12,28 @@ change, a stale mode version, a quarantine, or an unreachable authority fails cl
 Nothing falls back to the last MAIN.
 
 Personal prompts, replies, frames, input, cookies, CSRF tokens, and passkey material are
-not written to sqlite or the log hook. Effect relays are at most once per operation id.
-A lost answer is `uncertain` and is reconciled by a read, never by sending the effect again.
+not written to sqlite or the log hook.
 
-`phone.py` is not modified and is not imported. The HTTP shapes it already serves are
-mapped by `PhoneProtocolAdapter`. Where the current PWA cannot be relayed safely, the
-adapter refuses. The PC function that must exist before any of this is live is
-`accept_gateway_phone` (documented in INGRESS-IMPLEMENTATION.md); it is not implemented
-here and a successful relay is not an executor admission.
+The gateway this module calls is `ContinuityGateway` through `ContinuityGatewaySession`:
+`status()` with an empty payload, `relay_metadata` with exactly the five metadata fields
+`ContinuityGateway.relay` accepts, and `transition_request` with a fresh gateway
+`OwnerProof`. A phone prompt, event, frame, or cookie is not an argument to those calls.
+`ContinuityGateway.relay` sets `effect_authorized` false and posts only to an enrolled
+loopback origin. This module does not treat that post as fenced work, and it does not
+open a second socket to deliver the body. Phone routes that need a body fail with
+`body_not_relayable` and are not stored. Metadata notices are at most once per operation
+id. A lost metadata answer stays `uncertain` and is not sent again.
+
+`phone.py` is not modified and is not imported. `PhoneProtocolAdapter` maps the current
+HTTP paths and refuses where the PWA cannot be relayed. `accept_gateway_phone` is still
+the PC seam a future body channel would need. It is not implemented here.
+
+Optional transient relay: when the gateway object also has `relay_transient`, phone reads
+(overview, fleet, ask poll, frames) and effects (ask, session start, input, stop) go to the
+allowlisted ready MAIN through `ContinuityGateway.forward_transient`, in RAM only. The row for
+an effect keeps ids and a digest, never the text. A lost answer stays `uncertain` and is
+never sent again. `effect_authorized` is still false: MAIN's executor admits or refuses.
+Without `relay_transient`, the metadata-only rules above apply unchanged.
 
 Not operational failover. No gateway host is provisioned by this module.
 """
@@ -41,6 +55,14 @@ from urllib.parse import urlsplit
 from jarvis.continuity.authority import ACTIONS as MAIN_ACTIONS
 from jarvis.continuity.authority import PROFILES as MAIN_PROFILES
 from jarvis.continuity.authority import AuthorityError
+from jarvis.continuity.gateway import CAPABILITIES as RELAY_CAPABILITIES
+from jarvis.continuity.gateway import DEVICE_NS
+from jarvis.continuity.gateway import GatewayError
+from jarvis.continuity.gateway import HTTP_STATUS as GATEWAY_HTTP_STATUS
+from jarvis.continuity.gateway import OwnerProof as GatewayOwnerProof
+from jarvis.continuity.gateway import _message as gateway_message
+from jarvis.continuity.gateway import payload_digest
+from jarvis.continuity.gateway import sign_message
 
 SCHEMA_VERSION = 1
 PHONE_COOKIE = "__Host-jarvis_phone"
@@ -62,10 +84,21 @@ MOBILE_OS = frozenset({"ios", "android"})
 V2_SERVE = frozenset({"V2_ONLY_NO_MAIN", "V2_ACTIVE", "HANDOVER"})
 EFFECT_KINDS = frozenset({"ask", "session_start", "session_input", "session_stop", "logout_end"})
 READ_KINDS = frozenset({"overview", "fleet", "ask_poll", "session_frame", "effect_status"})
-GATEWAY_METHODS = ("status", "relay", "transition_request")
+# Session methods. `status` takes no arguments: the session already authenticated.
+# `relay_metadata` is the five-field ContinuityGateway.relay payload, never a body.
+GATEWAY_METHODS = ("status", "relay_metadata", "transition_request")
 # Methods this client must not call. Runtime and the executor own them.
 GATEWAY_NOT_OURS = ("renew", "release", "acknowledge", "consume", "admission",
-                    "transition_readiness", "transition_step")
+                    "transition_readiness", "transition_step", "set_mode", "enroll")
+# Keys ContinuityGateway.relay rejects. A phone request that carries one is not forwarded.
+PERSONAL_KEYS = frozenset({
+    "prompt", "body", "text", "content", "message", "file", "filename", "path",
+    "url", "upstream", "host", "authorization", "cookie", "secret", "token",
+    "password", "transcript", "frame", "image", "payload_body", "events",
+    "reply", "raw", "passkey", "csrf", "csrf_token", "spool",
+})
+BODY_TEXT = "The gateway relay carries metadata only. This request was not sent."
+METADATA_KEYS = frozenset({"attempt_id", "effect_class"})
 PAIR_PATHS = ("/phone/pair", "/phone/pair/status")
 PHONE_SHELL = (
     "/", "/phone.css", "/phone.js", "/sw.js", "/manifest.webmanifest",
@@ -86,11 +119,16 @@ APPROVALS = re.compile(
     r"(?:jarvis[\s,]+)?(?:approve[d]?|reject|deny|allow|ok(?:ay)?|sure|yep|yeah|yup|"
     r"nope|y|n)(?:\s+c?\d+)?", re.I)
 _ASK_STRIP = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
-_AUTH_STATUS = {
-    "stale": 409, "busy": 409, "key_reused": 409, "conflict": 409,
-    "not_quiet": 409, "lease_live": 409, "bad_request": 400, "bad_ticket": 400,
-    "ticket_expired": 410, "quarantined": 503,
-}
+# Statuses come from the gateway's own map, so a code cannot mean two things. Each boundary keeps
+# only its allowlist of codes; `authority_unavailable` is the ingress's own 503 for a gateway it
+# cannot trust.
+_AUTH_STATUS = {code: GATEWAY_HTTP_STATUS[code] for code in (
+    "stale", "busy", "key_reused", "conflict", "not_quiet", "lease_live", "bad_request",
+    "bad_ticket", "ticket_expired", "quarantined")}
+_GATEWAY_HTTP = {**{code: GATEWAY_HTTP_STATUS[code] for code in (
+    "bad_request", "forbidden", "not_found", "ticket_expired", "stale", "busy", "key_reused",
+    "conflict", "not_quiet", "lease_live", "quarantined", "no_relay", "unavailable",
+    "writer_busy")}, "authority_unavailable": 503}
 LEGACY_TEXT = "The phone link is still the PC's own origin. This gateway is not serving it."
 
 _PEER = contextvars.ContextVar("jarvis_ingress_peer", default=None)
@@ -214,6 +252,14 @@ class HttpResult:
         self.content_type = content_type
 
 
+def _envelope(body):
+    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _envelope_digest(envelope):
+    return "sha256:" + hashlib.sha256(envelope).hexdigest()
+
+
 def pin_target(device_id, url, connect_ip, *, allow_loopback=False):
     """Check a relay target. Raises unless `connect_ip` is tailnet (or loopback, if allowed).
 
@@ -280,6 +326,14 @@ def _sha256(text):
 def _digest_of(kind, body):
     raw = json.dumps([kind, body], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _metadata_digest(operation_id, attempt_id, effect_class, main, incarnation, epoch):
+    """Digest of routing metadata. The phone body is not an input."""
+    raw = json.dumps(
+        ["metadata", operation_id, attempt_id, effect_class, main, incarnation, epoch],
+        separators=(",", ":"), ensure_ascii=True)
+    return "sha256:" + hashlib.sha256(raw.encode("ascii")).hexdigest()
 
 
 def _clean(value, limit):
@@ -385,17 +439,86 @@ def _clean_events(events):
     return out
 
 
-class MobileIngress:
-    """Pairing, session ownership, and relay to the current ready MAIN.
+class ContinuityGatewaySession:
+    """Signed in-process client of `ContinuityGateway`.
 
-    Construct with a gateway that implements `status`, `relay`, and `transition_request`.
-    `allowed_mains` maps a device id to a `PinnedTarget` from `pin_target`. `blocked_stable_ids`
-    is the enrolled PCs that must not pair; `None` or empty refuses activation.
+    Each call mints a one-use device principal. `relay_metadata` has no body, URL, or
+    prompt argument. `transition_request` accepts only a gateway `OwnerProof`. This
+    object does not listen and does not dial a phone target.
+    """
+
+    def __init__(self, gateway, device_id, installation_id, private_key_path, *, wall=None):
+        self._gateway = gateway
+        self.device_id = _ident(device_id, "device_id")
+        self.installation_id = _ident(installation_id, "installation_id")
+        self._key = Path(private_key_path)
+        self._wall = wall or time.time
+
+    def status(self):
+        return self._device("status", {})
+
+    def relay_metadata(self, operation_id, target, attempt_id, digest, capability):
+        payload = {
+            "operation_id": operation_id, "target": target, "attempt_id": attempt_id,
+            "digest": digest, "capability": capability,
+        }
+        if set(payload) != {"operation_id", "target", "attempt_id", "digest", "capability"}:
+            raise IngressError("bad_request", 400, "That request cannot be relayed.")
+        if PERSONAL_KEYS.intersection(payload):
+            raise IngressError("personal_field", 400, "That request cannot be relayed.")
+        return self._device("relay", payload)
+
+    def relay_transient(self, operation_id, target, attempt_id, digest, capability, kind, envelope):
+        """Send one phone request to the ready MAIN through the gateway's RAM-only path.
+
+        `envelope` is the request body. It is bound to `digest` and signed over by hash only.
+        """
+        payload = {
+            "operation_id": operation_id, "target": target, "attempt_id": attempt_id,
+            "digest": digest, "capability": capability, "kind": kind,
+        }
+        if not isinstance(envelope, (bytes, bytearray)):
+            raise IngressError("bad_request", 400, "That request cannot be relayed.")
+        return self._device("relay", payload, envelope=bytes(envelope))
+
+    def transition_request(self, owner_proof, payload):
+        if not isinstance(owner_proof, GatewayOwnerProof):
+            raise IngressError("owner_proof_required", 403,
+                               "MAIN changes need a fresh owner proof. Nothing was changed.")
+        if not isinstance(payload, dict) or PERSONAL_KEYS.intersection(payload):
+            raise IngressError("personal_field", 400, "That request cannot be relayed.")
+        return self._gateway.transition_request(owner_proof, payload)
+
+    def _device(self, purpose, payload, envelope=None):
+        issued_at = int(self._wall())
+        nonce = "n-" + secrets.token_hex(8)
+        signed = payload_digest(payload)
+        signature = sign_message(DEVICE_NS, self._key, gateway_message(DEVICE_NS, {
+            "v": 1, "device_id": self.device_id, "installation_id": self.installation_id,
+            "nonce": nonce, "issued_at": issued_at, "purpose": purpose, "payload_digest": signed,
+        }))
+        principal = self._gateway.authenticate_device(
+            device_id=self.device_id, installation_id=self.installation_id, nonce=nonce,
+            issued_at=issued_at, purpose=purpose, payload=payload, signature=signature)
+        if purpose == "status":
+            return self._gateway.status(principal, payload)
+        if envelope is not None:
+            return self._gateway.forward_transient(principal, payload, envelope)
+        return self._gateway.relay(principal, payload)
+
+
+class MobileIngress:
+    """Pairing, session ownership, and metadata relay to the current ready MAIN.
+
+    `gateway` must provide `status()`, `relay_metadata(...)`, and `transition_request(proof, payload)`.
+    Pass a `ContinuityGatewaySession` for the real gateway. `allowed_mains` maps a device id to a
+    `PinnedTarget` from `pin_target`. That pin is an allowlist, not a URL this process dials.
+    `blocked_stable_ids` is the enrolled PCs that must not pair; `None` or empty refuses activation.
     """
 
     def __init__(self, path, gateway, *, origin, installation_id, allowed_mains,
                  peer_verifier, blocked_stable_ids, passkey_verifier=None, owner_verifier=None,
-                 clock=time.time, log=None):
+                 owner_proof=None, clock=time.time, log=None):
         self.path = Path(path)
         self.origin, self.hosts = _origin_of(origin)
         self.installation_id = _ident(installation_id, "installation_id")
@@ -414,6 +537,7 @@ class MobileIngress:
             self._blocked = frozenset(_ident(s, "stable_id") for s in blocked_stable_ids)
         self._peers, self._owners = peer_verifier, owner_verifier
         self._passkeys = passkey_verifier
+        self._owner_proof = owner_proof
         self._clock = clock
         self._log = log if callable(log) else None
         self._activated = None
@@ -432,11 +556,17 @@ class MobileIngress:
             self._db.execute("PRAGMA synchronous=FULL")
             self._open_schema()
         except Exception:
+            db = getattr(self, "_db", None)
+            if db is not None:
+                db.close()
             self._writer.close()
             raise
 
     def close(self):
         with self._lock:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
             try:
                 self._db.close()
             finally:
@@ -505,9 +635,11 @@ class MobileIngress:
 
     def _fetch_status(self):
         try:
-            status = self._gateway.status(self.installation_id)
+            status = self._gateway.status()
         except AuthorityError as exc:
             raise self._from_authority(exc) from None
+        except GatewayError as exc:
+            raise self._from_gateway(exc) from None
         except IngressError:
             raise
         except Exception:
@@ -537,11 +669,23 @@ class MobileIngress:
 
     def _from_authority(self, exc):
         code = exc.code if exc.code in _AUTH_STATUS else "authority_unavailable"
-        wait = exc.wait
+        return self._refusal(code, _AUTH_STATUS.get(code, 503), exc.wait)
+
+    def _from_gateway(self, exc):
+        code = exc.code if isinstance(getattr(exc, "code", None), str) else "authority_unavailable"
+        if code == "unauthorized":
+            code = "authority_unavailable"
+        status = _GATEWAY_HTTP.get(code, 503)
+        if code not in _GATEWAY_HTTP:
+            code = "authority_unavailable"
+        return self._refusal(code, status, getattr(exc, "wait", None))
+
+    def _refusal(self, code, status, wait):
         if isinstance(wait, bool) or not isinstance(wait, (int, float)) or wait != wait or not 0 <= wait <= 3600:
             wait = None
-        self._note(code)
-        return IngressError(code, _AUTH_STATUS.get(code, 503), "The authority refused that.", wait=wait)
+        if re.fullmatch(r"[a-z0-9_]{1,40}", code):
+            self._note(code)
+        return IngressError(code, status, "The authority refused that.", wait=wait)
 
     def _route(self, status):
         """The only device an ordinary relay may name: the ready MAIN, and only if pinned."""
@@ -811,9 +955,14 @@ class MobileIngress:
     def status(self, principal):
         row = self._check(principal)
         view = self._authority_view(self._live())
+        # `relay` is true only when the gateway has the transient path and MAIN is ready.
+        relay = self._transient() and view["main_ready"] is True
         return {"phone": {"id": row["id"], "name": row["name"], "created": row["created"]},
                 "role": "phone", "manage_main": bool(row["manage_main"]), "origin": self.origin,
-                "relay": view["main_ready"], "authority": view}
+                "relay": relay, "metadata_only": not relay, "authority": view}
+
+    def _transient(self):
+        return callable(getattr(self._gateway, "relay_transient", None))
 
     def _authority_view(self, status):
         try:
@@ -834,24 +983,47 @@ class MobileIngress:
                 "authority_id": authority_id, "preferred": preferred}
 
     def read(self, principal, kind, query=None):
-        """Idempotent relay. Cannot start an effect. Overview and frames are not stored."""
+        """Validate a read, then fetch it once through the transient path, or refuse.
+
+        Nothing returned is stored. Without `relay_transient` the read is refused.
+        """
         self._check(principal)
         if kind not in READ_KINDS:
             raise IngressError("bad_request", 400, "Unknown read.")
         status = self._live()
         main = self._route(status)
-        body = self._read_body(principal, kind, query or {})
+        query_body = self._read_body(principal, kind, query or {})
+        if not self._transient():
+            raise IngressError("body_not_relayable", 503, BODY_TEXT)
+        envelope = _envelope({"kind": kind, "query": query_body})
+        operation_id = "r-" + secrets.token_hex(8)
         try:
-            result = self._relay(principal, status, main, "read-" + kind, kind, body)
-        except RelayUncertain:
+            result = self._gateway.relay_transient(
+                operation_id, main, "a-" + secrets.token_hex(8), _envelope_digest(envelope),
+                "client", kind, envelope)
+        except GatewayError as exc:
+            raise self._from_gateway(exc) from None
+        except IngressError:
+            raise
+        except Exception:
+            self._note("uncertain")
             raise IngressError("uncertain", 409, "The outcome is unknown. It was not sent again.") from None
-        projected = self._project(kind, result)
-        if projected.get("uncertain"):
-            raise IngressError("uncertain", 409, "The outcome is unknown. It was not sent again.")
-        if projected.get("refused"):
-            raise IngressError("refused", projected.get("http_status") or 400, "The computer refused that.")
-        self._note("read")
-        return projected
+        if not self._read_result_ok(operation_id, result):
+            self._note("relay_overclaim")
+            raise IngressError("relay_overclaim", 503,
+                               "The relay did not authorize an effect. Nothing more was sent.")
+        shaped = dict(result["result"])
+        if result.get("raw") is not None:
+            shaped["raw"] = result["raw"]
+        return self._project(kind, shaped)
+
+    def _read_result_ok(self, operation_id, result):
+        if not isinstance(result, dict) or not isinstance(result.get("result"), dict):
+            return False
+        raw = result.get("raw")
+        return (result.get("operation_id") == operation_id and result.get("relayed") is True
+                and result.get("effect_authorized") is False
+                and (raw is None or isinstance(raw, (bytes, bytearray))))
 
     def _read_body(self, principal, kind, query):
         if kind in ("overview", "fleet"):
@@ -882,27 +1054,54 @@ class MobileIngress:
         raise IngressError("bad_request", 400, "Unknown read.")
 
     def submit(self, principal, operation_id, request):
-        """Relay one effect. The same id and digest returns the first outcome and does not resend."""
+        """Metadata notice, or a refusal when the request needs a phone body.
+
+        A phone kind is validated and then refused. It is not stored and not relayed.
+        A metadata request is forwarded once. The same id is not sent again.
+        """
         self._check(principal)
         if not isinstance(request, dict):
             raise IngressError("bad_request", 400, "Send a JSON object.")
-        kind = request.get("kind")
-        if kind not in EFFECT_KINDS:
-            raise IngressError("bad_request", 400, "Unknown operation.")
         if not isinstance(operation_id, str) or not _OP.match(operation_id):
             raise IngressError("operation_id_required", 400, "This request needs a stable operation id.")
+        kind = request.get("kind")
+        if kind in EFFECT_KINDS:
+            if self._transient():
+                return self._submit_effect(principal, operation_id, request)
+            return self._refuse_body(principal, operation_id, request)
+        if PERSONAL_KEYS.intersection(request) or set(request) - METADATA_KEYS:
+            raise IngressError("personal_field", 400, "That request cannot be relayed.")
+        return self._submit_metadata(principal, operation_id, request)
+
+    def _refuse_body(self, principal, operation_id, request):
+        """Run the phone checks, then stop. Nothing is inserted and nothing is relayed."""
+        del operation_id
+        status = self._live()
+        self._effect_body(principal, request.get("kind"), request, status)
+        self._route(status)
+        self._note("body_not_relayable")
+        raise IngressError("body_not_relayable", 503, BODY_TEXT)
+
+    def _submit_effect(self, principal, operation_id, request):
+        """Forward one phone effect once. The body goes to MAIN and is never stored here.
+
+        The row keeps ids and a digest only. The same id and body returns the stored
+        outcome. A lost or odd answer stays `uncertain` and is not sent again.
+        """
+        kind = request.get("kind")
         status = self._live()
         body = self._effect_body(principal, kind, request, status)
-        digest = _digest_of(kind, body)
+        main = self._route(status)
+        envelope = _envelope(body)
+        env_digest = _envelope_digest(envelope)
+        digest = _metadata_digest(operation_id, kind, env_digest, main,
+                                  status["incarnation"], status["epoch"])
         existing = self._op(operation_id)
         if existing is not None:
-            if existing["phone_id"] != principal.phone_id or existing["digest"] != digest or existing["kind"] != kind:
+            if (existing["phone_id"] != principal.phone_id or existing["digest"] != digest
+                    or existing["kind"] != kind):
                 raise IngressError("conflict", 409, "That request already exists with different contents.")
-            return self._reconcile(principal, existing, status)
-        try:
-            main = self._route(status)
-        except IngressError:
-            raise
+            return self._stored(existing)
         now = self._clock()
         try:
             with self._tx() as db:
@@ -914,97 +1113,152 @@ class MobileIngress:
             existing = self._op(operation_id)
             if existing is None or existing["digest"] != digest:
                 raise IngressError("conflict", 409, "That request already exists with different contents.") from None
-            return self._reconcile(principal, existing, status)
-        return self._finish_effect(principal, status, main, operation_id, kind, body)
-
-    def _finish_effect(self, principal, status, main, operation_id, kind, body):
+            return self._stored(existing)
+        attempt_id = "a-" + secrets.token_hex(8)
         try:
-            result = self._relay(principal, status, main, operation_id, kind, body)
+            result = self._gateway.relay_transient(
+                operation_id, main, attempt_id, env_digest, "client", kind, envelope)
         except RelayUncertain:
             self._update_op(operation_id, state="uncertain")
             self._note("uncertain")
             raise IngressError("uncertain", 409, "The outcome is unknown. It was not sent again.") from None
+        except GatewayError as exc:
+            self._update_op(operation_id, state="uncertain", http_status=_GATEWAY_HTTP.get(exc.code, 503))
+            raise self._from_gateway(exc) from None
         except IngressError as exc:
-            self._update_op(operation_id, state="refused", http_status=exc.status)
+            self._update_op(operation_id, state="uncertain", http_status=exc.status)
             raise
-        projected = self._project(kind, result)
-        job = projected.get("job") if isinstance(projected.get("job"), str) and _JOB.match(projected["job"]) else None
-        session_id = None
-        if kind == "session_start":
-            session_id = self._note_session(principal, body, projected, status, main)
-        if projected.get("uncertain"):
-            self._update_op(operation_id, state="uncertain", http_status=409, job_id=job, session_id=session_id)
+        except Exception:
+            self._update_op(operation_id, state="uncertain")
             self._note("uncertain")
-            raise IngressError("uncertain", 409, "The outcome is unknown. It was not sent again.")
-        if projected.get("refused"):
-            self._update_op(operation_id, state="refused", http_status=projected.get("http_status") or 400,
-                            job_id=job, session_id=session_id)
+            raise IngressError("uncertain", 409, "The outcome is unknown. It was not sent again.") from None
+        if not self._metadata_result_ok(operation_id, result):
+            self._update_op(operation_id, state="uncertain")
+            self._note("relay_overclaim")
+            raise IngressError("relay_overclaim", 503,
+                               "The relay did not authorize an effect. Nothing more was sent.")
+        if kind == "session_start" and result["upstream_accepted"]:
+            self._record_session(principal, operation_id, body, status, main)
+        if not result["upstream_accepted"]:
+            self._update_op(operation_id, state="refused", http_status=409)
             self._note("refused")
-            return projected
-        self._update_op(operation_id, state="accepted", http_status=projected.get("http_status") or 200,
-                        job_id=job, session_id=session_id)
-        projected["operation_id"] = operation_id
-        projected["duplicate"] = False
-        self._note("effect")
-        return projected
+            raise IngressError("refused", 409, "The computer refused that.")
+        self._update_op(operation_id, state="forwarded")
+        self._note("forwarded")
+        view = self._stored(self._op(operation_id))
+        view["duplicate"] = False
+        view["upstream_accepted"] = True
+        return view
+
+    def _record_session(self, principal, operation_id, body, status, main):
+        """A started session is keyed by its operation id until MAIN reports its own."""
+        sid = hashlib.sha256(("session\n" + operation_id).encode("utf-8")).hexdigest()[:32]
+        with self._tx() as db:
+            db.execute("INSERT OR IGNORE INTO sessions(session_id, phone_id, device, kind, state,"
+                       " incarnation, epoch, main, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                       (sid, principal.phone_id, body["device"], body["session_kind"], "live",
+                        status["incarnation"], status["epoch"], main, self._clock()))
+        self._update_op(operation_id, session_id=sid)
+
+    def _submit_metadata(self, principal, operation_id, request):
+        attempt_id = _ident(request.get("attempt_id"), "attempt_id")
+        effect_class = request.get("effect_class", "unspecified")
+        if effect_class != "unspecified":
+            effect_class = _ident(effect_class, "effect_class")
+        if effect_class in PERSONAL_KEYS or effect_class in RELAY_CAPABILITIES:
+            # A capability word would look like an authority grant. It is not an effect class.
+            raise IngressError("bad_request", 400, "Unknown operation.")
+        status = self._live()
+        main = self._route(status)
+        digest = _metadata_digest(operation_id, attempt_id, effect_class, main,
+                                  status["incarnation"], status["epoch"])
+        existing = self._op(operation_id)
+        if existing is not None:
+            if existing["phone_id"] != principal.phone_id or existing["digest"] != digest:
+                raise IngressError("conflict", 409, "That request already exists with different contents.")
+            return self._stored(existing)
+        now = self._clock()
+        try:
+            with self._tx() as db:
+                db.execute("INSERT INTO operations(operation_id, phone_id, kind, digest, state, target,"
+                           " incarnation, epoch, mode_version, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (operation_id, principal.phone_id, "metadata", digest, "inflight", main,
+                            status["incarnation"], status["epoch"], status["mode_version"], now))
+        except sqlite3.IntegrityError:
+            existing = self._op(operation_id)
+            if existing is None or existing["digest"] != digest:
+                raise IngressError("conflict", 409, "That request already exists with different contents.") from None
+            return self._stored(existing)
+        return self._finish_metadata(operation_id, main, attempt_id, digest)
+
+    def _finish_metadata(self, operation_id, main, attempt_id, digest):
+        if "client" not in RELAY_CAPABILITIES:
+            self._update_op(operation_id, state="uncertain")
+            raise IngressError("body_not_relayable", 503, BODY_TEXT)
+        try:
+            result = self._gateway.relay_metadata(operation_id, main, attempt_id, digest, "client")
+        except RelayUncertain:
+            self._update_op(operation_id, state="uncertain")
+            self._note("uncertain")
+            raise IngressError("uncertain", 409, "The outcome is unknown. It was not sent again.") from None
+        except GatewayError as exc:
+            self._update_op(operation_id, state="uncertain", http_status=_GATEWAY_HTTP.get(exc.code, 503))
+            raise self._from_gateway(exc) from None
+        except IngressError as exc:
+            self._update_op(operation_id, state="uncertain", http_status=exc.status)
+            raise
+        except Exception:
+            self._update_op(operation_id, state="uncertain")
+            self._note("uncertain")
+            raise IngressError("uncertain", 409, "The outcome is unknown. It was not sent again.") from None
+        if not self._metadata_result_ok(operation_id, result):
+            self._update_op(operation_id, state="uncertain")
+            self._note("relay_overclaim")
+            raise IngressError("relay_overclaim", 503,
+                               "The relay did not authorize an effect. Nothing more was sent.")
+        self._update_op(operation_id, state="forwarded")
+        self._note("forwarded")
+        view = self._stored(self._op(operation_id))
+        view["duplicate"] = False
+        view["upstream_accepted"] = bool(result.get("upstream_accepted"))
+        return view
+
+    def _metadata_result_ok(self, operation_id, result):
+        if not isinstance(result, dict):
+            return False
+        if PERSONAL_KEYS.intersection(result) or any(
+                key in result for key in ("path", "spool", "file", "redirect", "location", "url")):
+            return False
+        return (result.get("operation_id") == operation_id and result.get("relayed") is True
+                and result.get("effect_authorized") is False
+                and isinstance(result.get("upstream_accepted"), bool))
 
     def operation(self, principal, operation_id, cursor=None):
-        """Read the first outcome. Does not create a replacement operation."""
+        """Read the stored metadata outcome. Does not send the notice again."""
+        del cursor
         self._check(principal)
         if not isinstance(operation_id, str) or not _OP.match(operation_id):
             raise IngressError("not_found", 404, "No such request.")
         row = self._op(operation_id)
         if row is None or row["phone_id"] != principal.phone_id:
             raise IngressError("not_found", 404, "No such request.")
-        return self._reconcile(principal, row, self._live(), cursor=cursor)
+        return self._stored(row)
 
-    def _reconcile(self, principal, row, status, cursor=None):
-        """Return the stored outcome. A read may fill in a job id; the effect is not sent again."""
-        if row["state"] in ("inflight", "uncertain") and row["kind"] in EFFECT_KINDS:
-            self._learn(principal, row, status)
-            row = self._op(row["operation_id"])
+    def _stored(self, row):
+        """The row as the client may see it. No relay, no body, no job text."""
         view = {"operation_id": row["operation_id"], "kind": row["kind"], "state": row["state"],
-                "duplicate": True, "job": row["job_id"], "session": row["session_id"],
-                "cursor": row["cursor"], "http_status": row["http_status"]}
+                "duplicate": True, "effect_authorized": False, "target": row["target"]}
         if row["state"] in ("inflight", "uncertain"):
             view["uncertain"] = True
             view["state"] = "uncertain"
-            return view
-        if row["state"] == "refused":
+        elif row["state"] == "forwarded":
+            view["state"] = "forwarded"
+        elif row["state"] == "refused":
             raise IngressError("refused", row["http_status"] or 400, "The computer refused that.")
-        if row["kind"] == "ask" and row["job_id"] and row["state"] == "accepted":
-            after = cursor if isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0 else 0
-            try:
-                polled = self.read(principal, "ask_poll", {"job": row["job_id"], "after": after})
-            except IngressError as exc:
-                if exc.code in ("no_main", "target_denied", "authority_unavailable", "uncertain"):
-                    view["uncertain"] = True
-                    return view
-                raise
-            if isinstance(polled.get("cursor"), int):
-                self._update_op(row["operation_id"], cursor=polled["cursor"])
-            polled["operation_id"] = row["operation_id"]
-            polled["duplicate"] = True
-            polled["state"] = row["state"]
-            return polled
+        else:
+            view["uncertain"] = True
+            view["state"] = "uncertain"
         return view
-
-    def _learn(self, principal, row, status):
-        try:
-            main = self._route(status)
-        except IngressError:
-            return
-        try:
-            result = self._relay(principal, status, main, "read-" + row["operation_id"], "effect_status",
-                                 {"operation_id": row["operation_id"], "kind": row["kind"]})
-        except (IngressError, RelayUncertain):
-            return
-        projected = self._project("effect_status", result)
-        if projected.get("found") is not True:
-            return
-        job = projected.get("job") if isinstance(projected.get("job"), str) and _JOB.match(projected["job"]) else None
-        state = "accepted" if projected.get("accepted") is True else "uncertain"
-        self._update_op(row["operation_id"], state=state, job_id=job or row["job_id"])
 
     def _effect_body(self, principal, kind, request, status):
         if kind == "ask":
@@ -1069,17 +1323,12 @@ class MobileIngress:
         return sid
 
     def logout(self, principal):
-        """Revoke this phone locally. The PC release is one effect and is not retried."""
+        """Revoke this phone locally. The gateway cannot deliver a logout body to the PC."""
         row = self._check(principal)
-        operation_id = "logout-" + row["id"]
-        try:
-            self.submit(principal, operation_id, {"kind": "logout_end"})
-            ending = "sent"
-        except IngressError as exc:
-            ending = exc.code
         self._revoke(row["id"])
         self._principals.discard(principal._token)
-        return {"ok": True, "ending": ending, "cookie_header":
+        self._note("logout_local")
+        return {"ok": True, "ending": "local_only", "cookie_header":
                 f"{PHONE_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"}
 
     def _revoke(self, phone_id):
@@ -1157,40 +1406,57 @@ class MobileIngress:
             receipt = None
         if not isinstance(receipt, str) or not _RECEIPT.match(receipt):
             raise IngressError("forbidden", 403, "Passkey proof was refused.")
-        self._mark_preview(preview_id, "sending")
-        request = self._transition_request(principal, preview)
-        try:
-            view = self._gateway.transition_request(
-                {"role": "manage_main", "phone_id": principal.phone_id, "preview_id": preview_id,
-                 "receipt": receipt, "reconcile": False}, request)
-        except AuthorityError as exc:
-            self._mark_preview(preview_id, "uncertain")
-            raise self._from_authority(exc) from None
-        except Exception:
-            self._mark_preview(preview_id, "uncertain")
-            self._note("transition_uncertain")
-            raise IngressError("uncertain", 409, "The transition outcome is unknown. It was not started again.") from None
-        return self._accept_transition(preview_id, view)
+        # The receipt stays in this stack frame. It is not a gateway field.
+        del receipt
+        return self._send_transition(preview)
 
     def _reconcile_transition(self, principal, preview, status):
-        request = self._transition_request(principal, preview)
+        """Same client_key, a new owner proof. The store's idempotency is the reconcile."""
+        del principal
+        self._tuple_match(preview, status)
+        return self._send_transition(preview)
+
+    def _send_transition(self, preview):
+        payload = self._transition_payload(preview)
+        proof = self._mint_owner_proof(payload)
+        self._mark_preview(preview["preview_id"], "sending")
         try:
-            view = self._gateway.transition_request(
-                {"role": "manage_main", "phone_id": principal.phone_id, "preview_id": preview["preview_id"],
-                 "reconcile": True}, request)
+            view = self._gateway.transition_request(proof, payload)
         except AuthorityError as exc:
+            self._mark_preview(preview["preview_id"], "uncertain")
             raise self._from_authority(exc) from None
+        except GatewayError as exc:
+            self._mark_preview(preview["preview_id"], "uncertain")
+            raise self._from_gateway(exc) from None
+        except IngressError:
+            self._mark_preview(preview["preview_id"], "uncertain")
+            raise
         except Exception:
+            self._mark_preview(preview["preview_id"], "uncertain")
+            self._note("transition_uncertain")
             raise IngressError("uncertain", 409, "The transition outcome is unknown. It was not started again.") from None
-        if not isinstance(view, dict) or not isinstance(view.get("transition_id"), str):
-            raise IngressError("uncertain", 409, "The transition outcome is unknown. It was not started again.")
         return self._accept_transition(preview["preview_id"], view)
 
-    def _transition_request(self, principal, preview):
-        return {"caller": "phone-" + principal.phone_id, "client_key": preview["preview_id"],
-                "action": preview["action"], "candidate": preview["candidate"],
-                "expected_incarnation": preview["incarnation"], "expected_epoch": preview["epoch"],
-                "expected_policy": preview["policy_version"], "profile": preview["profile"]}
+    def _mint_owner_proof(self, payload):
+        if not callable(self._owner_proof):
+            raise IngressError("owner_proof_required", 503,
+                               "MAIN changes need a fresh owner proof. Nothing was changed.")
+        try:
+            proof = self._owner_proof(payload)
+        except IngressError:
+            raise
+        except Exception:
+            proof = None
+        if not isinstance(proof, GatewayOwnerProof):
+            raise IngressError("owner_proof_required", 403,
+                               "MAIN changes need a fresh owner proof. Nothing was changed.")
+        return proof
+
+    def _transition_payload(self, preview):
+        return {"client_key": preview["preview_id"], "action": preview["action"],
+                "candidate": preview["candidate"], "expected_incarnation": preview["incarnation"],
+                "expected_epoch": preview["epoch"], "expected_policy": preview["policy_version"],
+                "profile": preview["profile"]}
 
     def _tuple_match(self, preview, status):
         if (preview["incarnation"], preview["epoch"], preview["policy_version"], preview["mode_version"]) != (
@@ -1219,35 +1485,10 @@ class MobileIngress:
 
     # --- relay -------------------------------------------------------------------------
 
-    def _relay(self, principal, status, main, operation_id, kind, body):
-        target = self.allowed[main]
-        bounded = {
-            "v": 1, "kind": kind, "target_device": main, "pinned": target.as_dict(),
-            "claim": {"v": 1, "role": "phone", "phone_id": principal.phone_id,
-                      "opener": "phone:" + principal.phone_id, "stable_id": principal.stable_id,
-                      "login": principal.login, "gateway_installation": self.installation_id,
-                      "authority_id": status.get("authority_id"), "incarnation": status["incarnation"],
-                      "epoch": status["epoch"], "mode_version": status["mode_version"],
-                      "policy_version": status["policy_version"], "main": main, "manage_main": False},
-            "body": body,
-        }
-        client = {"role": "phone", "phone_id": principal.phone_id, "installation_id": self.installation_id}
-        try:
-            result = self._gateway.relay(client, operation_id, bounded)
-        except RelayUncertain:
-            raise
-        except AuthorityError as exc:
-            raise self._from_authority(exc) from None
-        except IngressError:
-            raise
-        except Exception:
-            raise RelayUncertain(True) from None
-        if not isinstance(result, dict):
-            raise RelayUncertain(True)
-        if any(key in result for key in ("path", "spool", "file", "redirect", "location", "url")):
-            self._note("spool_refused")
-            raise IngressError("spool_refused", 502, "The relay tried to leave RAM. It was dropped.")
-        return result
+    def _relay(self, *args, **kwargs):
+        """Body relay is not a gateway method. Kept so a caller cannot post a prompt."""
+        del args, kwargs
+        raise IngressError("body_not_relayable", 503, BODY_TEXT)
 
     def _project(self, kind, result):
         """Keep the phone's answer in the return value only. Callers must not store `reply` or `raw`."""
@@ -1387,6 +1628,7 @@ PC_SEAM = {
         "session_stop releases held input even when release_only is set",
         "identical operation_id + digest returns the first outcome; a different digest conflicts",
     ),
+    "not_called": "ContinuityGateway.relay does not deliver this body. Ingress does not call this function.",
 }
 
 
@@ -1464,7 +1706,7 @@ class PhoneProtocolAdapter:
             return HttpResult(200, {"phone": view["phone"], "host": urlsplit(self.ingress.origin).hostname,
                                     "main": {"id": main, "label": main}, "role": "phone",
                                     "manage_main": view["manage_main"], "relay": view["relay"],
-                                    "authority": view["authority"]})
+                                    "metadata_only": view["metadata_only"], "authority": view["authority"]})
         if method == "GET" and path == "/phone/api/overview":
             found = self.ingress.read(principal, "overview")
             return HttpResult(200, found.get("body") or {})

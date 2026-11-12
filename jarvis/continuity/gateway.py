@@ -10,9 +10,14 @@ The store trusts its caller. This module authenticates before every store call:
 an enrolled installation key for device routes, and a fresh signature by a
 pinned owner key for `manage_main`. There is no unsigned bypass.
 
+`AuthenticatedPort` is the store-shaped seam for `MainRuntime` and `ExecutorGuard`.
+It still signs with the installation key and the pinned owner key. A shared-secret
+identity dict is not accepted; the integration fleet uses this port.
+
 Full contract, error map, and limits: docs/design/mobile-continuity/GATEWAY-IMPLEMENTATION.md.
 """
 
+import base64
 import hashlib
 import ipaddress
 import json
@@ -30,7 +35,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from jarvis.continuity.authority import AuthorityError, AuthorityStore
+from jarvis.continuity.authority import (
+    MAX_SIGNATURE,
+    TICKET_FIELDS as _TICKET_FIELDS,
+    AuthorityError,
+    AuthorityStore,
+)
 
 DEVICE_NS = "jarvis-continuity-device-v1"
 OWNER_NS = "jarvis-continuity-owner-v1"
@@ -40,13 +50,17 @@ _NAMESPACES = (DEVICE_NS, OWNER_NS, TICKET_NS)
 MAX_BODY = 8192
 MAX_RESPONSE = 8192
 MAX_RELAY_RESPONSE = 1024
-MAX_SIGNATURE = 1800
 SKEW_SECONDS = 30
 CHALLENGE_TTL = 60.0
 MAX_CHALLENGES = 32
 MAX_NONCES = 4096
 MAX_RELAYS = 1024
 RELAY_PATH = "/v1/continuity/relay"
+MAX_ENVELOPE = 256 * 1024
+MAX_READ_RESPONSE = 4 * 1024 * 1024
+MAX_RAW = 2_500_000
+EFFECT_KINDS = frozenset({"ask", "session_start", "session_input", "session_stop", "logout_end"})
+READ_KINDS = frozenset({"overview", "fleet", "ask_poll", "session_frame", "effect_status"})
 
 CAPABILITIES = frozenset({
     "status", "lease", "fence", "candidate", "consume", "reconcile", "client",
@@ -80,10 +94,6 @@ _FORBIDDEN_KEYS = frozenset({
     "url", "upstream", "host", "authorization", "cookie", "secret", "token",
     "password", "transcript", "frame", "image", "payload_body",
 })
-_TICKET_FIELDS = (
-    "admission_id", "target", "operation_id", "attempt_id", "digest", "main",
-    "incarnation", "epoch", "issued_at", "admit_until", "issuer_incarnation",
-)
 _ADMISSION_KEYS = _TICKET_FIELDS + ("consumed_at", "already")
 _PURPOSE_PATH = {
     "status": "/v1/authority/status",
@@ -122,6 +132,30 @@ def _safe_code(code):
 
 def _finite_wait(wait):
     return isinstance(wait, (int, float)) and not isinstance(wait, bool) and math.isfinite(wait) and wait >= 0
+
+
+def _retry_after_seconds(value):
+    """Delay-seconds only. An HTTP-date is not a store wait."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not re.fullmatch(r"[0-9]{1,6}", text):
+        return None
+    return int(text)
+
+
+def _agreed_wait(body_wait, header):
+    """Exact store wait, only when Retry-After is its ceiling.
+
+    A header alone, a body field alone, a boolean, zero, or a mismatch is not
+    a wait. Callers must not treat a missing wait as the barrier having elapsed.
+    """
+    if not _finite_wait(body_wait) or body_wait <= 0 or body_wait > 86400:
+        return None
+    seconds = _retry_after_seconds(header)
+    if seconds is None or seconds != max(0, math.ceil(body_wait)):
+        return None
+    return body_wait
 
 
 def canonical(value):
@@ -369,6 +403,7 @@ class ContinuityGateway:
         self._owner_nonces = {}
         self._challenges = {}
         self._relays = {}
+        self._effects = {}
         self._events = []
         self._httpd = None
         self._thread = None
@@ -401,9 +436,9 @@ class ContinuityGateway:
 
     def serve(self, host="127.0.0.1", port=0, *, confirm_bind=False):
         """Bind an in-process HTTP server. Refuses wildcard addresses. Does not enable TLS."""
+        self._check_bind(host, confirm_bind)
         if self._httpd is not None:
             raise GatewayError("bad_request")
-        self._check_bind(host, confirm_bind)
         try:
             httpd = ThreadingHTTPServer((host, port), _Handler)
         except OSError:
@@ -691,15 +726,20 @@ class ContinuityGateway:
         digest, capability = _digest(payload["digest"]), _ident(payload["capability"])
         if capability not in CAPABILITIES:
             raise GatewayError("bad_request")
+        identity = (digest, target, attempt_id, capability)
         with self._lock:
             prior = self._relays.get(operation_id)
             if prior is not None:
-                if prior["digest"] != digest:
+                if prior["identity"] != identity:
                     raise GatewayError("conflict", operation_id=operation_id)
                 if prior["state"] == "done":
                     return dict(prior["result"])
                 raise GatewayError("no_relay", operation_id=operation_id)
-            status = self._relay_status()
+            try:
+                status = self._relay_status()
+            except GatewayError as exc:
+                raise GatewayError(exc.code, status=exc.status, wait=exc.wait,
+                                   operation_id=operation_id) from None
             record = self._devices.get(status["main"])
             if record is None or not record.relay_origin:
                 raise GatewayError("no_relay", operation_id=operation_id)
@@ -707,7 +747,7 @@ class ContinuityGateway:
                 raise GatewayError("no_relay", operation_id=operation_id)
             if len(self._relays) >= MAX_RELAYS:
                 raise GatewayError("unavailable", operation_id=operation_id)
-            self._relays[operation_id] = {"digest": digest, "state": "inflight"}
+            self._relays[operation_id] = {"identity": identity, "state": "inflight"}
             origin = record.relay_origin
         body = canonical({
             "operation_id": operation_id, "target": target, "attempt_id": attempt_id,
@@ -718,18 +758,114 @@ class ContinuityGateway:
             upstream = _post_json(origin + RELAY_PATH, body, MAX_RELAY_RESPONSE)
         except GatewayError:
             with self._lock:
-                self._relays[operation_id] = {"digest": digest, "state": "error"}
+                self._relays[operation_id] = {"identity": identity, "state": "error"}
             raise GatewayError("no_relay", operation_id=operation_id) from None
         if (set(upstream) != {"operation_id", "accepted"} or upstream["operation_id"] != operation_id
                 or not isinstance(upstream["accepted"], bool)):
             with self._lock:
-                self._relays[operation_id] = {"digest": digest, "state": "error"}
+                self._relays[operation_id] = {"identity": identity, "state": "error"}
             raise GatewayError("no_relay", operation_id=operation_id)
         result = {"operation_id": operation_id, "relayed": True, "effect_authorized": False,
                   "upstream_accepted": upstream["accepted"]}
         with self._lock:
-            self._relays[operation_id] = {"digest": digest, "state": "done", "result": result}
+            self._relays[operation_id] = {"identity": identity, "state": "done", "result": result}
         return result
+
+    def forward_transient(self, principal, payload, envelope):
+        """Forward one phone request to the ready MAIN through RAM only.
+
+        `envelope` is the request body the phone sent. It is checked against the signed
+        `digest`, sent once, and never stored, logged, or put in the audit trail. An
+        effect is keyed by `operation_id` and never re-posted: a repeat returns the stored
+        small result, and a lost or odd answer leaves the operation unresolved
+        (`no_relay`). A read is one attempt and is not remembered. `effect_authorized`
+        is always false: MAIN still needs its own admission ticket.
+        """
+        self._accept_device(principal, "client", "relay", _exact(
+            payload, ("operation_id", "target", "attempt_id", "digest", "capability", "kind")))
+        operation_id = _ident(payload["operation_id"])
+        target, attempt_id = _ident(payload["target"]), _ident(payload["attempt_id"])
+        digest, capability = _digest(payload["digest"]), payload["capability"]
+        kind = payload["kind"]
+        if capability != "client" or not isinstance(kind, str) or kind not in EFFECT_KINDS | READ_KINDS:
+            raise GatewayError("bad_request")
+        if not isinstance(envelope, (bytes, bytearray)) or not 1 <= len(envelope) <= MAX_ENVELOPE:
+            raise GatewayError("bad_request")
+        envelope = bytes(envelope)
+        if digest != "sha256:" + hashlib.sha256(envelope).hexdigest():
+            raise GatewayError("bad_request")
+        effect = kind in EFFECT_KINDS
+        identity = (digest, target, attempt_id, capability, kind)
+        with self._lock:
+            if effect:
+                prior = self._effects.get(operation_id)
+                if prior is not None:
+                    if prior["identity"] != identity:
+                        raise GatewayError("conflict", operation_id=operation_id)
+                    if prior["state"] == "done":
+                        return dict(prior["result"])
+                    raise GatewayError("no_relay", operation_id=operation_id)
+            try:
+                status = self._relay_status()
+            except GatewayError as exc:
+                raise GatewayError(exc.code, status=exc.status, wait=exc.wait,
+                                   operation_id=operation_id) from None
+            if target != status["main"]:
+                raise GatewayError("no_relay", operation_id=operation_id)
+            record = self._devices.get(status["main"])
+            if record is None or not record.relay_origin or record.relay_origin == self._listening_origin:
+                raise GatewayError("no_relay", operation_id=operation_id)
+            origin = record.relay_origin
+            if effect:
+                if len(self._effects) >= MAX_RELAYS:
+                    raise GatewayError("unavailable", operation_id=operation_id)
+                self._effects[operation_id] = {"identity": identity, "state": "inflight"}
+        body = json.dumps({
+            "operation_id": operation_id, "target": target, "attempt_id": attempt_id,
+            "digest": digest, "capability": capability, "kind": kind,
+            "authority_id": status["authority_id"], "incarnation": status["incarnation"],
+            "epoch": status["epoch"], "main": status["main"],
+            "envelope_b64": base64.b64encode(envelope).decode("ascii"),
+        }, sort_keys=True, separators=(",", ":")).encode("ascii")
+        limit = MAX_RELAY_RESPONSE if effect else MAX_READ_RESPONSE
+        try:
+            upstream = _post_json(origin + RELAY_PATH, body, limit)
+            result = self._transient_result(effect, operation_id, upstream)
+        except GatewayError:
+            if effect:
+                with self._lock:
+                    self._effects[operation_id] = {"identity": identity, "state": "error"}
+            raise GatewayError("no_relay", operation_id=operation_id) from None
+        if effect:
+            with self._lock:
+                self._effects[operation_id] = {"identity": identity, "state": "done", "result": result}
+        return result
+
+    @staticmethod
+    def _transient_result(effect, operation_id, upstream):
+        if upstream.get("operation_id") != operation_id:
+            raise GatewayError("no_relay")
+        if effect:
+            if set(upstream) != {"operation_id", "accepted"} or not isinstance(upstream["accepted"], bool):
+                raise GatewayError("no_relay")
+            return {"operation_id": operation_id, "relayed": True, "effect_authorized": False,
+                    "upstream_accepted": upstream["accepted"]}
+        if not set(upstream) <= {"operation_id", "result", "raw_b64"} or not isinstance(
+                upstream.get("result"), dict):
+            raise GatewayError("no_relay")
+        raw = None
+        if "raw_b64" in upstream:
+            text = upstream["raw_b64"]
+            if not isinstance(text, str) or len(text) > MAX_RAW * 4 // 3 + 8:
+                raise GatewayError("no_relay")
+            try:
+                raw = base64.b64decode(text.encode("ascii"), validate=True)
+            except (ValueError, UnicodeError):
+                raise GatewayError("no_relay") from None
+            if len(raw) > MAX_RAW:
+                raise GatewayError("no_relay")
+        return {"operation_id": operation_id, "relayed": True, "effect_authorized": False,
+                "result": upstream["result"], "raw": raw}
 
     def enroll(self, owner_proof, payload):
         """Bind an installation public key and capabilities. Owner proof required.
@@ -826,6 +962,8 @@ class ContinuityGateway:
         body = {"error": code}
         if operation_id:
             body["operation_id"] = operation_id
+        if _finite_wait(wait) and wait > 0:
+            body["wait"] = wait
         self._reply(handler, status, body, wait, code, device_id)
 
     def _dispatch_device(self, purpose, principal, payload):
@@ -982,6 +1120,11 @@ class AuthorityClient:
         self._key = None if private_key_path is None else Path(private_key_path)
         self._owner_key = None if owner_private_key_path is None else Path(owner_private_key_path)
 
+    @property
+    def can_sign_owner(self):
+        """True when this process has the owner private key. Possession is not a grant."""
+        return self._owner_key is not None
+
     def status(self):
         return self._device("status", {})
 
@@ -1082,15 +1225,21 @@ class AuthorityClient:
             raise GatewayError("bad_origin")
         request.add_header("Content-Type", "application/json")
         request.add_header("Accept", "application/json")
+        retry_after = None
         try:
             with _opener().open(request, timeout=10) as response:
                 status = getattr(response, "status", response.getcode())
+                retry_after = response.headers.get("Retry-After")
                 raw = response.read(MAX_RESPONSE + 1)
         except GatewayError:
             raise
         except urllib.error.HTTPError as exc:
-            status = exc.code
-            raw = exc.read(MAX_RESPONSE + 1)
+            try:
+                status = exc.code
+                retry_after = exc.headers.get("Retry-After") if exc.headers is not None else None
+                raw = exc.read(MAX_RESPONSE + 1)
+            finally:
+                exc.close()
         except Exception:
             raise GatewayError("unavailable") from None
         if len(raw) > MAX_RESPONSE:
@@ -1108,5 +1257,126 @@ class AuthorityClient:
             operation = body.get("operation_id")
             if not isinstance(operation, str) or not _ID.fullmatch(operation):
                 operation = None
-            raise GatewayError(code, status=status, operation_id=operation)
+            agreed = _agreed_wait(body.get("wait"), retry_after) if "wait" in body else None
+            raise GatewayError(code, status=status, wait=agreed, operation_id=operation)
         return body
+
+
+_LEASE_KEYS = frozenset({"holder", "lease_id", "incarnation", "epoch"})
+_REQUEST_KEYS = frozenset({
+    "client_key", "action", "candidate", "expected_incarnation", "expected_epoch",
+    "expected_policy", "profile",
+})
+
+
+class AuthenticatedPort:
+    """Store-shaped calls for `MainRuntime` and `ExecutorGuard`, over `AuthorityClient`.
+
+    The installation is fixed when the client is built. A `device_id` or
+    `installation_id` argument that names someone else is refused before any
+    request is signed. Owner steps need `can_sign_owner`. A `caller` string in a
+    transition request is not forwarded and is not proof.
+
+    `consume` requires `ticket_signature`. `ExecutorGuard.accept` does not pass
+    that field itself, so `integration.SignedAuthority` captures the MAIN signature at
+    verify time and passes it here. This port never accepts a shared-secret identity.
+
+    Refusals are `AuthorityError` with the stable code as the message, which is
+    what those callers already catch. Nothing here is a live failover.
+    """
+
+    def __init__(self, client):
+        if not isinstance(client, AuthorityClient) or client.device_id is None or client._key is None:
+            raise GatewayError("unauthorized")
+        self._client = client
+
+    def status(self):
+        return self._call(self._client.status)
+
+    def renew(self, lease_tuple):
+        self._lease(lease_tuple)
+        return self._call(lambda: self._client.renew(
+            lease_tuple["holder"], lease_tuple["lease_id"],
+            lease_tuple["incarnation"], lease_tuple["epoch"]))
+
+    def release(self, lease_tuple):
+        self._lease(lease_tuple)
+        return self._call(lambda: self._client.release(
+            lease_tuple["holder"], lease_tuple["lease_id"],
+            lease_tuple["incarnation"], lease_tuple["epoch"]))
+
+    def acknowledge(self, device_id, installation_id, mode_version, fenced_epoch, boot_id=None):
+        if device_id != self._client.device_id or installation_id != self._client.installation_id:
+            raise AuthorityError("forbidden", "forbidden")
+        return self._call(lambda: self._client.acknowledge(mode_version, fenced_epoch, boot_id))
+
+    def transition_request(self, request):
+        self._require_owner()
+        fields = self._request(request)
+        return self._call(lambda: self._client.transition_request(
+            fields["client_key"], fields["action"], fields["candidate"],
+            fields["expected_incarnation"], fields["expected_epoch"],
+            fields["expected_policy"], fields["profile"]))
+
+    def transition_readiness(self, transition_id, readiness):
+        if not isinstance(readiness, dict):
+            raise AuthorityError("bad_request", "bad_request")
+        if set(readiness) & _FORBIDDEN_KEYS or set(readiness) - {"control_ready", "ai_ready", "checkpoint"}:
+            raise AuthorityError("bad_request", "bad_request")
+        if "control_ready" not in readiness or "ai_ready" not in readiness:
+            raise AuthorityError("bad_request", "bad_request")
+        # Absent and JSON null are the same: the client omits the field. 1 is not true.
+        checkpoint = readiness.get("checkpoint")
+        return self._call(lambda: self._client.readiness(
+            transition_id, readiness["control_ready"], readiness["ai_ready"], checkpoint))
+
+    def transition_step(self, transition_id, step, canary_ok=None):
+        self._require_owner()
+        return self._call(lambda: self._client.step(transition_id, step, canary_ok))
+
+    def consume(self, ticket=None, **fields):
+        """Target consume. Missing `ticket_signature` does not call the store."""
+        payload = {}
+        if ticket is not None:
+            if not isinstance(ticket, dict):
+                raise AuthorityError("bad_request", "bad_request")
+            payload.update(ticket)
+        if fields:
+            payload.update(fields)
+        if set(payload) & _FORBIDDEN_KEYS:
+            raise AuthorityError("bad_request", "bad_request")
+        signature = payload.get("ticket_signature")
+        if not isinstance(signature, str):
+            raise AuthorityError("unauthorized", "unauthorized")
+        if set(payload) - set(_TICKET_FIELDS) - {"ticket_signature"}:
+            raise AuthorityError("bad_request", "bad_request")
+        if payload.get("target") != self._client.device_id:
+            raise AuthorityError("forbidden", "forbidden")
+        body = {key: payload[key] for key in _TICKET_FIELDS}
+        return self._call(lambda: self._client.consume(body, signature))
+
+    def admission(self, admission_id):
+        return self._call(lambda: self._client.admission(admission_id))
+
+    def _require_owner(self):
+        if not self._client.can_sign_owner:
+            raise AuthorityError("unauthorized", "unauthorized")
+
+    def _lease(self, lease_tuple):
+        if not isinstance(lease_tuple, dict) or set(lease_tuple) != _LEASE_KEYS:
+            raise AuthorityError("bad_request", "bad_request")
+        if lease_tuple["holder"] != self._client.device_id:
+            raise AuthorityError("forbidden", "forbidden")
+
+    def _request(self, request):
+        if not isinstance(request, dict) or set(request) & _FORBIDDEN_KEYS:
+            raise AuthorityError("bad_request", "bad_request")
+        if set(request) - _REQUEST_KEYS - {"caller"} or not _REQUEST_KEYS <= set(request):
+            raise AuthorityError("bad_request", "bad_request")
+        return request
+
+    def _call(self, fn):
+        try:
+            return fn()
+        except GatewayError as exc:
+            raise AuthorityError(exc.code, exc.code, wait=exc.wait) from None

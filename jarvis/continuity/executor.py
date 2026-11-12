@@ -16,9 +16,11 @@ import threading
 import time
 
 from .authority import (
+    MAX_SIGNATURE,
     MAX_TICKET_SECONDS,
     MODES,
     SCHEMA_VERSION,
+    TICKET_FIELDS as _TICKET_FIELDS,
     TICKET_SKEW,
     AuthorityError,
     _digest,
@@ -40,10 +42,6 @@ _OP_REQUIRED = (
     "issued_at", "admit_until", "issuer_incarnation", "admission_id", "signature",
 )
 _OP_OPTIONAL = frozenset(("session_id",))
-_TICKET_FIELDS = (
-    "admission_id", "target", "operation_id", "attempt_id", "digest", "main",
-    "incarnation", "epoch", "issued_at", "admit_until", "issuer_incarnation",
-)
 _TOKEN_FIELDS = (
     "authority_id", "fleet_id", "main", "incarnation", "epoch", "mode_version",
     "policy_version", "target", "operation_id", "attempt_id", "digest", "effect_class",
@@ -267,10 +265,12 @@ class ExecutorGuard:
         """
         if not callable(sink):
             raise AuthorityError("bad_request", "sink must be callable")
-        op = _operation(signed_operation, admission_ticket)
         with self._lock:
             self._enter()
             try:
+                if self._quarantined:
+                    raise AuthorityError("quarantined", "executor journal is unusable")
+                op = _operation(signed_operation, admission_ticket)
                 return self._accept_locked(signed_operation, op, sink, failpoint)
             finally:
                 self._leave()
@@ -746,7 +746,7 @@ def _operation(signed, ticket):
     signed = _only_fields(signed, _OP_REQUIRED, _OP_OPTIONAL, "signed operation")
     ticket = _only_fields(ticket, _TICKET_FIELDS, (), "admission ticket")
     signature = signed["signature"]
-    if not isinstance(signature, str) or not 1 <= len(signature) <= 512:
+    if not isinstance(signature, str) or not 1 <= len(signature) <= MAX_SIGNATURE:
         raise AuthorityError("bad_request", "signature missing")
     if signed["effect_class"] not in _EFFECTS:
         raise AuthorityError("bad_request", "unknown effect class")

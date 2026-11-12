@@ -4,28 +4,50 @@ Production behavior is unchanged legacy. `ContinuityIntegration` does not dispat
 to the hub, the phone listener, or the CLI, and it refuses cutover while the
 deployment gates in OPERATIONAL-CONTRACT.md are open.
 
-`IsolatedFleet` is a temp-directory loopback around the real `AuthorityStore`.
-It is not a gateway deployment. Device secrets and the passkey check are test
-doubles: they stop unauthenticated callers reaching the store, and they are not
-installation-key, TLS, or WebAuthn proof. Receipts record `signature_verified`
-false. Nothing here writes `jarvis.config.json` or `.jarvis/`.
+`IsolatedFleet` builds a temp-directory fleet from the real modules: `AuthorityStore`
+behind `ContinuityGateway` on a loopback socket, owner and installation ssh keys,
+`AuthorityClient`, `MainRuntime`, `ExecutorGuard`, `ContinuityGatewaySession` and
+`MobileIngress`. Only the MAIN relay sink and the clock are stand-ins. It is not an
+Oracle or Dell deployment. Nothing here writes `jarvis.config.json`, `.jarvis/` or a
+vault, and nothing starts at import time.
+
+The module-level `close_unfenced` / `refuse_unfenced` helpers are the opt-in launch
+contract. They are default-off RAM flags: legacy entry points call `refuse_unfenced`
+and it does nothing until a deployment explicitly calls `close_unfenced`.
 """
 
 import hashlib
-import hmac
+import base64
 import importlib
 import json
-import secrets
-import sqlite3
+import subprocess
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .authority import (
     LEASE_SECONDS,
     SAFETY_MARGIN,
+    TICKET_FIELDS,
     AuthorityError,
     AuthorityStore,
 )
-from .clock import CachedAuthority, suspend_aware_clock
+from .clock import suspend_aware_clock
+from .executor import ExecutorGuard
+from .gateway import (
+    RELAY_PATH,
+    TICKET_NS,
+    AuthenticatedPort,
+    AuthorityClient,
+    ContinuityGateway,
+    GatewayError,
+    HTTP_STATUS as GATEWAY_HTTP_STATUS,
+    _message,
+    verify_message,
+)
+from .ingress import READ_KINDS, ContinuityGatewaySession, MobileIngress, pin_target
+from .runtime import GatewayPort, MainRuntime, RuntimeRefusal, StoreAdapter
 
 ORIGIN = "https://gateway.test.invalid"
 FLEET_ID = "home"
@@ -37,38 +59,16 @@ PERSONAL = frozenset({
     "workflow", "message", "input", "payload",
 })
 
-# Contract-named store codes. Extras still fail closed; they never become HTTP 200.
-CONTRACT_HTTP = {
-    "bad_request": 400,
-    "bad_ticket": 400,
-    "ticket_expired": 410,
-    "stale": 409,
-    "busy": 409,
-    "key_reused": 409,
-    "conflict": 409,
-    "not_quiet": 409,
-    "lease_live": 409,
-    "quarantined": 503,
-}
-EXTRA_HTTP = {
-    "writer_busy": 503,
+# Contract-named store codes. Extras still fail closed; they never become HTTP 200. Codes the
+# gateway also speaks take its status (one meaning per code); the rest are integration-only.
+CONTRACT_HTTP = {code: GATEWAY_HTTP_STATUS[code] for code in (
+    "bad_request", "bad_ticket", "ticket_expired", "stale", "busy", "key_reused", "conflict",
+    "not_quiet", "lease_live", "quarantined")}
+EXTRA_HTTP = {**{code: GATEWAY_HTTP_STATUS[code] for code in (
+    "writer_busy", "not_found", "ahead", "bad_edge", "unacked", "expired", "draining", "mode",
+    "ineligible", "main_alive", "no_main", "noop", "not_ready", "bad_state", "no_admission",
+    "target_unfenced", "unknown_participant")}, **{
     "authority_unavailable": 503,
-    "not_found": 409,
-    "ahead": 409,
-    "bad_edge": 409,
-    "unacked": 409,
-    "expired": 409,
-    "draining": 409,
-    "mode": 409,
-    "ineligible": 409,
-    "main_alive": 409,
-    "no_main": 409,
-    "noop": 409,
-    "not_ready": 409,
-    "bad_state": 409,
-    "no_admission": 409,
-    "target_unfenced": 409,
-    "unknown_participant": 409,
     "personal_field": 400,
     "unauthenticated": 401,
     "bad_passkey": 401,
@@ -81,7 +81,7 @@ EXTRA_HTTP = {
     "v2_inactive": 409,
     "legacy_unwired": 409,
     "refuses_live_state": 403,
-}
+}}
 HTTP_STATUS = {**CONTRACT_HTTP, **EXTRA_HTTP}
 RETRY_AFTER = frozenset({"not_quiet", "lease_live"})
 STEPS = frozenset({"drain", "fence", "grant", "complete", "cancel"})
@@ -115,8 +115,6 @@ LEGACY_PATHS = (
 )
 
 INCOMPATIBILITIES = (
-    {"id": "peers_absent",
-     "detail": "jarvis/continuity/{gateway,ingress,runtime,executor}.py are not in the tree."},
     {"id": "store_states",
      "detail": "AuthorityStore has no CATCHING_UP or VERIFYING states. MAIN-HANDOFF section 6 lists both."},
     {"id": "no_signatures",
@@ -128,11 +126,11 @@ INCOMPATIBILITIES = (
     {"id": "phone_origin",
      "detail": "phone.py still binds 127.0.0.1:7787 on the PC that happens to be awake."},
     {"id": "cluster_main_unfenced",
-     "detail": "jarvis cluster main still writes cluster.main_device and does not take a lease."},
+     "detail": "jarvis cluster main still writes cluster.main_device and does not take a lease. A default-off gate refuses it only after an explicit cutover closes `cluster_cli.set_main`."},
     {"id": "hub_unfenced",
-     "detail": "Hub.dispatch does not consult continuity before local or node effects."},
+     "detail": "Hub.dispatch consults only a default-off gate before local or node effects; no lease is checked. A cutover closes `hub_dispatch`, `cluster_local` and `remote_call` by hand."},
     {"id": "sleep_unhooked",
-     "detail": "rest.sleep does not release a lease or invalidate CachedAuthority."},
+     "detail": "rest.sleep has a default-off gate but still does not release a lease or invalidate CachedAuthority; wiring MainRuntime.release_before_suspend is part of the cutover."},
     {"id": "margin_unmeasured",
      "detail": "SAFETY_MARGIN is the 2 second placeholder. It is not a measured suspend margin."},
     {"id": "windows_clock",
@@ -141,12 +139,9 @@ INCOMPATIBILITIES = (
      "detail": "No verified Oracle gateway host is enrolled. Arch and Dell are not a substitute."},
     {"id": "ai_profile",
      "detail": "Luna +5 and Grok 4.7 are routing intent only. A provider name is not ai_ready."},
-    {"id": "inprocess_auth_double",
-     "detail": "IsolatedFleet compares shared secrets in-process. That is not mutual TLS or an installation key."},
 )
 
-_CONSUME = ("admission_id", "target", "operation_id", "attempt_id", "digest", "main",
-            "incarnation", "epoch", "issued_at", "admit_until", "issuer_incarnation")
+_CONSUME = TICKET_FIELDS
 
 
 class IntegrationError(Exception):
@@ -181,8 +176,65 @@ def operation_digest(target, operation_id, attempt_id, effect_class):
     return "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _behavior(name):
+    """Run the real peer on a temp fixture. A peer that only has the right names fails here."""
+    with tempfile.TemporaryDirectory(prefix="jarvis-continuity-probe-") as folder:
+        folder = Path(folder)
+        if name == "gateway":
+            return callable(getattr(ContinuityGateway, "forward_transient", None))
+        if name == "ingress":
+            return callable(getattr(ContinuityGatewaySession, "relay_transient", None))
+        if name == "runtime":
+            store = AuthorityStore(folder / "a.sqlite", FLEET_ID, AUTHORITY_ID)
+            try:
+                runtime = MainRuntime(StoreAdapter(store), "probe", "probe-inst",
+                                      lambda: {"control_ready": True}, clock=None)
+                runtime.start()
+                try:
+                    runtime.require_authority("ordinary")
+                except RuntimeRefusal as exc:
+                    legacy = exc.code == "legacy"
+                else:
+                    legacy = False
+                calls = []
+
+                class Client:
+                    device_id = "probe"
+                    installation_id = "probe-inst"
+
+                    def consume(self, *args, **kwargs):
+                        calls.append(1)
+                        return {}
+
+                try:
+                    GatewayPort(Client()).consume(target="probe", admission_id="adm-x")
+                except (RuntimeRefusal, AuthorityError):
+                    unsigned = not calls
+                else:
+                    unsigned = False
+                return legacy and unsigned
+            finally:
+                store.close() if hasattr(store, "close") else None
+        if name == "executor":
+            guard = ExecutorGuard(folder / "e.sqlite", device_id="probe", installation_id="probe-inst",
+                                  fleet_id=FLEET_ID, authority_id=AUTHORITY_ID, boot=lambda: "boot-1")
+            try:
+                ran = []
+                guard.legacy_effect(lambda: ran.append(1))
+                if ran != [1]:
+                    return False
+                try:
+                    guard.accept({}, {}, lambda: ran.append(2))
+                except AuthorityError:
+                    return ran == [1]
+                return False
+            finally:
+                guard.close()
+    return False
+
+
 def peer_report():
-    """Import peer modules if they exist. Do not construct them."""
+    """Import the peers and run each against a temp fixture. Names alone are not compatibility."""
     report = {}
     for name, (class_name, methods) in PEER_FACADES.items():
         module_name = "jarvis.continuity." + name
@@ -198,6 +250,12 @@ def peer_report():
                             "missing": list(methods)}
             continue
         missing = [method for method in methods if not callable(getattr(cls, method, None))]
+        try:
+            behaves = _behavior(name)
+        except Exception:
+            behaves = False
+        if not behaves:
+            missing.append("behavior")
         report[name] = {"present": True, "compatible": not missing, "missing_class": None,
                         "missing": missing}
     return report
@@ -323,791 +381,453 @@ class ContinuityIntegration:
         return _blocked("rollback_quiesced")
 
 
-def _match_secret(offered, expected):
-    if not isinstance(offered, str) or not isinstance(expected, str) or len(offered) != len(expected):
-        return False
-    return hmac.compare_digest(offered, expected)
+def _ticket_fields(signed):
+    return {key: signed[key] for key in _CONSUME}
 
 
-class LoopbackGateway:
-    """In-process store client. Not ContinuityGateway and not an HTTPS server."""
+class LinkedClient(AuthorityClient):
+    """Real `AuthorityClient` whose link a test can cut. Nothing is faked above the wire."""
 
-    def __init__(self, store):
-        self.store = store
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.up = True
-        self.log = []
-        self.enrollment = {}
-        self.proofs = {}
-        self.renew_calls = 0
+        self.calls = []
 
-    def enroll(self, device, installation_id, secret):
-        self.enrollment[device] = {"installation_id": installation_id, "secret": secret}
-
-    def mint_owner_proof(self):
-        proof = "own-" + secrets.token_hex(8)
-        self.proofs[proof] = {"used": False, "result": None, "bound": None}
-        return proof
-
-    def audit(self, **fields):
-        if PERSONAL.intersection(fields):
-            raise IntegrationError("personal_field")
-        self.log.append(fields)
-
-    def _down(self):
+    def _send(self, path, obj):
+        self.calls.append(path)
         if not self.up:
-            raise IntegrationError("authority_unavailable")
+            raise GatewayError("unavailable")
+        return super()._send(path, obj)
 
-    def _call(self, fn):
-        self._down()
+    def renew_count(self):
+        return sum(1 for path in self.calls if path.endswith("/renew"))
+
+
+class SignedAuthority:
+    """`ExecutorGuard` authority over the real signed gateway.
+
+    `ExecutorGuard` verifies the MAIN ticket signature through `verify` and then calls
+    `consume` with plain fields. The gateway needs that signature too, so `verify`
+    keeps it (RAM, keyed by admission id) and `consume` refuses anything it did not
+    verify. The key for a MAIN comes from the owner-enrolled public key, never from
+    the request.
+    """
+
+    def __init__(self, client, public_keys):
+        self._port = AuthenticatedPort(client)
+        self._keys = dict(public_keys)
+        self._signed = {}
+        self._lock = threading.Lock()
+
+    def verify(self, signed):
         try:
-            return fn()
+            fields = _ticket_fields(signed)
+            signature = signed["signature"]
+            key = self._keys.get(signed["main"])
+        except (KeyError, TypeError):
+            return False
+        if key is None or not isinstance(signature, str):
+            return False
+        if not verify_message(TICKET_NS, _message(TICKET_NS, fields), signature, key):
+            return False
+        with self._lock:
+            self._signed[fields["admission_id"]] = (fields, signature)
+        return True
+
+    def consume(self, **fields):
+        with self._lock:
+            stored = self._signed.get(fields.get("admission_id"))
+        if stored is None:
+            raise AuthorityError("signature", "ticket was not verified against a MAIN signature")
+        original, signature = stored
+        for key in _CONSUME:
+            left, right = original[key], fields.get(key)
+            numeric = (isinstance(left, (int, float)) and not isinstance(left, bool)
+                       and isinstance(right, (int, float)) and not isinstance(right, bool))
+            if numeric and abs(left - right) <= 1e-6:
+                continue
+            if not numeric and left == right:
+                continue
+            raise AuthorityError("signature", "ticket fields differ from the signed ticket")
+        return self._port.consume(**original, ticket_signature=signature)
+
+    def admission(self, admission_id):
+        try:
+            return self._port.admission(admission_id)
         except AuthorityError as exc:
-            self.audit(code=exc.code)
-            raise IntegrationError(exc.code, exc.wait) from None
+            if exc.code == "not_found":
+                return None
+            raise
 
-    def _pc(self, identity):
-        if not isinstance(identity, dict):
-            raise IntegrationError("unauthenticated")
-        reject_personal(identity)
-        device = identity.get("device")
-        row = self.enrollment.get(device)
-        if row is None or identity.get("installation_id") != row["installation_id"]:
-            raise IntegrationError("unauthenticated")
-        if not _match_secret(identity.get("secret"), row["secret"]):
-            raise IntegrationError("unauthenticated")
-        return device
+    def status(self):
+        return self._port.status()
 
-    def _owner(self, identity):
-        if self._pc(identity) != "owner-pc":
-            raise IntegrationError("not_owner")
-        return "owner-pc"
-
-    def status(self, identity):
-        self._pc(identity)
-        return self._call(self.store.status)
-
-    def renew(self, identity, lease):
-        reject_personal(lease)
-        device = self._pc(identity)
-        if device != lease.get("holder"):
-            raise IntegrationError("unauthenticated")
-        self._down()
-        self.renew_calls += 1
-
-        def run():
-            return self.store.renew(lease["holder"], lease["lease_id"], lease["incarnation"], lease["epoch"])
-
-        view = self._call(run)
-        self.audit(op="renew", device=device, ready=bool(view.get("ready")))
-        return view
-
-    def release(self, identity, lease):
-        reject_personal(lease)
-        device = self._pc(identity)
-        if device != lease.get("holder"):
-            raise IntegrationError("unauthenticated")
-
-        def run():
-            self.store.release(lease["holder"], lease["lease_id"], lease["incarnation"], lease["epoch"])
-            return self.store.status()
-
-        view = self._call(run)
-        self.audit(op="release", device=device, mode=view["mode"])
-        return view
-
-    def acknowledge(self, identity, mode_version, fenced_epoch):
-        device = self._pc(identity)
-        installation = identity["installation_id"]
-        self._call(lambda: self.store.acknowledge(device, installation, mode_version, fenced_epoch))
-        self.audit(op="ack", device=device, mode_version=mode_version, fenced_epoch=fenced_epoch)
-        return {"device": device, "mode_version": mode_version, "fenced_epoch": fenced_epoch}
-
-    def _take_proof(self, proof, bound):
-        row = self.proofs.get(proof)
-        if row is None:
-            raise IntegrationError("unauthenticated")
-        if row["used"]:
-            if row["bound"] == bound and row["result"] is not None:
-                return row["result"]
-            raise IntegrationError("unauthenticated")
-        row["used"] = True
-        row["bound"] = bound
-        return None
-
-    def transition_request(self, proof, request):
-        reject_personal(request)
-        if request.get("action") not in ("make_main_now", "set_preferred_main", "recover"):
-            raise IntegrationError("bad_request")
-        if request.get("profile") not in ("control", "ai"):
-            raise IntegrationError("bad_request")
-        bound = (request["action"], request["candidate"], request["profile"], request["client_key"])
-        prior = self._take_proof(proof, bound)
-        if prior is not None:
-            return prior
-        view = self._call(lambda: self.store.request(
-            "owner-pc", request["client_key"], request["action"], request["candidate"],
-            request["expected_incarnation"], request["expected_epoch"], request["expected_policy"],
-            request["profile"]))
-        self.proofs[proof]["result"] = view
-        self.audit(op="transition", transition_id=view["transition_id"], action=view["action"])
-        return view
-
-    def transition_readiness(self, identity, transition_id, readiness):
-        reject_personal(readiness)
-        device = self._pc(identity)
-        current = self._call(lambda: self.store.transition(transition_id))
-        if current["candidate"] != device:
-            raise IntegrationError("not_candidate")
-        checkpoint = readiness.get("checkpoint")
-        view = self._call(lambda: self.store.readiness(
-            transition_id, bool(readiness.get("control_ready")), bool(readiness.get("ai_ready")), checkpoint))
-        self.audit(op="readiness", transition_id=transition_id, device=device,
-                   control=bool(view["control_ready"]), ai=bool(view["ai_ready"]))
-        return view
-
-    def transition_step(self, identity, transition_id, step, canary=None):
-        if step in ABSENT_STEPS or step not in STEPS:
-            raise IntegrationError("bad_request")
-        if step == "grant":
-            device = self._pc(identity)
-            current = self._call(lambda: self.store.transition(transition_id))
-            if current["candidate"] != device:
-                raise IntegrationError("not_candidate")
-            lease = self._call(lambda: self.store.grant(transition_id))
-            self.audit(op="grant", holder=lease["holder"], epoch=lease["epoch"], ready=False)
-            return lease
-        self._owner(identity)
-        if step == "drain":
-            view = self._call(lambda: self.store.drain(transition_id))
-        elif step == "fence":
-            view = self._call(lambda: self.store.fence(transition_id))
-        elif step == "cancel":
-            view = self._call(lambda: self.store.cancel(transition_id))
-        else:
-            if canary is not True and canary is not False:
-                raise IntegrationError("bad_request")
-            view = self._call(lambda: self.store.complete(transition_id, canary))
-        self.audit(op=step, transition_id=transition_id, state=view["state"])
-        return view
-
-    def consume(self, identity, ticket):
-        reject_personal(ticket)
-        device = self._pc(identity)
-        if device != ticket.get("main"):
-            raise IntegrationError("unauthenticated")
-        fields = {key: ticket[key] for key in _CONSUME}
-        receipt = self._call(lambda: self.store.consume(**fields))
-        self.audit(op="consume", admission_id=ticket["admission_id"], already=bool(receipt["already"]),
-                   target=ticket["target"], epoch=ticket["epoch"])
-        return receipt
-
-    def admission(self, identity, admission_id):
-        self._pc(identity)
-        return self._call(lambda: self.store.admission(admission_id))
-
-    def relay(self, principal, operation_id, bounded):
-        reject_personal(bounded if isinstance(bounded, dict) else {})
-        if not isinstance(principal, dict) or principal.get("role") != "phone":
-            raise IntegrationError("unauthenticated")
-        if principal.get("authenticated_by") != "session" or not principal.get("session_id"):
-            raise IntegrationError("unauthenticated")
-        view = self._call(self.store.status)
-        self.audit(op="relay", operation_id=operation_id, main=view["main"], ready=view["main_ready"])
-        if not view["main_ready"]:
-            raise IntegrationError("no_admission")
-        return {"ok": True, "main": view["main"], "incarnation": view["incarnation"], "epoch": view["epoch"],
-                "operation_id": operation_id, "digest": bounded["digest"], "target": bounded["target"],
-                "effect_class": bounded["effect_class"]}
+    def acknowledge(self, device_id, installation_id, mode_version, fenced_epoch, boot_id=None):
+        return self._port.acknowledge(device_id, installation_id, mode_version, fenced_epoch, boot_id=boot_id)
 
 
-class LocalExecutor:
-    """Durable target journal. Default construction refuses every effect: no signature verifier."""
+_PC_CAPS = ["status", "lease", "fence", "candidate", "consume", "reconcile"]
+_SERVER_CAPS = ["status", "fence", "reconcile"]
+_REPLY_LIMIT = 4 * 1024 * 1024
+_RELAY_KEYS = frozenset({
+    "operation_id", "target", "attempt_id", "digest", "capability", "kind", "authority_id",
+    "incarnation", "epoch", "main", "envelope_b64",
+})
 
-    def __init__(self, path, gateway, device, *, require_signature=True):
-        self.path = Path(path)
-        self.gateway = gateway
-        self.device = device
-        self.require_signature = require_signature
-        self._db = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS seen(
-              device_id TEXT PRIMARY KEY, incarnation INTEGER NOT NULL, epoch INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS receipts(
-              target TEXT NOT NULL, operation_id TEXT NOT NULL, attempt_id TEXT NOT NULL,
-              admission_id TEXT NOT NULL, digest TEXT NOT NULL, state TEXT NOT NULL,
-              run_count INTEGER NOT NULL, incarnation INTEGER NOT NULL, epoch INTEGER NOT NULL,
-              signature_verified INTEGER NOT NULL, PRIMARY KEY(target, operation_id, attempt_id));
-        """)
+
+class PcNode:
+    """One PC: real runtime, real executor journal, and a temporary MAIN relay sink.
+
+    The sink is a loopback test server standing in for MAIN's receiver. It is not a
+    shipped listener; `jarvis.continuity` never starts one. Effects go through
+    `require_authority`, then a freshly signed ticket, then `ExecutorGuard.accept`
+    with a zero-argument sink. Personal text is held in RAM only long enough to run.
+    """
+
+    def __init__(self, fleet, name, *, suspend_cache):
+        self.fleet = fleet
+        self.name = name
+        self.installation = name + "-inst"
+        self.boot = {"id": "boot-" + name + "-1"}
+        self.effects = []
+        self.refusals = []
+        self.client = fleet._client(LinkedClient, name)
+        self.port = GatewayPort(self.client)
+        self.authority = SignedAuthority(
+            self.client, {"zenbook": fleet.public("zenbook"), "dell": fleet.public("dell")})
+        clock = fleet.clock.mono if suspend_cache else None
+        self.runtime = MainRuntime(self.port, name, self.installation, self._probe,
+                                   clock=clock, boot=lambda: self.boot["id"])
+        self.executor_path = fleet.root / name / "executor.sqlite"
+        self.executor_path.parent.mkdir(parents=True, exist_ok=True)
+        self.executor = self._open_executor()
+        node = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if self.path != RELAY_PATH or not 0 < length <= _REPLY_LIMIT:
+                        raise ValueError
+                    body = json.loads(self.rfile.read(length).decode("utf-8"))
+                    status, reply = node.handle_relay(body)
+                except Exception:
+                    status, reply = 503, {"error": "unavailable"}
+                raw = json.dumps(reply, separators=(",", ":")).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=False)
+        self.thread.start()
+        self.origin = "http://127.0.0.1:%d" % self.server.server_address[1]
+
+    @staticmethod
+    def _probe():
+        return {"control_ready": True, "luna": True, "grok": True, "quota_ok": True,
+                "mediated_tools": True, "session_local": True, "checkpoint": "cp-1"}
+
+    def _open_executor(self):
+        return ExecutorGuard(
+            self.executor_path, device_id=self.name, installation_id=self.installation,
+            fleet_id=FLEET_ID, authority_id=AUTHORITY_ID, authority=self.authority,
+            verifier=self.authority.verify, boot=lambda: self.boot["id"], wall=self.fleet.clock.wall)
+
+    def reboot(self):
+        """Close the journal and reopen it under a new boot id. Nothing else is carried over."""
+        self.executor.close()
+        self.boot["id"] = "boot-%s-%d" % (self.name, int(self.boot["id"].rsplit("-", 1)[1]) + 1)
+        self.executor = self._open_executor()
+        return self.executor
+
+    def handle_relay(self, body):
+        if not isinstance(body, dict) or set(body) != _RELAY_KEYS:
+            return 400, {"error": "bad_request"}
+        envelope = base64.b64decode(body["envelope_b64"], validate=True)
+        if body["digest"] != "sha256:" + hashlib.sha256(envelope).hexdigest():
+            return 400, {"error": "bad_request"}
+        if body["target"] != self.name or body["main"] != self.name or body["capability"] != "client":
+            return 403, {"error": "forbidden"}
+        kind, operation_id = body["kind"], body["operation_id"]
+        if kind in READ_KINDS:
+            try:
+                self.runtime.require_authority("control", target=self.name)
+            except RuntimeRefusal as exc:
+                return 409, {"error": exc.code}
+            return 200, self._read(operation_id, kind)
+        try:
+            auth = self.runtime.require_authority("ordinary", target=self.name)
+        except RuntimeRefusal as exc:
+            self.refusals.append(exc.code)
+            return 200, {"operation_id": operation_id, "accepted": False}
+        wall = self.fleet.clock.wall()
+        ticket = {
+            "admission_id": "adm-%s-%s" % (operation_id, body["attempt_id"]), "target": self.name,
+            "operation_id": operation_id, "attempt_id": body["attempt_id"], "digest": body["digest"],
+            "main": self.name, "incarnation": auth["incarnation"], "epoch": auth["epoch"],
+            "issued_at": wall - 1, "admit_until": wall + 60, "issuer_incarnation": auth["incarnation"],
+        }
+        signed = {
+            **ticket, "authority_id": AUTHORITY_ID, "fleet_id": FLEET_ID,
+            "mode_version": auth["mode_version"], "policy_version": auth["policy_version"],
+            "effect_class": "ordinary", "signature": self.client.sign_ticket(ticket),
+        }
+        try:
+            receipt = self.executor.accept(signed, ticket, lambda: self.effects.append(operation_id))
+        except AuthorityError as exc:
+            self.refusals.append(exc.code)
+            return 200, {"operation_id": operation_id, "accepted": False}
+        return 200, {"operation_id": operation_id, "accepted": receipt.get("effect") == "completed"}
+
+    def _read(self, operation_id, kind):
+        if kind == "session_frame":
+            raw = base64.b64encode(b"\x89frame-" + self.name.encode()).decode("ascii")
+            return {"operation_id": operation_id, "raw_b64": raw, "result": {
+                "status": 200, "body": {},
+                "headers": {"X-Frame-Seq": "1", "X-Frame-Width": "2", "X-Frame-Height": "2"}}}
+        return {"operation_id": operation_id, "result": {
+            "status": 200, "body": {"main": self.name, "state": "ready"}, "headers": {}}}
 
     def close(self):
-        self._db.close()
-
-    def reopen(self):
-        """Process restart: same file, empty memory, including a lost in-flight effect."""
-        self.close()
-        revived = LocalExecutor(self.path, self.gateway, self.device, require_signature=self.require_signature)
-        return revived
-
-    def _seen(self):
-        return self._db.execute("SELECT * FROM seen WHERE device_id=?", (self.device,)).fetchone()
-
-    def _mark_seen(self, incarnation, epoch):
-        row = self._seen()
-        if row is None or (incarnation, epoch) > (row["incarnation"], row["epoch"]):
-            self._db.execute("INSERT INTO seen(device_id, incarnation, epoch) VALUES(?,?,?)"
-                             " ON CONFLICT(device_id) DO UPDATE SET incarnation=excluded.incarnation,"
-                             " epoch=excluded.epoch", (self.device, incarnation, epoch))
-
-    def _receipt(self, operation_id, attempt_id):
-        return self._db.execute(
-            "SELECT * FROM receipts WHERE target=? AND operation_id=? AND attempt_id=?",
-            (self.device, operation_id, attempt_id)).fetchone()
-
-    def reconcile(self, operation_id, attempt_id):
-        row = self._receipt(operation_id, attempt_id)
-        if row is None:
-            return {"state": "unknown", "operation_id": operation_id, "attempt_id": attempt_id, "run_count": 0}
-        return _receipt_view(row)
-
-    def fence(self, incarnation, epoch, mode_version):
-        """Remember an epoch the store has already moved to. Older epochs fail closed offline."""
-        del mode_version
-        self._mark_seen(int(incarnation), int(epoch))
-        row = self._seen()
-        return {"device": self.device, "incarnation": row["incarnation"], "epoch": row["epoch"]}
-
-    def stop_interactive(self, session_id, reason):
-        self._db.execute(
-            "INSERT OR REPLACE INTO receipts(target, operation_id, attempt_id, admission_id, digest, state,"
-            " run_count, incarnation, epoch, signature_verified) VALUES(?,?,?,?,?,?,?,?,?,0)",
-            (self.device, "interactive-" + session_id, "stop", "none", operation_digest(
-                self.device, session_id, "stop", "interactive"), "stopped", 0, 0, 0))
-        return {"session_id": session_id, "state": "stopped", "reason_code": reason, "replayed": False}
-
-    def accept(self, identity, operation, ticket):
-        reject_personal(operation if isinstance(operation, dict) else {})
-        reject_personal(ticket)
-        if self.require_signature:
-            raise IntegrationError("signature_unverified")
-        if ticket.get("target") != self.device:
-            raise IntegrationError("bad_request")
-        prior = self._receipt(ticket["operation_id"], ticket["attempt_id"])
-        if prior is not None:
-            if prior["digest"] != ticket["digest"] or prior["admission_id"] != ticket["admission_id"]:
-                raise IntegrationError("conflict")
-            return _receipt_view(prior)
-        seen = self._seen()
-        if seen is not None and (ticket["incarnation"], ticket["epoch"]) < (seen["incarnation"], seen["epoch"]):
-            raise IntegrationError("stale")
-        consumed = self.gateway.consume(identity, ticket)
-        if consumed["already"]:
-            self._insert(ticket, "reconciled", 0)
-            self._mark_seen(ticket["incarnation"], ticket["epoch"])
-            return self.reconcile(ticket["operation_id"], ticket["attempt_id"])
-        self._insert(ticket, "starting", 0)
-        if operation.get("crash") is True:
-            self._update(ticket, "uncertain", 0)
-            return self.reconcile(ticket["operation_id"], ticket["attempt_id"])
-        self._update(ticket, "accepted", 1)
-        self._mark_seen(ticket["incarnation"], ticket["epoch"])
-        return self.reconcile(ticket["operation_id"], ticket["attempt_id"])
-
-    def _insert(self, ticket, state, run_count):
-        self._db.execute(
-            "INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,0)",
-            (self.device, ticket["operation_id"], ticket["attempt_id"], ticket["admission_id"],
-             ticket["digest"], state, run_count, ticket["incarnation"], ticket["epoch"]))
-
-    def _update(self, ticket, state, run_count):
-        self._db.execute(
-            "UPDATE receipts SET state=?, run_count=? WHERE target=? AND operation_id=? AND attempt_id=?",
-            (state, run_count, self.device, ticket["operation_id"], ticket["attempt_id"]))
-
-    def runs(self, operation_id):
-        row = self._db.execute(
-            "SELECT COALESCE(SUM(run_count), 0) AS n FROM receipts WHERE target=? AND operation_id=?",
-            (self.device, operation_id)).fetchone()
-        return int(row["n"])
-
-
-def _receipt_view(row):
-    return {"target": row["target"], "operation_id": row["operation_id"], "attempt_id": row["attempt_id"],
-            "admission_id": row["admission_id"], "digest": row["digest"], "state": row["state"],
-            "run_count": row["run_count"], "incarnation": row["incarnation"], "epoch": row["epoch"],
-            "signature_verified": False, "replayed": row["state"] != "starting"}
-
-
-class PcRuntime:
-    """One PC's lease cache. Windows-shaped runtimes pass clock=None and never cache."""
-
-    def __init__(self, device, gateway, identity, *, clock, boot_id):
-        self.device = device
-        self.gateway = gateway
-        self.identity = identity
-        self.online_only = clock is None
-        self.cache = CachedAuthority(clock=clock, boot=lambda: boot_id)
-        self.boot_id = boot_id
-        self.lease = None
-        self.admitting = False
-        self.ai_ready = False
-        self.asleep = False
-
-    def start(self):
-        return {"device": self.device, "admitting": self.admitting, "ai_ready": False,
-                "online_only": self.online_only}
-
-    def readiness(self, profile="control"):
-        if profile not in ("control", "ai"):
-            raise IntegrationError("bad_request")
-        return {"device": self.device, "profile": profile, "control_ready": True, "ai_ready": False,
-                "reason": "provider_unverified" if profile == "ai" else "control_only",
-                "provider": None}
-
-    def hold(self, lease, *, ready):
-        self.lease = dict(lease)
-        self.admitting = bool(ready)
-        self.ai_ready = False
-        started = self.cache.now()
-        if started is not None:
-            self.cache.observe(holder=self.device, incarnation=lease["incarnation"], epoch=lease["epoch"],
-                               valid_for=lease["valid_for"], ready=ready, request_started=started)
-
-    def renew_once(self):
-        if self.lease is None:
-            raise IntegrationError("no_main")
-        started = self.cache.now()
-        view = self.gateway.renew(self.identity, self.lease)
-        self.cache.observe(holder=self.device, incarnation=self.lease["incarnation"], epoch=self.lease["epoch"],
-                           valid_for=view["valid_for"], ready=view["ready"], request_started=started)
-        self.admitting = bool(view["ready"]) and not self.asleep
-        return view
-
-    def require_authority(self, effect_class, target=None):
-        del target
-        if not self.admitting:
-            return {"ok": False, "code": "admission_stopped", "acted": False, "source": "local"}
-        if effect_class == "ai":
-            return {"ok": False, "code": "ai_not_ready", "acted": False, "ai_ready": False}
-        if not self.online_only and self.cache.remaining(self.device, require_ready=True) > 0:
-            return {"ok": True, "source": "cache", "acted": False,
-                    "cached_seconds": self.cache.remaining(self.device)}
-        try:
-            view = self.renew_once()
-        except IntegrationError as exc:
-            return {"ok": False, "code": exc.code, "http": exc.http, "acted": False, "source": "online"}
-        if not view.get("ready"):
-            return {"ok": False, "code": "not_ready", "acted": False, "source": "online"}
-        return {"ok": True, "source": "online", "acted": False, "cached_seconds": 0.0}
-
-    def begin_drain(self, transition_id):
-        self.stop_new_admission("drain")
-        return {"transition_id": transition_id, "admitting": False}
-
-    def release_before_suspend(self):
-        self.stop_new_admission("suspend")
-        released = False
-        code = None
-        if self.lease is not None:
-            try:
-                self.gateway.release(self.identity, self.lease)
-                released = True
-            except IntegrationError as exc:
-                code = exc.code
-        self.invalidate_after_resume()
-        self.cache.invalidate("suspend")
-        return {"released": released, "code": code, "admitting": False}
-
-    def invalidate_after_resume(self):
-        self.cache.invalidate("resumed")
-        self.lease = None
-        self.admitting = False
-        self.asleep = False
-
-    def stop_new_admission(self, reason):
-        self.admitting = False
-        self.asleep = reason == "asleep"
-        return {"admitting": False, "reason": reason}
-
-    def fall_asleep(self):
-        """Process stops renewing and admitting. It does not ack a fence and may not reach release."""
-        self.stop_new_admission("asleep")
-        return {"released": False, "admitting": False}
-
-    def wake(self):
-        self.asleep = False
-        self.cache.invalidate("resumed")
-        self.admitting = False
-        self.lease = None
-
-
-class MobileIngress:
-    """Session table for the isolated loopback. Metadata only. Not the live phone server."""
-
-    def __init__(self, gateway, runtimes, executors, identities, clock):
-        self.gateway = gateway
-        self.runtimes = runtimes
-        self.executors = executors
-        self.identities = identities
-        self.clock = clock
-        self.sessions = {}
-        self.ops = {}
-        self.previews = {}
-        self.pairing_code = "pair-" + secrets.token_hex(4)
-        self.pairing_used = False
-
-    def pair(self, pairing_proof, client_metadata):
-        reject_personal(client_metadata or {})
-        if self.pairing_used or pairing_proof != self.pairing_code:
-            raise IntegrationError("unauthenticated")
-        self.pairing_used = True
-        cookie = "ck-" + secrets.token_hex(8)
-        session = {"id": "ses-" + secrets.token_hex(8), "role": "phone", "manage_main": False,
-                   "csrf": "csrf-" + secrets.token_hex(8), "origin": ORIGIN, "input_open": True}
-        self.sessions[cookie] = session
-        return {"session_id": session["id"], "cookie": cookie, "csrf": session["csrf"],
-                "manage_main": False, "origin": ORIGIN}
-
-    def authenticate(self, cookie, csrf_token, request_origin):
-        session = self.sessions.get(cookie)
-        if session is None or csrf_token != session["csrf"] or request_origin != session["origin"]:
-            raise IntegrationError("unauthenticated")
-        return {"role": "phone", "session_id": session["id"], "manage_main": False,
-                "authenticated_by": "session", "cookie": cookie}
-
-    def status(self, principal):
-        self._session(principal)
-        try:
-            view = self.gateway.status(self.identities["owner-pc"])
-        except IntegrationError as exc:
-            return {"ok": False, "code": exc.code, "http": exc.http, "stale": True, "commands": False}
-        return {"ok": True, "mode": view["mode"], "main": view["main"], "main_ready": view["main_ready"],
-                "epoch": view["epoch"], "commands": False, "manage_main": False}
-
-    def submit(self, principal, operation_id, request):
-        session = self._session(principal)
-        reject_personal(request)
-        if operation_id in self.ops:
-            return dict(self.ops[operation_id])
-        record = {"operation_id": operation_id, "state": "held", "code": None, "run_count": 0,
-                  "session_id": session["id"], "cursor": 0}
-        self.ops[operation_id] = record
-        try:
-            bounded = self._bounded(operation_id, request)
-            relay = self.gateway.relay(principal, operation_id, bounded)
-            runtime = self.runtimes[relay["main"]]
-            decision = runtime.require_authority(relay["effect_class"], relay["target"])
-            if not decision["ok"]:
-                record.update(state="rejected", code=decision["code"], cursor=1)
-                return dict(record)
-            ticket = self._ticket(bounded, relay)
-            receipt = self.executors[relay["target"]].accept(self.identities[relay["main"]], {}, ticket)
-            record.update(state=receipt["state"], code=None, run_count=receipt["run_count"],
-                          admission_id=receipt["admission_id"], epoch=receipt["epoch"], cursor=2)
-        except IntegrationError as exc:
-            record.update(state="rejected", code=exc.code, cursor=1)
-        return dict(record)
-
-    def operation(self, principal, operation_id, cursor=None):
-        self._session(principal)
-        row = self.ops.get(operation_id)
-        if row is None:
-            return {"operation_id": operation_id, "state": "unknown", "cursor": cursor, "run_count": 0}
-        return dict(row)
-
-    def hold(self, principal, operation_id, request):
-        """Remember an explicit operation id and do not execute it."""
-        session = self._session(principal)
-        reject_personal(request)
-        if operation_id in self.ops:
-            return dict(self.ops[operation_id])
-        record = {"operation_id": operation_id, "state": "held", "code": None, "run_count": 0,
-                  "session_id": session["id"], "cursor": 0, "target": request["target"],
-                  "effect_class": request["effect_class"]}
-        self.ops[operation_id] = record
-        return dict(record)
-
-    def note_input(self, principal, token):
-        session = self._session(principal)
-        if not session["input_open"]:
-            return {"accepted": False, "replayed": False}
-        if not isinstance(token, str) or token in PERSONAL:
-            raise IntegrationError("personal_field")
-        session.setdefault("dropped", 0)
-        session["dropped"] = 0
-        return {"accepted": True, "persisted": False}
-
-    def disconnect(self, cookie):
-        session = self.sessions.get(cookie)
-        if session is None:
-            raise IntegrationError("unauthenticated")
-        session["input_open"] = False
-        stopped = self.executors["dell"].stop_interactive(session["id"], "disconnect")
-        return {"session_id": session["id"], "input_open": False, "stopped": stopped["state"]}
-
-    def manage_main_preview(self, principal, request):
-        if not principal.get("manage_main"):
-            raise IntegrationError("not_manage_main")
-        reject_personal(request)
-        view = self.gateway.status(self.identities["owner-pc"])
-        if view["transition"]:
-            raise IntegrationError("busy")
-        preview_id = "pv-" + secrets.token_hex(4)
-        proof = self.gateway.mint_owner_proof()
-        challenge = "ch-" + secrets.token_hex(4)
-        self.previews[preview_id] = {"proof": proof, "challenge": challenge, "request": dict(request),
-                                     "incarnation": view["incarnation"], "epoch": view["epoch"],
-                                     "policy": view["policy_version"]}
-        return {"preview_id": preview_id, "challenge": challenge, "mutates": False,
-                "incarnation": view["incarnation"], "epoch": view["epoch"], "policy": view["policy_version"],
-                "passkey_verifier": False}
-
-    def manage_main_confirm(self, principal, preview_id, passkey_proof):
-        if not principal.get("manage_main"):
-            raise IntegrationError("not_manage_main")
-        preview = self.previews.get(preview_id)
-        if preview is None or passkey_proof != preview["challenge"]:
-            raise IntegrationError("bad_passkey")
-        view = self.gateway.status(self.identities["owner-pc"])
-        if (view["incarnation"], view["epoch"], view["policy_version"]) != (
-                preview["incarnation"], preview["epoch"], preview["policy"]):
-            raise IntegrationError("stale")
-        return self.gateway.transition_request(preview["proof"], preview["request"])
-
-    def _session(self, principal):
-        if not isinstance(principal, dict) or principal.get("authenticated_by") != "session":
-            raise IntegrationError("unauthenticated")
-        for session in self.sessions.values():
-            if session["id"] == principal.get("session_id"):
-                return session
-        raise IntegrationError("unauthenticated")
-
-    def _bounded(self, operation_id, request):
-        effect = request.get("effect_class")
-        target = request.get("target")
-        if effect not in ("control", "ai") or not isinstance(target, str):
-            raise IntegrationError("bad_request")
-        attempt = request.get("attempt_id") or "a-1"
-        return {"operation_id": operation_id, "attempt_id": attempt, "target": target,
-                "effect_class": effect,
-                "digest": operation_digest(target, operation_id, attempt, effect)}
-
-    def _ticket(self, bounded, relay):
-        wall = self.clock.wall()
-        return {"admission_id": "adm-" + bounded["operation_id"], "target": bounded["target"],
-                "operation_id": bounded["operation_id"], "attempt_id": bounded["attempt_id"],
-                "digest": bounded["digest"], "main": relay["main"], "incarnation": relay["incarnation"],
-                "epoch": relay["epoch"], "issued_at": wall - 1, "admit_until": wall + 3600,
-                "issuer_incarnation": relay["incarnation"], "effect_class": bounded["effect_class"]}
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+        self.executor.close()
 
 
 class IsolatedFleet:
-    """Temp-store Arch/Dell/phone loopback. Production integration stays legacy."""
+    """Temp-directory fleet built from the real modules and nothing else.
+
+    Real: `AuthorityStore` behind `ContinuityGateway` on a loopback socket, installation
+    and owner ssh keys, `AuthorityClient`, `MainRuntime`, `ExecutorGuard`,
+    `ContinuityGatewaySession`, `MobileIngress`. Stand-ins: a loopback MAIN relay sink per
+    PC, and a `Clock`. It refuses a root under the live `.jarvis`. It is not Oracle or Dell.
+    """
 
     def __init__(self, directory, clock):
         root = Path(directory).resolve()
-        live = Path(__file__).resolve().parents[2] / ".jarvis"
+        live = (Path(__file__).resolve().parents[2] / ".jarvis").resolve()
         if root == live or live in root.parents:
             raise IntegrationError("refuses_live_state")
         self.root = root
         self.clock = clock
-        self.db_path = root / "authority.sqlite"
-        self.store = self._open_store()
-        self.gateway = LoopbackGateway(self.store)
-        self.secrets = {device: secrets.token_hex(16) for device in
-                        ("zenbook", "dell", "oracle", "owner-pc")}
-        for device in self.secrets:
-            installation = "owner-inst" if device == "owner-pc" else device + "-inst"
-            self.gateway.enroll(device, installation, self.secrets[device])
-        self.identities = {device: self._identity(device) for device in self.secrets}
-        boot_clock = clock.mono
-        self.arch = PcRuntime("zenbook", self.gateway, self.identities["zenbook"],
-                              clock=boot_clock, boot_id="arch-boot-1")
-        self.dell = PcRuntime("dell", self.gateway, self.identities["dell"], clock=None, boot_id="dell-boot-1")
-        self.arch_exec = LocalExecutor(root / "zenbook-receipts.sqlite", self.gateway, "zenbook",
-                                       require_signature=False)
-        self.dell_exec = LocalExecutor(root / "dell-receipts.sqlite", self.gateway, "dell",
-                                       require_signature=False)
-        self.ingress = MobileIngress(
-            self.gateway, {"zenbook": self.arch, "dell": self.dell},
-            {"zenbook": self.arch_exec, "dell": self.dell_exec}, self.identities, clock)
-        self.production = ContinuityIntegration()
-        self.signature_verified = False
-        self.production_failover = False
+        self._keys = self._make_keys()
+        self.gateway = ContinuityGateway.open(
+            root / "authority.sqlite", FLEET_ID, AUTHORITY_ID, [self._keys["owner"][0]],
+            monotonic=clock.mono, wall=clock.wall)
+        self.origin = self.gateway.serve()
+        self.owner = self._client(LinkedClient, None, owner=True)
+        self._enrolled = []
+        self.nodes = {}
+        self.ingress = None
+        try:
+            self.nodes["zenbook"] = PcNode(self, "zenbook", suspend_cache=True)
+            self.nodes["dell"] = PcNode(self, "dell", suspend_cache=False)
+        except Exception:
+            self.close()
+            raise
+        self.oracle = self._client(LinkedClient, "oracle")
+        self.phone_client = self._client(LinkedClient, "ingress")
 
-    def _open_store(self):
-        return AuthorityStore(self.db_path, FLEET_ID, AUTHORITY_ID, monotonic=self.clock.mono,
-                              wall=self.clock.wall, lease_seconds=LEASE_SECONDS, margin=SAFETY_MARGIN)
+    def _make_keys(self):
+        folder = self.root / "keys"
+        folder.mkdir(parents=True, exist_ok=True)
+        made = {}
+        for name in ("owner", "zenbook", "dell", "oracle", "ingress"):
+            path = folder / name
+            subprocess.run(
+                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "jarvis-continuity-test", "-f", str(path)],
+                check=True, capture_output=True, timeout=20)
+            token = (folder / (name + ".pub")).read_text(encoding="ascii").split()
+            made[name] = (token[0] + " " + token[1], path)
+        return made
 
-    def _identity(self, device):
-        installation = "owner-inst" if device == "owner-pc" else device + "-inst"
-        return {"device": device, "installation_id": installation, "secret": self.secrets[device]}
+    def public(self, name):
+        return self._keys[name][0]
 
-    def close(self):
-        for executor in (getattr(self, "arch_exec", None), getattr(self, "dell_exec", None)):
-            if executor is not None:
-                executor.close()
-        if getattr(self, "store", None) is not None:
-            self.store.close()
+    def status(self):
+        """Metadata status as the Arch PC's own authenticated client sees it."""
+        return self.nodes["zenbook"].client.status()
 
-    def dispatch_flags(self):
-        view = self.store.status()
-        legacy = view["mode"] == "LEGACY_ACTIVE"
-        v2 = view["mode"] == "V2_ACTIVE" and bool(view["main_ready"])
-        return {"mode": view["mode"], "legacy": legacy, "v2": v2, "both": bool(legacy and v2),
-                "production_mode": self.production.mode()["mode"]}
+    def _client(self, cls, name, *, owner=False):
+        kwargs = {"authority_id": AUTHORITY_ID, "wall": self.clock.wall}
+        if name is not None:
+            kwargs.update(device_id=name, installation_id=name + "-inst",
+                          private_key_path=self._keys[name][1])
+        if owner or name is None:
+            kwargs["owner_private_key_path"] = self._keys["owner"][1]
+        return cls(self.origin, **kwargs)
+
+    def enroll(self, name, kind, capabilities, relay_origin=None):
+        record = {"device_id": name, "installation_id": name + "-inst", "kind": kind,
+                  "public_key": self.public(name), "capabilities": list(capabilities)}
+        if relay_origin:
+            record["relay_origin"] = relay_origin
+        self._enrolled.append(record)
+        return self.owner.enroll(record)
+
+    def restart_gateway(self):
+        """Close the gateway and reopen it on the same database, a new port and fresh RAM.
+
+        Enrolments live in the gateway's RAM, so the owner re-enrols them. The authority
+        store keeps its rows: it comes back with a new incarnation and no MAIN.
+        """
+        self.gateway.close()
+        self.gateway = ContinuityGateway.open(
+            self.root / "authority.sqlite", FLEET_ID, AUTHORITY_ID, [self._keys["owner"][0]],
+            monotonic=self.clock.mono, wall=self.clock.wall)
+        self.origin = self.gateway.serve()
+        clients = [self.owner, self.oracle, self.phone_client] + [n.client for n in self.nodes.values()]
+        for client in clients:
+            client.origin = self.origin
+        for record in self._enrolled:
+            self.owner.enroll(record)
+        if self.ingress is not None:
+            self.ingress._gateway._gateway = self.gateway
+        return self.nodes["zenbook"].client.status()
 
     def cutover(self):
-        for device, kind in (("zenbook", "pc"), ("dell", "pc"), ("oracle", "server")):
-            self.store.register_participant(device, device + "-inst", kind)
-        version = self.store.status()["mode_version"]
-        version = self.store.set_mode("PREPARING_V2", version)
-        version = self.store.set_mode("QUIESCED", version)
-        for device in ("zenbook", "dell", "oracle"):
-            self.gateway.acknowledge(self.identities[device], version + 1, 0)
-        self.store.set_mode("V2_ONLY_NO_MAIN", version)
-        return self.store.status()
+        """Enroll everyone and walk the store to V2_ONLY_NO_MAIN. Every participant acks."""
+        for name, node in self.nodes.items():
+            self.enroll(name, "pc", _PC_CAPS, relay_origin=node.origin)
+        self.enroll("oracle", "server", _SERVER_CAPS)
+        self.enroll("ingress", "client", ["status", "client"])
+        status = self.nodes["zenbook"].client.status()
+        version = status["mode_version"]
+        version = self.owner.set_mode("PREPARING_V2", version)["mode_version"]
+        version = self.owner.set_mode("QUIESCED", version)["mode_version"]
+        for node in self.nodes.values():
+            node.executor.fence(status["incarnation"], 0, version + 1)
+        self.oracle.acknowledge(version + 1, 0)
+        self.owner.set_mode("V2_ONLY_NO_MAIN", version)
+        return self.nodes["zenbook"].client.status()
 
-    def _request(self, candidate, key, profile):
-        view = self.store.status()
-        action = "recover" if view["main"] is None else "make_main_now"
-        proof = self.gateway.mint_owner_proof()
-        return self.gateway.transition_request(proof, {
-            "action": action, "candidate": candidate, "profile": profile, "client_key": key,
-            "expected_incarnation": view["incarnation"], "expected_epoch": view["epoch"],
-            "expected_policy": view["policy_version"]})
+    def promote(self, candidate, key=None, *, canary=True, until="complete"):
+        """Owner-driven recover to `candidate`. `key` is the request idempotency id.
 
-    def try_request(self, candidate, key, profile="control"):
-        try:
-            return {"ok": True, "view": self._request(candidate, key, profile)}
-        except IntegrationError as exc:
-            return {"ok": False, "code": exc.code, "http": exc.http, "retry_after": exc.retry_after}
+        `until` stops after drain/fence/grant for failure tests.
+        """
+        key = key or "recover-" + candidate + "-" + str(int(self.clock.wall()))
+        node = self.nodes[candidate]
+        status = node.client.status()
+        opened = self.owner.transition_request(
+            key, "recover", candidate, status["incarnation"], status["epoch"], status["policy_version"])
+        tid = opened["transition_id"]
+        node.client.readiness(tid, True, False, "cp-1")
+        self.owner.step(tid, "drain")
+        if until == "drain":
+            return tid, None
+        while True:
+            try:
+                self.owner.step(tid, "fence")
+                break
+            except GatewayError as exc:
+                if exc.code != "not_quiet" or not exc.wait:
+                    raise
+                self.clock.tick(exc.wait + 0.01)
+        if until == "fence":
+            return tid, None
+        lease = self.owner.step(tid, "grant")
+        if until == "grant":
+            return tid, lease
+        self.owner.step(tid, "complete", canary)
+        return tid, lease
 
-    def prepare_candidate(self, transition_id, candidate, *, control=True, ai=False, profile="control"):
-        del profile
-        self.gateway.transition_readiness(self.identities[candidate], transition_id, {
-            "control_ready": control, "ai_ready": ai, "checkpoint": "cp-1"})
-        return self.gateway.transition_step(self.identities["owner-pc"], transition_id, "drain")
+    def phone_ingress(self, path, *, peer_verifier, owner_verifier=None, owner_proof=None,
+                      passkey_verifier=None, blocked_stable_ids=("pc-zenbook", "pc-dell"), log=None,
+                      origin=ORIGIN):
+        session = ContinuityGatewaySession(
+            self.gateway, "ingress", "ingress-inst", self._keys["ingress"][1], wall=self.clock.wall)
+        allowed = {
+            "zenbook": pin_target("zenbook", "https://zenbook.tailnet.ts.net", "100.64.0.10"),
+            "dell": pin_target("dell", "https://dell.tailnet.ts.net", "100.64.0.11"),
+        }
+        self.ingress = MobileIngress(
+            path, session, origin=origin, installation_id="oracle-inst", allowed_mains=allowed,
+            peer_verifier=peer_verifier, blocked_stable_ids=blocked_stable_ids,
+            passkey_verifier=passkey_verifier, owner_verifier=owner_verifier, owner_proof=owner_proof,
+            clock=self.clock.wall, log=log)
+        return self.ingress
 
-    def try_fence(self, transition_id):
-        try:
-            view = self.gateway.transition_step(self.identities["owner-pc"], transition_id, "fence")
-            return {"ok": True, "view": view}
-        except IntegrationError as exc:
-            return {"ok": False, "code": exc.code, "http": exc.http, "retry_after": exc.retry_after}
-
-    def ack_awake(self):
-        view = self.store.status()
-        for device, runtime in (("zenbook", self.arch), ("dell", self.dell), ("oracle", None)):
-            if runtime is not None and runtime.asleep:
-                continue
-            self.gateway.acknowledge(self.identities[device], view["mode_version"], view["epoch"])
-
-    def grant_candidate(self, transition_id, candidate):
-        return self.gateway.transition_step(self.identities[candidate], transition_id, "grant")
-
-    def finish(self, transition_id, candidate, canary):
-        view = self.gateway.transition_step(self.identities["owner-pc"], transition_id, "complete", canary=canary)
-        return view
-
-    def boot_zenbook(self):
-        self.cutover()
-        opened = self._request("zenbook", "boot-zenbook", "control")
-        self.prepare_candidate(opened["transition_id"], "zenbook", control=True, ai=False)
-        fenced = self.try_fence(opened["transition_id"])
-        if not fenced["ok"]:
-            raise IntegrationError(fenced["code"], fenced["retry_after"])
-        lease = self.grant_candidate(opened["transition_id"], "zenbook")
-        self.arch.hold(lease, ready=False)
-        refused = self._direct_accept("zenbook", "op-too-soon", "zenbook", lease)
-        self.finish(opened["transition_id"], "zenbook", True)
-        self.arch.renew_once()
-        return {"lease": self.arch.lease, "not_ready": refused, "status": self.store.status()}
-
-    def sleep_promote_dell(self, during_sleep=None):
-        """Arch stops renewing. Dell is not MAIN until the old validity and margin drain."""
-        old = {key: self.arch.lease[key] for key in
-               ("holder", "lease_id", "incarnation", "epoch", "valid_for", "ready")}
-        cache_while_asleep = None
-        self.arch.fall_asleep()
-        early_local = self.arch.require_authority("control")
-        if self.arch.cache.now() is not None:
-            cache_while_asleep = self.arch.cache.remaining("zenbook")
-        during = during_sleep() if during_sleep else None
-        early = self.try_request("dell", "recover-dell")
-        self.clock.tick(LEASE_SECONDS - 5)
-        still = self.try_request("dell", "recover-still")
-        self.clock.tick(6)
-        opened = self._request("dell", "recover-dell-2", "control")
-        self.prepare_candidate(opened["transition_id"], "dell", control=True, ai=False)
-        self.ack_awake()
-        waited = self.try_fence(opened["transition_id"])
-        if waited["ok"] or not waited["retry_after"]:
-            raise IntegrationError("bad_state")
-        self.clock.tick(waited["retry_after"] + 0.01)
-        fenced = self.try_fence(opened["transition_id"])
-        if not fenced["ok"]:
-            raise IntegrationError(fenced["code"], fenced["retry_after"])
-        lease = self.grant_candidate(opened["transition_id"], "dell")
-        self.dell.hold(lease, ready=False)
-        not_ready = self._direct_accept("dell", "op-before-canary", "dell", lease)
-        self.finish(opened["transition_id"], "dell", True)
-        self.dell.renew_once()
-        self.dell_exec.fence(lease["incarnation"], lease["epoch"], self.store.status()["mode_version"])
-        self.arch.wake()
-        return {"old_lease": old, "early_local": early_local, "cache_while_asleep": cache_while_asleep,
-                "during_sleep": during, "early": early, "still_alive": still, "waited": waited,
-                "not_ready": not_ready, "status": self.store.status(),
-                "dell_cached_seconds": self.dell.cache.remaining("dell")}
-
-    def _direct_accept(self, main, operation_id, target, lease):
-        ticket = self.ticket(main, operation_id, target, lease)
-        try:
-            receipt = self.executors()[target].accept(self.identities[main], {}, ticket)
-            return {"ok": True, "receipt": receipt}
-        except IntegrationError as exc:
-            return {"ok": False, "code": exc.code, "http": exc.http}
-
-    def executors(self):
-        return {"zenbook": self.arch_exec, "dell": self.dell_exec}
-
-    def ticket(self, main, operation_id, target, lease, attempt="a-1"):
-        wall = self.clock.wall()
-        return {"admission_id": "adm-" + operation_id, "target": target, "operation_id": operation_id,
-                "attempt_id": attempt, "digest": operation_digest(target, operation_id, attempt, "control"),
-                "main": main, "incarnation": lease["incarnation"], "epoch": lease["epoch"],
-                "issued_at": wall - 1, "admit_until": wall + 3600, "issuer_incarnation": lease["incarnation"]}
+    def tickets(self, name):
+        return self.nodes[name].executor
 
     def persisted_bytes(self):
-        blob = bytearray()
+        blobs = []
         for path in sorted(self.root.rglob("*")):
-            if path.is_file():
-                blob.extend(path.read_bytes())
-                blob.extend(b"\n")
-        blob.extend(json.dumps(self.gateway.log).encode())
-        return bytes(blob)
+            if path.is_file() and path.parent.name != "keys":
+                blobs.append(path.read_bytes())
+        blobs.append(json.dumps(self.gateway.audit_events()).encode("utf-8"))
+        return b"\n".join(blobs)
 
-    def restart_authority(self):
-        self.store.close()
-        self.store = self._open_store()
-        self.gateway.store = self.store
-        self.arch.invalidate_after_resume()
-        self.dell.invalidate_after_resume()
-        return self.store.status()
-
-    def reboot_executor(self, device):
-        revived = self.executors()[device].reopen()
-        if device == "dell":
-            self.dell_exec = revived
-        else:
-            self.arch_exec = revived
-        self.ingress.executors[device] = revived
-        return revived
-
-    def capture(self, fn):
+    def close(self):
+        if self.ingress is not None:
+            try:
+                self.ingress.close()
+            except Exception:
+                pass
+        for node in self.nodes.values():
+            node.close()
         try:
-            return {"ok": True, "value": fn()}
-        except IntegrationError as exc:
-            return {"ok": False, "code": exc.code, "http": exc.http, "retry_after": exc.retry_after}
+            self.gateway.close()
+        except Exception:
+            pass
+
+
+# Opt-in launch contract. Everything here is RAM and default-off: with no call to
+# `close_unfenced`, every legacy entry point behaves as before.
+_launch = {"closed": set(), "seen": "before", "phone_open": True}
+
+
+def close_unfenced(*surfaces):
+    """Close legacy surfaces. Called only by a deployment that has done the explicit cutover."""
+    _launch["closed"].update(str(item) for item in (surfaces or ("*",)))
+
+
+def open_unfenced():
+    _launch["closed"].clear()
+    _launch["seen"] = "before"
+    _launch["phone_open"] = True
+
+
+def refuse_unfenced(surface):
+    """Legacy entry-point hook: raise only after an explicit `close_unfenced`."""
+    if "*" in _launch["closed"] or surface in _launch["closed"]:
+        raise IntegrationError("legacy_retained")
+
+
+def node_seen_mode():
+    return _launch["seen"]
+
+
+def set_node_seen_mode(mode):
+    if mode not in ("before", "after"):
+        raise IntegrationError("bad_request")
+    _launch["seen"] = mode
+
+
+def apply_node_seen(record, run):
+    """Run a node job with the seen-mark before (legacy) or after (v2, so a failed run is retried)."""
+    if _launch["seen"] == "after":
+        result = run()
+        record()
+        return result
+    record()
+    return run()
+
+
+def phone_listener_open():
+    return _launch["phone_open"] and "phone" not in _launch["closed"] and "*" not in _launch["closed"]
+
+
+def set_phone_listener_open(value):
+    _launch["phone_open"] = bool(value)
