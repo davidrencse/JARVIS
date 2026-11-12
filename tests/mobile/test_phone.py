@@ -464,8 +464,6 @@ class RealShell(PhoneBase):
     def test_every_asset_the_shell_references_is_served(self):
         import re
         web = phone.WEB
-        if not (web / "phone" / "index.html").is_file():
-            self.skipTest("the phone shell isn't built yet")
         self.server.web = web
         texts = [(web / "phone" / name).read_text(encoding="utf-8")
                  for name in ("index.html", "sw.js", "manifest.webmanifest", "phone.css")]

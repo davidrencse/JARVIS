@@ -192,7 +192,13 @@ function page(opt = {}) {
     navigator: { userAgent: ua, platform: opt.platform || "Linux armv8l", maxTouchPoints: 5, standalone: opt.standalone === true,
       wakeLock: { request: async () => { state.locks++; return { release: async () => {}, addEventListener() {} }; } } },
     matchMedia: (q) => ({ matches: q === "(display-mode: standalone)" ? opt.standalone === true : false, addEventListener() {} }),
-    localStorage: { getItem: (k) => (store.has(k) ? store.get(k) : null), setItem: (k, v) => store.set(k, String(v)) },
+    localStorage: {
+      getItem: (k) => (store.has(k) ? store.get(k) : null),
+      setItem: (k, v) => { if (opt.storageSetThrows) throw new Error("denied"); store.set(k, String(v)); },
+      removeItem: (k) => { store.delete(k); },
+    },
+    btoa: (s) => Buffer.from(String(s), "latin1").toString("base64"),
+    atob: (s) => Buffer.from(String(s), "base64").toString("latin1"),
     getComputedStyle: () => ({ getPropertyValue: () => "" }),
     setTimeout: clock.setTimeout, clearTimeout: clock.clear, setInterval: clock.setInterval, clearInterval: clock.clear,
     URL: { createObjectURL: () => "blob:" + ++state.blobs, revokeObjectURL: (u) => state.revoked.push(u) },
@@ -209,12 +215,15 @@ function page(opt = {}) {
     async settle(ms = 0) { await clock.advance(ms); },
     async go(h) { location.hash = h; await clock.advance(5); },
     click: (id) => fire(els[id], "click", {}),
+    nav: context.navigator,
     storage: (k) => store.get(k),
+    hash: () => location.hash,
     sent: () => state.inputs.filter((e) => e.t !== "move"),
     callsTo: (path, method = "POST") => state.calls.filter((c) => c.path === path && c.method === method),
     frame(seq) {
       pushFrame(() => reply(200, undefined, { "X-Frame-Seq": String(seq), "X-Frame-Width": "1600", "X-Frame-Height": "1000" }));
     },
+    frameReply(status, body, headers) { pushFrame(() => reply(status, body, headers)); },
     ptr(kind, o) { return fire(stage(), kind, Object.assign({ pointerId: 1, pointerType: "touch", button: 0, buttons: 1, clientX: 200, clientY: 150 }, o)); },
     // Device detail, then the Control (or Camera) button, then the first frame.
     async open(kind = "control", device = "dell") {
@@ -369,13 +378,16 @@ const scenarios = {
     p.click("p-go");
     await p.settle(10);
     const first = p.callsTo("/phone/pair")[0];
-    assert.deepEqual(first.body, { code: "ABCD2345", name: "Pocket" });
+    assert.equal(first.body.code, "ABCD2345");
+    assert.equal(first.body.name, "Pocket");
+    assert.match(first.body.operation_id, /^[A-Za-z0-9_-]{8,64}$/);
     assert.equal(first.headers["X-JARVIS-Phone"], "1");
     assert.equal(first.headers["Content-Type"], "application/json");
     assert.equal(p.els["pair-wait"].hidden, false);
     assert.equal(p.els["pair-form"].hidden, true);
     await p.settle(2010);
     assert.equal(p.callsTo("/phone/pair/status").length, 1);
+    assert.equal(p.callsTo("/phone/pair/status")[0].body.operation_id, first.body.operation_id);
     p.state.routes["POST /phone/pair/status"] = () => { paired = true; return [200, { ok: true, phone: { id: "p1", name: "Pocket" } }]; };
     await p.settle(2010);
     assert.equal(p.els.app.hidden, false);
@@ -744,6 +756,8 @@ const scenarios = {
     const calls = p.callsTo("/phone/api/ask");
     assert.equal(calls.length, 2);
     assert.notEqual(calls[0].body.key, calls[1].body.key, "a request that failed on the PC retries as a new one");
+    assert.equal(calls[0].body.key, calls[0].body.operation_id);
+    assert.equal(calls[1].body.key, calls[1].body.operation_id);
     assert.match(calls[0].body.key, /^[A-Za-z0-9_-]{8,64}$/);
     assert.match(msg.textContent, /Second time\./);
   },
@@ -776,6 +790,8 @@ const scenarios = {
     p.fire(retry, "click", {}); await p.settle(30);
     const calls = p.callsTo("/phone/api/ask");
     assert.equal(calls[0].body.key, calls[1].body.key);
+    assert.equal(calls[0].body.operation_id, calls[0].body.key);
+    assert.equal(calls[1].body.operation_id, calls[0].body.key);
     assert.match(msg.textContent, /Once\./);
   },
 
@@ -1040,6 +1056,554 @@ const scenarios = {
     assert.equal(chunk.includes("main-transfer"), false);
     assert.equal(chunk.includes("localStorage"), false);
     assert.equal(chunk.includes('id !== "locate"'), true);
+    assert.equal(chunk.includes("localStorage"), false);
+    assert.equal(/console\.(log|debug|info|warn|error)/.test(chunk), false);
+  },
+
+  async csrf_is_captured_on_pair_reused_and_cleared_only_on_forget_or_revoke() {
+    const token = "csrf-token-value-0123456789abcd";
+    const kept = page({ storage: { "jarvis.phone.csrf": token } });
+    await kept.settle(10);
+    const me = kept.state.calls.find((c) => c.path === "/phone/api/me");
+    assert.equal(me.headers["X-CSRF-Token"], token);
+    assert.equal(kept.storage("jarvis.phone.csrf"), token);
+    kept.state.offline = true;
+    await kept.settle(5100);
+    assert.equal(kept.storage("jarvis.phone.csrf"), token, "a lost link keeps the token");
+    kept.state.offline = false;
+    kept.state.routes["GET /phone/api/overview"] = () => [500, { error: "busy" }];
+    await kept.settle(5100);
+    assert.equal(kept.storage("jarvis.phone.csrf"), token, "a refusal is not a revoke");
+    kept.state.routes["GET /phone/api/overview"] = () => [401, { error: "Not paired.", pair: false }];
+    await kept.settle(5100);
+    assert.equal(kept.storage("jarvis.phone.csrf"), token, "401 without pair is not a revoke");
+
+    const stale = page({ storage: { "jarvis.phone.csrf": "short" } });
+    await stale.settle(10);
+    assert.equal(stale.storage("jarvis.phone.csrf"), undefined);
+    assert.equal(stale.state.calls.find((c) => c.path === "/phone/api/me").headers["X-CSRF-Token"], undefined);
+
+    const p = page();
+    let paired = false;
+    p.state.routes["GET /phone/api/me"] = () => (paired ? [200, p.state.me] : [401, { error: "Pair first.", pair: true }]);
+    await p.settle(10);
+    p.els["p-code"].value = "ABCD2345";
+    p.els["p-name"].value = "Pocket";
+    p.click("p-go");
+    await p.settle(10);
+    assert.equal(p.callsTo("/phone/pair")[0].headers["X-CSRF-Token"], undefined);
+    p.state.routes["POST /phone/pair/status"] = () => {
+      paired = true;
+      return [200, { ok: true, csrf_token: token, phone: { id: "p1", name: "Pocket" } }];
+    };
+    await p.settle(4010);
+    assert.equal(p.storage("jarvis.phone.csrf"), token);
+    assert.equal(p.els.app.hidden, false);
+    const authed = p.state.calls.filter((c) => c.path === "/phone/api/me").at(-1);
+    assert.equal(authed.headers["X-CSRF-Token"], token);
+    await p.open();
+    const frame = p.state.calls.find((c) => c.path === "/phone/api/session/frame");
+    assert.equal(frame.headers["X-CSRF-Token"], token);
+    assert.match(frame.url, /^\/phone\/api\/session\/frame\?session=[^&]+&after=\d+$/);
+    assert.doesNotMatch(frame.url, /csrf|token|operation_id/i);
+    await p.go("#/phone");
+    p.click("pn-forget");
+    await p.settle(10);
+    p.click("pn-forget");
+    await p.settle(30);
+    assert.equal(p.els.pair.hidden, false);
+    assert.equal(p.storage("jarvis.phone.csrf"), undefined);
+    assert.equal(p.callsTo("/phone/api/logout")[0].headers["X-CSRF-Token"], token);
+
+    const revoked = page({ storage: { "jarvis.phone.csrf": token } });
+    revoked.state.routes["GET /phone/api/me"] = () => [401, { error: "This phone was revoked.", pair: true }];
+    await revoked.settle(10);
+    assert.equal(revoked.els.pair.hidden, false);
+    assert.equal(revoked.storage("jarvis.phone.csrf"), undefined);
+  },
+
+  async operation_ids_are_distinct_and_stable_when_the_same_request_is_retried() {
+    const p = page();
+    let paired = false;
+    p.state.routes["GET /phone/api/me"] = () => (paired ? [200, p.state.me] : [401, { error: "Pair first.", pair: true }]);
+    await p.settle(10);
+    p.els["p-code"].value = "ABCD2345";
+    p.click("p-go");
+    await p.settle(2010);
+    const pairId = p.callsTo("/phone/pair")[0].body.operation_id;
+    assert.equal(p.callsTo("/phone/pair/status")[0].body.operation_id, pairId);
+    p.state.offline = true;
+    await p.settle(2010);
+    const polls = p.callsTo("/phone/pair/status");
+    assert.ok(polls.length >= 2);
+    assert.ok(polls.every((c) => c.body.operation_id === pairId));
+    p.state.offline = false;
+    p.state.routes["POST /phone/pair/status"] = () => { paired = true; return [200, { ok: true, phone: { id: "p1", name: "Pocket" } }]; };
+    await p.settle(2010);
+    assert.equal(p.els.app.hidden, false);
+
+    await p.go("#/ask");
+    p.state.routes["POST /phone/api/ask"] = () => [200, { reply: "Done." }];
+    p.els["a-text"].value = "one"; p.fire(p.els["a-text"], "input", {}); p.click("a-send"); await p.settle(20);
+    p.els["a-text"].value = "two"; p.fire(p.els["a-text"], "input", {}); p.click("a-send"); await p.settle(20);
+    const asks = p.callsTo("/phone/api/ask");
+    assert.equal(asks[0].body.key, asks[0].body.operation_id);
+    assert.equal(asks[1].body.key, asks[1].body.operation_id);
+    assert.notEqual(asks[0].body.operation_id, asks[1].body.operation_id);
+    assert.notEqual(asks[0].body.operation_id, pairId);
+
+    await p.open();
+    const start = p.callsTo("/phone/api/session/start")[0];
+    assert.match(start.body.operation_id, /^[A-Za-z0-9_-]{8,64}$/);
+    p.ptr("pointerdown", { clientX: 40, clientY: 40 });
+    p.ptr("pointerup", { clientX: 40, clientY: 40 });
+    await p.settle(40);
+    const inputs = p.callsTo("/phone/api/session/input");
+    assert.ok(inputs.length >= 1);
+    assert.match(inputs[0].body.operation_id, /^[A-Za-z0-9_-]{8,64}$/);
+    assert.notEqual(inputs[0].body.operation_id, start.body.operation_id);
+    await p.go("#/devices");
+    await p.settle(20);
+    const stop = p.callsTo("/phone/api/session/stop").at(-1);
+    assert.equal(stop.body.operation_id, "stop-" + SID);
+    assert.equal(stop.body.session, SID);
+
+    let n = 0;
+    p.state.routes["POST /phone/api/logout"] = () => { if (++n === 1) throw new TypeError("lost"); return [200, { ok: true }]; };
+    await p.go("#/phone");
+    p.click("pn-forget"); await p.settle(10); p.click("pn-forget"); await p.settle(20);
+    assert.equal(p.els.pair.hidden, true);
+    p.click("pn-forget"); await p.settle(10); p.click("pn-forget"); await p.settle(20);
+    const outs = p.callsTo("/phone/api/logout");
+    assert.equal(outs.length, 2);
+    assert.equal(outs[0].body.operation_id, outs[1].body.operation_id);
+    assert.match(outs[0].body.operation_id, /^[A-Za-z0-9_-]{8,64}$/);
+    assert.notEqual(outs[0].body.operation_id, pairId);
+  },
+
+  async fleet_promote_is_owner_gated_and_names_pending_refused_and_stale() {
+    const legacy = await booted();
+    legacy.state.me.can_write = true;
+    legacy.state.routes["GET /phone/api/fleet"] = () => [200, Object.assign(FLEET(), { can_write: true, actions: [{ id: "invite", path: "/api/fleet/invite" }] })];
+    legacy.storage && legacy.nav;
+    await legacy.go("#/fleet");
+    await legacy.settle(20);
+    assert.equal(legacy.els["fl-promote"].hidden, true);
+    assert.match(legacy.els["fl-main-status"].textContent, /No authoritative MAIN status/);
+    assert.equal(legacy.els["fl-transition"].textContent, "");
+    assert.equal(legacy.state.calls.some((c) => c.path.startsWith("/phone/api/main") || c.path.startsWith("/api/fleet")), false);
+    assert.match(legacy.els["fl-note"].textContent, /look, not change/);
+
+    const owner = await booted();
+    owner.state.me.manage_main = true;
+    owner.state.me.authority = { main: "main", main_ready: true, mode: "V2_ACTIVE", epoch: 3, transition: { state: "REQUESTED", candidate: "dell" } };
+    owner.state.me.main = { id: "main", label: "Main PC" };
+    owner.state.routes["GET /phone/api/fleet"] = () => [200, FLEET()];
+    await owner.go("#/fleet");
+    await owner.settle(20);
+    assert.equal(owner.els["fl-promote"].hidden, false);
+    assert.match(owner.els["fl-main-status"].textContent, /MAIN is Main PC/);
+    assert.match(owner.els["fl-transition"].textContent, /Promotion pending/);
+    assert.equal(owner.els["fl-candidate"].value, "spare");
+    assert.doesNotMatch(owner.els["fl-candidate"].textContent, /Oracle|locate|203/);
+    owner.state.me.authority.transition = { state: "FAILED", outcome: HOSTILE };
+    owner.state.me.authority = owner.state.me.authority;
+    owner.click("fl-retry");
+    await owner.settle(20);
+    assert.match(owner.els["fl-transition"].textContent, /Promotion refused/);
+    assert.ok(owner.els["fl-transition"].textContent.includes(HOSTILE));
+    assert.deepEqual(owner.state.innerHTML, []);
+    owner.state.me.authority.transition = { state: "stale" };
+    await owner.go("#/devices");
+    await owner.go("#/fleet");
+    await owner.settle(20);
+    assert.match(owner.els["fl-transition"].textContent, /Promotion stale/);
+    assert.match(owner.els["fl-transition"].textContent, /Nothing was changed/);
+
+    const unready = await booted();
+    unready.state.me.manage_main = true;
+    unready.state.me.authority = { main: null, main_ready: false, mode: "V2_ONLY_NO_MAIN" };
+    unready.state.routes["GET /phone/api/fleet"] = () => [200, FLEET()];
+    await unready.go("#/fleet");
+    await unready.settle(20);
+    assert.match(unready.els["fl-main-status"].textContent, /No authoritative MAIN\./);
+    assert.equal(unready.els["fl-promote"].hidden, false);
+    unready.state.routes["POST /phone/api/main/preview"] = (b) => {
+      assert.equal(b.manage_main, undefined);
+      assert.equal(b.action, "recover");
+      assert.equal(b.profile, "control");
+      return [503, { error: "Passkey checks are not configured. Nothing was changed.", code: "passkey_unavailable" }];
+    };
+    unready.click("fl-promote-go");
+    await unready.settle(20);
+    assert.match(unready.els["fl-promote-msg"].textContent, /Passkey checks are not configured/);
+    assert.equal(unready.callsTo("/phone/api/main/confirm").length, 0);
+    assert.equal(unready.nav.credentials, undefined);
+  },
+
+  async fleet_promote_sends_a_passkey_proof_and_retries_the_same_operation() {
+    const p = await booted();
+    p.state.me.manage_main = true;
+    p.state.me.authority = { main: "main", main_ready: true, transition: null };
+    p.state.me.main = { id: "main", label: "Main PC" };
+    const seen = [];
+    p.nav.credentials = {
+      get: async (opt) => {
+        seen.push(opt);
+        const enc = (s) => Uint8Array.from(s, (ch) => ch.charCodeAt(0));
+        return {
+          rawId: enc("raw-id").buffer,
+          response: {
+            clientDataJSON: enc("client").buffer,
+            authenticatorData: enc("authdata").buffer,
+            signature: enc("sig").buffer,
+          },
+        };
+      },
+    };
+    const challenge = "Y2hhbGxlbmdl";
+    let previews = 0, confirms = 0;
+    p.state.routes["GET /phone/api/fleet"] = () => [200, FLEET()];
+    p.state.routes["POST /phone/api/main/preview"] = (b) => {
+      previews++;
+      assert.equal(b.action, "make_main_now");
+      assert.equal(b.candidate, "spare");
+      assert.equal(b.manage_main, undefined);
+      assert.match(b.operation_id, /^[A-Za-z0-9_-]{8,64}$/);
+      return [200, { preview_id: "pv-1", challenge, rp_id: "zenbook.tail.ts.net", credential_ids: ["Y3JlZA"], action: "make_main_now", candidate: "spare" }];
+    };
+    p.state.routes["POST /phone/api/main/confirm"] = (b) => {
+      confirms++;
+      if (confirms === 1) throw new TypeError("lost");
+      return [200, { transition_id: "tr-1", state: "REQUESTED" }];
+    };
+    await p.go("#/fleet");
+    await p.settle(20);
+    p.click("fl-promote-go");
+    await p.settle(30);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].publicKey.userVerification, "required");
+    assert.equal(seen[0].publicKey.rpId, "zenbook.tail.ts.net");
+    assert.equal(seen[0].publicKey.allowCredentials.length, 1);
+    assert.equal(seen[0].publicKey.allowCredentials[0].type, "public-key");
+    const challengeBytes = seen[0].publicKey.challenge;
+    const allowId = seen[0].publicKey.allowCredentials[0].id;
+    assert.equal(Object.prototype.toString.call(challengeBytes), "[object Uint8Array]");
+    assert.equal(Object.prototype.toString.call(allowId), "[object Uint8Array]");
+    assert.equal(Buffer.from(challengeBytes).toString("utf8"), "challenge");
+    assert.equal(Buffer.from(allowId).toString("utf8"), "cred");
+    assert.match(p.els["fl-transition"].textContent, /Promotion pending/);
+    assert.equal(p.els["fl-promote-go"].textContent, "Try again");
+    p.click("fl-promote-go");
+    await p.settle(30);
+    assert.equal(previews, 1, "a lost confirm does not mint another preview");
+    assert.equal(confirms, 2);
+    const bodies = p.callsTo("/phone/api/main/confirm");
+    assert.equal(bodies[0].body.operation_id, bodies[1].body.operation_id);
+    assert.equal(bodies[0].body.preview_id, "pv-1");
+    assert.equal(bodies[0].body.proof, undefined);
+    const proof = bodies[0].body.passkey_proof;
+    assert.equal(proof.challenge, challenge);
+    assert.equal(proof.type, "public-key");
+    assert.equal(proof.rawId, Buffer.from("raw-id").toString("base64url"));
+    assert.equal(proof.id, proof.rawId);
+    assert.equal(proof.response.clientDataJSON, Buffer.from("client").toString("base64url"));
+    assert.equal(proof.response.authenticatorData, Buffer.from("authdata").toString("base64url"));
+    assert.equal(proof.response.signature, Buffer.from("sig").toString("base64url"));
+    assert.deepEqual(bodies[1].body.passkey_proof, proof);
+    assert.equal(bodies[0].body.operation_id === p.callsTo("/phone/api/main/preview")[0].body.operation_id, false);
+    assert.equal(JSON.stringify(bodies[0].body).includes("private"), false);
+    assert.doesNotMatch(p.els["s-fleet"].textContent, /raw-id|authdata/);
+    assert.match(p.els["fl-transition"].textContent, /Promotion pending/);
+  },
+
+  async ask_keeps_the_dell_target_and_the_running_decision_trace() {
+    const p = await booted();
+    await p.go("#/ask");
+    const steps = [
+      { id: "route", parent: "", label: "Routing to Dell", detail: "dell", state: "run", kind: "step" },
+      { id: "tool:1", parent: "route", label: "notes", detail: "", state: "run", kind: "tool" },
+    ];
+    p.state.routes["POST /phone/api/ask"] = () => [200, { pending: true, job: "abc123", trace: { available: true, rev: 2, steps: steps.slice(0, 1) } }];
+    p.state.routes["GET /phone/api/ask/*"] = () => [200, { pending: true, job: "abc123", trace: { available: true, rev: 4, steps, streaming: true } }];
+    p.els["a-target"].value = "dell";
+    p.fire(p.els["a-target"], "change", {});
+    p.els["a-text"].value = "check the Dell notes";
+    p.fire(p.els["a-text"], "input", {});
+    p.click("a-send");
+    await p.settle(40);
+    const sent = p.callsTo("/phone/api/ask")[0];
+    assert.equal(sent.body.device, "dell");
+    assert.equal(sent.body.key, sent.body.operation_id);
+    const you = p.els["a-thread"].children[0];
+    const msg = p.els["a-thread"].children[1];
+    assert.match(you.textContent, /Dell: check the Dell notes/);
+    assert.match(msg.textContent, /Decision path/);
+    assert.match(msg.textContent, /Routing to Dell/);
+    await p.settle(800);
+    assert.match(msg.textContent, /Decision path/);
+    assert.match(msg.textContent, /notes/);
+    const flow = find(msg, (e) => e.getAttribute("class") === "flow");
+    assert.equal(flow.getAttribute("open"), "");
+    assert.equal(p.els["a-target"].value, "dell");
+    assert.equal(p.els["a-target"].disabled, true);
+  },
+
+  async csrf_storage_failure_keeps_this_tab_and_a_reload_offers_repair() {
+    const token = "csrf-token-value-0123456789abcd";
+    const broken = page({ storageSetThrows: true });
+    let paired = false;
+    broken.state.routes["GET /phone/api/me"] = () => (paired ? [200, broken.state.me] : [401, { error: "Pair first.", pair: true }]);
+    await broken.settle(10);
+    broken.els["p-code"].value = "ABCD2345";
+    broken.els["p-name"].value = "Pocket";
+    broken.click("p-go");
+    await broken.settle(10);
+    broken.state.routes["POST /phone/pair/status"] = () => {
+      paired = true;
+      return [200, { ok: true, csrf_token: token, phone: { id: "p1", name: "Pocket" } }];
+    };
+    await broken.settle(4010);
+    assert.equal(broken.els.app.hidden, false, "the open tab keeps the check in memory");
+    assert.equal(broken.storage("jarvis.phone.csrf"), undefined);
+    const authed = broken.state.calls.filter((c) => c.path === "/phone/api/me").at(-1);
+    assert.equal(authed.headers["X-CSRF-Token"], token);
+    assert.match(broken.els.app.textContent, /could not be saved/);
+    assert.equal(broken.state.calls.some((c) => String(c.url).includes(token)), false);
+    assert.doesNotMatch(broken.hash(), /csrf|token/i);
+
+    const again = page();
+    again.state.routes["GET /phone/api/me"] = () => [403, { error: "The session token did not match this origin.", code: "csrf" }];
+    await again.settle(10);
+    assert.equal(again.els.app.hidden, true);
+    assert.equal(again.els.pair.hidden, true);
+    assert.equal(again.els.down.hidden, false);
+    assert.match(again.els["down-h"].textContent, /Pair this phone again/);
+    assert.match(again.els["down-p"].textContent, /does not open the app/);
+    assert.equal(again.state.calls.some((c) => c.path === "/phone/api/overview"), false, "the paired cookie is not used as authorization");
+    const repair = find(again.els.down, (e) => e.tagName === "BUTTON" && e.textContent === "Pair again");
+    assert.ok(repair);
+    assert.equal(repair.hidden, false);
+    assert.equal(again.els["down-retry"].hidden, true);
+    const before = again.state.calls.length;
+    await again.settle(16000);
+    assert.equal(again.state.calls.length, before, "a csrf refusal does not keep presenting the cookie");
+    assert.equal(again.els.pair.hidden, true);
+    again.fire(repair, "click", {});
+    await again.settle(10);
+    assert.equal(again.els.pair.hidden, false);
+    assert.equal(again.els["pair-form"].hidden, false);
+    assert.equal(again.els.app.hidden, true);
+    assert.doesNotMatch(again.hash(), /csrf|token/i);
+    assert.equal(again.callsTo("/phone/api/logout").length, 0);
+
+    const kept = page({ storage: { "jarvis.phone.csrf": token } });
+    await kept.settle(10);
+    kept.state.offline = true;
+    await kept.settle(5100);
+    assert.equal(kept.storage("jarvis.phone.csrf"), token);
+    kept.state.offline = false;
+    kept.state.routes["GET /phone/api/overview"] = () => [403, { error: "Refused.", code: "forbidden" }];
+    await kept.settle(5100);
+    assert.equal(kept.storage("jarvis.phone.csrf"), token, "an ordinary 403 keeps the saved check");
+    assert.equal(kept.els.app.hidden, false);
+    assert.equal(kept.els.down.hidden, true);
+    assert.equal(find(kept.els.down, (e) => e.textContent === "Pair again"), null);
+  },
+
+  async ask_csrf_refusal_keeps_the_key_and_the_target() {
+    const token = "csrf-token-value-0123456789abcd";
+    const p = await booted({ storage: { "jarvis.phone.csrf": token } });
+    await p.go("#/ask");
+    p.els["a-target"].value = "dell";
+    p.fire(p.els["a-target"], "change", {});
+    p.els["a-text"].value = "check the Dell notes";
+    p.fire(p.els["a-text"], "input", {});
+    p.state.routes["POST /phone/api/ask"] = () => [403, { error: "The session token did not match this origin.", code: "csrf" }];
+    p.click("a-send");
+    await p.settle(30);
+    const sent = p.callsTo("/phone/api/ask")[0];
+    assert.equal(sent.body.device, "dell");
+    assert.equal(sent.body.key, sent.body.operation_id);
+    const saved = JSON.parse(p.storage("jarvis.phone.ask"));
+    assert.equal(saved.held, true);
+    assert.equal(saved.key, sent.body.key);
+    assert.equal(saved.target, "dell");
+    assert.equal(saved.text, "check the Dell notes");
+    assert.equal(p.storage("jarvis.phone.csrf"), token, "the refusal does not clear the saved check");
+    assert.equal(p.storage("jarvis.phone.target"), "dell");
+    assert.equal(p.els.app.hidden, true);
+    assert.match(p.els["down-h"].textContent, /Pair this phone again/);
+    assert.equal(p.state.calls.some((c) => String(c.url).includes(token)), false);
+
+    const next = await booted({ storage: {
+      "jarvis.phone.csrf": token,
+      "jarvis.phone.ask": p.storage("jarvis.phone.ask"),
+      "jarvis.phone.target": "dell",
+    } });
+    await next.settle(20);
+    assert.equal(next.els["a-text"].value, "check the Dell notes");
+    await next.go("#/ask");
+    assert.equal(next.els["a-target"].value, "dell");
+    next.state.routes["POST /phone/api/ask"] = () => [200, { reply: "Done." }];
+    next.click("a-send");
+    await next.settle(20);
+    const retried = next.callsTo("/phone/api/ask")[0];
+    assert.equal(retried.body.key, saved.key);
+    assert.equal(retried.body.operation_id, saved.key);
+    assert.equal(retried.body.device, "dell");
+  },
+
+  async fleet_promote_pending_clears_when_the_authoritative_main_switches() {
+    const p = await booted();
+    p.state.me.manage_main = true;
+    p.state.me.authority = { main: "main", main_ready: true, transition: null };
+    p.state.me.main = { id: "main", label: "Main PC" };
+    p.nav.credentials = {
+      get: async () => {
+        const enc = (s) => Uint8Array.from(s, (ch) => ch.charCodeAt(0));
+        return {
+          rawId: enc("raw-id").buffer,
+          response: {
+            clientDataJSON: enc("client").buffer,
+            authenticatorData: enc("authdata").buffer,
+            signature: enc("sig").buffer,
+          },
+        };
+      },
+    };
+    p.state.routes["GET /phone/api/fleet"] = () => [200, FLEET()];
+    p.state.routes["POST /phone/api/main/preview"] = (b) => {
+      assert.equal(b.candidate, "spare");
+      return [200, { preview_id: "pv-9", challenge: "Y2hhbGxlbmdl", rp_id: "zenbook.tail.ts.net", credential_ids: ["Y3JlZA"], action: "make_main_now", candidate: "spare" }];
+    };
+    p.state.routes["POST /phone/api/main/confirm"] = (b) => {
+      assert.match(b.operation_id, /^[A-Za-z0-9_-]{8,64}$/);
+      return [200, { transition_id: "tr-9", state: "REQUESTED", candidate: "spare" }];
+    };
+    await p.go("#/fleet");
+    await p.settle(20);
+    p.click("fl-promote-go");
+    await p.settle(30);
+    assert.equal(p.callsTo("/phone/api/main/confirm").length, 1);
+    assert.match(p.els["fl-transition"].textContent, /Promotion pending/);
+    assert.match(p.els["fl-main-status"].textContent, /MAIN is Main PC/);
+    assert.equal(p.state.me.authority.main, "main", "a pending confirm does not invent the new MAIN");
+    const moved = FLEET();
+    moved.devices = moved.devices.map((d) => {
+      if (d.id === "spare") return Object.assign({}, d, { role: "main", status: "main", online: true });
+      if (d.id === "main") return Object.assign({}, d, { role: "node", status: "online" });
+      return d;
+    });
+    p.state.routes["GET /phone/api/fleet"] = () => [200, moved];
+    p.state.me.authority = { main: "spare", main_ready: true, transition: { state: "REQUESTED", candidate: "spare" } };
+    p.state.me.main = { id: "spare", label: "Spare" };
+    p.click("fl-retry");
+    await p.settle(30);
+    assert.equal(/Promotion pending/.test(p.els["fl-transition"].textContent), false);
+    assert.match(p.els["fl-main-status"].textContent, /MAIN is Spare/);
+    assert.match(p.els["fl-list"].textContent, /Spare/);
+    assert.equal(p.callsTo("/phone/api/main/confirm").length, 1);
+  },
+
+  async fleet_promote_unrelated_main_keeps_pending() {
+    const p = await booted();
+    p.state.me.manage_main = true;
+    p.state.me.authority = { main: "A", main_ready: true, transition: null };
+    p.state.me.main = { id: "A", label: "Source A" };
+    const fleet = FLEET();
+    fleet.devices = [
+      { id: "A", label: "Source A", role: "main", profile: "pc", profile_label: "PC", status: "main", online: true, capabilities: [] },
+      { id: "B", label: "Candidate B", role: "node", profile: "pc", profile_label: "PC", status: "online", online: true, capabilities: [] },
+      { id: "C", label: "Other C", role: "node", profile: "pc", profile_label: "PC", status: "online", online: true, capabilities: [] },
+    ];
+    p.nav.credentials = {
+      get: async () => {
+        const enc = (s) => Uint8Array.from(s, (ch) => ch.charCodeAt(0));
+        return {
+          rawId: enc("raw-id").buffer,
+          response: {
+            clientDataJSON: enc("client").buffer,
+            authenticatorData: enc("authdata").buffer,
+            signature: enc("sig").buffer,
+          },
+        };
+      },
+    };
+    p.state.routes["GET /phone/api/fleet"] = () => [200, fleet];
+    p.state.routes["POST /phone/api/main/preview"] = (b) => {
+      assert.equal(b.candidate, "B");
+      return [200, { preview_id: "pv-abc", challenge: "Y2hhbGxlbmdl", rp_id: "zenbook.tail.ts.net", credential_ids: ["Y3JlZA"], action: "make_main_now", candidate: "B" }];
+    };
+    p.state.routes["POST /phone/api/main/confirm"] = (b) => {
+      assert.match(b.operation_id, /^[A-Za-z0-9_-]{8,64}$/);
+      return [200, { transition_id: "tr-abc", state: "REQUESTED", candidate: "B" }];
+    };
+    await p.go("#/fleet");
+    await p.settle(20);
+    assert.equal(p.els["fl-candidate"].value, "B");
+    p.click("fl-promote-go");
+    await p.settle(30);
+    const confirmId = p.callsTo("/phone/api/main/confirm")[0].body.operation_id;
+    assert.match(p.els["fl-transition"].textContent, /Promotion pending/);
+    assert.match(p.els["fl-main-status"].textContent, /MAIN is Source A/);
+    p.state.me.authority = { main: "C", main_ready: true, transition: null };
+    p.state.me.main = { id: "C", label: "Other C" };
+    p.click("fl-retry");
+    await p.settle(30);
+    assert.match(p.els["fl-transition"].textContent, /Promotion pending/);
+    assert.match(p.els["fl-transition"].textContent, /uncertain/);
+    assert.match(p.els["fl-main-status"].textContent, /MAIN is Other C/);
+    assert.equal(p.els["fl-promote-msg"].textContent.includes("finished"), false);
+    assert.equal(p.callsTo("/phone/api/main/confirm").length, 1);
+    assert.equal(p.callsTo("/phone/api/main/confirm")[0].body.operation_id, confirmId);
+  },
+
+  async frame403csrf() {
+    const token = "csrf-token-value-0123456789abcd";
+    const p = await booted({ storage: { "jarvis.phone.csrf": token } });
+    await p.open();
+    const framesAtOpen = p.state.calls.filter((c) => c.path === "/phone/api/session/frame").length;
+    p.frameReply(403, { error: "The session token did not match this origin.", code: "csrf", token });
+    await p.settle(30);
+    assert.equal(p.els.app.hidden, true);
+    assert.equal(p.els.pair.hidden, true);
+    assert.equal(p.els.down.hidden, false);
+    assert.match(p.els["down-h"].textContent, /Pair this phone again/);
+    const repair = find(p.els.down, (e) => e.tagName === "BUTTON" && e.textContent === "Pair again");
+    assert.ok(repair);
+    assert.equal(repair.hidden, false);
+    assert.equal(p.els["down-retry"].hidden, true);
+    assert.equal(p.storage("jarvis.phone.csrf"), token);
+    const frames = p.state.calls.filter((c) => c.path === "/phone/api/session/frame");
+    assert.equal(frames.length, framesAtOpen, "a csrf frame refusal does not start another frame request");
+    for (const c of p.state.calls) {
+      assert.equal(String(c.url).includes(token), false);
+      assert.doesNotMatch(c.url, /csrf|token|operation_id/i);
+    }
+    assert.equal(p.callsTo("/phone/api/session/stop").length, 0);
+    assert.equal(p.callsTo("/phone/api/session/input").length, 0);
+    const before = p.state.calls.length;
+    await p.settle(20000);
+    assert.equal(p.state.calls.length, before, "csrf recovery does not poll, retry frames, or beacon");
+    assert.equal(p.storage("jarvis.phone.csrf"), token);
+
+    const other = await booted({ storage: { "jarvis.phone.csrf": token } });
+    await other.open();
+    other.frameReply(403, { error: "Refused.", code: "forbidden" });
+    await other.settle(40);
+    assert.equal(other.storage("jarvis.phone.csrf"), token, "another 403 keeps the saved check");
+    assert.equal(other.els.app.hidden, false);
+    assert.equal(other.els.down.hidden, true);
+    assert.equal(find(other.els.down, (e) => e.textContent === "Pair again"), null);
+
+    const lost = await booted({ storage: { "jarvis.phone.csrf": token } });
+    await lost.open();
+    lost.state.offline = true;
+    await lost.settle(4000);
+    assert.equal(lost.storage("jarvis.phone.csrf"), token, "a lost frame link keeps the saved check");
+    assert.equal(lost.els.down.hidden, true);
+    assert.equal(find(lost.els.down, (e) => e.textContent === "Pair again"), null);
   },
 
 };
