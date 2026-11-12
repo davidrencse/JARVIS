@@ -49,10 +49,6 @@ _EFFECTS = frozenset({"control", "ordinary", "ai"})
 _LANES = ("luna", "grok", "quota_ok", "mediated_tools", "session_local")
 # Renew must not undo these. "suspend" stays until invalidate_after_resume.
 _NO_RENEW = frozenset({"suspend", "draining"})
-_PORT_METHODS = (
-    "status", "renew", "release", "acknowledge", "transition_request",
-    "transition_readiness", "transition_step", "consume", "admission",
-)
 # status() does not return lease_id. The holder must keep the grant response.
 _LEASE_FIELDS = ("holder", "lease_id", "incarnation", "epoch")
 _STEPS = frozenset({"drain", "fence", "grant", "complete", "cancel"})

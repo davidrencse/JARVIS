@@ -9,6 +9,7 @@ Not wired into `Remote.call` or `NodeWorker`. Not failover. See
 docs/design/mobile-continuity/EXECUTOR-IMPLEMENTATION.md.
 """
 
+from ..locking import transaction
 import hashlib
 import json
 import sqlite3
@@ -746,17 +747,7 @@ class ExecutorGuard:
                 pass
 
     def _tx(self):
-        guard = self
-
-        class _Tx:
-            def __enter__(self):
-                guard._db.execute("BEGIN IMMEDIATE")
-                return guard._db
-
-            def __exit__(self, kind, exc, tb):
-                guard._db.execute("COMMIT" if kind is None else "ROLLBACK")
-                return False
-        return _Tx()
+        return transaction(self._db)
 
 
 def _exists(path):

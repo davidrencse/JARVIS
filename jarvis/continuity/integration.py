@@ -45,9 +45,7 @@ from pathlib import Path
 from ..fsio import atomic_write
 
 from .authority import (
-    LEASE_SECONDS,
     MAX_SIGNATURE,
-    SAFETY_MARGIN,
     TICKET_FIELDS,
     AuthorityError,
     AuthorityStore,
@@ -115,7 +113,6 @@ EXTRA_HTTP = {**{code: GATEWAY_HTTP_STATUS[code] for code in (
 HTTP_STATUS = {**CONTRACT_HTTP, **EXTRA_HTTP}
 RETRY_AFTER = frozenset({"not_quiet", "lease_live"})
 STEPS = frozenset({"drain", "fence", "grant", "complete", "cancel"})
-ABSENT_STEPS = frozenset({"catching_up", "verifying"})
 
 PEER_FACADES = {
     "gateway": ("ContinuityGateway", (
@@ -199,11 +196,6 @@ def reject_personal(payload):
     if PERSONAL.intersection(payload):
         raise IntegrationError("personal_field")
     return payload
-
-
-def operation_digest(target, operation_id, attempt_id, effect_class):
-    raw = json.dumps([target, operation_id, attempt_id, effect_class], separators=(",", ":"))
-    return "sha256:" + hashlib.sha256(raw.encode()).hexdigest()
 
 
 def _behavior(name):
@@ -1288,20 +1280,6 @@ def local_desktop_args():
     if not isinstance(desktop, dict):
         return {}
     return {key: desktop[key] for key in ("tools", "config", "state") if key in desktop}
-
-
-def authorize_local_effect(state, config, surface, local_id):
-    """MAIN authority unless this exact bridge is still unused.
-
-    A device id alone is not admission. The guard's own check, before the sink, still
-    needs MAIN authority.
-    """
-    bridge = _bridge.get()
-    if (isinstance(bridge, dict) and bridge.get("used") is False
-            and bridge.get("state") == str(_state_dir(state)) and bridge.get("device") == local_id
-            and _ident_ok(local_id)):
-        return None
-    return require_production_authority(state, config, surface, target=local_id)
 
 
 def _admit_local(state, config, device, kind, payload, digest, *, desktop=None):

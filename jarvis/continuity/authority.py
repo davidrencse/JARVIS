@@ -31,9 +31,9 @@ Not here: transport, caller authentication, passkey verification, signatures, PC
 journals, executor guards. Callers pass identities they already authenticated.
 """
 
+from ..locking import transaction
 import hashlib
 import json
-import os
 import re
 import secrets
 import sqlite3
@@ -75,7 +75,6 @@ ACTIONS = ("make_main_now", "set_preferred_main", "recover")
 PROFILES = ("control", "ai")
 OPEN_STATES = ("REQUESTED", "VALIDATING", "DRAINING", "FENCING", "GRANTED_NOT_READY")
 FENCED_STATES = ("FENCING", "GRANTED_NOT_READY")
-FINAL_STATES = ("SUCCEEDED", "FAILED", "CANCELLED")
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -236,25 +235,7 @@ class AuthorityStore:
                 self._writer.close()
 
     def _tx(self):
-        store = self
-
-        class _Tx:
-            def __enter__(self):
-                store._lock.acquire()
-                try:
-                    store._db.execute("BEGIN IMMEDIATE")
-                except Exception:
-                    store._lock.release()
-                    raise
-                return store._db
-
-            def __exit__(self, kind, exc, tb):
-                try:
-                    store._db.execute("COMMIT" if kind is None else "ROLLBACK")
-                finally:
-                    store._lock.release()
-                return False
-        return _Tx()
+        return transaction(self._db, self._lock)
 
     def _row(self, db):
         return db.execute("SELECT * FROM authority WHERE fleet_id=?", (self.fleet_id,)).fetchone()

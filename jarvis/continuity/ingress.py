@@ -48,6 +48,7 @@ concrete WebAuthn verifier, owner bridge, ticket verifier, and signer.
 Not operational failover. No gateway host is provisioned by this module.
 """
 
+from ..locking import transaction
 import base64
 import contextvars
 import hashlib
@@ -80,7 +81,6 @@ from jarvis.continuity.gateway import OwnerProof as GatewayOwnerProof
 from jarvis.continuity.gateway import _message as gateway_message
 from jarvis.continuity.gateway import _public_key as gateway_public_key
 from jarvis.continuity.gateway import payload_digest
-from jarvis.continuity.gateway import pin_origin
 from jarvis.continuity.gateway import sign_message
 from jarvis.continuity.gateway import verify_message
 
@@ -407,11 +407,6 @@ def _safe_code(code):
     if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,40}", code):
         return code
     return "uncertain"
-
-
-def _digest_of(kind, body):
-    raw = json.dumps([kind, body], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _metadata_digest(operation_id, attempt_id, effect_class, main, incarnation, epoch):
@@ -1211,25 +1206,7 @@ class MobileIngress:
             self._log(code)
 
     def _tx(self):
-        store = self
-
-        class _Tx:
-            def __enter__(self):
-                store._lock.acquire()
-                try:
-                    store._db.execute("BEGIN IMMEDIATE")
-                except Exception:
-                    store._lock.release()
-                    raise
-                return store._db
-
-            def __exit__(self, kind, exc, tb):
-                try:
-                    store._db.execute("COMMIT" if kind is None else "ROLLBACK")
-                finally:
-                    store._lock.release()
-                return False
-        return _Tx()
+        return transaction(self._db, self._lock)
 
     def _open_schema(self):
         self._db.executescript(_SCHEMA)
