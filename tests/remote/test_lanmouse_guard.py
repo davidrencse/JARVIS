@@ -277,13 +277,28 @@ class SharingPausedTests(GuardTests):
         os.utime(marker, (old, old))
         self.assertIsNone(sharedinput.sharing_paused(self.state))
 
-    def test_clipboard_apply_skips_while_paused(self):
+    def test_clipboard_apply_skips_while_apart(self):
         from unittest import mock
         from jarvis import clipsync
-        (self.state / sharedinput.REMOTE_MARKER).write_text("{}")
+        self.step(False); self.step(False)
         with mock.patch.object(clipsync, "local_clipboard") as board:
             self.assertFalse(clipsync.apply(str(self.state), "text", b"hi"))
             board.assert_not_called()
+
+    def test_remote_control_turns_clipboard_on_even_apart(self):
+        from unittest import mock
+        from jarvis import clipsync
+        self.step(False); self.step(False)
+        self.assertEqual(sharedinput.clipboard_paused(self.state), "the laptops are apart")
+        for marker in (sharedinput.REMOTE_MARKER, sharedinput.CONTROLLING_MARKER):
+            (self.state / marker).write_text("{}")
+            self.assertIsNone(sharedinput.clipboard_paused(self.state))
+            self.assertIsNotNone(sharedinput.sharing_paused(self.state))  # shared input stays off
+            with mock.patch.object(clipsync, "local_clipboard") as board:
+                self.assertTrue(clipsync.apply(str(self.state), "text", b"hi"))
+                board.return_value.write.assert_called_once_with("text", b"hi")
+            (self.state / marker).unlink()
+        self.assertEqual(sharedinput.clipboard_paused(self.state), "the laptops are apart")
 
 
 class DisabledSwitchTests(unittest.TestCase):
