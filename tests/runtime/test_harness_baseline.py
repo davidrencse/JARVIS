@@ -26,18 +26,23 @@ def view(local, main):
 
 class LegacyRoleAuthority(unittest.TestCase):
     def test_config_file_alone_decides_main_so_a_stale_copy_still_claims_it(self):
-        """No durable arbiter: after `cluster main dell`, an un-updated Arch config still says
-        Arch is main, so both physical PCs read as MAIN at once (docs: Known authority bypasses)."""
+        """Unbound `cluster main` no longer rewrites the role. Two config documents can still
+        both read as MAIN, because identity() trusts the file it was given."""
         stale_arch = view("arch", "arch")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "jarvis.config.json"
-            set_main(stale_arch, path, "dell")          # only rewrites cluster.main_device
+            path.write_text(json.dumps(stale_arch), encoding="utf-8")
+            before = path.read_bytes()
+            with self.assertRaises(ValueError) as caught:
+                set_main(stale_arch, path, "dell")
+            self.assertIn("not changed", str(caught.exception))
+            self.assertEqual(path.read_bytes(), before)
             moved = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(moved["cluster"]["main_device"], "dell")
-        self.assertEqual(moved["cluster"]["local_device"], "arch")  # nothing else changed
-        dell_view = view("dell", moved["cluster"]["main_device"])
-        self.assertFalse(is_node(stale_arch))   # Arch, old copy: still MAIN
-        self.assertFalse(is_node(dell_view))    # Dell, new copy: also MAIN
+        self.assertEqual(moved["cluster"]["main_device"], "arch")
+        self.assertEqual(moved["cluster"]["local_device"], "arch")
+        dell_view = view("dell", "dell")
+        self.assertFalse(is_node(stale_arch))   # Arch copy: still MAIN
+        self.assertFalse(is_node(dell_view))    # a second document can also say it is MAIN
         self.assertEqual(identity(stale_arch)[1], "arch")
         self.assertEqual(identity(dell_view)[1], "dell")
 
