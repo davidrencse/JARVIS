@@ -13,6 +13,7 @@ Discovery recurses through the subsystem packages; the release runner uses this 
 | `mobile/` | Phone API, PWA, camera and location |
 | `remote/` | Remote sessions, input sharing, clipboard, transfer and Lan Mouse |
 | `cluster/` | Main/node transport, setup, roles and signed jobs |
+| `continuity/` | Authority, gateway, ingress, handoff drills and runtime fences |
 | `desktop/` | Application actions, Spotify, keyboard/mouse, OS backends and terminals |
 | `intelligence/` | Parsing, interpretation, routing, inference and conversation |
 | `security/` | Permissions, gates, approvals, browser restrictions and sandboxing |
