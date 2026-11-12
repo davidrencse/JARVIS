@@ -316,7 +316,7 @@ def listen_loop(state, config, base, threshold=None, config_path=None):
 
     from .events import Turn, emit, feed_sender
     from .instant import answer as instant_answer
-    from .listen import (RATE, MicLost, Transcriber, VoicePrint, _np, mic_settings, open_mic,
+    from .listen import (RATE, MicLost, Transcriber, VoicePrint, mic_settings, open_mic,
                          record_utterance, unsure, wake as wake_word)
     from .memory import Memory
     from .speech import SpeechQueue, Voice, spoken

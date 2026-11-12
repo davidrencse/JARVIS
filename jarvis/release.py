@@ -55,11 +55,9 @@ def release_dir(state):
 
 
 def _read(path):
-    try:
-        value = json.loads(Path(path).read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    from .fsio import read_json
+    value = read_json(path, {})
+    return value if isinstance(value, dict) else {}
 
 
 def _write(path, value):

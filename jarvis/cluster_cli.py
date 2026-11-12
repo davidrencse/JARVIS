@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .fsio import read_json
 from .cluster import Client, NodeWorker, save_json
 from .cluster_store import CAPABILITIES, NODE_DEFAULT, Broker
 from .deploy import code_key
@@ -798,7 +799,7 @@ def set_main(config, path, device, state=None):
                          transition_id=tid, epoch=epoch, incarnation=incarnation,
                          expected_epoch=durable.get("expected_epoch"),
                          expected_incarnation=incarnation, action=action, mode=_mode_of(pre))
-                fresh = _load_intent(state)
+                _load_intent(state)
                 return _unchanged(
                     {"status": "outcome_unknown", "code": "reconcile_required", "main_device": old_main,
                      "transition_id": tid, "epoch": epoch, "incarnation": incarnation,
@@ -1125,10 +1126,7 @@ def run(args, config, base):
                         "first if it should become a node.")
                 active = None
                 if note_path.is_file():
-                    try:
-                        active = json.loads(note_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        active = None
+                    active = read_json(note_path, None)
                 active_id = active.get("node_id") if isinstance(active, dict) else None
                 active_token = active.get("token") if isinstance(active, dict) else None
                 if (isinstance(active_id, str) and active_id != note["node_id"] and active_id == local_id

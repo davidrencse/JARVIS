@@ -36,7 +36,6 @@ command, which is what the in-process stand-ins dispatch on. Tests can pass
 ``transport=``; the default is the SSH adapter.
 """
 
-import base64
 import hashlib
 import json
 import os
@@ -57,7 +56,6 @@ MARKER_SCHEMA = "jarvis-brainsync-handoff/1"
 MEMORY_GIT_PATH = "state/memory.sqlite3"
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_BUNDLE_BYTES = 512 * 1024 * 1024
-MAX_REQUEST_BYTES = 4096
 MAX_FILES = 100_000
 EXCLUSION_SAMPLE = 50
 DEVICE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")

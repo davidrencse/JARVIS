@@ -25,6 +25,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .fsio import read_json
 from .adapters import _SameOriginRedirect
 from .claude_auth import renew_claude_session
 from .fsio import atomic_write
@@ -340,10 +341,7 @@ class Credits:
         return next((secrets[n] for n in names if secrets.get(n)), None)
 
     def manual(self):
-        try:
-            return json.loads(self.manual_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+        return read_json(self.manual_path, {})
 
     def set_manual(self, provider, remaining, total=None, unit="USD", note=""):
         if provider not in {p[0] for p in PROVIDERS}:
@@ -606,10 +604,7 @@ class Credits:
 
     def _elevenlabs(self, reading, keys):
         month = _now().strftime("%Y-%m")
-        try:
-            usage = json.loads((self.state / "voice-usage.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            usage = {}
+        usage = read_json(self.state / 'voice-usage.json', {})
         budget = int(self.config.get("voice", {}).get("monthly_char_budget", 30000))
         jarvis_meter = _meter("JARVIS budget this month", usage.get(month, 0), budget,
                               unit="chars")
@@ -683,10 +678,7 @@ def save_key(state_dir, provider, config=None, secret=None):
             raise ValueError(f"{name} rejected that key ({exc}); nothing was saved.") from None
         reading.update(status="unchecked", note=f"Saved without a live check: {exc}")
     path = Path(state_dir).resolve() / "secrets.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
+    data = read_json(path, {})
     data[keys[0]] = key
     path.parent.mkdir(parents=True, exist_ok=True)
     write_private(path, json.dumps(data, indent=2))

@@ -33,7 +33,7 @@ import time
 import zlib
 from pathlib import Path
 
-from .fsio import atomic_write
+from .fsio import atomic_write, read_json
 from .platforms import NO_WINDOW
 from .cluster import Client, save_json
 from .cluster_store import NODE_DEFAULT, Broker
@@ -913,10 +913,7 @@ def _node_link_paths(state):
     state = Path(state).resolve()
     paths = [state / name for name in _LINK_NAMES]
     paths.append(state / "logs" / "cluster-tunnel.log")
-    try:
-        note = json.loads((state / "cluster-node.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        note = None
+    note = read_json(state / 'cluster-node.json', None)
     link = note.get("link") if isinstance(note, dict) else None
     if isinstance(link, dict):
         alias = "jarvis-" + str(link.get("hostname") or "peer")
@@ -1413,10 +1410,7 @@ def _doctor_node(config, state, local, main, forward, checks, code):
         return None
     _check(checks, "node agent running", _agent_running(state), "jarvis cluster run",
            "jarvis cluster autostart on")
-    try:
-        stats = json.loads((Path(state) / "cluster-link-stats.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        stats = None
+    stats = read_json(Path(state) / 'cluster-link-stats.json', None)
     if stats:
         polls = stats["polls_ok"] + stats["polls_failed"]
         # A few failures while the main reboots are normal; a steady share means a bad link.

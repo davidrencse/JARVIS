@@ -17,6 +17,7 @@ import json
 import os
 import re
 from contextlib import contextmanager
+from .fsio import read_json
 from .platforms import on_windows
 import time
 from pathlib import Path
@@ -131,10 +132,7 @@ MIC_FILE = "mic.json"
 def mic_settings(state_dir):
     """What voice setup measured for this machine's mic: the device, and the speech
     cutoffs fitted to the room. {} before setup has run."""
-    try:
-        return json.loads((Path(state_dir) / "voice" / MIC_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    return read_json(Path(state_dir) / 'voice' / MIC_FILE, {})
 
 
 def save_mic_settings(state_dir, data):

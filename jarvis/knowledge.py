@@ -37,6 +37,7 @@ from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
+from .fsio import read_json
 from .platforms import NO_WINDOW, on_windows
 from .fsio import atomic_write
 from .stemming import stem
@@ -571,10 +572,7 @@ class KnowledgeBase:
 
     def _engine(self, update=None):
         path = self.root / "engine.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {"next_source": 1, "next_answer": 1}
+        data = read_json(path, {'next_source': 1, 'next_answer': 1})
         if update:
             data.update(update)
             self._atomic(path, json.dumps(data, indent=2))
@@ -606,10 +604,7 @@ class KnowledgeBase:
         path = folder / f"{name}.json"
 
         def load():
-            try:
-                return json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                return {}
+            return read_json(path, {})
         if not update:
             return load()
         with self.lock():  # read, change and write as one: a concurrent sync's update survives

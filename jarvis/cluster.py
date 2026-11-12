@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .fsio import read_json
 from .platforms import NO_WINDOW, on_windows
 from . import __version__
 from .deploy import code_fingerprint
@@ -1312,10 +1313,7 @@ class NodeWorker:
         if is_bad(self.state, want):
             return False
         mark = self.state / "cluster-update.json"
-        try:
-            last = json.loads(mark.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            last = {}
+        last = read_json(mark, {})
         if last.get("code") == want and time.time() - last.get("at", 0) < 600:
             return False
         save_json(mark, {"code": want, "at": time.time()})
@@ -1498,10 +1496,7 @@ class NodeWorker:
         """Why a polled job must not run, or None. Each job must carry the main's signature for
         this node (made with the code key the node pinned at join), be fresh, and not have run
         before (a captured job replayed by a port squatter). A node with no pinned key refuses."""
-        try:
-            pinned = json.loads((self.state / "cluster-node.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pinned = {}
+        pinned = read_json(self.state / 'cluster-node.json', {})
         key, me = pinned.get("code_key"), pinned.get("node_id")
         if not key:
             # Paired before code signing existed: nothing to check a job against, so it can't
@@ -1514,10 +1509,7 @@ class NodeWorker:
         if why:
             return why
         seen_path = self.state / "cluster-jobs-seen.json"
-        try:
-            seen = json.loads(seen_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            seen = {}
+        seen = read_json(seen_path, {})
         now = time.time()
         seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and now - v < 3600}
         if job["id"] in seen:
@@ -1546,10 +1538,7 @@ class NodeWorker:
 
     def _mark_seen(self, job_id):
         seen_path = self.state / "cluster-jobs-seen.json"
-        try:
-            seen = json.loads(seen_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            seen = {}
+        seen = read_json(seen_path, {})
         now = time.time()
         seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and now - v < 3600}
         seen[job_id] = now

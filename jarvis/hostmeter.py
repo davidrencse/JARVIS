@@ -136,12 +136,6 @@ if ($cycles.ok) {
 """
 
 
-def cache_clear():
-    with _CACHE_LOCK:
-        _CACHE["at"] = 0.0
-        _CACHE["raw"] = None
-
-
 def _now(now):
     return time.time() if now is None else float(now)
 

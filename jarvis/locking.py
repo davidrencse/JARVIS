@@ -1,4 +1,4 @@
-"""Local process locks: the OS releases ownership when a worker exits."""
+"""Local process locks and explicit SQLite transactions."""
 
 import errno
 import os
@@ -52,3 +52,34 @@ def exclusive_lock(path, timeout=0.0, poll=0.05):
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+class transaction:
+    """BEGIN IMMEDIATE, committing on success and rolling back on any exception.
+
+    An optional process-local lock covers both the transaction and its finalization.
+    The connection must use explicit transaction control (isolation_level=None).
+    """
+
+    def __init__(self, connection, lock=None):
+        self.connection = connection
+        self.lock = lock
+
+    def __enter__(self):
+        if self.lock is not None:
+            self.lock.acquire()
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+        except Exception:
+            if self.lock is not None:
+                self.lock.release()
+            raise
+        return self.connection
+
+    def __exit__(self, kind, exc, tb):
+        try:
+            self.connection.execute("COMMIT" if kind is None else "ROLLBACK")
+        finally:
+            if self.lock is not None:
+                self.lock.release()
+        return False

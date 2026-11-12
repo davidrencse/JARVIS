@@ -93,10 +93,8 @@ class Budget:
         self.cap, self.lock = int(cap), _budget_lock(self.path)
 
     def _load(self):
-        try:
-            stamps = json.loads(self.path.read_text(encoding="utf-8")) if self.path else []
-        except (OSError, ValueError):
-            stamps = []
+        from .fsio import read_json
+        stamps = read_json(self.path, []) if self.path else []
         now = time.time()
         return [t for t in stamps if isinstance(t, (int, float)) and now - t < WINDOW]
 
