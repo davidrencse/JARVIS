@@ -1047,17 +1047,18 @@ def apart_now(state):
 
 
 def sharing_paused(state):
-    """Why shared input and the shared clipboard are off right now, or None: the laptops read
-    apart (the guard's last settled reading) or a remote-control session is on."""
+    """Why shared input and the shared clipboard are off right now, or None.
+
+    Remote control wins. Otherwise the same projection as start and pair: a settled
+    apart reading pauses, fresh or stale. A dead guard that last said apart does not
+    resume the clipboard, and this function does not start or stop Lan Mouse.
+    off_when_apart is not consulted here; start and pair are the ones that honor it."""
     if not state:
         return None
     if remote_session_live(state):
         return "remote control is on"
-    try:
-        memo = json.loads((Path(state) / GUARD_FILE).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if isinstance(memo, dict) and memo.get("apart_now") is True:
+    avail = sharing_availability(state)
+    if avail.get("settled") == "apart":
         return "the laptops are apart"
     return None
 
@@ -1119,7 +1120,9 @@ def start_blocked(state, config=None, now=None):
     """A sentence when Lan Mouse must not be started, else None.
     A fresh apart reading always blocks. A recorded hand start also blocks while the settled
     flag still says apart, so nothing turns it back on from a stale screen. Unknown does not
-    block: a 'can't tell' changes nothing. off_when_apart false blocks nothing."""
+    block: a 'can't tell' changes nothing, and a stale apart memo does not trap a manual start.
+    Pair is stricter (pair_blocked): it also refuses a stale settled apart, before any write.
+    off_when_apart false blocks nothing."""
     if not state:
         return None
     if config is not None and (config.get("lan_mouse") or {}).get("off_when_apart", True) is False:
@@ -1134,6 +1137,28 @@ def start_blocked(state, config=None, now=None):
         return ("Lan Mouse was started by hand and the computers still read apart, "
                 "so it is not turned back on. Remote control still works.")
     return None
+
+
+def pair_blocked(state, config=None, now=None):
+    """A sentence when pairing must not write either Lan Mouse config, else None.
+
+    Uses sharing_availability, the same projection as start and the clipboard.
+    A fresh apart reading and a stale settled apart both refuse, before any local
+    or peer write and before a daemon stop or start. Start stays narrower: unknown
+    does not block a manual start. Pair would install a pairing and can restart a
+    running daemon, so a stale apart is enough. off_when_apart false refuses nothing."""
+    if not state:
+        return None
+    if config is not None and (config.get("lan_mouse") or {}).get("off_when_apart", True) is False:
+        return None
+    avail = sharing_availability(state, now=now)
+    if avail.get("state") != "apart" and avail.get("settled") != "apart":
+        return None
+    if avail.get("state") != "apart":
+        return ("Shared mouse and keyboard stays unpaired while the last reading "
+                "still says the computers are apart. Nothing was written. "
+                "Remote control still works.")
+    return APART_START
 
 
 def present_input_link(level, lines, sharing):
@@ -1201,9 +1226,9 @@ def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None, st
     path.write_text(text, encoding="utf-8")
     restarted = False
     if lan_mouse_status()["running"]:  # it reads the config only at startup
-        # Apart: leave the running daemon. Stopping it here and starting it again would
-        # turn sharing back on while the computers are apart.
-        if not start_blocked(state, config):
+        # Fresh or stale apart: leave the running daemon. Stopping it here and starting
+        # it again would turn sharing back on while the last reading says apart.
+        if not pair_blocked(state, config):
             stop()
             import time as _time
             for _ in range(20):  # stop() only signals; start() would see the dying daemon and skip
@@ -1246,10 +1271,14 @@ def control(arg, state=None, config=None, now=None):
 def pair(config, state, device, position, remote=None):
     """Pair this computer's Lan Mouse with `device`, which sits on our `position` side:
     exchange certificate fingerprints and addresses over the cluster (or SSH), then
-    have each side write its own config. Both must have run Lan Mouse once."""
+    have each side write its own config. Both must have run Lan Mouse once.
+    Refuses before either write while the computers read apart, fresh or stale."""
     from .remote import Remote
     if position not in OPPOSITE:
         raise ValueError(f"position must be one of {', '.join(OPPOSITE)}.")
+    blocked = pair_blocked(state, config)
+    if blocked:
+        raise RuntimeError(blocked)
     remote = remote or Remote(config, state)
     ok, text = remote.call(device, "input_info", "")
     if not ok:
