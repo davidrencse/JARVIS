@@ -1307,13 +1307,130 @@ def vault_for(config, state):
 
 def recall(config, state, text, **limits):
     """Vault recall lines for a request; [] when off, abstaining, or on any error
-    (recall must never break a request)."""
+    (recall must never break a request).
+
+    `vault.enabled` and `vault.recall` are checked first, before ordinary note search
+    and before the archive path. Only a literal false turns either one off. A missing
+    value stays on, which is what those two keys already meant.
+
+    `second_brain.canonical_read` true then switches this call to the latest archived
+    memory/history/tasks payloads. That path never reads an older revision and never
+    falls back to SQLite or to ordinary note search. It is the only opt-in read, and
+    it is not a cutover. Other callers still use SQLite."""
     try:
+        settings = (config or {}).get("vault") or {}
+        if settings.get("enabled", True) is False or settings.get("recall", True) is False:
+            return []
+        raw = (config or {}).get("second_brain")
+        if isinstance(raw, dict) and raw.get("canonical_read") is True:
+            return _canonical_recall(config, state, text, **limits)
         vault = vault_for(config, state)
-        if vault is None or (config.get("vault") or {}).get("recall", True) is False:
+        if vault is None:
             return []
         return vault.context(text, **limits)
     except Exception:
+        return []
+
+
+def _archive_blocks_recall(report):
+    """Backlog, gap, or a damaged head: do not serve an older note and do not read SQLite.
+
+    A missing or unreadable personal database is not a block. The vault notes are the
+    source then, and the canonical iterator still refuses a gap or a bad head."""
+    if not isinstance(report, dict):
+        return True
+    if report.get("archive_chunk_damaged") or report.get("archive_revision_conflict"):
+        return True
+    if report.get("archive_integrity") == "unverified" and report.get("queue") == "ok":
+        return True
+    for key in ("archive_pending", "archive_held", "archive_baseline_pending",
+                "archive_unreconciled", "archive_errors"):
+        if report.get(key):
+            return True
+    return False
+
+
+def _recall_bounds(limit, max_chars):
+    """Caller limit and character cap, clamped. Bad values fall back to 4 and 900."""
+    try:
+        return max(1, min(int(limit), 8)), max(80, min(int(max_chars), 4000))
+    except (TypeError, ValueError):
+        return 4, 900
+
+
+def _archive_words(text):
+    """Query words worth matching. Short text and stopwords match nothing."""
+    if len((text or "").strip()) < 12:
+        return []
+    return [w for w in re.findall(r"[a-z0-9]{4,}", (text or "").lower()) if w not in STOPWORDS]
+
+
+def _archive_line(obj, words):
+    """One line for this payload, or None. The search JSON is not kept.
+
+    The string is fields and children only, for this payload only. A lowercase copy is
+    used to find the hit, then both are dropped. The line keeps an 80-character label
+    and 160 characters of that JSON around the hit (40 before, 120 after)."""
+    blob = json.dumps({"fields": obj.get("fields") or {}, "children": obj.get("children")},
+                      ensure_ascii=False, sort_keys=True)
+    low = blob.lower()
+    if not any(word in low for word in words):
+        return None
+    hit = next(word for word in words if word in low)
+    at = low.find(hit)
+    snippet = blob[max(0, at - 40):at + 120].replace("\n", " ")
+    fields = obj.get("fields") or {}
+    label = str(fields.get("title") or fields.get("text") or obj.get("kind") or "record")[:80]
+    rid = f"{obj.get('store')}/{obj.get('kind')}/{obj.get('key')}"
+    return f"[vault:archive:{rid}] {label} — {snippet}"
+
+
+def _canonical_recall(config, state, text, limit=4, max_chars=900):
+    """Bounded lines from the latest verified archive payloads of memory, history and tasks.
+
+    Streams one validated payload at a time across those three stores. The scan keeps
+    filenames. One payload is in hand, and only while the output still has room is its
+    fields/children JSON built for matching. That JSON is dropped before the next note.
+    A chunked payload cannot exceed the loader's MAX_OVERFLOW_BYTES (64 MiB). The result
+    itself is at most the clamped line count (1..8, default 4) and character cap
+    (80..4000, default 900). That cap is the length of the newline-joined lines: a
+    newline counts only between lines, and a line that does not fit is omitted whole.
+
+    Validation does not stop when the output is full. A later gap, bad hash, or bad
+    identity fails the whole call: lines already chosen are discarded and the result is
+    []. Tombstones are skipped. Nothing in this function reads SQLite rows or an older
+    revision. This is the scoped opt-in, not a cutover."""
+    from .second_brain_runtime import status as archive_status, vault_root
+    report = archive_status(config, state)
+    if _archive_blocks_recall(report):
+        return []
+    gate = vault_root(config)
+    if not gate.get("ok"):
+        return []
+    from .second_brain import SecondBrain, SecondBrainError
+    brain = SecondBrain(gate["root"])
+    try:
+        limit, max_chars = _recall_bounds(limit, max_chars)
+        words = _archive_words(text)
+        lines, used, full = [], 0, not words
+        for name in ("memory", "history", "tasks"):
+            for obj in brain.iter_canonical_records(store=name):
+                if full:
+                    continue
+                line = _archive_line(obj, words)
+                if line is None:
+                    continue
+                # Cap is the joined lines. A separator counts only between them.
+                extra = len(line) if not lines else len(line) + 1
+                if used + extra > max_chars:
+                    full = True
+                    continue
+                lines.append(line)
+                used += extra
+                if len(lines) >= limit:
+                    full = True
+        return lines
+    except (SecondBrainError, OSError, ValueError, TypeError):
         return []
 
 

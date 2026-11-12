@@ -187,11 +187,14 @@ def sleep(state, base, action="suspend-then-hibernate", suspend=True, launch=Non
     if action not in SLEEP_ACTIONS:
         raise ValueError(f"Sleep action must be one of: {', '.join(SLEEP_ACTIONS)}.")
     try:
-        from .continuity.integration import refuse_unfenced
+        from .continuity.integration import refuse_unfenced, release_for_suspend
     except ImportError:  # continuity is optional; without it the legacy path is the only one
         refuse_unfenced = None
+        release_for_suspend = None
     if refuse_unfenced is not None:
         refuse_unfenced("sleep")
+    if release_for_suspend is not None:
+        release_for_suspend(state)
     result = pause(state)
     if not suspend:
         result["note"] = "JARVIS is paused on this PC. Run `jarvis wake` to bring it back."

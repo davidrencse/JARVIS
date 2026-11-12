@@ -162,6 +162,29 @@ def run_here(action, arg, tools=None, config=None, state=None):
     return tools.call(action, {ARG[action]: arg})
 
 
+def _managed_local_call(remote, action, arg, target, pass_config):
+    """One guarded local desktop effect, or None when this state is still legacy.
+
+    A quarantined marker propagates. This does not call the hub, so the local effect
+    is admitted once.
+    """
+    try:
+        from .continuity.integration import continuity_state, run_managed_local
+    except ImportError:
+        return None
+    if continuity_state(remote.state) != "managed":
+        return None
+    desktop = {"tools": remote.tools}
+    if pass_config:
+        desktop["config"] = remote.config
+        desktop["state"] = remote.state
+    result = run_managed_local(
+        remote.state, remote.config, target, "desktop", {"action": action, "arg": arg}, desktop=desktop)
+    if not isinstance(result, dict):
+        return False, ""
+    return bool(result.get("ok")), str(result.get("text", ""))
+
+
 class Remote:
     def __init__(self, config, state_dir, tools=None):
         self.config, self.state, self.tools = config, Path(state_dir), tools
@@ -213,9 +236,10 @@ class Remote:
         if action not in ACTIONS:
             return False, f"Unknown desktop action {action}."
         try:
-            from .continuity.integration import refuse_unfenced
+            from .continuity.integration import refuse_unfenced, require_production_authority
         except ImportError:  # continuity is optional; without it the legacy path is the only one
             refuse_unfenced = None
+            require_production_authority = None
         if refuse_unfenced is not None:
             refuse_unfenced("remote_call")
         device = self.resolve(device)
@@ -226,12 +250,17 @@ class Remote:
             # local/main come from topology.identity (patchable); Roles only names the legacy target
             # rule (explicit, else origin, else local). Approval station unused here.
             target = Roles(local, main, ORIGIN.get(), None).execution_target(device)
+            if target == local:
+                # One admission inside the local effect. Routing this through the hub would
+                # admit it twice. On a node the main's SSH fallback runs here directly.
+                managed = _managed_local_call(self, action, arg, target, pass_config=(local == main))
+                if managed is not None:
+                    return managed
+            if require_production_authority is not None:
+                require_production_authority(self.state, self.config, "remote_call", target=target)
             if target not in self.machines:
                 return False, f"Unknown node {target!r}; known: {', '.join(self.names())}."
             if target == local:
-                # This machine acts itself. On a node this matters: the main's SSH fallback
-                # runs `jarvis desktop ...` here, and routing that back through the main
-                # would send it to this (stopped) node agent again.
                 # Only the main can ask David, so only there does app_ui get the config.
                 return run_here(action, arg, self.tools,
                                 **({"config": self.config, "state": self.state} if local == main else {}))
@@ -259,7 +288,15 @@ class Remote:
                 return False, str(exc)
             except (OSError, ValueError, RuntimeError) as exc:
                 return False, str(exc)
-        if not device or device == self.here():
+        here = not device or device == self.here()
+        if here:
+            managed = _managed_local_call(self, action, arg, device or self.here(), pass_config=True)
+            if managed is not None:
+                return managed
+        if require_production_authority is not None:
+            require_production_authority(
+                self.state, self.config, "remote_call", target=device or self.here())
+        if here:
             return run_here(action, arg, self.tools, config=self.config, state=self.state)
         if device not in self.machines:
             return False, f"Unknown laptop {device!r}; known: {', '.join(self.names())}."

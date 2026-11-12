@@ -16,11 +16,13 @@ Gates, re-checked every cycle (nothing is written when any fails):
 
 Status is read-only and numeric: counts, ages, a reason code. No record bodies, ids or paths. It
 never says "saved to Obsidian": `state` is `current` only when nothing is pending, held or
-failing, a drain has succeeded, every published head this process could open through the
-archive loader read back, AND no published record has a revision gap or duplicate. A gap is
-`conflict`, not `current`, even when the newest note reads back. A chunked note or any note up
-to 64 KiB is opened; a larger plain note is not. Stage is C2 transitional: SQLite is still the
-source and authoritative reads/rebuild (C3) are not cut over.
+failing, a drain has succeeded, every published head was opened through the archive loader,
+and no published record has a revision gap or duplicate. A gap is `conflict`, not `current`.
+A damaged chunk, a plain-note hash mismatch, and a note larger than 64 KiB are all opened.
+Superseded oversize rows are counted and are not pending or held. `canonical` is true only
+when `second_brain.canonical_read` is literal true and this report is fully healthy. That
+flag is the scoped recall opt-in, not a cutover of other SQLite readers. Stage stays
+C2 transitional.
 """
 
 import atexit
@@ -64,7 +66,8 @@ def settings(config):
     return {"enabled": raw.get("enabled") is True, "interval_s": interval,
             "file_sync_s": number("file_sync_s", FILE_SYNC_S, 0.0, 86400.0),   # 0 turns it off
             "batch": int(number("batch", BATCH, 1, 500)),
-            "max_backoff_s": number("max_backoff_s", MAX_BACKOFF_S, interval, 3600.0)}
+            "max_backoff_s": number("max_backoff_s", MAX_BACKOFF_S, interval, 3600.0),
+            "canonical_read": raw.get("canonical_read") is True}
 
 
 def _state_key(state):
@@ -416,6 +419,7 @@ def status(config, state, queue=None):
             out["queue"] = f"error:{type(exc).__name__}"
     out["archive_pending"] = _num(counts, _PENDING)
     out["archive_held"] = _num(counts, _HELD)
+    out["archive_superseded"] = _num(counts, ("superseded",)) or 0
     out["archive_errors"] = _num(counts, _ERRORS)
     out["capture_enabled"] = counts.get("enabled") is True
     out["capture_complete"] = counts.get("capture_complete") is True
@@ -455,7 +459,29 @@ def status(config, state, queue=None):
     out["files_stale"] = bool(cfg["file_sync_s"]) and has_files and (
         not files or files.get("ok") is not True)
     out["state"] = _verdict(out)
+    out["canonical"] = _canonical_claim(cfg, out)
     return out
+
+
+def _canonical_claim(cfg, out):
+    """True only for an explicit canonical_read opt-in over a fully healthy archive.
+
+    The queue must be current, every acknowledged head must have been opened, and neither
+    a gap nor a damaged head may be present. Anything short of that stays false. This does
+    not mean legacy SQLite callers have cut over."""
+    if not cfg.get("canonical_read"):
+        return False
+    if out.get("state") != "current":
+        return False
+    if out.get("archive_integrity") == "unverified":
+        return False
+    if out.get("archive_chunk_damaged") or out.get("archive_revision_conflict"):
+        return False
+    heads = out.get("archive_heads") or 0
+    checked = out.get("archive_chunk_checked") or 0
+    if checked < heads:
+        return False
+    return True
 
 
 def _verdict(out):
@@ -492,10 +518,10 @@ def _verdict(out):
 
 
 def _published_integrity(state, root):
-    """Bounded read-back of acknowledged heads. Counts only. Each opened note goes through
-    SecondBrain.published_readable (_load). A revision gap is counted even when the note is
-    left unopened, so a gap cannot by itself become `current`. Heads left unopened are not
-    counted as checked."""
+    """Read-back of every acknowledged head. Counts only. Each non-tombstone note goes
+    through SecondBrain.published_readable (_load), including gaps, duplicates and plain
+    notes larger than 64 KiB. A revision gap is counted on its own, so a readable gapped
+    head still cannot become `current`. A tombstone is counted checked and is not opened."""
     from .second_brain import SecondBrain
     brain = SecondBrain(root)
     checked = damaged = conflicts = 0

@@ -15,6 +15,7 @@ import shutil
 import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from . import transfer
 from .transfer import _check_target, _fail, _ssh_args, collision_name, safe_name
 
 MAX_ENTRIES = 3000
@@ -229,11 +230,12 @@ class Storage:
             raise ValueError("Copies need one local and one SSH device.")
         remote_id = src_device if self.is_remote(src_device) else dst_device
         device = self.device(remote_id)
-        if device.get("transport") != "ssh" or not device.get("target"):
+        via_ssh = device.get("transport") == "ssh" and device.get("target")
+        if not via_ssh and not transfer.clustered(self.config):
             label = device.get("label") or remote_id
-            raise ValueError(f"Copying to or from {label} needs SSH, and it is only reachable "
-                             "through the cluster hub. Browsing works; to copy, set it up with "
-                             "an SSH target or move the file another way (shared folder, USB).")
+            raise ValueError(f"Copying to or from {label} needs SSH or the cluster link, and "
+                             "neither is set up. Browsing works; to copy, set it up with an SSH "
+                             "target or move the file another way (shared folder, USB).")
         src = self.resolve(src_device, src_path)
         dst = self.resolve(dst_device, dst_dir)
         if not dst["dir"]:
@@ -242,6 +244,8 @@ class Storage:
             else _pure(src.get("sep"))(src["path"]).name
         if not _name_ok(name):
             raise ValueError("Can't copy a drive or filesystem root; pick something inside it.")
+        if not via_ssh:
+            return self._copy_cluster(remote_id, src_device, src, name, dst_device, dst)
         # Normalize before checking collisions: two Linux names can map to one
         # Windows name. Inspect candidates directly, never infer absence from a
         # truncated directory listing. lstat also counts broken symlinks as taken.
@@ -278,6 +282,64 @@ class Storage:
             raise RuntimeError("The copy took over an hour and was stopped.") from None
         if done.returncode:
             _fail("Copying", done)
+        return {"copied": name, "as": final, "from": f"{src_device}:{src['path']}",
+                "to": f"{dst_device}:{dst['path']}", "dir": src["dir"],
+                "bytes": None if src["dir"] else src["size"]}
+
+    def _copy_cluster(self, node, src_device, src, name, dst_device, dst):
+        """Copy over the cluster link (chunked transfer jobs) to or from a hub-only node."""
+        from .topology import identity
+        local, main = identity(self.config)
+        if local != main or self.state is None:
+            raise ValueError("Copies to or from another laptop run from the main PC's console.")
+        config, state = self.config, self.state
+        up = not self.is_remote(src_device)  # main -> node, else node -> main
+
+        def job(payload):
+            return transfer.call(config, state, node, payload)
+
+        if not src["dir"]:
+            if src["size"] > transfer.MAX_BYTES:
+                raise ValueError(f"Files over {transfer.MAX_BYTES // 1024 ** 3} GB aren't "
+                                 "copied this way.")
+            if up:
+                with open(src["path"], "rb") as source:
+                    size = os.fstat(source.fileno()).st_size
+                    final = transfer.push(config, state, node, source, size, name=name,
+                                          dest="path", folder=dst["path"])["sent"]
+            else:
+                final = transfer.pull_path(config, state, node, src["path"], dst["path"], name)
+        else:
+            tree = transfer.check_tree(transfer.walk_tree(src["path"]) if up
+                                       else job({"action": "tree", "path": src["path"]}))
+            if up:
+                made = job({"action": "mkdir", "dir": dst["path"], "name": name})
+                final, folders = made["as"], {(): made["path"]}
+            else:
+                final = transfer.make_dir(dst["path"], name)
+                folders = {(): str(Path(dst["path"]) / final)}
+            try:
+                for rel in tree["dirs"]:
+                    parent = folders[tuple(rel[:-1])]
+                    if up:
+                        folders[tuple(rel)] = job({"action": "mkdir", "dir": parent,
+                                                   "name": rel[-1]})["path"]
+                    else:
+                        folders[tuple(rel)] = str(Path(parent) / transfer.make_dir(parent, rel[-1]))
+                for item in tree["files"]:
+                    rel, parent = item["rel"], folders[tuple(item["rel"][:-1])]
+                    if up:
+                        with open(Path(src["path"]).joinpath(*rel), "rb") as source:
+                            transfer.push(config, state, node, source,
+                                          os.fstat(source.fileno()).st_size, name=rel[-1],
+                                          dest="path", folder=parent)
+                    else:
+                        transfer.pull_path(config, state, node, src["path"], parent, rel[-1],
+                                           rel=rel)
+            except Exception as exc:
+                where = folders[()]
+                raise RuntimeError(f"The folder copy stopped part-way ({exc}). What arrived so "
+                                   f"far is in {where}.") from exc
         return {"copied": name, "as": final, "from": f"{src_device}:{src['path']}",
                 "to": f"{dst_device}:{dst['path']}", "dir": src["dir"],
                 "bytes": None if src["dir"] else src["size"]}

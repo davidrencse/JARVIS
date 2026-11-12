@@ -4,8 +4,12 @@ STATUS: this module is the storage engine. Nothing here runs on import or reads 
 wired in by `second_brain_queue.py` (C2 write-through outbox for memory/history/tasks) and
 `second_brain_runtime.py` (the drainer the voice daemon starts, the scoped file sync for
 plans/runs/knowledge, and `jarvis archive status|sync|drain|verify|validate|restore`).
-It is NOT the canonical store (C3 is not cut over): SQLite/JSON state stays the source of truth,
-the vault holds a verified archive, and `parity()`/`validate()`/`restore()` prove it can rebuild.
+SQLite/JSON stays the source for every caller except one opt-in read.
+`iter_canonical_records()` yields one verified latest live payload at a time;
+`canonical_records()` is that iterator collected into a list. `vault.recall` streams the
+iterator only when `second_brain.canonical_read` is literal true and `vault.enabled` /
+`vault.recall` are not literal false. That path is not a cutover. `parity()`, `validate()`
+and `restore()` still prove the archive can rebuild.
 
 What it does
 - Streams personal rows/files from a per-store consistent snapshot (sqlite backup API into a
@@ -55,7 +59,6 @@ MAX_RECORD_BYTES = 16 * 1024 * 1024   # payload bytes (> Memory's 2M-char cap at
 CHUNK_BYTES = 4 * 1024 * 1024        # one chunk file
 MAX_OVERFLOW_BYTES = 64 * 1024 * 1024  # hard ceiling for any chunked payload (writer and reader)
 CHUNK_FORMAT = "jarvis-record-chunks/1"
-STATUS_NOTE_BYTES = 64 * 1024  # status opens a published note through _load at this size, or when a .jrc sits beside it
 BATCH = 500                          # rows fetched at a time from a snapshot
 TMP_PREFIX = ".jr-tmp-"
 CLAIM_STALE_S = 300   # a revision lock older than this belonged to a crashed writer
@@ -1053,16 +1056,30 @@ class SecondBrain:
     def publication_sound(self, store, kind, key, payload_sha):
         """True when the queue may leave this payload acknowledged without a new revision.
 
-        A tombstone stays acknowledged: sync and drain must not resurrect it. A gap or a
-        duplicate revision number is not itself a sound head. The newest note is read through
-        _load. Intact means leave it acknowledged: the missing numbers are not filled in.
-        Damaged means False, so the caller appends the next revision and leaves the old bytes."""
+        A gap or a duplicate revision number is never sound, tombstone or not. A contiguous
+        tombstone stays acknowledged and is not opened, so a damaged chunk cannot block a
+        deletion. Any other newest note is read through _load. False does not by itself
+        append a revision: `repair_withheld` keeps an intact gap and any tombstone fail-closed."""
+        info = self._latest_info(store, kind, key)
+        if not info or info.get("conflict"):
+            return False
+        if info.get("tomb"):
+            return True
+        return self._note_intact(info, payload_sha)
+
+    def repair_withheld(self, store, kind, key, payload_sha):
+        """True when a false `publication_sound` must not queue another revision.
+
+        A tombstone is never resurrected. An intact newest note behind a gap or a duplicate
+        number stays as the owner left it; the missing numbers are not synthesized. A damaged
+        newest note is not withheld, so the next drain can append a revision and leave the
+        old bytes in place."""
         info = self._latest_info(store, kind, key)
         if not info:
             return False
         if info.get("tomb"):
             return True
-        return self._note_intact(info, payload_sha)
+        return bool(info.get("conflict") and self._note_intact(info, payload_sha))
 
     def _damaged_matching_head(self, current, payload_sha):
         """The newest filename claims this payload, and _load says the note does not hold it.
@@ -1071,32 +1088,16 @@ class SecondBrain:
                     and current.get("payload") == payload_sha[:12]
                     and not self._note_intact(current, payload_sha))
 
-    def _status_candidate(self, info):
-        """Status does not open a large plain note. A missing note, a note at most
-        STATUS_NOTE_BYTES, or any chunk file next to the note is in bounds."""
-        if not info:
-            return True
-        folder = Path(info["dir"])
-        try:
-            with os.scandir(folder) as entries:
-                for entry in entries:
-                    if entry.name.endswith(".jrc") and not entry.is_symlink():
-                        return True
-            return os.lstat(folder / info["name"]).st_size <= STATUS_NOTE_BYTES
-        except OSError:
-            return True
-
     def published_readable(self, store, kind, key, payload_sha):
-        """Bounded head check for status. None: not opened. True/False: _load verdict.
+        """Head check for status. True/False from _load. Never skips a large plain note.
 
         A tombstone is True and is not opened, so a damaged chunk cannot block a deletion.
-        A revision gap does not skip the head and is not a healthy read: the newest note goes
-        through _load. True means that note holds this payload. It does not mean the revision
-        list is 1..n; revision_conflict is that fact. A head with no note is False. Damaged
-        bytes of an older revision are not opened here; validate() lists those."""
+        Every other published head is opened through _load, including a gap, a duplicate
+        revision number, and a plain note larger than 64 KiB. True means that note holds
+        this payload. It does not mean the revision list is 1..n; revision_conflict is that
+        fact. A missing note is False. Damaged bytes of an older revision are not opened
+        here; validate() lists those."""
         info = self._latest_info(store, kind, key)
-        if not self._status_candidate(info):
-            return None
         if not info:
             return False
         if info.get("tomb"):
@@ -1320,6 +1321,90 @@ class SecondBrain:
         return {"ok": True, "status": "tombstoned"}
 
     # -- read / validate -----------------------------------------------------------------------
+    def _placed(self, info):
+        """(store, kind slug) from a note's directory, or ('', '') when it is not under the area."""
+        try:
+            parts = Path(info["dir"]).relative_to(self.area).parts
+        except (ValueError, IndexError):
+            return "", ""
+        if len(parts) < 2:
+            return "", ""
+        return parts[0], parts[1]
+
+    def _canonical_payload(self, info, rec_store, kind_slug):
+        """One latest live payload, or SecondBrainError. Does not keep the note bytes.
+
+        `_load` checks the hash (and, for a chunked note, the MAX_OVERFLOW_BYTES ceiling).
+        `_valid_payload` checks the schema, the kind against KINDS, and the key.
+        The folder must be that store and `_slug(kind, 20)`. The filename stem must be
+        `stem_for(store/kind/key)`, the same identity `validate()` uses."""
+        path = Path(info["dir"]) / info["name"]
+        try:
+            parsed = self._load(path)
+        except (OSError, ValueError, SecondBrainError) as exc:
+            raise SecondBrainError(f"unreadable: {exc}") from exc
+        obj = parsed.get("obj")
+        if not parsed.get("payload_ok") or not isinstance(obj, dict):
+            raise SecondBrainError("payload hash mismatch")
+        try:
+            self._valid_payload(obj)
+        except ValueError as exc:
+            raise SecondBrainError("record-identity-mismatch") from exc
+        if obj.get("store") != rec_store or _slug(obj.get("kind"), 20) != kind_slug:
+            raise SecondBrainError("record-identity-mismatch")
+        rid = self.record_id(obj.get("store"), obj.get("kind"), obj.get("key"))
+        if self.stem_for(rid)[0] != info.get("stem"):
+            raise SecondBrainError("record-identity-mismatch")
+        return obj
+
+    def iter_canonical_records(self, store=None, kind=None):
+        """Yield one validated latest live payload at a time. Skips tombstones. Does not read SQLite.
+
+        Raises SecondBrainError on a revision gap, a duplicate revision number, or a head
+        that does not _load (including a payload hash mismatch) or that fails
+        `_canonical_payload`. An older revision is never returned in place of a bad head.
+        `store` and `kind` limit which records are considered; a problem outside that limit
+        is not this call's error. A tombstone is skipped even when its revision list has a
+        gap, and it is not opened.
+
+        The scan keeps filenames, not bodies. Each selected note is loaded, checked, and
+        then yielded or discarded before the next note is opened. A chunked payload above
+        MAX_OVERFLOW_BYTES never loads. KINDS has no two kinds in one store that share a
+        `_slug(kind, 20)` folder. A kind filter selects that folder. If a later valid kind
+        shared the slug, this filter skips that other valid payload instead of calling it
+        an identity mismatch. A malformed kind, folder, or stem still raises."""
+        if store is not None and store not in KINDS:
+            raise SecondBrainError("unknown store")
+        if kind is not None and not any(kind in kinds for kinds in KINDS.values()):
+            raise SecondBrainError("unknown kind")
+        if store is not None and kind is not None and kind not in KINDS[store]:
+            raise SecondBrainError("unknown kind")
+        want_slug = _slug(kind, 20) if kind is not None else None
+        latest, _, _, _ = self._scan()
+        for _stem, info in sorted(latest.items()):
+            rec_store, kind_slug = self._placed(info)
+            if store is not None and rec_store != store:
+                continue
+            if want_slug is not None and kind_slug != want_slug:
+                continue
+            if info.get("tomb"):
+                continue
+            if info.get("conflict"):
+                raise SecondBrainError("revision-gap-or-duplicate")
+            obj = self._canonical_payload(info, rec_store, kind_slug)
+            # Folder match is by slug. A different valid kind with that same slug is outside
+            # this filter. `_canonical_payload` already rejected a bad kind, folder, or stem.
+            if kind is not None and obj.get("kind") != kind:
+                continue
+            yield obj
+
+    def canonical_records(self, store=None, kind=None):
+        """Verified latest live payloads. Skips tombstones. Does not read SQLite.
+
+        List form of `iter_canonical_records`: the same selection, the same errors, every
+        selected payload retained. Recall uses the iterator so it does not."""
+        return list(self.iter_canonical_records(store=store, kind=kind))
+
     def latest(self, record_id):
         """Payload dict of the newest non-tombstone revision, or None. Raises on damaged notes."""
         stem = self.stem_for(record_id)[0]

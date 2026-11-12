@@ -6,6 +6,12 @@ in-process. This is the equivalent that does work: drop a file on the console (o
 `jarvis send`) and it lands in ~/JARVIS-Drop on the other laptop; `jarvis fetch` pulls
 one back to ~/Downloads/JARVIS-Drop. Only the fixed drop folders are touched.
 
+The console's storage browser (storage.py) also copies files and folders to or from a node
+the hub is the only way to reach. Those jobs are the "path" operations (`tree`, `mkdir`, `get`
+with a path, `put` with dest "path"): the receiving or serving computer checks every path
+against its own storage roots (Storage._local), names are single components, and only the
+main's console can send them (a node may not use them against the main).
+
 With the cluster on, files ride the hub link in CHUNK-sized `transfer` jobs: the main
 dispatches them to a node, and a node hands them to the main (its "files" capability
 allows that one kind). The receiving side writes a hidden .part file and gives it a
@@ -33,6 +39,9 @@ UPLOAD_ID = re.compile(r"[a-f0-9]{32}")
 PART = ".jarvis-upload-{}.part"
 RESERVE = 2 * 1024 ** 3  # an upload may never leave less than this free in the drop folder
 NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. ()+,@-]{0,199}")
+MAX_TREE = 3000  # files plus folders in one folder copy
+MAX_DEPTH = 32  # folder nesting in one folder copy
+MAX_COLLISIONS = 200
 
 
 def ssh_device(config, name=None):
@@ -204,13 +213,43 @@ def desktop_folder():
     return folder
 
 
+def plain_name(name):
+    """One path component: no separators, no dot names, no NUL, at most 255 characters."""
+    return (isinstance(name, str) and 0 < len(name) <= 255 and name not in (".", "..")
+            and not re.search(r"[/\\\x00]", name))
+
+
+def _plain_path(value):
+    return isinstance(value, str) and 0 < len(value) <= 4096 and "\x00" not in value
+
+
+def is_path_op(payload):
+    """True for the operations that name paths on the receiving computer (storage copies)."""
+    action = payload.get("action")
+    return (action in ("tree", "mkdir") or (action == "get" and "path" in payload)
+            or (action == "put" and payload.get("dest") == "path"))
+
+
 def validate(payload):
     """Refuse anything but the fixed transfer operations (cluster.validate_action)."""
     action = payload.get("action")
     if action == "inbox":
         return
+    if action == "tree":
+        if not _plain_path(payload.get("path")):
+            raise ValueError("Invalid folder path.")
+        return
+    if action == "mkdir":
+        if not _plain_path(payload.get("dir")) or not plain_name(payload.get("name")):
+            raise ValueError("Invalid folder name.")
+        return
     if action == "get":
-        if not isinstance(payload.get("name"), str) or not NAME.fullmatch(payload["name"]):
+        if "path" in payload:
+            rel = payload.get("rel", [])
+            if (not _plain_path(payload["path"]) or "name" in payload or not isinstance(rel, list)
+                    or len(rel) > MAX_DEPTH or not all(plain_name(part) for part in rel)):
+                raise ValueError("Invalid file path.")
+        elif not isinstance(payload.get("name"), str) or not NAME.fullmatch(payload["name"]):
             raise ValueError("Invalid drop-folder name.")
         offset = payload.get("offset")
         if not isinstance(offset, int) or isinstance(offset, bool) or not 0 <= offset <= MAX_BYTES:
@@ -232,6 +271,9 @@ def validate(payload):
     if payload.get("dest", "drop") in ("drop", "desktop"):
         if not isinstance(payload.get("name"), str) or not 0 < len(payload["name"]) <= 255:
             raise ValueError("Invalid file name.")
+    elif payload.get("dest") == "path":
+        if not _plain_path(payload.get("dir")) or not plain_name(payload.get("name")):
+            raise ValueError("Invalid file name or folder.")
     elif payload.get("dest") != "clipboard" or payload.get("kind") not in ("text", "png", "files"):
         raise ValueError("Invalid transfer destination.")
 
@@ -277,11 +319,144 @@ def _land(part, folder, name):
         return final
 
 
-def run_here(payload, state=None):
+def _within(config, path):
+    """Resolve `path` on this computer, only if it is inside this computer's storage roots."""
+    if config is None:
+        raise ValueError("This computer can't check its storage folders, so it won't copy there.")
+    from .storage import Storage
+    from .topology import identity
+    return Storage(config)._local(identity(config)[0], path, "resolve")
+
+
+def make_dir(parent, name):
+    """Create a new folder `name` in `parent`, taking `name (2)` and so on if it is taken."""
+    base = safe_name(name)
+    final, n = base, 1
+    while True:
+        try:
+            os.mkdir(Path(parent) / final)
+            return final
+        except FileExistsError:
+            n += 1
+            if n > MAX_COLLISIONS:
+                raise ValueError(f"{base} and {MAX_COLLISIONS} numbered copies of it already "
+                                 "exist there; tidy up or pick another folder.") from None
+            final = collision_name(base, n, directory=True, max_bytes=200)
+
+
+def walk_tree(root):
+    """Folders and files under `root` as lists of names, parents first.
+
+    Links and special files are skipped, never followed, so nothing outside the folder is read.
+    """
+    dirs, files, state = [], [], {"skipped": 0, "bytes": 0}
+
+    def scan(path, rel):
+        if len(rel) >= MAX_DEPTH:
+            raise ValueError("That folder is nested too deeply to copy this way.")
+        try:
+            with os.scandir(path) as found:
+                entries = sorted(found, key=lambda e: e.name)
+        except PermissionError:
+            raise ValueError("Permission denied reading a folder inside it.") from None
+        for entry in entries:
+            if (not plain_name(entry.name) or entry.is_symlink()
+                    or getattr(entry, "is_junction", lambda: False)()):
+                state["skipped"] += 1
+            elif entry.is_dir(follow_symlinks=False):
+                dirs.append([*rel, entry.name])
+                if len(dirs) + len(files) > MAX_TREE:
+                    break
+                scan(entry.path, [*rel, entry.name])
+            elif entry.is_file(follow_symlinks=False):
+                size = entry.stat(follow_symlinks=False).st_size
+                if size > MAX_BYTES:
+                    raise ValueError(f"{entry.name} is over {MAX_BYTES // 1024 ** 3} GB, which "
+                                     "isn't copied this way.")
+                files.append({"rel": [*rel, entry.name], "size": size})
+                state["bytes"] += size
+            else:
+                state["skipped"] += 1
+            if len(dirs) + len(files) > MAX_TREE:
+                break
+        if len(dirs) + len(files) > MAX_TREE:
+            raise ValueError(f"That folder has more than {MAX_TREE} items; copy it in smaller "
+                             "pieces or zip it first.")
+        if state["bytes"] > MAX_BYTES:
+            raise ValueError(f"That folder is over {MAX_BYTES // 1024 ** 3} GB in total; copy it "
+                             "in smaller pieces.")
+
+    scan(str(root), [])
+    return {"dirs": dirs, "files": files, "skipped": state["skipped"], "bytes": state["bytes"]}
+
+
+def check_tree(tree):
+    """Refuse a folder listing from the other computer that is not the plain shape walk_tree makes."""
+    try:
+        dirs, files = tree["dirs"], tree["files"]
+        ok = (isinstance(dirs, list) and isinstance(files, list)
+              and len(dirs) + len(files) <= MAX_TREE
+              and all(isinstance(rel, list) and 0 < len(rel) <= MAX_DEPTH
+                      and all(plain_name(part) for part in rel) for rel in dirs)
+              and all(isinstance(f["rel"], list) and 0 < len(f["rel"]) <= MAX_DEPTH
+                      and all(plain_name(part) for part in f["rel"])
+                      and isinstance(f["size"], int) and not isinstance(f["size"], bool)
+                      and 0 <= f["size"] <= MAX_BYTES for f in files))
+    except (KeyError, TypeError):
+        ok = False
+    if not ok:
+        raise ValueError("The other computer sent an unreadable folder listing.")
+    return tree
+
+
+def _path_op(payload, config):
+    """The path operations that don't write an upload: `tree`, `mkdir`, `get` by path."""
+    action = payload["action"]
+    if action == "tree":
+        base = _within(config, payload["path"])
+        if not base["dir"]:
+            raise ValueError("Not a folder.")
+        return walk_tree(base["path"])
+    if action == "mkdir":
+        parent = _within(config, payload["dir"])
+        if not parent["dir"]:
+            raise ValueError("The destination must be a folder.")
+        final = make_dir(parent["path"], payload["name"])
+        return {"path": str(Path(parent["path"]) / final), "as": final}
+    base = _within(config, payload["path"])
+    rel = payload.get("rel") or []
+    target = base
+    if rel:
+        if not base["dir"]:
+            raise ValueError("Not a folder.")
+        target = _within(config, str(Path(base["path"]).joinpath(*rel)))
+        if Path(base["path"]) not in Path(target["path"]).parents:
+            raise ValueError("That file is outside the folder being copied.")
+    if target["dir"] or not Path(target["path"]).is_file():
+        raise ValueError("That is not a file.")
+    size = target["size"]
+    if size > MAX_BYTES:
+        raise ValueError(f"Files over {MAX_BYTES // 1024 ** 3} GB aren't copied this way.")
+    with open(target["path"], "rb") as stream:
+        stream.seek(payload["offset"])
+        data = stream.read(CHUNK)
+    return {"data": base64.b64encode(data).decode(), "size": size,
+            "eof": payload["offset"] + len(data) >= size}
+
+
+def run_here(payload, state=None, config=None):
     """One transfer operation on this machine (a cluster job, or the main serving a node)."""
     validate(payload)
-    folder = (desktop_folder() if payload["action"] == "put" and payload.get("dest") == "desktop"
-              else drop_folder())
+    if is_path_op(payload) and payload["action"] != "put":
+        return _path_op(payload, config)
+    if payload["action"] == "put" and payload.get("dest") == "path":
+        where = _within(config, payload["dir"])
+        if not where["dir"]:
+            raise ValueError("The destination must be a folder.")
+        folder = Path(where["path"])
+    else:
+        folder = (desktop_folder() if payload["action"] == "put" and payload.get("dest") == "desktop"
+                  else drop_folder())
     action = payload["action"]
     if action == "inbox":
         entries = []
@@ -320,7 +495,7 @@ def run_here(payload, state=None):
         except RuntimeError:
             part.unlink(missing_ok=True)  # the disk filled up mid-upload: give the space back
             raise
-    if payload["offset"] + len(data) > (MAX_BYTES if payload.get("dest", "drop") in ("drop", "desktop")
+    if payload["offset"] + len(data) > (MAX_BYTES if payload.get("dest", "drop") in ("drop", "desktop", "path")
                                          else CLIP_BYTES):
         part.unlink(missing_ok=True)
         raise ValueError("That is too large to send this way.")
@@ -389,12 +564,16 @@ def call(config, state, device, payload, timeout=120):
         "timeout": max(1, timeout - 5)}, timeout=timeout)
 
 
-def push(config, state, device, source, size, name=None, dest="drop", kind=None):
-    """Stream `source` (a binary file object of `size` bytes) to `device` in chunks."""
+def push(config, state, device, source, size, name=None, dest="drop", kind=None, folder=None):
+    """Stream `source` (a binary file object of `size` bytes) to `device` in chunks.
+
+    dest "path" lands the file in `folder`, a folder on that device inside its storage roots.
+    """
     upload, offset, result = uuid.uuid4().hex, 0, None
-    if dest not in ("drop", "desktop", "clipboard"):
+    if dest not in ("drop", "desktop", "clipboard", "path"):
         raise ValueError("Invalid transfer destination.")
     extra = ({"dest": dest, "name": name, "size": size} if dest in ("drop", "desktop")
+             else {"dest": "path", "name": name, "size": size, "dir": folder} if dest == "path"
              else {"dest": "clipboard", "kind": kind})
     while True:
         data = source.read(CHUNK)
@@ -484,3 +663,29 @@ def fetch_file(config, state, name, device=None, dest=None):
     finally:
         part.unlink(missing_ok=True)
     return {"fetched": final, "path": str(folder / final), "bytes": (folder / final).stat().st_size}
+
+
+def pull_path(config, state, device, path, folder, name, rel=None):
+    """Stream one file on `device` (`path`, or `rel` inside the folder `path`) into local `folder`.
+
+    Returns the name it landed under; an existing file is never replaced.
+    """
+    folder = Path(folder)
+    extra = {"rel": rel} if rel else {}
+    part = folder / PART.format(uuid.uuid4().hex)
+    try:
+        with open(part, "xb") as out:
+            while True:
+                chunk = call(config, state, device, {"action": "get", "path": path,
+                                                     "offset": out.tell(), **extra})
+                if out.tell() == 0:
+                    _check_space(folder, chunk["size"])
+                data = base64.b64decode(chunk["data"], validate=True)
+                out.write(data)
+                if chunk["eof"]:
+                    break
+                if not data:
+                    raise RuntimeError("The file changed while it was being copied; try again.")
+        return _land(part, folder, safe_name(name))
+    finally:
+        part.unlink(missing_ok=True)

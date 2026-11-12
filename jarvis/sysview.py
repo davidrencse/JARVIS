@@ -27,7 +27,7 @@ STATIONS = [
     {"id": "remember", "title": "Remember", "verb": "recalls",
      "plain": "Before answering it gathers what it already knows: your Obsidian notes, wiki "
               "claims with their sources and dates, and past conversations.",
-     "modules": ["vault", "knowledge", "memory", "second_brain", "second_brain_queue", "second_brain_runtime", "consolidate", "vault_mcp", "tasks", "history", "embed", "stemming", "situation"]},
+     "modules": ["vault", "knowledge", "memory", "second_brain", "second_brain_queue", "second_brain_runtime", "brainsync", "consolidate", "vault_mcp", "tasks", "history", "embed", "stemming", "situation"]},
     {"id": "think", "title": "Think", "verb": "answers",
      "plain": "The brain (ChatGPT through Codex, or Claude) writes the answer. Big jobs go to "
               "a planner that hands each step to a specialist agent.",

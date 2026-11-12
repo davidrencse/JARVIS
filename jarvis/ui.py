@@ -1128,7 +1128,8 @@ class Console:
     # default-denies /api/fleet* to node tokens and the phone server has no write route.
     def fleet(self):
         from . import fleet_management
-        return fleet_management.inventory(self.config, self.state)
+        return fleet_management.inventory(
+            self.config, self.state, config_path=self.base / "jarvis.config.json")
 
     def fleet_vault(self):
         from . import fleet_management
@@ -1140,11 +1141,15 @@ class Console:
 
     def fleet_main_preview(self, body):
         from . import fleet_management
-        return fleet_management.main_transfer(self.config, self.state, body)
+        return fleet_management.main_transfer(
+            self.config, self.state, body, config_path=self.base / "jarvis.config.json")
 
     def fleet_main_transfer(self, body):
+        """POST /api/fleet/main-transfer. The path is this console's config file.
+        Fleet fails closed when that file is absent; it does not search for another."""
         from . import fleet_management
-        return fleet_management.main_transfer_refuse(self.config, self.state, body)
+        return fleet_management.main_transfer_refuse(
+            self.config, self.state, body, config_path=self.base / "jarvis.config.json")
 
     def fleet_action(self, kind, body):
         """invite | revoke | capabilities. The reply to an invite holds the secret code: the

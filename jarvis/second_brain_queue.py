@@ -27,8 +27,13 @@ How capture works
 - Disabled (no configure / enabled=False) is the legacy behaviour: no tables, no hooks run.
 
 Not claimed: a cross-store atomic checkpoint (each store has its own queue), fleet/lease fencing,
-or that the vault is already the read path (C3). Retention pruning of captured stores is
-suspended while capture is enabled so no pending record can disappear (see history/store).
+or that every reader has cut over to the vault. `vault.recall` can opt in
+(`second_brain.canonical_read`); every other caller still reads SQLite. Retention pruning of
+captured stores is suspended while capture is enabled so no pending record can disappear
+(see history/store). A held `oversize` row stops blocking once a later pending revision of
+the same record fits: the row stays, state `superseded`, reason `superseded-oversize`,
+payload unchanged. Secret and conflict holds are not superseded. A transaction that is
+itself over the cap still raises ArchiveCaptureError.
 """
 
 import json
@@ -81,9 +86,11 @@ _SEED = {
     "tasks": (("tasks", "id", "task"),),
 }
 BACKFILL_BATCH = 200
+# Superseded rows keep their payload but are not a head and do not block a later revision.
 _HEAD_SQL = ("SELECT o.seq, o.store, o.kind, o.key FROM archive_outbox o WHERE o.state='pending' "
              "AND o.seq=(SELECT MIN(p.seq) FROM archive_outbox p WHERE p.store=o.store "
-             "AND p.kind=o.kind AND p.key=o.key) ORDER BY o.seq LIMIT ?")
+             "AND p.kind=o.kind AND p.key=o.key AND p.state IN ('pending', 'held')) "
+             "ORDER BY o.seq LIMIT ?")
 
 
 class ArchiveCaptureError(RuntimeError):
@@ -239,7 +246,7 @@ def _build(db, store, kind, key):
     raise ArchiveCaptureError(f"unknown record kind {kind!r}")
 
 
-def _enqueue(db, store, kind, key, origin, verify=None, hold_unverified=False):
+def _enqueue(db, store, kind, key, origin, verify=None, hold_unverified=False, withhold=None):
     """Queue the record's current revision unless it equals the newest queued/published one.
     Returns 1 if an event was added, 0 if nothing changed, -1 if a matching head could not be
     read back and the caller must keep its backlog row (vault not available to verify)."""
@@ -259,8 +266,10 @@ def _enqueue(db, store, kind, key, origin, verify=None, hold_unverified=False):
         return 0
     digest = sb._sha(text)
     size = len(text.encode("utf-8"))
+    # A superseded oversize row still holds the old bytes. It is not the current revision.
     last = db.execute("SELECT payload_sha FROM archive_outbox WHERE store=? AND kind=? AND key=? "
-                      "ORDER BY seq DESC LIMIT 1", (store, kind, key)).fetchone()
+                      "AND state IN ('pending', 'held') ORDER BY seq DESC LIMIT 1",
+                      (store, kind, key)).fetchone()
     if last is None:
         last = db.execute("SELECT payload_sha FROM archive_head WHERE store=? AND kind=? AND key=?",
                           (store, kind, key)).fetchone()
@@ -274,7 +283,12 @@ def _enqueue(db, store, kind, key, origin, verify=None, hold_unverified=False):
                 sound = False
             if sound:
                 return 0
-            # head hash matches but the note did not read back: queue a repair revision
+            # An intact gap, or a tombstone, is not a repair. A damaged head is.
+            try:
+                if withhold is not None and withhold(store, kind, key, digest):
+                    return 0
+            except (OSError, sb.SecondBrainError):
+                pass
         elif hold_unverified and _head_matches(db, store, kind, key, digest):
             return -1  # do not drop the backlog row until a drain can open the note
         else:
@@ -313,17 +327,19 @@ def _same_payload_queued(db, store, kind, key, digest):
         (store, kind, key, digest)).fetchone() is not None
 
 
-def _backfill(db, limit=BACKFILL_BATCH, verify=None):
+def _backfill(db, limit=BACKFILL_BATCH, verify=None, withhold=None):
     """One bounded batch of the baseline backlog -> outbox events (origin 'baseline'). Newest
     state wins and is appended AFTER anything the triggers already queued, so ordering per record
     holds. When `verify(store, kind, key, sha)` is set, a head whose hash matches is acked as
     unchanged only if that call reads the note back; a damaged note is queued for a new revision.
+    `withhold` true means the gap or tombstone stays fail-closed: no repair row is queued.
     Without `verify`, a matching head is left in the backlog (return counts only rows consumed).
     Returns (events_added, rows_consumed). Caller owns the transaction."""
     rows = db.execute("SELECT store,kind,key FROM archive_backfill ORDER BY rowid LIMIT ?", (limit,)).fetchall()
     added = consumed = 0
     for store, kind, key in rows:
-        n = _enqueue(db, store, kind, key, "baseline", verify=verify, hold_unverified=True)
+        n = _enqueue(db, store, kind, key, "baseline", verify=verify, hold_unverified=True,
+                     withhold=withhold)
         if n < 0:
             continue
         db.execute("DELETE FROM archive_backfill WHERE store=? AND kind=? AND key=?", (store, kind, key))
@@ -447,10 +463,10 @@ def _age(stamp):
 
 def _store_status(path):
     info = {"exists": path.exists(), "configured": False, "enabled": False, "pending": 0, "held": 0,
-            "errors": 0, "unreconciled": 0, "bytes": 0, "oldest_age_s": None, "last_success": None,
-            "source_gone": 0, "held_reasons": {}, "error_samples": [], "baseline_seeded": False,
-            "baseline_pending": 0, "rows": 0, "heads": 0, "last_drain": None, "excluded": 0,
-            "overflow_max_bytes": 0, "held_oversize_bytes": 0}
+            "superseded": 0, "errors": 0, "unreconciled": 0, "bytes": 0, "oldest_age_s": None,
+            "last_success": None, "source_gone": 0, "held_reasons": {}, "error_samples": [],
+            "baseline_seeded": False, "baseline_pending": 0, "rows": 0, "heads": 0, "last_drain": None,
+            "excluded": 0, "overflow_max_bytes": 0, "held_oversize_bytes": 0}
     if not info["exists"]:
         return info
     conn = _open(path, readonly=True)
@@ -461,11 +477,11 @@ def _store_status(path):
         info.update(configured=True, enabled=meta.get("enabled") == "1",
                     last_success=meta.get("last_success_at"), source_gone=int(meta.get("source_gone", 0)),
                     excluded=int(meta.get("excluded", 0)))
-        row = conn.execute("SELECT SUM(state='pending'), SUM(state='held'), "
+        row = conn.execute("SELECT SUM(state='pending'), SUM(state='held'), SUM(state='superseded'), "
                            "SUM(last_error IS NOT NULL), COALESCE(SUM(bytes),0), MIN(captured_at) "
                            "FROM archive_outbox").fetchone()
-        info.update(pending=row[0] or 0, held=row[1] or 0, errors=row[2] or 0, bytes=row[3],
-                    oldest_age_s=_age(row[4]))
+        info.update(pending=row[0] or 0, held=row[1] or 0, superseded=row[2] or 0,
+                    errors=row[3] or 0, bytes=row[4], oldest_age_s=_age(row[5]))
         info["unreconciled"] = conn.execute("SELECT COUNT(*) FROM archive_guard").fetchone()[0]
         info["baseline_seeded"] = meta.get("baseline_seeded_at") is not None
         info["last_drain"] = meta.get("last_drain_at")
@@ -493,7 +509,8 @@ def status(state_dir):
 
     Returns {"ok": bool, "enabled": bool (any store capturing), "configured": bool (all three
     stores have an outbox), "capture_complete": bool (all three configured AND enabled), "marker",
-    "pending", "held", "errors", "unreconciled", "bytes", "oldest_age_s" (int|None),
+    "pending", "held", "superseded" (oversize rows kept, not blocking), "errors", "unreconciled",
+    "bytes", "oldest_age_s" (int|None),
     "last_success" (ISO|None: last acknowledged publish), "last_drain" (ISO|None: last drain that
     reached the vault and finished without error, even if the queue was empty), "source_gone",
     "baseline_seeded" (every enabled store had its pre-existing rows queued), "baseline_pending"
@@ -503,7 +520,8 @@ def status(state_dir):
     ok is False only if a database could not be read (then "error" says which)."""
     state = Path(state_dir).expanduser()
     out = {"ok": True, "enabled": False, "configured": False, "capture_complete": False,
-           "marker": (state / MARKER).exists(), "pending": 0, "held": 0, "errors": 0, "unreconciled": 0,
+           "marker": (state / MARKER).exists(), "pending": 0, "held": 0, "superseded": 0,
+           "errors": 0, "unreconciled": 0,
            "bytes": 0, "oldest_age_s": None, "last_success": None, "last_drain": None, "source_gone": 0,
            "baseline_seeded": False, "baseline_pending": 0, "rows": 0, "heads": 0,
            "excluded": 0, "held_reasons": {}, "error_samples": [], "stores": {},
@@ -515,8 +533,8 @@ def status(state_dir):
             out["stores"][store] = {"exists": True, "configured": False, "enabled": False, "error": _short(exc)}
             out.update(ok=False, error=f"{store}: {_short(exc)}")
             continue
-        for k in ("pending", "held", "errors", "unreconciled", "bytes", "source_gone", "baseline_pending",
-                  "rows", "heads", "excluded"):
+        for k in ("pending", "held", "superseded", "errors", "unreconciled", "bytes", "source_gone",
+                  "baseline_pending", "rows", "heads", "excluded"):
             out[k] += info[k]
         for k in ("overflow_max_bytes", "held_oversize_bytes"):
             out[k] = max(out[k], info.get(k, 0))
@@ -671,6 +689,18 @@ def release_held(state_dir, record_id=None, reason=None):
     return total
 
 
+def _supersede_oversize(conn, cap):
+    """A held oversize row stops being the head once a later pending revision of the same
+    record fits under `cap`. The row and its payload stay, as state superseded. Secret,
+    conflict, and every other hold are left blocking. Returns how many rows changed."""
+    return conn.execute(
+        "UPDATE archive_outbox AS held SET state='superseded', held_reason='superseded-oversize', "
+        "last_error=NULL WHERE held.state='held' AND held.held_reason='oversize' AND EXISTS ("
+        "SELECT 1 FROM archive_outbox AS newer WHERE newer.store=held.store AND newer.kind=held.kind "
+        "AND newer.key=held.key AND newer.seq>held.seq AND newer.state='pending' AND newer.bytes<=?)",
+        (cap,)).rowcount
+
+
 def _hold(conn, seq, reason):
     with _tx(conn):
         conn.execute("UPDATE archive_outbox SET state='held', held_reason=?, last_error=NULL WHERE seq=?",
@@ -762,20 +792,24 @@ def drain(state_dir, vault_root, limit=100, *, allow_secret_like=(), dry_run=Fal
     One drain at a time per state dir (flock on <state>/archive.lock; a second caller gets
     busy=True and changes nothing). Each event is the exact payload captured at commit time,
     published through SecondBrain.publish (conflict/secret/size checks, fsync, read-back) and
-    removed from the queue only afterwards. Held or failed events stay queued, block newer
-    events of the same record (order is preserved) and are never dropped. dry_run writes nothing
-    (not even the vault) and does not need the lock.
+    removed from the queue only afterwards. Held or failed events stay queued and block newer
+    events of the same record (order is preserved). A held oversize row is the exception: when
+    a later pending revision of that record fits, the old row becomes superseded and keeps its
+    payload. It is not deleted. Secret and conflict holds are never superseded. dry_run writes
+    nothing (not the vault, not the outbox) and does not need the lock.
 
     Returns {"ok": bool, "busy": bool, "vault_ok": bool, "dry_run": bool, "acked": int,
     "published": int, "unchanged": int, "held": int, "failed": int, "reconciled": int,
-    "remaining": int (pending+held left in enabled stores), "held_ids": [<=20 ids],
+    "superseded": int (oversize rows marked this call), "remaining": int (pending+held left
+    in enabled stores; superseded is not remaining), "held_ids": [<=20 ids],
     "error_samples": [<=5 short strings], "error"?: str, "elapsed_ms": int, "stores": {...}}.
     ok means: vault reachable, not busy, no database error. It does NOT mean the queue is empty:
     check remaining/held/failed."""
     t0 = time.monotonic()
     rep = {"ok": True, "busy": False, "vault_ok": False, "dry_run": bool(dry_run), "acked": 0,
            "published": 0, "unchanged": 0, "held": 0, "failed": 0, "reconciled": 0, "baselined": 0,
-           "released_oversize": 0, "chunked": 0, "repaired": 0, "baseline_pending": 0, "remaining": 0, "held_ids": [], "error_samples": [], "stores": {}, "elapsed_ms": 0}
+           "released_oversize": 0, "superseded": 0, "chunked": 0, "repaired": 0,
+           "baseline_pending": 0, "remaining": 0, "held_ids": [], "error_samples": [], "stores": {}, "elapsed_ms": 0}
     state = Path(state_dir).expanduser()
     try:
         limit = max(1, min(int(limit), MAX_LIMIT))
@@ -834,20 +868,25 @@ def _drain_locked(state, vault_root, limit, allow_secret_like, dry_run, max_reco
                     if vault["ok"]:
                         batches = 0
                         verify = brains[store].publication_sound
+                        withhold = brains[store].repair_withheld
                         while batches * BACKFILL_BATCH < limit:   # bounded and resumable per drain
                             with _tx(conn):
                                 added, seen = _backfill(
-                                    conn, min(BACKFILL_BATCH, limit - batches * BACKFILL_BATCH), verify=verify)
+                                    conn, min(BACKFILL_BATCH, limit - batches * BACKFILL_BATCH),
+                                    verify=verify, withhold=withhold)
                             rep["baselined"] += seen
                             batches += 1
                             if seen == 0:
                                 break
-                    # recovery: held only for size, now fits the bound or the owner's overflow policy
+                    # recovery: held only for size, now fits the bound or the owner's overflow policy.
+                    # What still does not fit stops blocking only when a later pending revision does.
                     if (cap := max(brain.max_record_bytes, brains[store].max_overflow_bytes)):
                         with _tx(conn):
                             rep["released_oversize"] += conn.execute(
                                 "UPDATE archive_outbox SET state='pending', held_reason=NULL "
                                 "WHERE state='held' AND held_reason='oversize' AND bytes<=?", (cap,)).rowcount
+                        with _tx(conn):
+                            rep["superseded"] += _supersede_oversize(conn, cap)
             except sqlite3.Error as exc:
                 rep.update(ok=False)
                 info["error"] = _short(exc)

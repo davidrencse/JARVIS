@@ -267,15 +267,35 @@ def _valid(config, path, value):
     return int(value) if float(low).is_integer() and float(value).is_integer() else round(float(value), 3)
 
 
+def _apply_main(config, path, state, device):
+    """A settings save that is only cluster.main_device. Anything else is the caller's job
+    to reject first. The role moves only when set_main's handoff succeeds; pending leaves
+    saved and restart empty and does not record a cluster overlay."""
+    from .cluster_cli import set_main
+    outcome = set_main(config, path, device, state=state)
+    handoff = {key: outcome.get(key) for key in (
+        "ok", "status", "transition_id", "main", "epoch", "publication", "authority", "mutated")}
+    if outcome.get("error"):
+        handoff["error"] = outcome.get("error")
+    if outcome.get("ok") is True and outcome.get("mutated") is True and outcome.get("main") == device:
+        _SAVED_CLUSTER.setdefault(str(state), {})["main_device"] = device
+        return {**read(config, state), "saved": ["cluster.main_device"], "restart": [], "handoff": handoff}
+    return {**read(config, state), "saved": [], "restart": [],
+            "handoff": {**handoff, "mutated": False}}
+
+
 def write(config, path, state, changes, confirmed=False):
     """Apply {path: value} after validating every change; nothing is saved if one is bad.
-    A change that loosens a safety net (LOOSENS) needs confirmed=True."""
+    A change that loosens a safety net (LOOSENS) needs confirmed=True.
+    cluster.main_device is accepted only as the sole change, and only through set_main."""
     if not isinstance(changes, dict) or not changes:
         raise ValueError("Send at least one setting to change.")
+    if "cluster.main_device" in changes:
+        if len(changes) != 1:
+            raise ValueError("Moving MAIN cannot be combined with other settings. Nothing was saved.")
+        return _apply_main(config, path, state, changes["cluster.main_device"])
     clean, threshold = {}, None
     for key, value in changes.items():
-        if key == "cluster.main_device":
-            raise ValueError("Moving MAIN is unavailable until safe handoff is implemented. See Connections for readiness.")
         if key == "voiceprint.threshold":
             if isinstance(value, bool) or not isinstance(value, (int, float)) \
                     or not VOICE_THRESHOLD[0] <= value <= VOICE_THRESHOLD[1]:
