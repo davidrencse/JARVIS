@@ -285,3 +285,45 @@ loss intentionally stops new work. These limits prevent claiming operational fai
 - Current git worktree has extensive pre-existing edits, additions, and deletions. This report
   was added without reverting or rewriting them. No host connection, credentials, provider,
   service, live state, or production configuration was accessed.
+
+## 7. Gateway alignment note (2026-11-11)
+
+Added after sections 1–6. It does not change those decisions and it is not a
+cutover authorization. The implementation record is
+`docs/design/mobile-continuity/GATEWAY-IMPLEMENTATION.md`.
+
+`jarvis/continuity/gateway.py` now implements the section 3 method names
+(`status`, `renew`, `release`, `acknowledge`, `transition_request`,
+`transition_readiness`, `transition_step`, `consume`, `admission`, `relay`) plus
+owner-only `enroll` and `set_mode`. Authentication is an SSH installation key
+and a pinned owner key. There is still no WebAuthn verifier, no provisioned
+Oracle gateway, and no live listener on import.
+
+Incompatibilities left strict on purpose:
+
+- `consume` is called by the enrolled target and requires a MAIN ticket
+  signature. The contract's `authenticated_main` name is not the HTTP caller.
+  `integration.LoopbackGateway.consume` instead requires the caller to be MAIN
+  and does not check an installation-key signature.
+- `transition_step` is owner-proof only. There is no unsigned policy identity.
+  The loopback stand-in lets the candidate `grant` with a shared secret.
+- `AuthenticatedPort` matches the `MainRuntime` / `ExecutorGuard` argument
+  lists, but `consume` without `ticket_signature` does not reach the store.
+  `ExecutorGuard.accept` still omits that field, so that wiring fails closed.
+- `peer_report()` is name-compatible for gateway, ingress, runtime, and
+  executor. `INCOMPATIBILITIES` still says those modules are absent.
+  `test_operational_e2e.py` still asserts absence. Production
+  `ContinuityIntegration` remains `LEGACY_ACTIVE`.
+- `IsolatedFleet` uses `LoopbackGateway`, not `ContinuityGateway`. Its identity
+  dict includes `secret`, and `reject_personal` rejects that key, so stand-in
+  `acknowledge` raises `personal_field` before any mode change. Do not delete
+  `secret` from the personal-field set to make that drill pass.
+- Gateway `not_found` is HTTP 404. The integration extra map uses 409.
+- `not_quiet` and `lease_live` HTTP errors include the store's `wait` and a
+  matching `Retry-After`. The client keeps that wait only when both agree.
+  Phone ask, overview, and frame bodies are still not relayed. Metadata-only
+  authority storage does not by itself forbid a later transient forward, and
+  this gateway does not store or retry a personal body.
+
+Nothing in this note authorizes sleeping Arch, promoting Dell, or serving the
+phone from Oracle.
