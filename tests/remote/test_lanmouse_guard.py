@@ -1,7 +1,11 @@
 import ipaddress
+import io
 import json
+import sys
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from jarvis import sharedinput
@@ -452,3 +456,174 @@ class StartBlockedTests(unittest.TestCase):
                 stop_fn=lambda: calls.append("stop"), now=self.now + 30 * i)
             self.assertIsNone(out["action"])
         self.assertEqual(calls, [])
+
+
+class ApartPairPolicyTests(unittest.TestCase):
+    """One projection, three decisions. Start allows a stale apart memo. Pair refuses
+    before any write, fresh or stale, and does not stop or start the daemon. The
+    clipboard keeps pausing on that settled apart. Temp files only; no daemon."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.state = Path(self.dir.name)
+        self.now = time.time()
+        self.config = {"lan_mouse": {"off_when_apart": True}}
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def memo(self, **fields):
+        (self.state / sharedinput.GUARD_FILE).write_text(json.dumps(fields), encoding="utf-8")
+
+    def fresh(self):
+        self.memo(apart_now=True, read_at=self.now, why="apart", override=False)
+
+    def stale(self, read_at="old"):
+        if read_at == "old":
+            read_at = self.now - sharedinput.AVAILABILITY_TTL - 30
+        fields = {"apart_now": True, "why": "old", "override": False}
+        if read_at is not None:
+            fields["read_at"] = read_at
+        self.memo(**fields)
+
+    def test_start_allows_stale_apart_and_clipboard_still_pauses(self):
+        self.stale()
+        self.assertEqual(sharedinput.sharing_availability(self.state, now=self.now)["state"], "unknown")
+        self.assertEqual(sharedinput.sharing_availability(self.state, now=self.now)["settled"], "apart")
+        self.assertIsNone(sharedinput.start_blocked(self.state, self.config, now=self.now))
+        self.assertEqual(sharedinput.sharing_paused(self.state), "the laptops are apart")
+        with unittest.mock.patch.object(sharedinput, "start", return_value={"started": True}) as start, \
+                unittest.mock.patch.object(sharedinput, "stop") as stop, \
+                unittest.mock.patch.object(sharedinput, "lan_mouse_status") as status:
+            ok, _ = sharedinput.control("start", state=self.state, config=self.config, now=self.now)
+        self.assertTrue(ok)
+        start.assert_called_once()
+        stop.assert_not_called()
+        status.assert_not_called()
+        self.stale(read_at=None)  # no timestamp: still settled apart, still not a start block
+        self.assertIsNone(sharedinput.start_blocked(self.state, self.config, now=self.now))
+        self.assertEqual(sharedinput.sharing_paused(self.state), "the laptops are apart")
+
+    def test_pair_refuses_fresh_and_stale_apart_before_any_write_or_restart(self):
+        for name, plant in (("fresh", self.fresh), ("stale", self.stale),
+                            ("no-timestamp", lambda: self.stale(read_at=None))):
+            with self.subTest(name=name):
+                plant()
+                cfg_path = self.state / "lan-mouse-config.toml"
+                cfg_path.write_text("port = 4242\n", encoding="utf-8")
+                before = cfg_path.read_bytes()
+                remote = unittest.mock.Mock()
+                with unittest.mock.patch.object(sharedinput, "config_path", return_value=cfg_path), \
+                        unittest.mock.patch.object(sharedinput, "write_pairing",
+                                                   side_effect=AssertionError("config write")) as write, \
+                        unittest.mock.patch.object(sharedinput, "start",
+                                                   side_effect=AssertionError("start")) as start, \
+                        unittest.mock.patch.object(sharedinput, "stop",
+                                                   side_effect=AssertionError("stop")) as stop, \
+                        unittest.mock.patch.object(sharedinput, "lan_mouse_status",
+                                                   side_effect=AssertionError("status")) as status, \
+                        unittest.mock.patch.object(sharedinput, "local_info",
+                                                   side_effect=AssertionError("local")) as info:
+                    with self.assertRaises(RuntimeError) as raised:
+                        sharedinput.pair(self.config, self.state, "dell", "right", remote)
+                self.assertIn("Remote control still works", str(raised.exception))
+                remote.call.assert_not_called()
+                write.assert_not_called()
+                start.assert_not_called()
+                stop.assert_not_called()
+                status.assert_not_called()
+                info.assert_not_called()
+                self.assertEqual(cfg_path.read_bytes(), before)
+                self.assertFalse(list(self.state.glob("*.bak-*")))
+
+    def test_switch_off_does_not_take_the_apart_refusal(self):
+        self.fresh()
+        config = {"lan_mouse": {"off_when_apart": False}}
+        self.assertIsNone(sharedinput.pair_blocked(self.state, config, now=self.now))
+        self.assertIsNone(sharedinput.start_blocked(self.state, config, now=self.now))
+        self.stale()
+        self.assertIsNone(sharedinput.pair_blocked(self.state, config, now=self.now))
+        # The clipboard follows the settled reading, not the switch.
+        self.assertEqual(sharedinput.sharing_paused(self.state), "the laptops are apart")
+        remote = unittest.mock.Mock()
+        remote.call.return_value = (True, json.dumps({"hostname": "dell", "addresses": [],
+                                                      "lan_mouse": {"fingerprint": None}}))
+        with unittest.mock.patch.object(sharedinput, "local_info",
+                                        return_value={"hostname": "here", "addresses": ["192.0.2.1"],
+                                                      "lan_mouse": {"fingerprint": "ab"}}), \
+                unittest.mock.patch.object(sharedinput, "write_pairing",
+                                           side_effect=AssertionError("config write")) as write, \
+                unittest.mock.patch.object(sharedinput, "start") as start, \
+                unittest.mock.patch.object(sharedinput, "stop") as stop:
+            with self.assertRaisesRegex(ValueError, "no certificate on dell"):
+                sharedinput.pair(config, self.state, "dell", "right", remote)
+        remote.call.assert_called_once()
+        self.assertEqual(remote.call.call_args.args[1], "input_info")
+        write.assert_not_called()
+        start.assert_not_called()
+        stop.assert_not_called()
+
+    def test_direct_write_pairing_still_writes_but_does_not_restart_when_stale(self):
+        self.stale()
+        path = self.state / "lan-mouse-config.toml"
+        path.write_text("port = 4242\n", encoding="utf-8")
+        fingerprint = ":".join(["ab"] * 32)
+        with unittest.mock.patch.object(sharedinput, "lan_mouse_status", return_value={"running": True}), \
+                unittest.mock.patch.object(sharedinput, "start", side_effect=AssertionError("start")) as start, \
+                unittest.mock.patch.object(sharedinput, "stop", side_effect=AssertionError("stop")) as stop:
+            out = sharedinput.write_pairing("Dell", ["192.0.2.20"], "right", fingerprint,
+                                            path, state=self.state, config=self.config)
+        start.assert_not_called()
+        stop.assert_not_called()
+        self.assertFalse(out["restarted"])
+        self.assertEqual(sharedinput.read_config(path)["clients"][0]["ips"], ["192.0.2.20"])
+
+    def test_cli_pair_refuses_fresh_and_stale_apart_before_pair_runs(self):
+        from jarvis.__main__ import main
+        cfg = self.state / "jarvis.config.json"
+        cfg.write_text(json.dumps({
+            "cluster": {"enabled": False},
+            "devices": {"dell": {"hostname": "pair-test-peer.invalid", "label": "Dell",
+                                 "transport": "ssh", "target": "david@192.0.2.10"}},
+            "lan_mouse": {"off_when_apart": True},
+        }), encoding="utf-8")
+        config_bytes = cfg.read_bytes()
+        lan = self.state / "lan-mouse-config.toml"
+        lan.write_text("port = 4242\n", encoding="utf-8")
+        lan_bytes = lan.read_bytes()
+        for name, plant in (("fresh", self.fresh), ("stale", self.stale),
+                            ("no-timestamp", lambda: self.stale(read_at=None))):
+            with self.subTest(name=name):
+                plant()
+                memo_bytes = (self.state / sharedinput.GUARD_FILE).read_bytes()
+                out, err = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(sharedinput, "pair",
+                                                side_effect=AssertionError("pair ran")) as pair, \
+                        unittest.mock.patch.object(sharedinput, "write_pairing",
+                                                   side_effect=AssertionError("config write")) as write, \
+                        unittest.mock.patch.object(sharedinput, "start",
+                                                   side_effect=AssertionError("start")) as start, \
+                        unittest.mock.patch.object(sharedinput, "stop",
+                                                   side_effect=AssertionError("stop")) as stop, \
+                        unittest.mock.patch.object(sharedinput, "lan_mouse_status",
+                                                   side_effect=AssertionError("status")) as status, \
+                        unittest.mock.patch.object(sharedinput, "local_info",
+                                                   side_effect=AssertionError("local")) as info, \
+                        unittest.mock.patch.object(sharedinput, "config_path", return_value=lan), \
+                        unittest.mock.patch.object(sys, "argv",
+                                                   ["jarvis", "--config", str(cfg), "--state", str(self.state),
+                                                    "lanmouse", "pair", "--device", "dell", "--position", "right"]), \
+                        redirect_stdout(out), redirect_stderr(err):
+                    code = main()
+                self.assertEqual(code, 1, err.getvalue())
+                self.assertIn("Remote control still works", err.getvalue())
+                pair.assert_not_called()
+                write.assert_not_called()
+                start.assert_not_called()
+                stop.assert_not_called()
+                status.assert_not_called()
+                info.assert_not_called()
+                self.assertEqual(cfg.read_bytes(), config_bytes)
+                self.assertEqual(lan.read_bytes(), lan_bytes)
+                self.assertEqual((self.state / sharedinput.GUARD_FILE).read_bytes(), memo_bytes)
+                self.assertEqual(out.getvalue(), "")
