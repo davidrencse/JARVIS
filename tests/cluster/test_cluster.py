@@ -322,6 +322,17 @@ class ClusterHTTPTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaisesRegex(RuntimeError, "cannot use"):
                 self.client.request("/v1/control", body)
 
+    def test_files_node_cannot_use_storage_copy_operations_on_the_main(self):
+        self.client.token = self.hub.broker.enroll("node", {"files"})
+        with patch("jarvis.cluster.execute_local", return_value={}) as execute:
+            for payload in ({"action": "tree", "path": "/"},
+                            {"action": "get", "path": "/etc/passwd", "offset": 0},
+                            {"action": "mkdir", "dir": "/", "name": "x"}):
+                with self.subTest(payload=payload), self.assertRaisesRegex(RuntimeError, "read or write folders"):
+                    self.client.request("/v1/control", {"node": "main", "kind": "transfer",
+                                                        "payload": payload})
+        execute.assert_not_called()
+
     def test_large_transfer_chunk_reaches_the_node_and_is_compacted(self):
         executed = []
         worker = NodeWorker(self.node, self.state,

@@ -965,7 +965,29 @@ class SigningKeyAndRoleLockTests(unittest.TestCase):
                 with self.assertRaises(ConfigBusy) as caught:
                     set_main(stale, self.path, "dell", state=self.state)
         self.assertEqual(caught.exception.code, "busy")
-        saved = set_main(stale, self.path, "dell", state=self.state)
+        class _Handoff:
+            def __init__(self):
+                self.phase = "before"
+
+            def candidate_readiness(self, device):
+                return {"control_ready": True, "ai_ready": False}
+
+            def authority_status(self):
+                main = "main" if self.phase == "before" else "dell"
+                body = {"mode": "V2_ACTIVE", "lease_valid": True, "main_ready": True, "main": main,
+                        "epoch": 3, "incarnation": 1, "grant_barrier": 0, "transition": None}
+                if self.phase == "after":
+                    body["transition"] = {"state": "SUCCEEDED", "candidate": "dell",
+                                          "transition_id": "t-fleet", "action": "set_preferred_main"}
+                return body
+
+            def __call__(self, old, new, config, base):
+                self.phase = "after"
+                return {"ok": True, "status": "ready", "main": new, "transition_id": "t-fleet",
+                        "epoch": 3, "action": "set_preferred_main"}
+
+        with mock.patch("jarvis.cluster_cli._bound_handoff", return_value=_Handoff()):
+            saved = set_main(stale, self.path, "dell", state=self.state)
         written = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(written["cluster"]["main_device"], "dell")
         self.assertEqual(written["devices"]["oracle1"]["profile"], "cloud")

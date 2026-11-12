@@ -49,6 +49,42 @@ class Base(unittest.TestCase):
     def disk(self):
         return json.loads(self.path.read_text(encoding="utf-8"))
 
+    @contextlib.contextmanager
+    def bound_main(self):
+        """A contract-compliant handoff for set_main. The patch replaces only the binding
+        lookup: set_main still takes the managed lock, reads the file, and patches the role
+        itself after the authenticated status shows the requested main. The handoff writes nothing."""
+        seen = []
+        state = self.state
+
+        class _Handoff:
+            def __init__(self):
+                self.phase = "before"
+                self.target = "dell"
+                self.state = state
+
+            def candidate_readiness(self, device):
+                return {"control_ready": True, "ai_ready": False}
+
+            def authority_status(self):
+                main = "zenbook" if self.phase == "before" else self.target
+                return {"mode": "V2_ACTIVE", "lease_valid": True, "main_ready": True, "main": main,
+                        "epoch": 1, "incarnation": 1, "grant_barrier": 0,
+                        "transition": None if self.phase == "before" else {
+                            "state": "SUCCEEDED", "candidate": self.target, "transition_id": "t-writers",
+                            "action": "set_preferred_main"}}
+
+            def __call__(self, old, new, config, base):
+                seen.append({"old": old, "new": new, "config": config, "base": base,
+                             "held": config_lock.held(self.state)})
+                self.target = new
+                self.phase = "after"
+                return {"ok": True, "status": "ready", "main": new,
+                        "transition_id": "t-writers", "epoch": 1, "action": "set_preferred_main"}
+
+        with mock.patch.object(cluster_cli, "_bound_handoff", return_value=_Handoff()):
+            yield seen
+
     def edit_disk(self, fn):
         doc = self.disk()
         fn(doc)
@@ -179,7 +215,13 @@ class PatchConfigTests(Base):
             proc.wait(10)
             proc.stdin.close()
             proc.stdout.close()
-        self.assertEqual(cluster_cli.set_main(MAIN, self.path, "dell", state=self.state)["main_device"], "dell")
+        # The other process has released the lock. Unbound set_main still refuses, so the
+        # write that proves this process can take the lock is a bound handoff.
+        with self.bound_main():
+            moved = cluster_cli.set_main(MAIN, self.path, "dell", state=self.state)
+        self.assertEqual(moved["main_device"], "dell")
+        self.assertTrue(moved["ok"] and moved["mutated"])
+        self.assertEqual(self.disk()["cluster"]["main_device"], "dell")
 
 
 class CliWriterTests(Base):
@@ -216,27 +258,60 @@ class CliWriterTests(Base):
     def test_set_main_keeps_a_device_written_after_the_caller_loaded_its_copy(self):
         stale = json.loads(json.dumps(MAIN))
         self.edit_disk(lambda d: d["devices"].update(oracle1={"label": "oracle1", "profile": "cloud"}))
-        cluster_cli.set_main(stale, self.path, "dell", state=self.state)
+        with self.bound_main() as seen:
+            cluster_cli.set_main(stale, self.path, "dell", state=self.state)
         disk = self.disk()
         self.assertEqual(disk["devices"]["oracle1"]["profile"], "cloud")
         self.assertEqual(disk["cluster"]["main_device"], "dell")
+        self.assertEqual(disk["keep"], {"me": [1, 2, 3]})
         self.assertEqual(len(self.backups()), 1)
+        saved = json.loads((self.tmp / self.backups()[0]).read_text(encoding="utf-8"))
+        self.assertEqual(saved["cluster"]["main_device"], "zenbook")
+        self.assertEqual(saved["devices"]["oracle1"]["profile"], "cloud")
+        self.assertNotIn("oracle1", stale["devices"])
+        self.assertEqual(seen[0]["old"], "zenbook")
+        self.assertEqual(seen[0]["new"], "dell")
+        self.assertEqual(seen[0]["config"]["devices"]["oracle1"]["profile"], "cloud")
+        self.assertTrue(seen[0]["held"])
+        self.assertEqual(seen[0]["base"], self.tmp)
+
+    def test_unbound_set_main_refuses_without_changing_the_role(self):
+        before = self.path.read_bytes()
+        with self.assertRaises(ValueError) as caught:
+            cluster_cli.set_main(MAIN, self.path, "dell", state=self.state)
+        self.assertIn("Moving MAIN is unavailable", str(caught.exception))
+        self.assertIn("safe handoff", str(caught.exception))
+        self.assertIn("not changed", str(caught.exception))
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+        self.assertEqual(self.disk()["cluster"]["main_device"], "zenbook")
 
     def test_set_main_checks_the_device_on_disk(self):
         self.edit_disk(lambda d: d["devices"].pop("dell"))
-        with self.assertRaises(ValueError):
-            cluster_cli.set_main(MAIN, self.path, "dell", state=self.state)
+        before = self.path.read_bytes()
+        with self.bound_main() as seen:
+            with self.assertRaises(ValueError) as caught:
+                cluster_cli.set_main(MAIN, self.path, "dell", state=self.state)
+        self.assertIn("No device 'dell'", str(caught.exception))
+        self.assertEqual(seen, [])
+        self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(self.disk()["cluster"]["main_device"], "zenbook")
 
     def test_leave_only_turns_the_cluster_off(self):
+        self.edit_disk(lambda d: d["cluster"].update(local_device="dell"))
         self.edit_disk(lambda d: d.update(newer=True))
+        node = self.disk()
         with mock.patch("jarvis.cluster_tunnel.status", return_value={"running": False}), \
                 mock.patch("jarvis.cluster_tunnel.autostart", return_value={}), \
                 mock.patch.object(cluster_cli, "autostart", return_value={}):
-            cluster_setup.leave(MAIN, self.path, self.state)
+            cluster_setup.leave(node, self.path, self.state)
         disk = self.disk()
         self.assertFalse(disk["cluster"]["enabled"])
         self.assertTrue(disk["newer"])
+        self.assertEqual(disk["cluster"]["local_device"], "dell")
+        self.assertEqual(disk["cluster"]["main_device"], "zenbook")
+        self.assertEqual(disk["devices"], node["devices"])
+        self.assertEqual(disk["keep"], node["keep"])
 
 
 class InviteUnderLockTests(Base):
@@ -245,8 +320,10 @@ class InviteUnderLockTests(Base):
             return cluster_setup.invite(config or MAIN, self.path, self.state, node)
 
     def test_role_flip_while_the_signing_key_is_made_stops_before_any_credential(self):
-        def code_key(state):  # `cluster main dell` lands while the key is generated
-            cluster_cli.set_main(MAIN, self.path, "dell", state=self.state)
+        def code_key(state):  # a managed role write lands while the key is generated
+            def flip(doc):
+                doc["cluster"]["main_device"] = "dell"
+            config_lock.patch_config(state, self.path, flip, backup="cluster-main")
             return HOST_KEY
         with self.assertRaises(ValueError) as caught:
             self.invite(code_key=code_key)

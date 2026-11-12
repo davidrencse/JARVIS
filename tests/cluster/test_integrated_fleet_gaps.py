@@ -73,7 +73,7 @@ class SettingsWriteTests(Base):
                 cluster_cli.set_main(memory, self.path, "dell", state=self.state)
             return real(text, *args, **kwargs)
 
-        with mock.patch.object(config_lock.json, "loads", side_effect=loads):
+        with self.bound_main(), mock.patch.object(config_lock.json, "loads", side_effect=loads):
             settings.write(memory, self.path, self.state, {"voice.kokoro_speed": 1.1})
         disk = self.disk()
         self.assertEqual(fired["n"], 1)
@@ -86,7 +86,8 @@ class SettingsWriteTests(Base):
 
     def test_stale_memory_does_not_restore_main(self):
         memory = json.loads(self.path.read_text(encoding="utf-8"))
-        cluster_cli.set_main(memory, self.path, "dell", state=self.state)
+        with self.bound_main():
+            cluster_cli.set_main(memory, self.path, "dell", state=self.state)
         settings.write(memory, self.path, self.state, {"voice.kokoro_speed": 1.1})
         disk = self.disk()
         self.assertEqual(disk["cluster"]["main_device"], "dell")
