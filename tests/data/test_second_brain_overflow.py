@@ -426,6 +426,9 @@ class Recovery(Bound):
         self.assertNotEqual(again["state"], "current")
         self.assertEqual(again["archive_chunk_damaged"], 0)   # the new head reads back on its own
         self.assertGreaterEqual(again["archive_revision_conflict"], 1)
+        head_sha = sqlite3.connect(self.state / "tasks.sqlite3").execute(
+            "SELECT payload_sha FROM archive_head").fetchone()[0]
+        self.assertFalse(self.brain.publication_sound("tasks", "task", task["id"], head_sha))
         q.rescan(self.state)
         second = self.drain_all()
         self.assertEqual((second["repaired"], second["failed"], second["remaining"]), (0, 0, 0))
@@ -437,6 +440,103 @@ class Recovery(Bound):
                               "stores": {}})
         self.assertEqual(view["skipped"], {"oversize": 1, "secret-like": 1})
         self.assertEqual(view["repaired"], 1)
+
+
+class Supersede(Bound):
+    """A held oversize head must not block a later revision that fits. The old bytes stay."""
+
+    def _spec(self, task_id, spec):
+        conn = sqlite3.connect(self.state / "tasks.sqlite3")
+        try:
+            conn.execute("UPDATE tasks SET spec=? WHERE id=?", (json.dumps(spec), task_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _rows(self):
+        conn = sqlite3.connect(self.state / "tasks.sqlite3")
+        try:
+            return conn.execute(
+                "SELECT state, held_reason, payload, bytes FROM archive_outbox ORDER BY seq").fetchall()
+        finally:
+            conn.close()
+
+    def test_shrink_then_transition_publishes_and_keeps_the_oversize_bytes(self):
+        store = Store(self.state, prune=False)
+        huge = "H" * 9000
+        task = store.add({"objective": huge})
+        q.configure(self.state, True)
+        self.drain_all()
+        self.assertEqual([row[1:3] for row in outbox(self.state)], [("held", "oversize")])
+        self.assertEqual(self.notes(), [])
+        with self.assertRaises(q.ArchiveCaptureError):
+            store.transition(task["id"], "queued", "failed", {"why": "still huge"})
+        self.assertEqual(store.get(task["id"])["state"], "queued")
+        self._spec(task["id"], {"objective": "small now"})
+        before = [row[:2] for row in self._rows()]
+        dry = q.drain(self.state, self.vault, dry_run=True)
+        self.assertEqual(dry["acked"], 0)
+        self.assertEqual(dry["superseded"], 0)
+        self.assertEqual(self.notes(), [])
+        self.assertEqual([row[:2] for row in self._rows()], before)   # dry-run does not supersede
+        first = self.drain_all()
+        self.assertGreaterEqual(first["superseded"], 1)
+        self.assertEqual(len(self.notes()), 1)
+        store.transition(task["id"], "queued", "failed", {"why": "stop"})
+        note_names = sorted(path.name for path in self.notes())
+        queued = [row[:2] for row in self._rows()]
+        dry = q.drain(self.state, self.vault, dry_run=True)
+        self.assertEqual(dry["acked"], 0)
+        self.assertEqual(sorted(path.name for path in self.notes()), note_names)
+        self.assertEqual([row[:2] for row in self._rows()], queued)
+        rep = self.drain_all()
+        self.assertEqual((rep["failed"], rep["held"], rep["remaining"]), (0, 0, 0))
+        self.assertEqual(len(self.notes()), 2)
+        kept = [row for row in self._rows() if row[0] == "superseded"]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0][1], "superseded-oversize")
+        self.assertIn(huge, kept[0][2])
+        self.assertGreater(kept[0][3], 4096)
+        st = q.status(self.state)
+        self.assertEqual((st["pending"], st["held"]), (0, 0))
+        self.assertGreaterEqual(st["superseded"], 1)
+        self.assertNotIn("oversize", st["held_reasons"])
+        out = rt.status(self.config(), self.state)
+        self.assertEqual(out["state"], "current")
+        self.assertEqual(out["archive_held"], 0)
+        self.assertGreaterEqual(out["archive_superseded"], 1)
+        self.assertFalse(out["canonical"])   # opt-in is off
+        latest = self.brain.latest(self.rid(task["id"]))
+        self.assertEqual(latest["fields"]["state"], "failed")
+        self.assertIn("small now", latest["fields"]["spec"])
+        self.assertNotIn(huge, json.dumps(latest))
+        q.rescan(self.state)
+        again = self.drain_all()
+        self.assertEqual((again["repaired"], again["remaining"], len(self.notes())), (0, 0, 2))
+
+    def test_secret_and_conflict_holds_are_not_superseded(self):
+        store = Store(self.state, prune=False)
+        task = store.add({"objective": "H" * 9000})
+        q.configure(self.state, True)
+        self.drain_all()
+        conn = sqlite3.connect(self.state / "tasks.sqlite3")
+        conn.execute("UPDATE archive_outbox SET held_reason='secret-like'")
+        conn.commit()
+        conn.close()
+        self._spec(task["id"], {"objective": "small now"})
+        rep = self.drain_all()
+        self.assertEqual(rep["superseded"], 0)
+        self.assertEqual(self.notes(), [])
+        self.assertEqual([row[1:3] for row in outbox(self.state) if row[1] == "held"],
+                         [("held", "secret-like")])
+        conn = sqlite3.connect(self.state / "tasks.sqlite3")
+        conn.execute("UPDATE archive_outbox SET held_reason='conflict' WHERE state='held'")
+        conn.commit()
+        conn.close()
+        rep = self.drain_all()
+        self.assertEqual(rep["superseded"], 0)
+        self.assertEqual(q.status(self.state)["held_reasons"], {"conflict": 1})
+        self.assertEqual(self.notes(), [])
 
 
 class RealSize(Base):

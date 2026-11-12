@@ -10,6 +10,8 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
+from jarvis import transfer
+from jarvis.cluster import validate_action
 from jarvis.storage import REMOTE_SCRIPT, Storage
 from jarvis.ui import Console, Handler
 
@@ -186,6 +188,201 @@ class CopyTests(Temp):
         (self.remote / "f.txt").write_text("x")
         with self.assertRaisesRegex(ValueError, "must be a folder"):
             self.fs.copy("dell", str(self.local / "a.txt"), "zen", str(self.remote / "f.txt"))
+
+
+class ClusterCopyTests(Temp):
+    """The Dell is a hub-only node (no SSH target): copies ride chunked transfer jobs."""
+
+    def setUp(self):
+        super().setUp()
+        self.node = self.base / "node"  # the Dell's storage root, on this machine
+        self.node.mkdir()
+        self.state = self.base / "state"
+        self.state.mkdir()
+        self.config = {
+            "devices": {"main": {"transport": "local", "hostname": "M"},
+                        "dell": {"transport": "cluster", "hostname": "D", "label": "Dell G15"}},
+            "cluster": {"enabled": True, "main_device": "main", "local_device": "main"},
+            "storage": {"main": {"roots": [str(self.local)]}, "dell": {"roots": [str(self.node)]}}}
+        self.node_config = {**self.config, "cluster": {**self.config["cluster"],
+                                                       "local_device": "dell"}}
+        self.fs = Storage(self.config, self.state)
+        self.calls = []
+
+        def fake_call(config, state, device, payload, timeout=120):
+            """What the hub does: JSON across, validated, run on the node with ITS config."""
+            self.calls.append(payload)
+            payload = json.loads(json.dumps(payload))
+            validate_action("transfer", payload)
+            return json.loads(json.dumps(transfer.run_here(payload, self.state, self.node_config)))
+
+        def fake_dispatch(config, state, node, kind, payload, timeout=45):
+            self.assertEqual((node, kind), ("dell", "storage"))
+            return Storage(self.node_config)._local("dell", payload["path"], payload["action"])
+
+        for target in (patch("jarvis.transfer.call", fake_call),
+                       patch("jarvis.cluster.dispatch", fake_dispatch)):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def test_file_goes_main_to_node_and_never_overwrites(self):
+        (self.node / "inbox").mkdir()
+        with patch.object(transfer, "CHUNK", 2):
+            one = self.fs.copy("main", str(self.local / "a.txt"), "dell", str(self.node / "inbox"))
+        two = self.fs.copy("main", str(self.local / "a.txt"), "dell", str(self.node / "inbox"))
+        self.assertEqual((one["as"], two["as"]), ("a.txt", "a (2).txt"))
+        self.assertEqual((self.node / "inbox" / "a.txt").read_text(), "alpha")
+        self.assertEqual((self.node / "inbox" / "a (2).txt").read_text(), "alpha")
+        self.assertEqual((one["copied"], one["dir"], one["bytes"]), ("a.txt", False, 5))
+        self.assertEqual(one["to"], f"dell:{self.node / 'inbox'}")
+        self.assertEqual([c["last"] for c in self.calls if c["action"] == "put"][:3],
+                         [False, False, True])
+        self.assertEqual(list((self.node / "inbox").glob(".jarvis-upload-*")), [])
+
+    def test_file_comes_node_to_main_in_chunks_without_overwriting(self):
+        (self.node / "n.bin").write_bytes(bytes(range(11)))
+        (self.local / "n.bin").write_bytes(b"mine")
+        with patch.object(transfer, "CHUNK", 4):
+            out = self.fs.copy("dell", str(self.node / "n.bin"), "main", str(self.local))
+        self.assertEqual(out["as"], "n (2).bin")
+        self.assertEqual((self.local / "n (2).bin").read_bytes(), bytes(range(11)))
+        self.assertEqual((self.local / "n.bin").read_bytes(), b"mine")
+        self.assertEqual(sum(c["action"] == "get" for c in self.calls), 3)
+        self.assertEqual(list(self.local.glob(".jarvis-upload-*")), [])
+
+    def test_folder_goes_both_ways_with_subfolders_and_empty_ones(self):
+        (self.local / "docs" / "sub" / "empty").mkdir(parents=True)
+        (self.local / "docs" / "sub" / "c.txt").write_text("gamma")
+        (self.local / "docs" / "zero.txt").write_text("")
+        (self.node / "inbox").mkdir()
+        out = self.fs.copy("main", str(self.local / "docs"), "dell", str(self.node / "inbox"))
+        self.assertTrue(out["dir"])
+        self.assertIsNone(out["bytes"])
+        landed = self.node / "inbox" / "docs"
+        self.assertEqual((landed / "b.txt").read_text(), "beta")
+        self.assertEqual((landed / "sub" / "c.txt").read_text(), "gamma")
+        self.assertTrue((landed / "sub" / "empty").is_dir())
+        self.assertEqual((landed / "zero.txt").read_bytes(), b"")
+        back = self.fs.copy("dell", str(landed), "main", str(self.local))
+        self.assertEqual(back["as"], "docs (2)")  # docs already exists on the main
+        again = self.local / "docs (2)"
+        self.assertEqual((again / "sub" / "c.txt").read_text(), "gamma")
+        self.assertTrue((again / "sub" / "empty").is_dir())
+        self.assertEqual((again / "b.txt").read_text(), "beta")
+
+    def test_folder_copy_skips_links_instead_of_following_them(self):
+        (self.local / "docs" / "leak").symlink_to(self.base / "secret.txt")
+        self.fs.copy("main", str(self.local / "docs"), "dell", str(self.node))
+        self.assertTrue((self.node / "docs" / "b.txt").exists())
+        self.assertFalse((self.node / "docs" / "leak").exists())
+
+    def test_destination_outside_the_nodes_roots_is_refused(self):
+        for dest in (str(self.base), str(self.node / ".." / "dell")):
+            with self.assertRaisesRegex(ValueError, "outside the allowed"):
+                self.fs.copy("main", str(self.local / "a.txt"), "dell", dest)
+        self.assertEqual(list(self.base.glob("a*.txt")), [])
+        # and the node itself refuses a path op aimed outside its roots, whatever main checked
+        for payload in ({"action": "mkdir", "dir": str(self.base), "name": "x"},
+                        {"action": "put", "upload": "a" * 32, "offset": 0, "last": True,
+                         "data": "", "dest": "path", "dir": str(self.base), "name": "x"},
+                        {"action": "tree", "path": str(self.base)},
+                        {"action": "get", "path": str(self.base / "secret.txt"), "offset": 0}):
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "outside"):
+                transfer.run_here(payload, self.state, self.node_config)
+        self.assertFalse((self.base / "x").exists())
+
+    def test_node_refuses_symlink_escape_and_unconfigured_path_ops(self):
+        (self.node / "link").symlink_to(self.base)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            transfer.run_here({"action": "mkdir", "dir": str(self.node / "link"), "name": "x"},
+                              self.state, self.node_config)
+        with self.assertRaisesRegex(ValueError, "can't check its storage"):
+            transfer.run_here({"action": "tree", "path": str(self.node)}, self.state)
+
+    def test_source_outside_the_roots_is_refused_before_any_transfer(self):
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.fs.copy("main", str(self.base / "secret.txt"), "dell", str(self.node))
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.fs.copy("dell", str(self.base / "secret.txt"), "main", str(self.local))
+        self.assertEqual(self.calls, [])
+
+    def test_traversal_and_separator_names_are_refused_by_validation(self):
+        base = {"action": "put", "upload": "a" * 32, "offset": 0, "last": True, "data": "",
+                "dest": "path", "dir": str(self.node)}
+        bad = ("..", ".", "../x", "a/b", "a\\b", "..\\x", "", "x\x00y", "a" * 256)
+        for name in bad:
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    validate_action("transfer", {**base, "name": name})
+                with self.assertRaises(ValueError):
+                    validate_action("transfer", {"action": "mkdir", "dir": str(self.node),
+                                                 "name": name})
+        for rel in (["..", "x"], ["a/b"], ["ok", ".."], "x", [1]):
+            with self.subTest(rel=rel), self.assertRaises(ValueError):
+                validate_action("transfer", {"action": "get", "path": str(self.node),
+                                             "rel": rel, "offset": 0})
+        with self.assertRaises(ValueError):  # a drop name and a path together
+            validate_action("transfer", {"action": "get", "path": str(self.node),
+                                         "name": "a.txt", "offset": 0})
+        with self.assertRaises(ValueError):
+            validate_action("transfer", {"action": "tree", "path": ""})
+
+    def test_node_get_by_rel_cannot_leave_the_folder_it_was_given(self):
+        (self.node / "dir").mkdir()
+        (self.node / "other.txt").write_text("x")
+        (self.node / "dir" / "esc").symlink_to(self.node / "other.txt")
+        with self.assertRaisesRegex(ValueError, "outside the folder"):
+            transfer.run_here({"action": "get", "path": str(self.node / "dir"),
+                               "rel": ["esc"], "offset": 0}, self.state, self.node_config)
+
+    def test_a_hostile_node_folder_listing_is_refused(self):
+        (self.node / "d").mkdir()
+        evil = {"dirs": [["..", "x"]], "files": [], "skipped": 0, "bytes": 0}
+        with patch("jarvis.transfer.call", lambda *a, **k: evil), \
+                self.assertRaisesRegex(ValueError, "unreadable folder listing"):
+            self.fs.copy("dell", str(self.node / "d"), "main", str(self.local))
+        self.assertFalse((self.local / "d").exists())
+
+    def test_size_and_count_caps_stay(self):
+        (self.local / "big.bin").write_bytes(b"x")
+        with patch.object(transfer, "MAX_BYTES", 0), \
+                self.assertRaisesRegex(ValueError, "aren't copied this way"):
+            self.fs.copy("main", str(self.local / "big.bin"), "dell", str(self.node))
+        (self.local / "docs" / "more.txt").write_text("m")
+        with patch.object(transfer, "MAX_TREE", 1), \
+                self.assertRaisesRegex(ValueError, "smaller pieces"):
+            self.fs.copy("main", str(self.local / "docs"), "dell", str(self.node))
+        self.assertFalse((self.node / "docs").exists())
+
+    def test_a_failed_folder_copy_says_where_the_rest_landed(self):
+        real = transfer.push
+
+        def flaky(*a, **k):
+            raise ConnectionError("Node dell is offline.")
+        with patch("jarvis.transfer.push", flaky), \
+                self.assertRaisesRegex(RuntimeError, "stopped part-way .*offline.*docs"):
+            self.fs.copy("main", str(self.local / "docs"), "dell", str(self.node))
+        self.assertIs(transfer.push, real)
+
+    def test_ssh_devices_keep_using_scp_even_with_the_cluster_on(self):
+        self.config["devices"]["dell"] = {"transport": "ssh", "hostname": "D",
+                                         "target": "jdoe@10.0.0.9"}
+        fs = Storage(self.config, self.state)
+        with patch("jarvis.storage.subprocess.run") as run, \
+                patch("jarvis.storage.shutil.which", lambda n: n), \
+                patch.object(Storage, "_copy_cluster") as cluster:
+            run.return_value = subprocess.CompletedProcess([], 0, "", "")
+            fs.copy("main", str(self.local / "a.txt"), "dell", str(self.node))
+        cluster.assert_not_called()
+        self.assertEqual(run.call_args.args[0][0], "scp")
+
+    def test_without_the_cluster_or_ssh_the_old_plain_error_stays(self):
+        config = {**self.config, "cluster": {"enabled": False}}
+        config["devices"] = {**config["devices"], "dell": {"transport": "cluster", "label": "Dell"}}
+        fs = Storage(config, self.state)
+        fs.is_remote = lambda d: d == "dell"
+        with self.assertRaisesRegex(ValueError, "needs SSH"):
+            fs.copy("dell", "x", "main", str(self.local))
 
 
 class StorageHttpTests(Temp):
