@@ -8,13 +8,6 @@ from datetime import datetime
 from pathlib import Path
 
 from . import __version__
-from .desktop import lan_mouse_config, local_fingerprint, remote_fingerprint
-from .devices import devices_here, ssh_inventory
-from .inventory import collect
-from .prompts import build_prompt, prompt_engineer_prompt
-from .runner import make_plan, run_task, workspace
-from .store import Store, lanes_from
-from .voice import speak
 
 # Anchor config and state to the project so `jarvis` works from any folder.
 HOME = Path(__file__).resolve().parent.parent
@@ -285,6 +278,7 @@ def main():
         if enabled(config):
             identity(config)
         else:
+            from .devices import devices_here
             config["devices"] = devices_here(config.get("devices", {}))
         if is_node(config) and args.command in ("add", "runs", "show", "plan", "engineer", "run",
                 "mem", "orchestrate", "kb", "vault", "archive", "tasks", "task", "credits", "grokbot", "route",
@@ -322,6 +316,7 @@ def main():
                 emit([{k: r[k] for k in ("name", "source", "status", "headline", "note")}
                       for r in Credits(args.state, config).all(refresh=True)])
         elif args.command == "inventory":
+            from .inventory import collect
             if args.device == "local":
                 result = collect()
             else:
@@ -341,6 +336,7 @@ def main():
                 elif device["transport"] == "local":
                     result = collect()
                 else:
+                    from .devices import ssh_inventory
                     result = ssh_inventory(device.get("target"), device.get("identity_file"))
             if args.output:
                 out = Path(args.output)
@@ -399,6 +395,7 @@ def main():
                     raise ValueError("Unknown configured device.")
                 device = {"transport": "local"} if here else devices[remote.resolve(args.device)]
                 if device["transport"] == "local":
+                    from .desktop import local_fingerprint
                     value = local_fingerprint()
                 elif enabled(config):  # over the cluster: the peer reads its own certificate
                     ok, text = remote.call(args.device, "input_info", "")
@@ -408,9 +405,11 @@ def main():
                     if not value:
                         raise ValueError(f"Lan Mouse has no certificate on {args.device} yet; start it there once.")
                 else:
+                    from .desktop import remote_fingerprint
                     value = remote_fingerprint(device.get("target"), device.get("identity_file"))
                 emit({"device": args.device, "fingerprint": value})
             else:
+                from .desktop import lan_mouse_config
                 text = lan_mouse_config(args.peer_name or "", args.peer_ip, args.position,
                                         args.peer_fingerprint or "",
                                         capture_backend=args.capture_backend)
@@ -542,10 +541,14 @@ def main():
             else:
                 emit(transfer.list_inbox(config, args.state, args.device))
         elif args.command == "speak":
+            from .voice import speak
             emit(speak(args.text, args.output))
         else:
+            from .store import Store, lanes_from
             store = Store(args.state, lanes_from(config))
             if args.command == "add":
+                from .prompts import build_prompt
+                from .runner import workspace
                 spec = json.loads(Path(args.spec).read_text(encoding="utf-8-sig"))
                 build_prompt(spec)
                 workspace(spec, config, base)
@@ -557,10 +560,13 @@ def main():
             elif args.command == "show":
                 emit({**store.get(args.id), "events": store.events(args.id)})
             elif args.command == "plan":
+                from .runner import make_plan
                 emit(make_plan(store.get(args.id)["spec"], config, base))
             elif args.command == "engineer":
+                from .prompts import prompt_engineer_prompt
                 print(prompt_engineer_prompt(store.get(args.id)["spec"]))
             elif args.command == "run":
+                from .runner import run_task
                 result = run_task(store, args.id, config, base, args.timeout)
                 emit(result)
                 return 0 if result["state"] == "finished" else 1
@@ -810,7 +816,11 @@ def cognition(args, config, base):
     from .router import pick_adapter
     from .speech import Voice
 
-    store = None if node else Store(args.state, lanes_from(config))
+    if node:
+        store = None
+    else:
+        from .store import Store, lanes_from
+        store = Store(args.state, lanes_from(config))
     memory = None if node else Memory(args.state, semantic=semantic_recall(config))
     if args.command == "route":
         from .assistant import decide

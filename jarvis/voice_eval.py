@@ -132,7 +132,6 @@ def evaluate_speaker(enrolled, positives, negatives, embed, profile=None, pinned
     [(label, audio)] against all of it. `profile`/`pinned`: the live voiceprint, scored
     the same way (old plain match vs anchored) to show what learned clips do."""
     from .listen import VoicePrint
-    np = _np()
     pos, neg, by_label = [], [], {}
     pos_live, neg_live, neg_old = [], [], []
     for label, source, audio in positives:

@@ -35,30 +35,30 @@ def _path_config(path):
 
 
 def parser(sub):
-    command = sub.add_parser("cluster", help="Configure the main PC and its lightweight nodes",
-        description="Setup: on the main `jarvis cluster init` then `jarvis cluster invite NODE`; "
-                    "on each node `jarvis cluster join CODE`. `jarvis cluster doctor` on either "
-                    "says what is wrong and how to fix it.")
+    command = sub.add_parser("cluster", help="Configure the main and its nodes",
+        description="On the main, run `jarvis cluster init`, then `jarvis cluster invite NODE`; "
+                    "on each node, run `jarvis cluster join CODE`; "
+                    "run `jarvis cluster doctor` on the main or a node to see what is wrong and how to fix it")
     command.add_argument("action", choices=("init", "invite", "join", "leave", "doctor",
                                            "configure", "enroll", "revoke", "caps", "status",
                                            "run", "serve", "node", "request", "autostart", "tunnel", "update", "release", "main", "roles"))
-    command.add_argument("value", nargs="?", help="node ID, invite code or file, request ID, or on/off")
-    command.add_argument("--id", dest="device_id", help="init: this PC's device ID (default: from its hostname)")
+    command.add_argument("value", nargs="?", help="Node ID, invite code or file, request ID, or on/off")
+    command.add_argument("--id", dest="device_id", help="Init: this PC's device ID (default: from its hostname)")
     command.add_argument("--address", action="append", default=[],
-                         help="invite: an address nodes can reach this main at (repeatable; LAN and Tailscale are found)")
-    command.add_argument("--no-autostart", action="store_true", help="init/join: don't start at login")
-    command.add_argument("--no-start", action="store_true", help="join: save the link without connecting")
-    command.add_argument("--main", dest="main_device", help="device ID of the main PC")
-    command.add_argument("--local", dest="local_device", help="this PC's device ID, or auto")
-    command.add_argument("--url", help="main HTTPS origin, or loopback HTTP through SSH")
-    command.add_argument("--hostname", help="enroll: hostname of a new node")
+                         help="Invite: an address where nodes can reach this main (repeatable; LAN and Tailscale are found)")
+    command.add_argument("--no-autostart", action="store_true", help="Init/join: don't start at login")
+    command.add_argument("--no-start", action="store_true", help="Join: save the link without connecting")
+    command.add_argument("--main", dest="main_device", help="Device ID of the main")
+    command.add_argument("--local", dest="local_device", help="This PC's device ID, or auto")
+    command.add_argument("--url", help="HTTPS origin of the main, or loopback HTTP through an SSH tunnel")
+    command.add_argument("--hostname", help="Enroll: hostname of a new node")
     command.add_argument("--capability", action="append", choices=sorted(CAPABILITIES),
-                         help="enroll/invite/caps: what the node may do (default: "
+                         help="Enroll/invite/caps: what the node may do (default: "
                               + ", ".join(sorted(NODE_DEFAULT)) + ")")
-    command.add_argument("--output", help="enroll: write the one-time pairing bundle here")
-    command.add_argument("--port", type=int, default=7777, help="main: local console port")
-    command.add_argument("--rollback", action="store_true", help="update: swap a node back to its previous code")
-    command.add_argument("--autostart", action="store_true", help="tunnel start/stop: also enable/disable login startup")
+    command.add_argument("--output", help="Enroll: write the one-time pairing bundle here")
+    command.add_argument("--port", type=int, default=7777, help="Main: local console port")
+    command.add_argument("--rollback", action="store_true", help="Update: swap a node back to its previous code")
+    command.add_argument("--autostart", action="store_true", help="Tunnel start/stop: also enable or disable login startup")
 
 
 def roles(config):
@@ -939,6 +939,21 @@ def set_main(config, path, device, state=None):
                 publication="outcome_unknown", authority="unknown", error=_RECONCILE_ERROR)
 
         pre = _call_authority_status(handoff)
+        if pre.get("mode") in ("LEGACY_ACTIVE", "PREPARING_V2", "QUIESCED"):
+            next_modes = {"LEGACY_ACTIVE": "enter PREPARING_V2, then QUIESCED; ",
+                          "PREPARING_V2": "enter QUIESCED; ", "QUIESCED": ""}
+            return _unchanged(
+                {"status": "refused", "code": "cutover_required", "main_device": old_main,
+                 "main": pre.get("main")},
+                publication="not_started", authority="not_granted",
+                error=(f"The authority is in {pre['mode']}. The operator must finish cutover: "
+                       f"{next_modes[pre['mode']]}run continuity ack --next-version on every eligible "
+                       "PC while QUIESCED to acknowledge the upcoming mode version; "
+                       "enter V2_ONLY_NO_MAIN using the current "
+                       "--expect-version. Then obtain a ready MAIN lease through a manual recover "
+                       "transition with verified readiness and canary before moving MAIN. "
+                       "continuity mode V2_ACTIVE cannot grant a lease. "
+                       "cluster.main_device was not changed."))
         conflict = _active_conflict(pre, device, old_main, intent)
         if conflict:
             return _unchanged(

@@ -1058,6 +1058,21 @@ def sharing_paused(state):
     return None
 
 
+def clipboard_paused(state):
+    """Why the shared clipboard is off right now, or None. Unlike shared input, a live
+    remote-control session (either side: this computer is driven, or its console drives a
+    node) turns the clipboard ON even while the laptops are apart, so copy and paste work
+    across the Remote view (David, 2026-11-12). Otherwise it follows sharing_paused."""
+    if not state:
+        return None
+    if remote_session_live(state) or controlling_remote(state):
+        return None
+    avail = sharing_availability(state)
+    if avail.get("settled") == "apart":
+        return "the laptops are apart"
+    return None
+
+
 AVAILABILITY_TTL = 300.0  # s: the guard reads every 30-60 s; older than this means it isn't running
 
 

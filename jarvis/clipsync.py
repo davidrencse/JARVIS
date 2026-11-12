@@ -625,13 +625,13 @@ APPLIED = "clipboard-applied.json"
 
 
 def _paused(state):
-    """Why the shared clipboard is off right now (apart, remote control on), or None."""
+    """Why the shared clipboard is off right now (apart, not in remote control), or None."""
     try:
-        from .sharedinput import sharing_paused
+        from .sharedinput import clipboard_paused
     except ImportError:  # the bare-script remote half has no package
         return None
     try:
-        return sharing_paused(state)
+        return clipboard_paused(state)
     except Exception:
         return None
 
@@ -732,7 +732,7 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
 
     def _share(kind, data, dest):
         why = _paused(state)
-        if why:  # apart or remote control on: this copy stays here
+        if why:  # apart (and no remote control on): this copy stays here
             if why != paused[0]:
                 log(f"sharing paused ({why}); copies stay on this laptop")
             paused[0] = why
