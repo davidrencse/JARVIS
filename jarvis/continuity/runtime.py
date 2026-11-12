@@ -9,7 +9,9 @@ provider. A managed hub supplies an ``AuthorityPort`` (in tests,
 Default policy is legacy-until-cutover and manual recovery. Automatic recover
 and failback are opt-in. Failback cannot be configured below 30 seconds and
 never uses ``make_main_now``. A cached grant never authorizes work while the
-authority is unreachable.
+authority is unreachable. ``SafeHandoff`` is the manual owner sequence: it does
+not create an authority, does not fail over on its own, and does not write a
+saved role.
 
 Not operational failover: no gateway is authenticated here, Windows has no
 suspend-aware cache, and the store's safety margin is still the unmeasured
@@ -17,7 +19,14 @@ prototype value. ``GatewayPort`` speaks the authority client's method names.
 It does not sign, does not enroll, and does not change the authority mode.
 """
 
+import hashlib
+import importlib
+import json
+import os
 import re
+from pathlib import Path
+
+from jarvis.fsio import atomic_write
 
 from jarvis.continuity.authority import (
     ACTIONS,
@@ -507,6 +516,60 @@ class MainRuntime:
         self._lease = {key: lease[key] for key in _LEASE_FIELDS}
         self._cache.invalidate("accepted")
 
+    def lease_snapshot(self):
+        """Copied grant tuple, or None when this PC has no grant in memory.
+
+        Status does not include a lease id. A coordinator that never saw the
+        grant cannot rebuild one from this snapshot.
+        """
+        lease = self._lease
+        if not isinstance(lease, dict) or any(key not in lease for key in _LEASE_FIELDS):
+            return None
+        return {key: lease[key] for key in _LEASE_FIELDS}
+
+    def release_for_handoff(self, transition_id):
+        """Release this PC's grant during an open drain. This does not fence.
+
+        A missing, stale, or expired local grant is a report. ``fence`` stays
+        false so this PC cannot clear the authority barrier on its own.
+        """
+        if not _ident_ok(transition_id):
+            raise RuntimeRefusal("bad_request")
+        try:
+            status = self._port.status()
+        except LinkError:
+            self._lose_link()
+            return {"released": False, "code": "partition", "fence": False}
+        except AuthorityError as err:
+            return {"released": False, "code": err.code, "fence": False}
+        except RuntimeRefusal as err:
+            return {"released": False, "code": err.code, "fence": False}
+        self._last = status
+        current = status.get("transition") or {}
+        if current.get("transition_id") != transition_id or current.get("state") != "DRAINING":
+            return {"released": False, "code": "unknown_transition", "fence": False}
+        if current.get("source") not in (None, self.device_id):
+            return {"released": False, "code": "not_holder", "fence": False}
+        snapshot = self.lease_snapshot()
+        if snapshot is None or snapshot.get("holder") != self.device_id:
+            return {"released": False, "code": "no_lease", "fence": False}
+        if (status.get("incarnation") != snapshot["incarnation"]
+                or status.get("epoch") != snapshot["epoch"]
+                or status.get("lease_holder") != self.device_id):
+            code = "no_lease" if status.get("lease_holder") is None else "stale"
+            return {"released": False, "code": code, "fence": False}
+        try:
+            self._port.release(snapshot)
+        except LinkError:
+            self._lose_link()
+            return {"released": False, "code": "partition", "fence": False}
+        except AuthorityError as err:
+            return {"released": False, "code": err.code, "fence": False}
+        except RuntimeRefusal as err:
+            return {"released": False, "code": err.code, "fence": False}
+        # Keep the local tuple. A later renew must be refused by the authority.
+        return {"released": True, "code": "released", "fence": False}
+
     def renew_once(self):
         if not self._started:
             raise RuntimeRefusal("not_started")
@@ -759,6 +822,11 @@ class MainRuntime:
         if self._block == "quarantined" or status.get("mode") == "QUARANTINED":
             return "quarantined"
         if self._block == "draining" or status.get("mode") == "HANDOVER":
+            # The candidate holds a not-ready lease while the old epoch is fenced.
+            # That is canary time, not a local drain.
+            if (self._block != "draining" and status.get("main") == self.device_id
+                    and status.get("lease_valid") and not status.get("main_ready")):
+                return "main_not_ready"
             return "draining"
         if status.get("main") == self.device_id and status.get("main_ready") and not self._block:
             return "main"
@@ -1019,3 +1087,882 @@ class RecoveryOrchestrator:
         self._lease["valid_for"] = lease.get("valid_for")
         self._lease["ready"] = False
         return _step(True, "promoting", "canary_required", transition=transition, lease=dict(self._lease))
+
+
+_HANDOFF_ACTIONS = frozenset({"set_preferred_main", "recover"})
+_FENCE_WAIT = frozenset({"not_quiet", "lease_live"})
+_PORT_HANDOFF = ("status", "release", "transition_request", "transition_readiness", "transition_step")
+
+
+def _caller_key(action, old_main, new_main, status):
+    body = "{0}|{1}|{2}|{3}|{4}|{5}".format(
+        action, old_main, new_main, status["incarnation"], status["epoch"], status["policy_version"])
+    return "sh-" + hashlib.sha256(body.encode("ascii")).hexdigest()[:32]
+
+
+_JOURNAL_STEPS = ("brain", "repoint", "canary", "complete")
+_JOURNAL_KEYS = frozenset({
+    "schema", "transition_id", "candidate", "action", "incarnation", "epoch", "steps",
+})
+_STEP_KEYS = frozenset({"phase", "ok"})
+
+
+def _journal_default(base):
+    """``base/.jarvis`` only when ``base`` is an existing directory. A token is not a path."""
+    if not isinstance(base, (str, os.PathLike)):
+        return None
+    path = Path(base)
+    try:
+        if not path.is_dir() or path.is_symlink():
+            return None
+    except OSError:
+        return None
+    return path / ".jarvis" / "handoff-journal.json"
+
+
+def _journal_banned(value):
+    if isinstance(value, dict):
+        if any(key not in _JOURNAL_KEYS and key not in _STEP_KEYS for key in value):
+            # Nested step maps use phase/ok only. The top document uses _JOURNAL_KEYS.
+            if any(key in _WIRE_BANNED or key in {"lease_id", "config", "base", "checkpoint"} for key in value):
+                return True
+        for key, item in value.items():
+            if key in _WIRE_BANNED or key in {"lease_id", "config", "base", "checkpoint", "secret"}:
+                return True
+            if _journal_banned(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_journal_banned(item) for item in value)
+    if isinstance(value, str) and (value.startswith("ls-") or "BEGIN " in value):
+        return True
+    return False
+
+
+def _journal_load_text(path):
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema") != 1 or _journal_banned(raw):
+        return None
+    if set(raw) - _JOURNAL_KEYS:
+        return None
+    steps = raw.get("steps", {})
+    if not isinstance(steps, dict) or set(steps) - set(_JOURNAL_STEPS):
+        return None
+    for name, step in steps.items():
+        if not isinstance(step, dict) or set(step) - _STEP_KEYS:
+            return None
+        if step.get("phase") not in ("started", "finished"):
+            return None
+        if step.get("phase") == "finished" and step.get("ok") not in (True, False):
+            return None
+        if step.get("phase") == "started" and "ok" in step:
+            return None
+    return raw
+
+
+def _journal_write(path, doc):
+    """Replace the journal. Caller holds the lock. Metadata only."""
+    path = Path(path)
+    if _journal_banned(doc) or set(doc) - _JOURNAL_KEYS:
+        raise RuntimeRefusal("bad_request")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n"
+    atomic_write(path, payload, mode=0o600, fsync=True)
+
+
+class _HandoffJournal:
+    """Per-transition step record. Lease ids and personal fields are not stored."""
+
+    def __init__(self, path):
+        self.path = None if path is None else Path(path)
+        self.corrupt = False
+        self.doc = {"schema": 1, "steps": {}}
+        if self.path is not None and self.path.exists():
+            loaded = _journal_load_text(self.path)
+            if loaded is None:
+                self.corrupt = True
+            else:
+                self.doc = loaded
+
+    def step(self, name):
+        found = (self.doc.get("steps") or {}).get(name) or {}
+        if not isinstance(found, dict):
+            return {}
+        return {"phase": found.get("phase"), "ok": found.get("ok")}
+
+    def any_recorded(self):
+        return any(self.step(name).get("phase") in ("started", "finished") for name in _JOURNAL_STEPS)
+
+    def callback_done(self, name):
+        found = self.step(name)
+        return found.get("phase") == "finished" and found.get("ok") is True
+
+    def bind(self, transition, incarnation, epoch):
+        if self.corrupt:
+            return False
+        tid = transition.get("transition_id")
+        if not _ident_ok(tid):
+            self.corrupt = True
+            return False
+
+        def merge(doc):
+            if doc.get("transition_id") == tid:
+                if doc.get("epoch") not in (None, epoch) or doc.get("incarnation") not in (None, incarnation):
+                    return None
+                if doc.get("candidate") not in (None, transition.get("candidate")):
+                    return None
+            else:
+                doc = {"schema": 1, "steps": {}}
+            doc["schema"] = 1
+            doc["transition_id"] = tid
+            doc["candidate"] = transition.get("candidate")
+            doc["action"] = transition.get("action")
+            doc["incarnation"] = incarnation
+            doc["epoch"] = epoch
+            doc.setdefault("steps", {})
+            return doc
+
+        return self._update(merge)
+
+    def mark(self, name, phase, ok=None):
+        if self.corrupt or name not in _JOURNAL_STEPS or phase not in ("started", "finished"):
+            return False
+        body = {"phase": phase}
+        if phase == "finished":
+            body["ok"] = ok is True
+
+        def merge(doc):
+            doc.setdefault("steps", {})[name] = body
+            return doc
+
+        return self._update(merge)
+
+    def claim(self, name):
+        """Compare-and-set ``started`` under the journal lock.
+
+        ``("claimed", None)`` is the only winner. ``("started", None)`` means
+        another caller already owns the step. ``("finished", ok)`` is a prior
+        result. Anything else is ``("corrupt", None)`` and must not run the hook.
+        """
+        if self.corrupt or name not in _JOURNAL_STEPS:
+            return "corrupt", None
+        box = {"phase": "corrupt", "ok": None}
+
+        def merge(doc):
+            steps = doc.get("steps")
+            if not isinstance(steps, dict):
+                box["phase"] = "corrupt"
+                return None
+            found = steps.get(name)
+            if found is None:
+                steps[name] = {"phase": "started"}
+                box["phase"] = "claimed"
+                return doc
+            if not isinstance(found, dict):
+                box["phase"] = "corrupt"
+                return None
+            phase = found.get("phase")
+            if phase == "started":
+                box["phase"] = "started"
+                return doc
+            if phase == "finished":
+                box["phase"] = "finished"
+                box["ok"] = found.get("ok") is True
+                return doc
+            box["phase"] = "corrupt"
+            return None
+
+        if not self._update(merge):
+            return "corrupt", None
+        return box["phase"], box["ok"]
+
+    def _update(self, merge):
+        if self.corrupt:
+            return False
+        if self.path is None:
+            updated = merge(self.doc)
+            if updated is None:
+                self.corrupt = True
+                return False
+            self.doc = updated
+            return True
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name("." + self.path.name + ".jarvis-lock")
+        fd = None
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+            current = self.doc
+            if self.path.exists():
+                loaded = _journal_load_text(self.path)
+                if loaded is None:
+                    self.corrupt = True
+                    return False
+                current = loaded
+            updated = merge(current)
+            if updated is None or _journal_banned(updated):
+                self.corrupt = True
+                return False
+            _journal_write(self.path, updated)
+            self.doc = updated
+            return True
+        except (OSError, RuntimeRefusal):
+            return False
+        finally:
+            if fd is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+
+
+def _public_snapshot(runtime):
+    """Holder's copied tuple. Never reads a private lease attribute."""
+    method = getattr(runtime, "lease_snapshot", None)
+    if not callable(method):
+        return None
+    try:
+        snap = method()
+    except (RuntimeRefusal, AuthorityError, LinkError, OSError):
+        return None
+    return _lease_view(snap)
+
+
+class SafeHandoff:
+    """Manual MAIN handoff through an owner-authenticated port.
+
+    ``port`` is a ``StoreAdapter`` or ``GatewayPort``: ``transition_request`` and
+    ``transition_step`` are the owner calls. This object does not create an
+    authority, enroll a device, or choose a successor by itself.
+
+    ``readiness(candidate)`` returns ``control_ready``, ``ai_ready``, and an
+    optional ``checkpoint``. Missing or non-boolean flags are a refusal. Nothing
+    here fills those in. ``candidate_readiness(device)`` is that same check for
+    the coordinator: the device must be this candidate, and the result is the
+    validated trio or ``RuntimeRefusal``. ``repoint(old, new, lease)`` must be
+    an authenticated signing-key and endpoint update. ``ok`` alone, or
+    ``config_only``, does not confirm it. ``canary(new)`` is a real bool. After
+    the old lease is fenced, ``jarvis.brainsync.handoff(old, new, config, base)``
+    is imported and must return ``ok`` True. ``config`` and ``base`` are local
+    hook arguments, not authority requests. A failure after the fence cancels
+    only when authenticated status shows no holder. Fence waits come back as
+    ``pending`` with ``retry_after``. The same call resumes one transition for
+    the same candidate and refuses a different one. The result never includes a
+    lease id.
+
+    There is no force flag and no automatic failover. A ready target with no
+    matching journal is ``already_main`` and is not a completed handoff. Callbacks
+    are journaled as metadata. The first process to claim a step runs it; a
+    started step with no result is not replayed.
+    """
+
+    def __init__(self, port, *, source_runtime, candidate_runtime, readiness, repoint, canary,
+                 journal_path=None):
+        if any(not callable(getattr(port, name, None)) for name in _PORT_HANDOFF):
+            raise RuntimeRefusal("bad_request")
+        if candidate_runtime is None or not _ident_ok(getattr(candidate_runtime, "device_id", None)):
+            raise RuntimeRefusal("bad_request")
+        if source_runtime is not None and not _ident_ok(getattr(source_runtime, "device_id", None)):
+            raise RuntimeRefusal("bad_request")
+        if not callable(readiness) or not callable(repoint) or not callable(canary):
+            raise RuntimeRefusal("bad_request")
+        if journal_path is not None and not isinstance(journal_path, (str, os.PathLike)):
+            raise RuntimeRefusal("bad_request")
+        if isinstance(journal_path, str) and not journal_path:
+            raise RuntimeRefusal("bad_request")
+        self._port = port
+        self._source = source_runtime
+        self._candidate = candidate_runtime
+        self._readiness = readiness
+        self._repoint = repoint
+        self._canary = canary
+        self._journal_path = journal_path
+        self._active_journal = None
+
+    def authority_status(self):
+        """Authenticated ``port.status()``. Transport errors are ``RuntimeRefusal('partition')``."""
+        try:
+            status = self._port.status()
+        except RuntimeRefusal as err:
+            if err.code in _LINK_CODES or err.code == "partition":
+                raise RuntimeRefusal("partition") from None
+            raise
+        except LinkError:
+            raise RuntimeRefusal("partition") from None
+        except AuthorityError as err:
+            code = err.code if isinstance(err.code, str) and _CODE.match(err.code) else "partition"
+            if code in _LINK_CODES:
+                code = "partition"
+            raise RuntimeRefusal(code) from None
+        except Exception:
+            raise RuntimeRefusal("partition") from None
+        if not isinstance(status, dict) or _wire_banned(status):
+            raise RuntimeRefusal("partition")
+        return status
+
+    def candidate_readiness(self, device):
+        """Validated readiness for this handoff's candidate. No invented flags.
+
+        A device other than ``self._candidate.device_id`` raises
+        ``RuntimeRefusal('candidacy_mismatch')`` and does not call readiness.
+        ``_facts`` failure raises ``RuntimeRefusal`` with that code. A validated
+        report is exactly ``control_ready``, ``ai_ready``, and ``checkpoint``,
+        including explicit false flags.
+        """
+        if device != self._candidate.device_id:
+            raise RuntimeRefusal("candidacy_mismatch")
+        facts, code = self._facts(device)
+        if code is not None:
+            raise RuntimeRefusal(code)
+        return facts
+
+    def _read_status(self):
+        try:
+            return self.authority_status(), None
+        except RuntimeRefusal as err:
+            return None, err
+
+    def __call__(self, old_main, new_main, config, base):
+        if not _ident_ok(old_main) or not _ident_ok(new_main) or old_main == new_main:
+            return _handoff_result(False, "refused", "bad_request")
+        if self._candidate.device_id != new_main:
+            return _handoff_result(False, "refused", "candidacy_mismatch")
+        if self._source is not None and self._source.device_id != old_main:
+            return _handoff_result(False, "refused", "candidacy_mismatch")
+        # config and base stay local. Path, url, and host are for the storage
+        # hook. Outbound authority bodies and the journal keep their allowlists.
+        self._active_journal = None
+        self._journal_base = base
+        status, err = self._read_status()
+        if err is not None:
+            return _handoff_from_error(err)
+        if status.get("mode") in _LEGACY_MODES:
+            return _handoff_result(False, "refused", "legacy", status=status)
+        if status.get("mode") == "QUARANTINED":
+            return _handoff_result(False, "refused", "quarantined", status=status)
+        transition = status.get("transition")
+        if transition:
+            return self._resume(status, transition, old_main, new_main, config, base)
+        if status.get("lease_valid") and status.get("main") == new_main:
+            if (status.get("main_ready") is True and status.get("mode") == "V2_ACTIVE"
+                    and not status.get("transition")):
+                proved = self._journaled_success(status, new_main)
+                if proved is not None:
+                    return proved
+                return _handoff_result(False, "already_main", "already_main", status=status, action=None)
+            return _handoff_result(False, "not_ready", "not_ready", status=status)
+        action, refusal = self._action(status, old_main)
+        if refusal is not None:
+            return _handoff_result(False, "refused", refusal, status=status)
+        facts, fact_code = self._facts(new_main)
+        if fact_code is not None:
+            return _handoff_result(False, "not_ready", fact_code, status=status)
+        if not facts["control_ready"]:
+            return _handoff_result(False, "not_ready", "not_ready", status=status)
+        request = {
+            "caller": "safe-handoff",
+            "client_key": _caller_key(action, old_main, new_main, status),
+            "action": action,
+            "candidate": new_main,
+            "expected_incarnation": status["incarnation"],
+            "expected_epoch": status["epoch"],
+            "expected_policy": status["policy_version"],
+            "profile": "control",
+        }
+        _opened, err = _invoke(lambda: self._port.transition_request(request))
+        if err is not None:
+            return _handoff_from_error(err, status=status)
+        status, err = self._read_status()
+        if err is not None:
+            return _handoff_from_error(err)
+        transition = status.get("transition")
+        if not transition or transition.get("candidate") != new_main:
+            return _handoff_result(False, "refused", "bad_state", status=status)
+        return self._resume(status, transition, old_main, new_main, config, base)
+
+    def _action(self, status, old_main):
+        """``set_preferred_main`` only while the central lease is live. ``recover`` only when it is not."""
+        if status.get("lease_valid") and status.get("main"):
+            if status.get("main") != old_main:
+                return None, "candidacy_mismatch"
+            if self._source is None:
+                return None, "source_required"
+            return "set_preferred_main", None
+        if status.get("lease_valid"):
+            return None, "main_alive"
+        return "recover", None
+
+    def _facts(self, candidate):
+        try:
+            raw = self._readiness(candidate)
+        except Exception:
+            return None, "not_ready"
+        if not isinstance(raw, dict) or _wire_banned(raw):
+            return None, "bad_request"
+        if set(raw) - {"control_ready", "ai_ready", "checkpoint"}:
+            return None, "bad_request"
+        if "control_ready" not in raw or "ai_ready" not in raw:
+            return None, "not_ready"
+        if type(raw["control_ready"]) is not bool or type(raw["ai_ready"]) is not bool:
+            return None, "not_ready"
+        checkpoint = raw.get("checkpoint")
+        if checkpoint is not None and not _ident_ok(checkpoint):
+            return None, "bad_checkpoint"
+        return {
+            "control_ready": raw["control_ready"],
+            "ai_ready": raw["ai_ready"],
+            "checkpoint": checkpoint,
+        }, None
+
+    def _resume(self, status, transition, old_main, new_main, config, base):
+        if transition.get("candidate") != new_main or transition.get("action") not in _HANDOFF_ACTIONS:
+            return _handoff_result(False, "conflict", "conflict", status=status, transition=transition)
+        source = transition.get("source")
+        if source is not None and source != old_main:
+            return _handoff_result(False, "conflict", "conflict", status=status, transition=transition)
+        if transition.get("action") == "recover" and status.get("lease_valid"):
+            return _handoff_result(False, "refused", "main_alive", status=status, transition=transition)
+        state = transition.get("state")
+        tid = transition.get("transition_id")
+        if state in ("REQUESTED", "VALIDATING"):
+            facts, fact_code = self._facts(new_main)
+            if fact_code is not None:
+                return _handoff_result(False, "not_ready", fact_code, status=status, transition=transition)
+            _posted, err = _invoke(lambda: self._port.transition_readiness(tid, facts))
+            if err is not None:
+                return _handoff_from_error(err, status=status, transition=transition)
+            if not facts["control_ready"]:
+                return _handoff_result(False, "not_ready", "not_ready", status=status, transition=transition)
+            view, err = _invoke(lambda: self._port.transition_step(tid, "drain"))
+            if err is not None:
+                return _handoff_from_error(err, status=status, transition=transition)
+            transition = view
+            state = view.get("state")
+        if state == "DRAINING":
+            if self._source is not None and callable(getattr(self._source, "begin_drain", None)):
+                try:
+                    report = self._source.begin_drain(tid)
+                except (RuntimeRefusal, AuthorityError) as err:
+                    return _handoff_result(False, "refused", err.code, status=status, transition=transition)
+                if not isinstance(report, dict) or report.get("admission_stopped") is not True:
+                    return _handoff_result(False, "refused", "drain", status=status, transition=transition)
+            released = self._release_source(status, transition)
+            if released is not None:
+                return _handoff_result(False, "refused", released, status=status, transition=transition)
+            fenced, err = _invoke(lambda: self._port.transition_step(tid, "fence"))
+            if err is not None:
+                if isinstance(err, AuthorityError) and err.code in _FENCE_WAIT:
+                    fresh, _ignored = self._read_status()
+                    return _handoff_result(
+                        False, "pending", err.code, status=fresh or status, transition=transition,
+                        retry_after=err.wait)
+                if isinstance(err, LinkError):
+                    return _handoff_result(False, "partition", "partition", status=status, transition=transition)
+                return self._abort(tid, getattr(err, "code", "fence"), transition)
+            transition = fenced or transition
+            state = "FENCING"
+        if state == "FENCING":
+            lease, err = _invoke(lambda: self._port.transition_step(tid, "grant"))
+            if err is not None:
+                if isinstance(err, AuthorityError) and err.code in _FENCE_WAIT:
+                    fresh, _ignored = self._read_status()
+                    return _handoff_result(
+                        False, "pending", err.code, status=fresh or status, transition=transition,
+                        retry_after=err.wait)
+                if isinstance(err, LinkError) or _is_partition(err):
+                    return self._lost_grant(tid, transition, old_main, new_main, config, base)
+                return self._abort(tid, getattr(err, "code", "grant"), transition)
+            # A not-ready grant is the only grant. ready True would admit before the canary.
+            if not isinstance(lease, dict) or lease.get("ready") is not False:
+                return self._abort(tid, "epoch", transition)
+            if not _grant_ok(lease, new_main, transition.get("expected_epoch")):
+                return self._abort(tid, "epoch", transition)
+            try:
+                self._candidate.accept_lease(lease)
+            except (RuntimeRefusal, AuthorityError) as err:
+                return self._abort(tid, err.code, transition)
+            except Exception:
+                return self._abort(tid, "accept", transition)
+            state = "GRANTED_NOT_READY"
+        if state == "GRANTED_NOT_READY":
+            return self._promote(transition, old_main, new_main, config, base)
+        return _handoff_result(False, "refused", "bad_state", status=status, transition=transition)
+
+    def _journal(self):
+        if self._active_journal is None:
+            path = self._journal_path
+            if path is None:
+                path = _journal_default(getattr(self, "_journal_base", None))
+            self._active_journal = _HandoffJournal(path)
+        return self._active_journal
+
+    def _grant_current(self, status, transition):
+        """Current authority tuple plus the holder's public snapshot, or a refusal code."""
+        current = status.get("transition") or {}
+        if current.get("transition_id") != transition.get("transition_id"):
+            return None, "stale"
+        if current.get("state") != "GRANTED_NOT_READY":
+            return None, "bad_state"
+        if current.get("candidate") != self._candidate.device_id:
+            return None, "stale"
+        if status.get("lease_valid") is not True or status.get("main") != self._candidate.device_id:
+            return None, "expired"
+        if status.get("lease_holder") != self._candidate.device_id or status.get("main_ready") is True:
+            return None, "stale"
+        snap = _public_snapshot(self._candidate)
+        if not _grant_ok(snap, self._candidate.device_id, transition.get("expected_epoch")):
+            return None, "lease_unavailable"
+        if (snap.get("incarnation") != status.get("incarnation")
+                or snap.get("epoch") != status.get("epoch")
+                or snap.get("holder") != status.get("lease_holder")):
+            return None, "stale"
+        return snap, None
+
+    def _lost_grant(self, transition_id, transition, old_main, new_main, config, base):
+        """The grant answer was lost. Do not invent a lease id."""
+        status, err = self._read_status()
+        if err is not None:
+            return _handoff_from_error(err, transition=transition)
+        current = status.get("transition") or {}
+        if (current.get("transition_id") != transition_id
+                or current.get("state") != "GRANTED_NOT_READY"):
+            return _handoff_result(False, "partition", "partition", status=status, transition=transition)
+        _snap, problem = self._grant_current(status, current)
+        if problem is not None:
+            if problem == "lease_unavailable":
+                return self._abort(transition_id, "lease_unavailable", current)
+            journal = self._journal()
+            if journal.corrupt or journal.any_recorded():
+                return self._uncertain(current, "reconcile")
+            return self._abort(transition_id, problem, current)
+        return self._promote(current, old_main, new_main, config, base)
+
+    def _promote(self, transition, old_main, new_main, config, base):
+        self._journal_base = base
+        status, err = self._read_status()
+        if err is not None:
+            return _handoff_from_error(err, transition=transition)
+        snap, problem = self._grant_current(status, transition)
+        journal = self._journal()
+        if journal.corrupt:
+            return self._uncertain(transition, "reconcile")
+        if problem is not None:
+            if journal.any_recorded():
+                return self._uncertain(transition, "reconcile")
+            return self._abort(transition.get("transition_id"), problem, transition)
+        if not journal.bind(transition, snap["incarnation"], snap["epoch"]):
+            return self._uncertain(transition, "reconcile")
+        brain = self._callback(
+            transition, "brain", lambda _snap: _brainsync_handoff(old_main, new_main, config, base),
+            lambda result: isinstance(result, dict) and result.get("ok") is True,
+            lambda result: "missing_hook" if isinstance(result, dict) and result.get("error") == "missing_hook" else "brain")
+        if brain is not None:
+            return brain
+        repoint = self._callback(
+            transition, "repoint", lambda granted: self._repoint(old_main, new_main, dict(granted)),
+            _repoint_ok, lambda _result: "repoint")
+        if repoint is not None:
+            return repoint
+        canary = self._callback(
+            transition, "canary", lambda _snap: self._canary(new_main),
+            lambda result: result is True, lambda _result: "canary")
+        if canary is not None:
+            return canary
+        return self._complete(transition)
+
+    def _callback(self, transition, name, call, accept, refuse_code):
+        """One winner claims the step under the journal lock and runs the hook."""
+        journal = self._journal()
+        status, err = self._read_status()
+        if err is not None:
+            return _handoff_from_error(err, transition=transition)
+        snap, problem = self._grant_current(status, transition)
+        phase, ok_flag = journal.claim(name)
+        if phase == "started":
+            return self._uncertain(transition, "reconcile")
+        if phase == "finished":
+            if ok_flag is True:
+                return None
+            return self._abort(transition.get("transition_id"), refuse_code(None), transition)
+        if phase != "claimed":
+            return self._uncertain(transition, "reconcile")
+        if problem is not None:
+            return self._abort(transition.get("transition_id"), problem, transition)
+        try:
+            result = call(snap)
+        except Exception:
+            return self._uncertain(transition, "reconcile")
+        if not accept(result):
+            journal.mark(name, "finished", ok=False)
+            return self._abort(transition.get("transition_id"), refuse_code(result), transition)
+        if not journal.mark(name, "finished", ok=True):
+            return self._uncertain(transition, "reconcile")
+        return None
+
+    def _complete(self, transition):
+        journal = self._journal()
+        tid = transition.get("transition_id")
+        record = journal.step("complete")
+        if record.get("phase") == "finished":
+            if record.get("ok") is not True:
+                return self._abort(tid, "complete", transition)
+            proved = self._prove_ready(transition)
+            if proved is None:
+                return self._uncertain(transition, "reconcile")
+            return proved
+        if record.get("phase") == "started":
+            proved = self._prove_ready(transition)
+            if proved is not None:
+                journal.mark("complete", "finished", ok=True)
+                return proved
+            status, err = self._read_status()
+            if err is not None:
+                return self._uncertain(transition, "reconcile")
+            _snap, problem = self._grant_current(status, transition)
+            if problem is not None:
+                return self._uncertain(transition, "reconcile")
+        else:
+            status, err = self._read_status()
+            if err is not None:
+                return _handoff_from_error(err, transition=transition)
+            _snap, problem = self._grant_current(status, transition)
+            if problem is not None:
+                if journal.any_recorded():
+                    return self._uncertain(transition, "reconcile")
+                return self._abort(tid, problem, transition)
+            if not journal.mark("complete", "started"):
+                return self._uncertain(transition, "reconcile")
+        view, err = _invoke(lambda: self._port.transition_step(tid, "complete", canary_ok=True))
+        if isinstance(err, LinkError) or _is_partition(err):
+            proved = self._prove_ready(transition)
+            if proved is not None:
+                journal.mark("complete", "finished", ok=True)
+                return proved
+            return self._uncertain(transition, "reconcile")
+        if err is not None:
+            journal.mark("complete", "finished", ok=False)
+            return self._abort(tid, getattr(err, "code", "complete"), transition)
+        journal.mark("complete", "finished", ok=True)
+        proved = self._prove_ready(transition)
+        if proved is None:
+            fresh, _ignored = self._read_status()
+            if not fresh or view.get("state") != "SUCCEEDED":
+                return _handoff_result(False, "no_main", "status", status=fresh, transition=view or transition)
+            return _handoff_result(False, "no_main", "not_ready", status=fresh, transition=view)
+        return proved
+
+    def _journaled_success(self, status, new_main):
+        """Ready state proves a handoff only when this journal bound the callbacks."""
+        journal = self._journal()
+        if journal.corrupt or journal.doc.get("candidate") != new_main:
+            return None
+        if (journal.doc.get("incarnation") != status.get("incarnation")
+                or journal.doc.get("epoch") != status.get("epoch")):
+            return None
+        action = journal.doc.get("action")
+        transition_id = journal.doc.get("transition_id")
+        if action not in _HANDOFF_ACTIONS or not _ident_ok(transition_id):
+            return None
+        return self._prove_ready({
+            "transition_id": transition_id,
+            "candidate": new_main,
+            "action": action,
+            "state": "SUCCEEDED",
+        })
+
+    def _prove_ready(self, transition):
+        """Success only when authority status matches the journaled grant tuple."""
+        journal = self._journal()
+        for name in ("brain", "repoint", "canary"):
+            if not journal.callback_done(name):
+                return None
+        status, err = self._read_status()
+        if err is not None or not status:
+            return None
+        if status.get("mode") != "V2_ACTIVE" or status.get("main_ready") is not True:
+            return None
+        if status.get("lease_valid") is not True or status.get("main") != transition.get("candidate"):
+            return None
+        if status.get("transition"):
+            return None
+        if (status.get("incarnation") != journal.doc.get("incarnation")
+                or status.get("epoch") != journal.doc.get("epoch")):
+            return None
+        if isinstance(journal.doc.get("epoch"), bool) or not isinstance(journal.doc.get("epoch"), int):
+            return None
+        return _handoff_result(
+            True, "ready", "new_main", status=status,
+            transition={"transition_id": transition.get("transition_id"), "state": "SUCCEEDED",
+                        "action": transition.get("action")},
+            action=transition.get("action"))
+
+    def _uncertain(self, transition, code):
+        """The effect may have happened. Do not cancel, replay, or open another transition."""
+        fresh, _err = self._read_status()
+        return _handoff_result(False, "uncertain", code, status=fresh, transition=transition)
+
+    def _release_source(self, status, transition):
+        """Ask the source to release. A local miss does not clear or skip the authority fence."""
+        if transition.get("action") != "set_preferred_main":
+            return None
+        if self._source is None:
+            if status.get("lease_valid"):
+                return "source_required"
+            return None
+        method = getattr(self._source, "release_for_handoff", None)
+        if not callable(method):
+            if status.get("lease_valid"):
+                return "no_lease"
+            return None
+        try:
+            report = method(transition.get("transition_id"))
+        except (RuntimeRefusal, AuthorityError) as err:
+            report = {"released": False, "code": err.code, "fence": False}
+        except Exception:
+            report = {"released": False, "code": "no_lease", "fence": False}
+        if not isinstance(report, dict):
+            report = {"released": False, "code": "no_lease", "fence": False}
+        # A source that claims the fence is done is ignored. The authority call is the fence.
+        if report.get("released") is True and report.get("fence") is not True:
+            return None
+        code = report.get("code") or "no_lease"
+        if code == "partition":
+            return "partition"
+        fresh, err = self._read_status()
+        if err is not None:
+            return "partition"
+        if fresh.get("lease_valid"):
+            return code
+        return None
+
+    def _status_clear(self, status):
+        """True only when authenticated status shows no holder and no open transition."""
+        if not isinstance(status, dict):
+            return False
+        if status.get("lease_valid") is True or status.get("main") is not None:
+            return False
+        if status.get("lease_holder") is not None or status.get("transition"):
+            return False
+        return status.get("mode") == "V2_ONLY_NO_MAIN"
+
+    def _abort(self, transition_id, code, transition):
+        """Cancel, then say ``no_main`` only when status shows the holder is gone.
+
+        A failed cancel, a live candidate, or a status that cannot be read is
+        ``uncertain`` or ``partition`` and still carries the transition.
+        """
+        _view, err = _invoke(lambda: self._port.transition_step(transition_id, "cancel"))
+        fresh, status_err = self._read_status()
+        bound = transition if isinstance(transition, dict) else {}
+        if not bound.get("transition_id"):
+            bound = dict(bound)
+            bound["transition_id"] = transition_id
+        if status_err is not None or not isinstance(fresh, dict):
+            if _is_partition(status_err) or isinstance(status_err, LinkError):
+                return _handoff_result(False, "partition", "partition", transition=bound)
+            return _handoff_result(
+                False, "uncertain", "reconcile", status=fresh if isinstance(fresh, dict) else None,
+                transition=bound)
+        if err is not None:
+            if isinstance(err, LinkError) or _is_partition(err):
+                return _handoff_result(False, "partition", "partition", status=fresh, transition=bound)
+            return _handoff_result(False, "uncertain", "reconcile", status=fresh, transition=bound)
+        if not self._status_clear(fresh):
+            return _handoff_result(False, "uncertain", "reconcile", status=fresh, transition=bound)
+        return _handoff_result(False, "no_main", code, status=fresh, transition=bound)
+
+
+def _grant_ok(lease, new_main, expected_epoch):
+    if not isinstance(lease, dict) or lease.get("holder") != new_main:
+        return False
+    epoch = lease.get("epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int):
+        return False
+    if isinstance(expected_epoch, bool) or not isinstance(expected_epoch, int):
+        return False
+    if epoch <= expected_epoch:
+        return False
+    if "ready" in lease and lease.get("ready") is not False and lease.get("ready") is not True:
+        return False
+    return True
+
+
+def _lease_view(lease):
+    if not isinstance(lease, dict) or any(key not in lease for key in _LEASE_FIELDS):
+        return None
+    view = {key: lease[key] for key in _LEASE_FIELDS}
+    if "valid_for" in lease:
+        view["valid_for"] = lease["valid_for"]
+    if "ready" in lease:
+        view["ready"] = lease["ready"]
+    return view
+
+
+def _repoint_ok(result):
+    if not isinstance(result, dict) or result.get("config_only") is True:
+        return False
+    return (result.get("ok") is True and result.get("authenticated") is True
+            and result.get("key_updated") is True and result.get("endpoint_updated") is True)
+
+
+def _brainsync_handoff(old_main, new_main, config, base):
+    """Import the storage hook only after the fence. Never treat a missing hook as success."""
+    try:
+        module = importlib.import_module("jarvis.brainsync")
+    except ImportError:
+        return {"ok": False, "status": "missing", "error": "missing_hook"}
+    hook = getattr(module, "handoff", None)
+    if not callable(hook):
+        return {"ok": False, "status": "missing", "error": "missing_hook"}
+    try:
+        result = hook(old_main, new_main, config, base)
+    except Exception:
+        return {"ok": False, "status": "error", "error": "hook_failed"}
+    if not isinstance(result, dict):
+        return {"ok": False, "status": "error", "error": "hook_failed"}
+    return result
+
+
+def _is_partition(err):
+    return isinstance(err, (LinkError, RuntimeRefusal)) and getattr(err, "code", None) == "partition"
+
+
+def _invoke(fn):
+    try:
+        return fn(), None
+    except (LinkError, AuthorityError, RuntimeRefusal) as err:
+        return None, err
+
+
+def _handoff_from_error(err, status=None, transition=None):
+    code = getattr(err, "code", None) or "partition"
+    if isinstance(err, LinkError) or code in _LINK_CODES:
+        code = "partition"
+        state = "partition"
+    else:
+        state = "refused"
+    return _handoff_result(False, state, code, status=status, transition=transition)
+
+
+def _handoff_result(ok, state, code, status=None, transition=None, retry_after=None, action=None):
+    status = status or {}
+    transition = transition or {}
+    if action is None:
+        action = transition.get("action")
+    body = {
+        "ok": bool(ok) and ok is True,
+        "status": state,
+        "code": code,
+        "transition_id": transition.get("transition_id"),
+        "main": status.get("main"),
+        "epoch": status.get("epoch"),
+        "mode": status.get("mode"),
+        "action": action,
+    }
+    if state == "pending":
+        body["retry_after"] = retry_after
+    return body

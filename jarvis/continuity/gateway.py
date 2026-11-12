@@ -15,15 +15,34 @@ It still signs with the installation key and the pinned owner key. A shared-secr
 identity dict is not accepted; the integration fleet uses this port.
 
 Full contract, error map, and limits: docs/design/mobile-continuity/GATEWAY-IMPLEMENTATION.md.
+
+Process entry (not run on import): `python -m jarvis.continuity.gateway`.
+`serve` reads one dedicated JSON file and validates it before opening the
+authority database. It does not read `jarvis.config.json` and it does not
+load an owner private key. `backup` copies that database with the SQLite
+backup API while holding the authority writer lock. `restore` checks the
+snapshot read-only, writes a new file while holding the destination writer
+lock, and requires a new authority id.
+The destination drops leases, transitions, admissions, participants, and
+the gateway directory, then stays `LEGACY_ACTIVE` until a new cutover.
+See `GatewayConfig`, `FailoverPolicy`, `backup_gateway`, and `restore_gateway`.
 """
 
+import argparse
 import base64
+import errno
 import hashlib
 import ipaddress
 import json
 import math
+import os
 import re
 import secrets
+import signal
+import socket
+import sqlite3
+import ssl
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,9 +56,11 @@ from urllib.parse import urlsplit
 
 from jarvis.continuity.authority import (
     MAX_SIGNATURE,
+    SCHEMA_VERSION,
     TICKET_FIELDS as _TICKET_FIELDS,
     AuthorityError,
     AuthorityStore,
+    _writer_lock,
 )
 
 DEVICE_NS = "jarvis-continuity-device-v1"
@@ -74,14 +95,16 @@ _CLIENT_CAPS = frozenset({"status", "client", "reconcile"})
 HTTP_STATUS = {
     "bad_request": 400, "bad_ticket": 400, "bad_origin": 400, "refused_bind": 400,
     "unauthorized": 401,
-    "forbidden": 403, "unknown_participant": 403,
+    "forbidden": 403, "unknown_participant": 403, "revoked": 403,
     "not_found": 404,
     "ticket_expired": 410,
     "stale": 409, "busy": 409, "key_reused": 409, "conflict": 409, "not_quiet": 409,
     "lease_live": 409, "ahead": 409, "bad_edge": 409, "unacked": 409, "expired": 409,
     "draining": 409, "mode": 409, "ineligible": 409, "main_alive": 409, "no_main": 409,
     "noop": 409, "not_ready": 409, "bad_state": 409, "no_admission": 409,
-    "target_unfenced": 409,
+    "target_unfenced": 409, "installation_mismatch": 409, "active_holder": 409,
+    "transition_member": 409,
+    "envelope_unsigned": 401, "body_not_relayable": 503,
     "quarantined": 503, "writer_busy": 503, "unavailable": 503, "no_relay": 503,
     "authority_mismatch": 503, "redirect": 503,
 }
@@ -110,6 +133,7 @@ _OWNER_PATH = {
     "step": "/v1/authority/transitions/step",
     "enroll": "/v1/authority/participants",
     "mode": "/v1/authority/mode",
+    "disable": "/v1/authority/participants/disable",
 }
 _DEVICE_PURPOSE = {path: name for name, path in _PURPOSE_PATH.items()}
 _OWNER_PURPOSE = {path: name for name, path in _OWNER_PATH.items()}
@@ -193,10 +217,25 @@ def pin_origin(origin):
 
 
 def pin_relay(origin):
-    """Relay targets are loopback HTTP only. Non-loopback and https forwards are refused."""
+    """Pin a loopback HTTP or tailnet HTTPS relay origin; never accept redirects."""
     pinned = pin_origin(origin)
     parts = urlsplit(pinned)
-    if parts.scheme != "http" or parts.hostname not in {"127.0.0.1", "::1"}:
+    host = (parts.hostname or "").lower()
+    if parts.scheme == "http":
+        if host not in {"127.0.0.1", "::1"}:
+            raise GatewayError("bad_origin")
+    elif parts.scheme == "https":
+        # A DNS name is explicitly pinned by the enrollment record. Never accept
+        # an address literal or a merely similar public hostname.
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            raise GatewayError("bad_origin")
+        if not host.endswith(".ts.net") or host == "ts.net":
+            raise GatewayError("bad_origin")
+    else:
         raise GatewayError("bad_origin")
     return pinned
 
@@ -368,8 +407,29 @@ class _Handler(BaseHTTPRequestHandler):
     def version_string(self):
         return "jarvis-continuity"
 
+    def setup(self):
+        timeout = getattr(self.server, "request_timeout", None)
+        if timeout:
+            try:
+                self.request.settimeout(timeout)
+            except OSError:
+                pass
+        super().setup()
+
+    def handle(self):
+        # A client that never finishes the body, or a shutdown that closes the
+        # socket, must not sit in the server forever or dump a traceback.
+        try:
+            super().handle()
+        except (TimeoutError, ConnectionError, socket.timeout):
+            return
+
     def do_POST(self):
-        self.server.gateway._http(self)
+        gateway = self.server.gateway
+        if gateway._closing or gateway._closed:
+            gateway._reply(self, 503, {"error": "unavailable"}, None, "unavailable")
+            return
+        gateway._http(self)
 
     def do_GET(self):
         self.server.gateway._reply(self, 405, {"error": "bad_request"}, None, "bad_request")
@@ -380,11 +440,95 @@ class _Handler(BaseHTTPRequestHandler):
         return
 
 
+class _GatewayHTTPServer(ThreadingHTTPServer):
+    """Listener whose client reads and handler joins are bounded.
+
+    Handler threads are non-daemon so a request still inside the authority
+    database keeps the process up until it finishes or the socket times out.
+    `block_on_close` stays false: `server_close` must not join without a
+    deadline. `shutdown` on the gateway counts handlers itself and waits
+    with a timeout.
+    """
+
+    daemon_threads = False
+    block_on_close = False
+    request_timeout = 5.0
+
+    def __init__(self, server_address, RequestHandlerClass):
+        self._socks = set()
+        self._inflight_lock = threading.Lock()
+        self._active = 0
+        self._idle = threading.Event()
+        self._idle.set()
+        super().__init__(server_address, RequestHandlerClass)
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        try:
+            conn.settimeout(self.request_timeout)
+        except OSError:
+            pass
+        with self._inflight_lock:
+            self._socks.add(conn)
+        return conn, addr
+
+    def process_request(self, request, client_address):
+        # Count before the thread runs. When the accept loop has returned,
+        # every accepted request is already in `_active`.
+        with self._inflight_lock:
+            self._active += 1
+            self._idle.clear()
+        started = False
+        try:
+            super().process_request(request, client_address)
+            started = True
+        finally:
+            if not started:
+                with self._inflight_lock:
+                    self._socks.discard(request)
+                    self._active -= 1
+                    if self._active == 0:
+                        self._idle.set()
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._inflight_lock:
+                self._socks.discard(request)
+                self._active -= 1
+                if self._active == 0:
+                    self._idle.set()
+
+    def abort_inflight(self):
+        """Unblock handlers stuck in a socket read. Does not touch the database."""
+        with self._inflight_lock:
+            socks = list(self._socks)
+        for sock in socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def wait_idle(self, timeout):
+        if self._idle.wait(timeout):
+            return True
+        with self._inflight_lock:
+            return self._active == 0
+
+
 class ContinuityGateway:
     """One `AuthorityStore`, one device directory, and an optional in-process HTTP server.
 
     `open` does not listen. Call `serve` explicitly. `close` stops the listener and,
     when this object created the store, closes it.
+
+    Enrollment metadata and device-nonce replay digests live in gateway-owned
+    tables in the store database (`gateway_directory`, `gateway_nonces`).
+    `open` loads them through the same validators `enroll` uses. A row that
+    fails validation refuses startup (`bad_state`). Owner challenges and owner
+    nonces stay in RAM: a restart voids outstanding owner challenges. Relay
+    and phone bodies stay in RAM and are never written.
     """
 
     def __init__(self, store, owner_public_keys, *, wall=time.time, owns_store=False):
@@ -408,7 +552,13 @@ class ContinuityGateway:
         self._httpd = None
         self._thread = None
         self._listening_origin = None
+        self._tls = False
         self._closed = False
+        self._closing = False
+        # Manual promotion only. Constructed with the default so no gateway
+        # object can grow an automatic promoter later in this process.
+        self.policy = FailoverPolicy(auto_failover=False)
+        self._load_durable()
 
     @classmethod
     def open(cls, path, fleet_id, authority_id, owner_public_keys, *, monotonic=time.monotonic,
@@ -434,24 +584,53 @@ class ContinuityGateway:
             self._closed = True
             self.store.close()
 
-    def serve(self, host="127.0.0.1", port=0, *, confirm_bind=False):
-        """Bind an in-process HTTP server. Refuses wildcard addresses. Does not enable TLS."""
+    def serve(self, host="127.0.0.1", port=0, *, confirm_bind=False, tls_cert=None, tls_key=None):
+        """Bind an in-process HTTP server. Refuses wildcard addresses.
+
+        TLS stays off unless both `tls_cert` and `tls_key` are set. Then the
+        accepted socket is wrapped with the stdlib `ssl.SSLContext` (TLS 1.2
+        or newer) and the origin uses `https`. Passing only one path is
+        `bad_config`. This loads the TLS key into the SSL stack for the
+        handshake. It does not load an owner private key, and it does not
+        start failover.
+        """
         self._check_bind(host, confirm_bind)
+        if (tls_cert is None) != (tls_key is None):
+            raise GatewayError("bad_config")
         if self._httpd is not None:
             raise GatewayError("bad_request")
         try:
-            httpd = ThreadingHTTPServer((host, port), _Handler)
+            httpd = _GatewayHTTPServer((host, port), _Handler)
         except OSError:
             raise GatewayError("refused_bind") from None
-        httpd.daemon_threads = True
         httpd.gateway = self
         httpd.timeout = 2
+        if tls_cert is not None:
+            try:
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
+                context.load_cert_chain(certfile=str(tls_cert), keyfile=str(tls_key))
+                httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+            except (OSError, ssl.SSLError):
+                httpd.server_close()
+                raise GatewayError("bad_config") from None
         self._httpd = httpd
+        self._tls = tls_cert is not None
         bound_host, bound_port = httpd.server_address[:2]
         shown = f"[{bound_host}]" if ":" in bound_host else bound_host
-        self._listening_origin = f"http://{shown}:{bound_port}"
+        scheme = "https" if self._tls else "http"
+        self._listening_origin = f"{scheme}://{shown}:{bound_port}"
+        self._closing = False
         self._thread = threading.Thread(target=httpd.serve_forever, name="continuity-gateway", daemon=False)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception:
+            self._httpd = None
+            self._thread = None
+            self._tls = False
+            self._listening_origin = None
+            httpd.server_close()
+            raise GatewayError("refused_bind") from None
         return self._listening_origin
 
     @staticmethod
@@ -467,15 +646,33 @@ class ContinuityGateway:
             raise GatewayError("refused_bind")
 
     def shutdown(self):
+        """Stop the accept loop and joined handlers. Never waits without a deadline.
+
+        In-flight reads are aborted, then the server thread is joined. Handlers
+        already past the closed check are given `request_timeout` plus a second
+        to leave the database. After that this returns anyway so `close` can
+        drop the writer lock. A handler that starts later sees `_closing` and
+        does not touch the database.
+        """
+        self._closing = True
         httpd, thread = self._httpd, self._thread
         self._httpd = None
         self._thread = None
         if httpd is not None:
+            httpd.abort_inflight()
             httpd.shutdown()
-            httpd.server_close()
         if thread is not None:
-            thread.join(timeout=5)
+            thread.join(timeout=3)
+            if thread.is_alive():
+                thread.join(timeout=1)
+        if httpd is not None:
+            httpd.wait_idle(httpd.request_timeout + 1)
+            try:
+                httpd.server_close()
+            except OSError:
+                pass
         self._listening_origin = None
+        self._tls = False
 
     @property
     def listening(self):
@@ -512,11 +709,15 @@ class ContinuityGateway:
             "v": 1, "device_id": device_id, "installation_id": installation_id, "nonce": nonce,
             "issued_at": issued_at, "purpose": purpose, "payload_digest": digest,
         })
+        # Replay key is a digest. The nonce text is not stored.
+        nonce_digest = _nonce_digest(nonce)
         with self._lock:
-            self._fresh(self._nonces, (device_id, nonce), issued_at)
+            self._fresh(self._nonces, (device_id, nonce_digest), issued_at)
             if not verify_message(DEVICE_NS, message, signature, record.public_key):
                 raise GatewayError("unauthorized")
-            self._nonces[(device_id, nonce)] = issued_at + SKEW_SECONDS
+            expires = issued_at + SKEW_SECONDS
+            self._persist_device_nonce(device_id, nonce_digest, expires)
+            self._nonces[(device_id, nonce_digest)] = expires
         return DevicePrincipal(self._token, device_id, installation_id, record.kind,
                                record.capabilities, purpose, digest)
 
@@ -590,6 +791,11 @@ class ContinuityGateway:
         return payload
 
     def _store(self, fn):
+        # `_closed` means `close` has dropped or is dropping the connection.
+        # `_closing` alone only stops new HTTP work; in-process calls after
+        # `shutdown` and before `close` still reach the open store.
+        if self._closed:
+            raise GatewayError("unavailable")
         try:
             return fn()
         except AuthorityError as exc:
@@ -870,8 +1076,16 @@ class ContinuityGateway:
     def enroll(self, owner_proof, payload):
         """Bind an installation public key and capabilities. Owner proof required.
 
-        `client` devices are directory entries only. They are not authority participants,
-        so a phone cannot satisfy or block a fence. The directory is RAM-only.
+        `client` devices are directory entries only. They are not authority
+        participants, so a phone cannot satisfy or block a fence. Nothing in
+        the config file enrolls a device, and this method does not run without
+        a fresh owner proof.
+
+        The participant row and the directory row commit in one transaction,
+        or neither does. RAM is updated only after that commit. A restart
+        loads the directory back. Stored columns are the device id, installation
+        id, kind, public key, capability list, and optional loopback relay
+        origin. The owner signature and the request body are not stored.
         """
         self._accept_owner(owner_proof, "enroll", _exact(payload, (
             "device_id", "installation_id", "kind", "public_key", "capabilities"), ("relay_origin",)))
@@ -882,13 +1096,23 @@ class ContinuityGateway:
         public_key = _public_key(payload["public_key"])
         capabilities = self._capabilities(kind, payload["capabilities"])
         relay_origin = pin_relay(payload["relay_origin"]) if "relay_origin" in payload else None
-        if kind != "client":
-            self._store(lambda: self.store.register_participant(device_id, installation_id, kind, True))
+        record = _Record(device_id, installation_id, kind, public_key, capabilities, relay_origin)
+        # Gateway lock first, then the store lock inside the helper, so an
+        # authenticate on another thread cannot invert the order. Membership
+        # and the directory row commit together before RAM sees the device.
         with self._lock:
-            self._devices[device_id] = _Record(
-                device_id, installation_id, kind, public_key, capabilities, relay_origin)
+            self._save_enrollment(record)
+            self._devices[device_id] = record
         return {"device_id": device_id, "installation_id": installation_id, "kind": kind,
                 "capabilities": sorted(capabilities)}
+
+    def disable_participant(self, owner_proof, payload):
+        """Durably revoke a participant after fresh owner proof."""
+        self._accept_owner(owner_proof, "disable", _exact(payload, ("device_id", "installation_id")))
+        device_id = _ident(payload["device_id"])
+        installation_id = _ident(payload["installation_id"])
+        result = self._store(lambda: self.store.disable_participant(device_id, installation_id))
+        return result if isinstance(result, dict) else {"device_id": device_id, "disabled": True}
 
     def set_mode(self, owner_proof, payload):
         """One cutover edge. The store still refuses jumps to V2_ACTIVE."""
@@ -900,7 +1124,8 @@ class ContinuityGateway:
         version = self._store(lambda: self.store.set_mode(mode, _nnint(payload["expected_mode_version"])))
         return {"mode": mode, "mode_version": version}
 
-    def _capabilities(self, kind, values):
+    @staticmethod
+    def _capabilities(kind, values):
         if not isinstance(values, list) or not values or len(values) > len(CAPABILITIES):
             raise GatewayError("bad_request")
         caps = []
@@ -932,9 +1157,139 @@ class ContinuityGateway:
             raise GatewayError("no_relay")
         return status
 
+    # --- durable directory -------------------------------------------------------------
+
+    def _store_tx(self):
+        """One immediate transaction on the authority connection.
+
+        Caller may already hold the gateway lock. This acquires `store._lock`
+        after that, never before. It does not call `AuthorityStore._tx`,
+        because that helper releases the store lock itself. A closed store
+        is not opened again here.
+        """
+        if self._closed:
+            raise GatewayError("unavailable")
+        store = self.store
+        store._lock.acquire()
+        try:
+            store._db.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            store._lock.release()
+            raise
+        return _GatewayTx(store)
+
+    def _load_durable(self):
+        """Read the directory and unexpired nonce digests. Invalid rows refuse startup."""
+        if not hasattr(self.store, "_db") or not hasattr(self.store, "_lock"):
+            raise GatewayError("bad_state")
+        try:
+            with self._store_tx() as db:
+                _ensure_gateway_schema(db)
+                now = self._wall()
+                db.execute("DELETE FROM gateway_nonces WHERE expires_at < ?", (now,))
+                rows = list(db.execute(
+                    "SELECT device_id, installation_id, kind, public_key, capabilities, relay_origin"
+                    " FROM gateway_directory ORDER BY device_id"))
+                nonces = list(db.execute(
+                    "SELECT device_id, nonce_digest, expires_at FROM gateway_nonces"))
+        except GatewayError:
+            raise
+        except sqlite3.Error:
+            raise GatewayError("bad_state") from None
+        devices = {}
+        for row in rows:
+            record = _record_from_stored(row)
+            if record.device_id in devices:
+                raise GatewayError("bad_state")
+            devices[record.device_id] = record
+        loaded = {}
+        for row in nonces:
+            key, expires = _nonce_from_stored(row)
+            loaded[key] = expires
+        if len(loaded) > MAX_NONCES:
+            raise GatewayError("unavailable")
+        self._devices = devices
+        self._nonces = loaded
+
+    def _save_enrollment(self, record):
+        """Commit participant membership and the directory row together.
+
+        Dependency: `AuthorityStore.register_participant` in `authority.py` is
+        the owned statement of this invariant (WS1). Calling it would commit
+        the participant before this directory insert, so a directory failure
+        left a durable member with no directory row. The same SQL runs here,
+        inside this transaction, under the store lock `_store_tx` already
+        holds. `_apply_participant_registration` is that copy.
+
+        Gateway enroll calls `register_participant(device_id, installation_id,
+        kind, True)` and does not pass `reenable`. A missing row inserts that
+        installation with `eligible` 1. A changed installation id is
+        `INSERT OR REPLACE` of device_id, installation_id, kind, and eligible.
+        Ack columns are omitted on purpose: they take the schema defaults,
+        which is the installation-change reset (`mode_version` 0,
+        `fenced_epoch` -1, `boot_id` and `acked_at` null). The same
+        installation updates kind only, so acknowledgements stay and a
+        revoked installation is not made eligible again. Kind must be `pc`
+        or `server`. The current holder and an open transition endpoint are
+        refused by `store._refuse_live_member` with no write.
+        `store._guard()` is the quarantine check `register_participant` runs
+        before its write. Clients are directory entries only: they do not
+        write `participants` and do not call `_guard()`.
+
+        RAM is updated by the caller only after this returns.
+        """
+        caps = _caps_json(record.capabilities)
+        try:
+            with self._store_tx() as db:
+                _ensure_gateway_schema(db)
+                if record.kind != "client":
+                    _apply_participant_registration(
+                        self.store, db, record.device_id, record.installation_id, record.kind)
+                db.execute(
+                    "INSERT INTO gateway_directory(device_id, installation_id, kind, public_key,"
+                    " capabilities, relay_origin) VALUES(?,?,?,?,?,?)"
+                    " ON CONFLICT(device_id) DO UPDATE SET"
+                    " installation_id=excluded.installation_id, kind=excluded.kind,"
+                    " public_key=excluded.public_key, capabilities=excluded.capabilities,"
+                    " relay_origin=excluded.relay_origin",
+                    (record.device_id, record.installation_id, record.kind, record.public_key,
+                     caps, record.relay_origin))
+        except GatewayError:
+            raise
+        except AuthorityError as exc:
+            raise GatewayError(exc.code, wait=exc.wait) from None
+        except sqlite3.Error:
+            raise GatewayError("unavailable") from None
+
+    def _persist_device_nonce(self, device_id, nonce_digest, expires):
+        """Commit one replay digest. The nonce text is not a parameter we store."""
+        now = self._wall()
+        try:
+            with self._store_tx() as db:
+                _ensure_gateway_schema(db)
+                db.execute("DELETE FROM gateway_nonces WHERE expires_at < ?", (now,))
+                found = db.execute(
+                    "SELECT 1 FROM gateway_nonces WHERE device_id=? AND nonce_digest=?",
+                    (device_id, nonce_digest)).fetchone()
+                if found is not None:
+                    raise GatewayError("unauthorized")
+                count = db.execute("SELECT COUNT(*) FROM gateway_nonces").fetchone()[0]
+                if count >= MAX_NONCES:
+                    raise GatewayError("unavailable")
+                db.execute(
+                    "INSERT INTO gateway_nonces(device_id, nonce_digest, expires_at) VALUES(?,?,?)",
+                    (device_id, nonce_digest, float(expires)))
+        except GatewayError:
+            raise
+        except sqlite3.Error:
+            raise GatewayError("unavailable") from None
+
     # --- HTTP --------------------------------------------------------------------------
 
     def _http(self, handler):
+        if self._closing or self._closed:
+            self._reply(handler, 503, {"error": "unavailable"}, None, "unavailable")
+            return
         code, status, wait, device_id, operation_id = "unavailable", 503, None, None, None
         try:
             if "?" in handler.path or handler.path != handler.path.split("?")[0]:
@@ -990,6 +1345,8 @@ class ContinuityGateway:
             return self.transition_step(proof, payload)
         if purpose == "enroll":
             return self.enroll(proof, payload)
+        if purpose == "disable":
+            return self.disable_participant(proof, payload)
         return self.set_mode(proof, payload)
 
     def _device_from_body(self, path, parsed):
@@ -1183,6 +1540,9 @@ class AuthorityClient:
 
     def set_mode(self, mode, expected_mode_version):
         return self._owner("mode", {"mode": mode, "expected_mode_version": expected_mode_version})
+
+    def disable_participant(self, device_id, installation_id):
+        return self._owner("disable", {"device_id": device_id, "installation_id": installation_id})
 
     def _device(self, purpose, payload):
         if self._key is None or self.device_id is None or self.installation_id is None:
@@ -1380,3 +1740,1159 @@ class AuthenticatedPort:
             return fn()
         except GatewayError as exc:
             raise AuthorityError(exc.code, exc.code, wait=exc.wait) from None
+
+
+class _GatewayTx:
+    """Finishes a transaction `_store_tx` already began. Releases the store lock."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def __enter__(self):
+        return self.store._db
+
+    def __exit__(self, kind, exc, tb):
+        try:
+            self.store._db.execute("ROLLBACK" if kind is not None else "COMMIT")
+        finally:
+            self.store._lock.release()
+        return False
+
+
+_GATEWAY_SCHEMA_VERSION = "1"
+_ALLOWED_SNAPSHOT_TABLES = frozenset({
+    "meta", "authority", "participants", "transitions", "admissions",
+    "gateway_directory", "gateway_nonces",
+})
+_CONFIG_KEYS = frozenset({
+    "state_path", "fleet_id", "authority_id", "owner_public_keys",
+    "bind_host", "bind_port", "tls_cert", "tls_key",
+    "lease_seconds", "margin", "auto_failover",
+})
+_CONFIG_REQUIRED = frozenset({"state_path", "fleet_id", "authority_id", "owner_public_keys"})
+_MAX_CONFIG_BYTES = 65536
+_DIRECTORY_DDL = (
+    "CREATE TABLE IF NOT EXISTS gateway_directory ("
+    " device_id TEXT PRIMARY KEY,"
+    " installation_id TEXT NOT NULL,"
+    " kind TEXT NOT NULL,"
+    " public_key TEXT NOT NULL,"
+    " capabilities TEXT NOT NULL,"
+    " relay_origin TEXT)"
+)
+_NONCE_DDL = (
+    "CREATE TABLE IF NOT EXISTS gateway_nonces ("
+    " device_id TEXT NOT NULL,"
+    " nonce_digest TEXT NOT NULL,"
+    " expires_at REAL NOT NULL,"
+    " PRIMARY KEY (device_id, nonce_digest))"
+)
+
+
+def _apply_participant_registration(store, db, device_id, installation_id, kind):
+    """Same writes as `register_participant(..., eligible=True)` without `reenable`.
+
+    Dependency: authority.py `register_participant` and `_refuse_live_member`.
+    Kept here so enrollment can commit membership and the directory row in
+    one transaction. Do not add the ack columns to the INSERT: omitting them
+    is the installation-change reset. The same installation updates kind
+    only, so this replay cannot undo `disable_participant`. `_guard` runs
+    only on this path. A client directory row does not call it.
+    """
+    if kind not in ("pc", "server"):
+        raise GatewayError("bad_request")
+    store._guard()
+    old = db.execute("SELECT * FROM participants WHERE device_id=?", (device_id,)).fetchone()
+    if old is None:
+        store._refuse_live_member(db, device_id)
+        db.execute(
+            "INSERT INTO participants(device_id, installation_id, kind, eligible)"
+            " VALUES(?,?,?,1)",
+            (device_id, installation_id, kind))
+        return
+    if old["installation_id"] != installation_id:
+        store._refuse_live_member(db, device_id)
+        db.execute(
+            "INSERT OR REPLACE INTO participants(device_id, installation_id, kind, eligible)"
+            " VALUES(?,?,?,1)",
+            (device_id, installation_id, kind))
+        return
+    if old["kind"] != kind:
+        store._refuse_live_member(db, device_id)
+    db.execute(
+        "UPDATE participants SET kind=? WHERE device_id=? AND installation_id=?",
+        (kind, device_id, installation_id))
+
+
+def _ensure_gateway_schema(db):
+    """Create the gateway tables. They hold no prompt, body, or private key column."""
+    db.execute(_DIRECTORY_DDL)
+    db.execute(_NONCE_DDL)
+    row = db.execute("SELECT value FROM meta WHERE key='gateway_schema'").fetchone()
+    if row is None:
+        db.execute(
+            "INSERT INTO meta(key, value) VALUES('gateway_schema', ?)", (_GATEWAY_SCHEMA_VERSION,))
+    elif row[0] != _GATEWAY_SCHEMA_VERSION:
+        raise GatewayError("bad_state")
+
+
+def _caps_json(capabilities):
+    return json.dumps(sorted(capabilities), separators=(",", ":"), ensure_ascii=True)
+
+
+def _nonce_digest(nonce):
+    """Replay identity for one device nonce. The nonce text is not returned."""
+    return "sha256:" + hashlib.sha256(nonce.encode("ascii")).hexdigest()
+
+
+def _record_from_stored(row):
+    """One directory row, or `bad_state`. A loose row is not skipped."""
+    try:
+        device_id = _ident(row["device_id"])
+        installation_id = _ident(row["installation_id"])
+        kind = row["kind"]
+        if kind not in {"pc", "server", "client"}:
+            raise GatewayError("bad_state")
+        public_key = _public_key(row["public_key"])
+        text = row["capabilities"]
+        if not isinstance(text, str):
+            raise GatewayError("bad_state")
+        parsed = json.loads(text)
+        capabilities = ContinuityGateway._capabilities(kind, parsed)
+        if _caps_json(capabilities) != text:
+            raise GatewayError("bad_state")
+        relay = row["relay_origin"]
+        if relay is not None:
+            if not isinstance(relay, str):
+                raise GatewayError("bad_state")
+            pinned = pin_relay(relay)
+            if pinned != relay:
+                raise GatewayError("bad_state")
+            relay = pinned
+    except GatewayError as exc:
+        if exc.code != "bad_state":
+            raise GatewayError("bad_state") from None
+        raise
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        raise GatewayError("bad_state") from None
+    return _Record(device_id, installation_id, kind, public_key, capabilities, relay)
+
+
+def _nonce_from_stored(row):
+    try:
+        device_id = _ident(row["device_id"])
+        digest = _digest(row["nonce_digest"])
+        expires = row["expires_at"]
+        if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+            raise GatewayError("bad_state")
+        expires = float(expires)
+        if not math.isfinite(expires) or expires < 0:
+            raise GatewayError("bad_state")
+    except GatewayError as exc:
+        if exc.code != "bad_state":
+            raise GatewayError("bad_state") from None
+        raise
+    except (TypeError, ValueError, KeyError):
+        raise GatewayError("bad_state") from None
+    return (device_id, digest), expires
+
+
+class FailoverPolicy:
+    """Manual MAIN promotion only.
+
+    WS1 owns lease grant and fencing. This process has no safe hook that can
+    promote a candidate, so it never does. `auto_failover` defaults to false.
+    `FailoverPolicy(auto_failover=True)` raises `auto_failover_disabled`
+    before a store is opened and before any promotion attempt. Any other
+    value is `bad_config`.
+
+    `on_unreachable` and `on_lease` return `action=none`. An unreachable peer
+    is not a promotion. A live lease is not a promotion. Nothing here calls
+    those methods on a timer.
+    """
+
+    def __init__(self, auto_failover=False):
+        if auto_failover is True:
+            raise GatewayError("auto_failover_disabled")
+        if auto_failover is not False:
+            raise GatewayError("bad_config")
+        self.auto_failover = False
+
+    def on_unreachable(self, device_id):
+        """A silent peer does not elect a MAIN."""
+        _ident(device_id)
+        return {"action": "none", "auto_failover": False, "reason": "manual_only"}
+
+    def on_lease(self, lease_valid):
+        """A live or lapsed lease does not elect a MAIN."""
+        if not isinstance(lease_valid, bool):
+            raise GatewayError("bad_config")
+        return {"action": "none", "auto_failover": False, "reason": "manual_only"}
+
+
+class GatewayConfig:
+    """Dedicated gateway JSON. This is not `jarvis.config.json`.
+
+    Required: `state_path`, `fleet_id`, `authority_id`, `owner_public_keys`
+    (a non-empty list of `ssh-ed25519` public key strings, no comment).
+    Optional: `bind_host` (`127.0.0.1`), `bind_port` (`0`), `tls_cert` and
+    `tls_key` (both paths or neither), `lease_seconds` and `margin` (test
+    clocks only; omitted uses the store defaults), `auto_failover` (false).
+
+    Unknown keys are `bad_config`, including any owner private-key field.
+    `owner_public_keys` only verify owner signatures. They do not enroll a
+    device. `serve` with `auto_failover` true is `auto_failover_disabled`
+    and does not open `state_path`.
+
+    On restore, `authority_id` is the snapshot pin, not the id written into
+    the destination. `state_path` is the destination and must not exist yet.
+    David then replaces this file with one whose `authority_id` is the
+    `--new-authority-id` value before serving that destination.
+    """
+
+    def __init__(self, *, state_path, fleet_id, authority_id, owner_public_keys, bind_host,
+                 bind_port, tls_cert, tls_key, lease_seconds, margin, auto_failover):
+        self.state_path = state_path
+        self.fleet_id = fleet_id
+        self.authority_id = authority_id
+        self.owner_public_keys = tuple(owner_public_keys)
+        self.bind_host = bind_host
+        self.bind_port = bind_port
+        self.tls_cert = tls_cert
+        self.tls_key = tls_key
+        self.lease_seconds = lease_seconds
+        self.margin = margin
+        self.auto_failover = auto_failover
+
+
+def _live_roots():
+    repo = Path(__file__).resolve().parents[2]
+    return (repo / ".jarvis", Path.home() / ".local" / "state" / "jarvis")
+
+
+def _reject_live(path):
+    """Refuse the repo `.jarvis` tree and the user JARVIS state directory."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        raise GatewayError("bad_config") from None
+    for root in _live_roots():
+        try:
+            base = root.resolve()
+        except OSError:
+            continue
+        if resolved == base or base in resolved.parents:
+            raise GatewayError("refuses_live_state")
+
+
+def _config_pairs(pairs):
+    out = {}
+    for key, value in pairs:
+        if not isinstance(key, str) or key in out:
+            raise GatewayError("bad_config")
+        out[key] = value
+    return out
+
+
+def _as_ident(value):
+    try:
+        return _ident(value)
+    except GatewayError:
+        raise GatewayError("bad_config") from None
+
+
+def _config_number(value, low, high, *, low_inclusive):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GatewayError("bad_config")
+    number = float(value)
+    if not math.isfinite(number):
+        raise GatewayError("bad_config")
+    if low_inclusive:
+        ok = low <= number <= high
+    else:
+        ok = low < number <= high
+    if not ok:
+        raise GatewayError("bad_config")
+    return number
+
+
+def _tls_file(value):
+    if not isinstance(value, str) or not value or "\x00" in value or len(value) > 4096:
+        raise GatewayError("bad_config")
+    file = Path(value)
+    if file.is_symlink() or not file.is_file():
+        raise GatewayError("bad_config")
+    _reject_live(file)
+    return str(file)
+
+
+def load_gateway_config(path):
+    """Parse one gateway JSON file. Does not open `state_path`.
+
+    A file named `jarvis.config.json`, a symlink, or a file under the live
+    state roots is refused before its bytes are used as config. The state
+    path is checked the same way, still without opening it.
+    """
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise GatewayError("bad_config")
+    file = Path(path)
+    if file.name.startswith("jarvis.config.json") or file.is_symlink():
+        raise GatewayError("bad_config")
+    if not file.is_file():
+        raise GatewayError("not_found")
+    resolved = file.resolve()
+    if resolved.name.startswith("jarvis.config.json"):
+        raise GatewayError("bad_config")
+    _reject_live(resolved)
+    try:
+        if resolved.stat().st_size > _MAX_CONFIG_BYTES:
+            raise GatewayError("bad_config")
+        raw = resolved.read_text(encoding="utf-8")
+    except GatewayError:
+        raise
+    except (OSError, UnicodeError):
+        raise GatewayError("bad_config") from None
+    try:
+        data = json.loads(raw, object_pairs_hook=_config_pairs)
+    except GatewayError:
+        raise
+    except (json.JSONDecodeError, UnicodeError):
+        raise GatewayError("bad_config") from None
+    if not isinstance(data, dict) or set(data) - _CONFIG_KEYS or not _CONFIG_REQUIRED <= set(data):
+        raise GatewayError("bad_config")
+    state_path = data["state_path"]
+    if not isinstance(state_path, str) or not state_path or "\x00" in state_path or len(state_path) > 4096:
+        raise GatewayError("bad_config")
+    _reject_live(state_path)
+    keys = data["owner_public_keys"]
+    if not isinstance(keys, list) or not keys or len(keys) > 16:
+        raise GatewayError("bad_config")
+    public_keys = []
+    for key in keys:
+        try:
+            public_keys.append(_public_key(key))
+        except GatewayError:
+            raise GatewayError("bad_config") from None
+    if len(set(public_keys)) != len(public_keys):
+        raise GatewayError("bad_config")
+    bind_host = data.get("bind_host", "127.0.0.1")
+    if not isinstance(bind_host, str):
+        raise GatewayError("bad_config")
+    ContinuityGateway._check_bind(bind_host, False)
+    bind_port = data.get("bind_port", 0)
+    if isinstance(bind_port, bool) or not isinstance(bind_port, int) or not 0 <= bind_port <= 65535:
+        raise GatewayError("bad_config")
+    has_cert = "tls_cert" in data
+    has_key = "tls_key" in data
+    if has_cert != has_key:
+        raise GatewayError("bad_config")
+    tls_cert = _tls_file(data["tls_cert"]) if has_cert else None
+    tls_key = _tls_file(data["tls_key"]) if has_key else None
+    lease_seconds = None
+    if "lease_seconds" in data:
+        lease_seconds = _config_number(data["lease_seconds"], 0, 300, low_inclusive=False)
+    margin = None
+    if "margin" in data:
+        margin = _config_number(data["margin"], 0, 86400, low_inclusive=True)
+    auto_failover = data.get("auto_failover", False)
+    if not isinstance(auto_failover, bool):
+        raise GatewayError("bad_config")
+    return GatewayConfig(
+        state_path=state_path, fleet_id=_as_ident(data["fleet_id"]),
+        authority_id=_as_ident(data["authority_id"]), owner_public_keys=tuple(public_keys),
+        bind_host=bind_host, bind_port=bind_port, tls_cert=tls_cert, tls_key=tls_key,
+        lease_seconds=lease_seconds, margin=margin, auto_failover=auto_failover)
+
+
+def _require_config(config):
+    if not isinstance(config, GatewayConfig):
+        raise GatewayError("bad_config")
+
+
+def _present_file(path):
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise GatewayError("bad_config")
+    file = Path(path)
+    _reject_live(path)
+    if file.is_symlink():
+        raise GatewayError("conflict")
+    if not file.is_file():
+        raise GatewayError("not_found")
+    return file
+
+
+def _absent_file(path):
+    """A path that must not exist. Symlinks are refused and not followed."""
+    if not isinstance(path, str) or not path or "\x00" in path or len(path) > 4096:
+        raise GatewayError("bad_config")
+    file = Path(path)
+    _reject_live(path)
+    parent = file.parent
+    if str(parent) not in ("", ".") and not parent.is_dir():
+        raise GatewayError("not_found")
+    if os.path.lexists(file):
+        raise GatewayError("conflict")
+    return file
+
+
+def _exclusive_create(path):
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        raise GatewayError("conflict") from None
+    except OSError as exc:
+        if exc.errno in {errno.EEXIST, errno.ELOOP, errno.ENOTDIR}:
+            raise GatewayError("conflict") from None
+        raise GatewayError("conflict") from None
+    os.close(fd)
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        return
+
+
+def _open_ro(path):
+    """Read-only SQLite connection. query_only is on, so this cannot write."""
+    try:
+        uri = Path(path).resolve().as_uri() + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True, isolation_level=None)
+    except (OSError, sqlite3.Error, ValueError):
+        raise GatewayError("bad_state") from None
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute("PRAGMA query_only=ON")
+        _integrity(db)
+    except GatewayError:
+        db.close()
+        raise
+    except sqlite3.Error:
+        db.close()
+        raise GatewayError("bad_state") from None
+    return db
+
+
+def _integrity(db):
+    row = db.execute("PRAGMA integrity_check").fetchone()
+    if row is None or row[0] != "ok":
+        raise GatewayError("bad_state")
+
+
+def _snapshot_shape(db):
+    """Refuse a snapshot that is not this authority schema or that grew a table."""
+    try:
+        schema = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
+        if schema is None or schema[0] != str(SCHEMA_VERSION):
+            raise GatewayError("bad_state")
+        objects = db.execute(
+            "SELECT type, name, tbl_name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        rows = db.execute("SELECT fleet_id, authority_id FROM authority").fetchall()
+    except GatewayError:
+        raise
+    except sqlite3.Error:
+        raise GatewayError("bad_state") from None
+    for obj in objects:
+        if obj["type"] == "table" and obj["name"] in _ALLOWED_SNAPSHOT_TABLES:
+            continue
+        if obj["type"] == "index" and obj["tbl_name"] in _ALLOWED_SNAPSHOT_TABLES:
+            continue
+        raise GatewayError("bad_state")
+    if len(rows) != 1:
+        raise GatewayError("bad_state")
+    return rows[0]["fleet_id"], rows[0]["authority_id"]
+
+
+def _pin_snapshot(db, config):
+    fleet_id, authority_id = _snapshot_shape(db)
+    if fleet_id != config.fleet_id or authority_id != config.authority_id:
+        raise GatewayError("authority_mismatch")
+    return fleet_id, authority_id
+
+
+def _assert_wiped(db, fleet_id, new_authority_id):
+    row = db.execute(
+        "SELECT authority_id, mode, holder, lease_id, lease_ready, transition_id, max_validity"
+        " FROM authority WHERE fleet_id=?", (fleet_id,)).fetchone()
+    if (row is None or row["authority_id"] != new_authority_id or row["mode"] != "LEGACY_ACTIVE"
+            or row["holder"] is not None or row["lease_id"] is not None or row["lease_ready"]
+            or row["transition_id"] is not None or row["max_validity"] != 0):
+        raise GatewayError("bad_state")
+    for table in ("admissions", "transitions", "participants", "gateway_directory", "gateway_nonces"):
+        if db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0] != 0:
+            raise GatewayError("bad_state")
+
+
+def _wipe_destination(db, fleet_id, new_authority_id):
+    """Drop grants and membership. The new id is the only authority identity left."""
+    _ensure_gateway_schema(db)
+    now = time.time()
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for table in ("admissions", "transitions", "participants", "gateway_directory", "gateway_nonces"):
+            db.execute("DELETE FROM " + table)
+        changed = db.execute(
+            "UPDATE authority SET authority_id=?, mode='LEGACY_ACTIVE', mode_version=1,"
+            " incarnation=1, epoch=0, policy_version=1, holder=NULL, lease_id=NULL,"
+            " lease_ready=0, last_holder=NULL, preferred=NULL, transition_id=NULL,"
+            " max_validity=0, updated_at=? WHERE fleet_id=?",
+            (new_authority_id, now, fleet_id)).rowcount
+        if changed == 0:
+            raise GatewayError("bad_state")
+        db.execute("COMMIT")
+    except Exception:
+        try:
+            db.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    _assert_wiped(db, fleet_id, new_authority_id)
+
+
+def backup_gateway(config, output):
+    """Copy one stopped authority database to a new file.
+
+    Does not construct `AuthorityStore`, so the source incarnation does not
+    move. Acquires the same exclusive lock as the store (`<state_path>.writer`
+    via `_writer_lock`). A held lock is `writer_busy` and creates no output.
+
+    `output` must be absent. A symlink is `conflict` and is not followed.
+    The file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`. The SQLite backup
+    API then copies pages into it. On failure the new file is removed.
+
+    The source is opened read-only after the lock is held. Its fleet id and
+    authority id must match the config. An extra table, view, or trigger is
+    `bad_state` and is not copied. No personal body is read or written.
+    """
+    _require_config(config)
+    source = _present_file(config.state_path)
+    dest = _absent_file(output)
+    if source.resolve() == Path(output).resolve():
+        raise GatewayError("conflict")
+    try:
+        lock = _writer_lock(str(Path(config.state_path)) + ".writer")
+    except AuthorityError as exc:
+        raise GatewayError(exc.code if _safe_code(exc.code) else "writer_busy") from None
+    created = False
+    src = dst = None
+    fleet_id = authority_id = None
+    try:
+        src = _open_ro(source)
+        fleet_id, authority_id = _pin_snapshot(src, config)
+        _exclusive_create(dest)
+        created = True
+        dst = sqlite3.connect(os.fspath(dest), isolation_level=None)
+        # The backup API reads the source. query_only stays on so this
+        # connection still cannot run a writing statement.
+        src.backup(dst)
+        _integrity(dst)
+    except Exception:
+        if created:
+            _unlink(dest)
+        raise
+    finally:
+        if dst is not None:
+            dst.close()
+        if src is not None:
+            src.close()
+        lock.close()
+    return {"ok": True, "output": os.fspath(dest), "state_path": os.fspath(source),
+            "fleet_id": fleet_id, "authority_id": authority_id}
+
+
+def _refuse_destination(path):
+    """The new database and the siblings SQLite or the writer lock would reuse."""
+    dest = _absent_file(path)
+    for suffix in ("-wal", "-shm", "-journal", ".writer"):
+        sibling = Path(os.fspath(dest) + suffix)
+        if os.path.lexists(sibling):
+            raise GatewayError("conflict")
+    return dest
+
+
+def _dirfd_names(collection):
+    """Function names in an `os.supports_*` set.
+
+    Those sets store the interpreter's original function objects. Comparing
+    identity would treat a wrapper around `os.link` as a platform that cannot
+    publish with `linkat`, and restore would fail closed before the publish
+    check. The name is the capability. A real platform that lacks `link`
+    still has no such name.
+    """
+    return {getattr(fn, "__name__", "") for fn in collection}
+
+
+def _posix_anchored_io():
+    """True when restore can pin the parent directory and publish with `linkat`.
+
+    A platform without directory fds fails closed. Restore does not fall
+    back to path-string `os.link`: swapping the parent for a symlink in that
+    window would receive the new authority file. `follow_symlinks=False` is
+    required for the same reason; without it, restore refuses to publish.
+    """
+    if sys.platform == "win32":
+        return False
+    if not all(hasattr(os, flag) for flag in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_EXCL")):
+        return False
+    names = _dirfd_names(getattr(os, "supports_dir_fd", ()))
+    if not {"open", "stat", "unlink", "link"} <= names:
+        return False
+    follow = _dirfd_names(getattr(os, "supports_follow_symlinks", ()))
+    return "link" in follow
+
+
+def _dir_flags():
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    return flags
+
+
+def _open_parent_dir(parent):
+    """Open the real directory. A symlink parent is `conflict` and is not followed."""
+    try:
+        return os.open(os.fspath(parent), _dir_flags())
+    except OSError:
+        raise GatewayError("conflict") from None
+
+
+def _parent_anchored(dir_fd, parent):
+    """The path still names the directory fd, not a symlink planted later."""
+    try:
+        fd = os.open(os.fspath(parent), _dir_flags())
+    except OSError:
+        return False
+    try:
+        here, opened = os.fstat(fd), os.fstat(dir_fd)
+    finally:
+        os.close(fd)
+    return (here.st_dev, here.st_ino) == (opened.st_dev, opened.st_ino)
+
+
+def _entry_absent(dir_fd, name):
+    try:
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        raise GatewayError("conflict") from None
+    return False
+
+
+def _require_unpublished(dir_fd, name):
+    """Destination and SQLite sidecars are absent. The writer lock is checked apart."""
+    for entry in (name, name + "-wal", name + "-shm", name + "-journal"):
+        if not _entry_absent(dir_fd, entry):
+            raise GatewayError("conflict")
+
+
+def _create_at(dir_fd, name):
+    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        return os.open(name, flags, 0o600, dir_fd=dir_fd)
+    except OSError:
+        raise GatewayError("conflict") from None
+
+
+def _flock_exclusive(fd):
+    """Same nonblocking exclusive flock as `authority._writer_lock` on POSIX.
+
+    The caller created `fd` with `O_EXCL` and holds it through publication.
+    There is no close-and-reopen gap. A preexisting or replaced lock file is
+    not adopted, because this is never asked to open a path.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        raise GatewayError("unavailable") from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise GatewayError("writer_busy") from None
+
+
+def _entry_is_fd(dir_fd, name, fd):
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise GatewayError("conflict") from None
+    cur = os.fstat(fd)
+    return stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) == (cur.st_dev, cur.st_ino)
+
+
+def _unlink_if_ours(dir_fd, name, fd):
+    """Remove `name` only while it is still the inode `fd` has open.
+
+    A replacement directory entry is left alone. Callers never pass the
+    published destination: a failed link means that name is not ours.
+    """
+    if dir_fd is None or fd is None or not name:
+        return
+    try:
+        if not _entry_is_fd(dir_fd, name, fd):
+            return
+        os.unlink(name, dir_fd=dir_fd)
+    except (GatewayError, OSError):
+        return
+
+
+def _unlink_regular(dir_fd, name):
+    """Unlink a regular file at `name`. A symlink is left in place."""
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except (FileNotFoundError, OSError):
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except OSError:
+        return
+
+
+def _sqlite_image_io():
+    """Serialize and deserialize exist, so SQLite need not open the destination."""
+    return hasattr(sqlite3.Connection, "serialize") and hasattr(sqlite3.Connection, "deserialize")
+
+
+def _plain_sqlite_image(blob):
+    """A rollback-journal SQLite file. Write version 2 is WAL and needs a sidecar."""
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) < 100:
+        return False
+    if bytes(blob[:16]) != b"SQLite format 3\x00":
+        return False
+    return blob[18] == 1 and blob[19] == 1
+
+
+def _rollback_header(blob):
+    """Return `blob` with a rollback-journal header.
+
+    The backup API copies a consistent page image. When the source is WAL,
+    bytes 18 and 19 of that image stay at write/read version 2 even though
+    the pages already contain the checkpointed rows. A version-2 file is not
+    published: opening it looks for a `-wal` sidecar of the destination name.
+    Those two bytes are the WAL marker. The caller deserializes the result
+    and runs `integrity_check` before the publishing link.
+    """
+    if not isinstance(blob, (bytes, bytearray)) or len(blob) < 100:
+        raise GatewayError("unavailable")
+    if bytes(blob[:16]) != b"SQLite format 3\x00":
+        raise GatewayError("unavailable")
+    raw = bytearray(blob)
+    if raw[18] == 2 and raw[19] == 2:
+        raw[18] = 1
+        raw[19] = 1
+    if not _plain_sqlite_image(raw):
+        raise GatewayError("unavailable")
+    return bytes(raw)
+
+
+def _non_wal(db):
+    """Leave a journal mode whose serialized image does not point at `-wal`."""
+    for mode in ("DELETE", "OFF", "TRUNCATE", "MEMORY"):
+        try:
+            row = db.execute("PRAGMA journal_mode=%s" % mode).fetchone()
+        except sqlite3.Error:
+            continue
+        if row is not None and str(row[0]).lower() != "wal":
+            return
+    raise GatewayError("unavailable")
+
+
+def _wiped_image(src, fleet_id, new_id):
+    """Copy and wipe `src` in memory. Return a plain SQLite image.
+
+    SQLite is not given the destination path. Replacing that parent with a
+    symlink cannot redirect this copy, and a WAL sidecar of the destination
+    name is never created. A build without `serialize`/`deserialize`, or an
+    image that stays WAL, is `unavailable` rather than a path-string fallback.
+    """
+    if not _sqlite_image_io():
+        raise GatewayError("unavailable")
+    try:
+        mem = sqlite3.connect(":memory:", isolation_level=None)
+    except sqlite3.Error:
+        raise GatewayError("unavailable") from None
+    mem.row_factory = sqlite3.Row
+    try:
+        src.backup(mem)
+        _non_wal(mem)
+        _wipe_destination(mem, fleet_id, new_id)
+        _non_wal(mem)
+        _integrity(mem)
+        blob = _rollback_header(mem.serialize())
+    except GatewayError:
+        raise
+    except sqlite3.Error:
+        raise GatewayError("bad_state") from None
+    finally:
+        mem.close()
+    return blob
+
+
+def _verify_image(blob, fleet_id, new_id):
+    """Re-read a plain image in a new memory database. No destination path."""
+    if not _plain_sqlite_image(blob) or not _sqlite_image_io():
+        raise GatewayError("bad_state")
+    try:
+        check = sqlite3.connect(":memory:", isolation_level=None)
+    except sqlite3.Error:
+        raise GatewayError("unavailable") from None
+    check.row_factory = sqlite3.Row
+    try:
+        check.deserialize(bytes(blob))
+        check.execute("PRAGMA query_only=ON")
+        _integrity(check)
+        _assert_wiped(check, fleet_id, new_id)
+        return _snapshot_shape(check)
+    except GatewayError:
+        raise
+    except sqlite3.Error:
+        raise GatewayError("bad_state") from None
+    finally:
+        check.close()
+
+
+def _write_fd(fd, blob):
+    """Replace the inode's bytes. The directory entry is not named here."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        view = memoryview(blob)
+        offset = 0
+        while offset < len(view):
+            wrote = os.write(fd, view[offset:])
+            if wrote <= 0:
+                raise GatewayError("unavailable")
+            offset += wrote
+        os.ftruncate(fd, len(blob))
+        os.fsync(fd)
+    except GatewayError:
+        raise
+    except OSError:
+        raise GatewayError("unavailable") from None
+
+
+def _read_fd(fd):
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks = []
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+    except OSError:
+        raise GatewayError("unavailable") from None
+    return b"".join(chunks)
+
+
+def _publish_ready(parent_fd, dest, lock_name, lock_fd, partial_name, partial_fd):
+    """The opened directory, lock inode, temp inode, and destination are unchanged.
+
+    A parent path that no longer names the directory fd, a destination or
+    sidecar that appeared, or a lock/temp name whose inode is no longer the
+    one this restore holds, is `conflict`. Nothing is unlinked here.
+    """
+    if not _parent_anchored(parent_fd, dest.parent):
+        raise GatewayError("conflict")
+    _require_unpublished(parent_fd, dest.name)
+    if not _entry_is_fd(parent_fd, lock_name, lock_fd):
+        raise GatewayError("conflict")
+    if not _entry_is_fd(parent_fd, partial_name, partial_fd):
+        raise GatewayError("conflict")
+
+
+def restore_gateway(config, snapshot, new_authority_id):
+    """Write a new authority file that cannot resume the snapshot's grants.
+
+    `config.authority_id` is the source pin. It must equal the snapshot's
+    authority id, and `config.fleet_id` must equal the snapshot's fleet id.
+    The check opens the snapshot read-only. This does not take the source
+    writer lock and does not construct `AuthorityStore` on the snapshot, so
+    the snapshot's incarnation does not move.
+
+    `new_authority_id` must be a different identifier. The destination is
+    `config.state_path`. That path, and its `-wal`, `-shm`, `-journal`, and
+    `.writer` siblings, must not exist. A sibling is enough to revive pages
+    or to collide with a live writer, so it is `conflict`. Symlinks count as
+    existing and are not followed.
+
+    The parent directory is opened `O_DIRECTORY|O_NOFOLLOW`. Creates, stats,
+    unlinks, and the publishing link use that directory fd. A platform
+    without directory fds raises `unavailable` and does not publish by path.
+    If the parent path later becomes a symlink, the fd still names the
+    original directory and publication is refused.
+
+    This restore creates `<state_path>.writer` with `O_EXCL` and flocks it
+    the way `AuthorityStore` does (`LOCK_EX|LOCK_NB` on that fd). The same
+    fd is held, without closing it, until the hard link returns. The lock
+    file this call just created is the reservation, not a foreign writer.
+    A `.writer` that already existed, or a different inode placed at that
+    name, is `conflict` and is not removed. The flock is not dropped and
+    taken again before publication.
+
+    Pages are copied in a private memory database. SQLite never opens the
+    destination path, so replacing the parent directory with a symlink cannot
+    redirect the copy. The wiped image is a plain rollback-journal file, not
+    WAL, and those bytes are written to a temporary inode created through the
+    directory fd. Admissions, transitions, participants, the gateway directory,
+    and device-nonce digests are deleted in that memory copy. Lease columns
+    are cleared (`holder`, `lease_id`, `lease_ready`, `transition_id`,
+    `max_validity`). `mode` is set to `LEGACY_ACTIVE`, `policy_version` to 1,
+    and incarnation/epoch to the fresh-file pair (1, 0). `authority_id`
+    becomes `new_authority_id`. Immediately before that write, and again
+    immediately before the link, the parent path must still name the opened
+    directory and the destination and its sidecars must be absent. The link
+    fails if the name exists. This function never unlinks `state_path` or a
+    sibling it does not still have open. A failure removes the temp inode
+    and, when this restore still owns the lock inode, that lock name. A build
+    that cannot serialize a plain image raises `unavailable` and does not
+    fall back to opening the destination path.
+
+    DESIGN.md section 16A.6 accepted that a stale backup might restore a
+    device revoked after the backup. This command does not. Membership is
+    empty, so a rolled-back admission is not returned as `already`, and a
+    revoked installation is not enrolled. David re-enrolls the devices he
+    still wants and runs cutover again.
+
+    The config file is not modified. Serving `state_path` with this same
+    config quarantines, because the file's authority id is no longer the
+    pin. David writes a new config whose `authority_id` is the new id and
+    whose `state_path` is this destination. The first `AuthorityStore` open
+    then increments incarnation and epoch. `max_validity` is 0, so that open
+    does not treat an old lease as still running. Mode stays `LEGACY_ACTIVE`.
+
+    `auto_failover` is not a promotion switch here. This function never
+    promotes a device.
+    """
+    _require_config(config)
+    new_id = _as_ident(new_authority_id)
+    if new_id == config.authority_id:
+        raise GatewayError("conflict")
+    if not _posix_anchored_io() or not _sqlite_image_io():
+        raise GatewayError("unavailable")
+    source = _present_file(snapshot)
+    dest = _refuse_destination(config.state_path)
+    if dest.name in ("", ".", "..") or "/" in dest.name:
+        raise GatewayError("bad_config")
+    if source.resolve() == dest.resolve():
+        raise GatewayError("conflict")
+    parent_fd = _open_parent_dir(dest.parent)
+    lock_fd = partial_fd = None
+    partial_name = None
+    lock_name = dest.name + ".writer"
+    release_lock = False
+    published = False
+    try:
+        _require_unpublished(parent_fd, dest.name)
+        if not _entry_absent(parent_fd, lock_name):
+            raise GatewayError("conflict")
+        if not _parent_anchored(parent_fd, dest.parent):
+            raise GatewayError("conflict")
+        src = _open_ro(source)
+        try:
+            fleet_id, authority_id = _pin_snapshot(src, config)
+        finally:
+            src.close()
+        lock_fd = _create_at(parent_fd, lock_name)
+        try:
+            _flock_exclusive(lock_fd)
+        except GatewayError:
+            # Do not unlink. A failed flock means this name is not our reservation.
+            os.close(lock_fd)
+            lock_fd = None
+            raise
+        release_lock = True
+        if not _entry_is_fd(parent_fd, lock_name, lock_fd):
+            raise GatewayError("conflict")
+        partial_name = ".%s.partial-%s" % (dest.name, secrets.token_hex(8))
+        _reject_live(dest.parent / partial_name)
+        if not _entry_absent(parent_fd, partial_name):
+            raise GatewayError("conflict")
+        partial_fd = _create_at(parent_fd, partial_name)
+        src = _open_ro(source)
+        try:
+            image = _wiped_image(src, fleet_id, new_id)
+        finally:
+            src.close()
+        _publish_ready(parent_fd, dest, lock_name, lock_fd, partial_name, partial_fd)
+        _write_fd(partial_fd, image)
+        readback = _read_fd(partial_fd)
+        if readback != image:
+            raise GatewayError("bad_state")
+        seen_fleet, seen_auth = _verify_image(readback, fleet_id, new_id)
+        if seen_fleet != fleet_id or seen_auth != new_id:
+            raise GatewayError("bad_state")
+        # The parent can move while the bytes are written. Recheck on the
+        # directory fd immediately before the publishing link.
+        _publish_ready(parent_fd, dest, lock_name, lock_fd, partial_name, partial_fd)
+        try:
+            os.link(
+                partial_name, dest.name,
+                src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            raise GatewayError("conflict") from None
+        published = True
+        _unlink_if_ours(parent_fd, partial_name, partial_fd)
+        _unlink_if_ours(parent_fd, lock_name, lock_fd)
+        release_lock = False
+    except Exception:
+        # `dest` is published only by linkat. Never unlink that name: a failed
+        # link means the directory entry belongs to someone else. The same
+        # rule applies to a writer inode this restore does not still hold.
+        if not published:
+            if partial_fd is not None and partial_name:
+                for suffix in ("-wal", "-shm", "-journal"):
+                    _unlink_regular(parent_fd, partial_name + suffix)
+                _unlink_if_ours(parent_fd, partial_name, partial_fd)
+            if release_lock and lock_fd is not None:
+                _unlink_if_ours(parent_fd, lock_name, lock_fd)
+        raise
+    finally:
+        if partial_fd is not None:
+            os.close(partial_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(parent_fd)
+    return {
+        "ok": True, "state_path": os.fspath(dest), "fleet_id": fleet_id,
+        "source_authority_id": authority_id, "authority_id": new_id,
+        "mode": "LEGACY_ACTIVE", "participants": 0, "admissions": 0,
+        "transitions": 0, "directory": 0, "serve_requires_new_config": True,
+    }
+
+
+def serve_gateway(config):
+    """Open the store and listen. The caller prints readiness and must `close`.
+
+    `FailoverPolicy` is built first. `auto_failover=True` raises
+    `auto_failover_disabled` and does not create or open `state_path`.
+    No thread calls `on_unreachable` or `on_lease`.
+    """
+    _require_config(config)
+    policy = FailoverPolicy(auto_failover=config.auto_failover)
+    kwargs = {}
+    if config.lease_seconds is not None:
+        kwargs["lease_seconds"] = config.lease_seconds
+    if config.margin is not None:
+        kwargs["margin"] = config.margin
+    gateway = ContinuityGateway.open(
+        config.state_path, config.fleet_id, config.authority_id, config.owner_public_keys, **kwargs)
+    gateway.policy = policy
+    try:
+        origin = gateway.serve(
+            config.bind_host, config.bind_port, tls_cert=config.tls_cert, tls_key=config.tls_key)
+    except Exception:
+        gateway.close()
+        raise
+    return gateway, origin
+
+
+def _emit(obj, stream):
+    print(json.dumps(obj, sort_keys=True, separators=(",", ":")), file=stream, flush=True)
+
+
+class _Parser(argparse.ArgumentParser):
+    """Usage mistakes are `bad_config`, not an argparse traceback."""
+
+    def error(self, message):
+        raise GatewayError("bad_config")
+
+
+def _parser():
+    parser = _Parser(prog="python -m jarvis.continuity.gateway")
+    commands = parser.add_subparsers(dest="command")
+    serve = commands.add_parser("serve")
+    serve.add_argument("--config", required=True)
+    backup = commands.add_parser("backup")
+    backup.add_argument("--config", required=True)
+    backup.add_argument("--output", required=True)
+    restore = commands.add_parser("restore")
+    restore.add_argument("--config", required=True)
+    restore.add_argument("--input", required=True)
+    restore.add_argument("--new-authority-id", required=True)
+    return parser
+
+
+def _serve_until_signal(config):
+    gateway, origin = serve_gateway(config)
+    stop = threading.Event()
+
+    def _handle(signum, _frame):
+        stop.set()
+
+    previous = {}
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, _handle)
+        _emit({"authority_id": config.authority_id, "origin": origin, "pid": os.getpid()}, sys.stdout)
+        while not stop.is_set():
+            thread = gateway._thread
+            if thread is None or not thread.is_alive():
+                break
+            thread.join(timeout=0.5)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        gateway.close()
+    return 0
+
+
+def _dispatch(argv):
+    args = _parser().parse_args(argv)
+    if args.command is None:
+        raise GatewayError("bad_config")
+    config = load_gateway_config(args.config)
+    if args.command == "serve":
+        return _serve_until_signal(config)
+    if args.command == "backup":
+        _emit(backup_gateway(config, args.output), sys.stdout)
+        return 0
+    if args.command == "restore":
+        _emit(restore_gateway(config, args.input, args.new_authority_id), sys.stdout)
+        return 0
+    raise GatewayError("bad_config")
+
+
+def main(argv=None):
+    """Run `serve`, `backup`, or `restore`. Return 0 on success and 2 on refusal.
+
+    stdout is one JSON object. `serve` prints `authority_id`, `origin`, and
+    `pid` after the socket is listening, then waits for SIGINT or SIGTERM
+    and closes the listener and the store. stderr on failure is
+    `{"error":"<code>"}` with no path and no traceback.
+
+    Codes: `bad_config` (shape, unknown key, tls pair, `jarvis.config.json`),
+    `auto_failover_disabled` (serve with the flag true), `refuses_live_state`,
+    `refused_bind`, `writer_busy`, `not_found`, `conflict` (existing output,
+    symlink, or new authority id equal to the source pin),
+    `authority_mismatch`, `bad_state`, `unavailable`.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    try:
+        return _dispatch(list(argv))
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except GatewayError as exc:
+        _emit({"error": exc.code}, sys.stderr)
+        return 2
+    except AuthorityError as exc:
+        code = exc.code if _safe_code(getattr(exc, "code", None)) else "unavailable"
+        _emit({"error": code}, sys.stderr)
+        return 2
+    except Exception:
+        _emit({"error": "unavailable"}, sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

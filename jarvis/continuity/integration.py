@@ -8,26 +8,45 @@ deployment gates in OPERATIONAL-CONTRACT.md are open.
 behind `ContinuityGateway` on a loopback socket, owner and installation ssh keys,
 `AuthorityClient`, `MainRuntime`, `ExecutorGuard`, `ContinuityGatewaySession` and
 `MobileIngress`. Only the MAIN relay sink and the clock are stand-ins. It is not an
-Oracle or Dell deployment. Nothing here writes `jarvis.config.json`, `.jarvis/` or a
-vault, and nothing starts at import time.
+Oracle or Dell deployment. Nothing here writes `jarvis.config.json` or a vault,
+and nothing starts at import time. `configure_production` writes only the managed
+marker in the state directory it is given.
 
 The module-level `close_unfenced` / `refuse_unfenced` helpers are the opt-in launch
 contract. They are default-off RAM flags: legacy entry points call `refuse_unfenced`
 and it does nothing until a deployment explicitly calls `close_unfenced`.
+
+`configure_production` is the other explicit enrollment. It binds a runtime the caller
+already built and writes `continuity-managed.json` in that state directory. It does not
+create an authority. An optional `issuer` signs one admission per effect; a missing
+issuer refuses. With no marker, legacy calls stay as they are. Once the marker is on
+disk, a process with no binding refuses before any effect. A managed hub job carries
+that admission inside the payload, so the existing job signature covers it and another
+process can read it from the broker.
 """
 
+import contextvars
 import hashlib
 import base64
 import importlib
 import json
+import os
+import re
+import secrets
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ..fsio import atomic_write
+
 from .authority import (
     LEASE_SECONDS,
+    MAX_SIGNATURE,
     SAFETY_MARGIN,
     TICKET_FIELDS,
     AuthorityError,
@@ -44,9 +63,17 @@ from .gateway import (
     GatewayError,
     HTTP_STATUS as GATEWAY_HTTP_STATUS,
     _message,
+    sign_message,
     verify_message,
 )
-from .ingress import READ_KINDS, ContinuityGatewaySession, MobileIngress, pin_target
+from .ingress import (
+    READ_KINDS,
+    ContinuityGatewaySession,
+    EnvelopeSigner,
+    MobileIngress,
+    TicketSignatureVerifier,
+    pin_target,
+)
 from .runtime import GatewayPort, MainRuntime, RuntimeRefusal, StoreAdapter
 
 ORIGIN = "https://gateway.test.invalid"
@@ -67,7 +94,10 @@ CONTRACT_HTTP = {code: GATEWAY_HTTP_STATUS[code] for code in (
 EXTRA_HTTP = {**{code: GATEWAY_HTTP_STATUS[code] for code in (
     "writer_busy", "not_found", "ahead", "bad_edge", "unacked", "expired", "draining", "mode",
     "ineligible", "main_alive", "no_main", "noop", "not_ready", "bad_state", "no_admission",
-    "target_unfenced", "unknown_participant")}, **{
+    "target_unfenced", "unknown_participant", "installation_mismatch", "active_holder",
+    "transition_member", "revoked")}, **{
+    "envelope_unsigned": 401,
+    "body_not_relayable": 503,
     "authority_unavailable": 503,
     "personal_field": 400,
     "unauthenticated": 401,
@@ -751,11 +781,17 @@ class IsolatedFleet:
             "zenbook": pin_target("zenbook", "https://zenbook.tailnet.ts.net", "100.64.0.10"),
             "dell": pin_target("dell", "https://dell.tailnet.ts.net", "100.64.0.11"),
         }
+        # Same objects production_ingress requires. The ingress key signs the phone
+        # claim; each PC public key checks that MAIN's admission ticket.
         self.ingress = MobileIngress(
             path, session, origin=origin, installation_id="oracle-inst", allowed_mains=allowed,
             peer_verifier=peer_verifier, blocked_stable_ids=blocked_stable_ids,
             passkey_verifier=passkey_verifier, owner_verifier=owner_verifier, owner_proof=owner_proof,
-            clock=self.clock.wall, log=log)
+            clock=self.clock.wall, log=log,
+            envelope_signer=EnvelopeSigner(self._keys["ingress"][1]),
+            ticket_verifier=TicketSignatureVerifier({
+                "zenbook": self.public("zenbook"), "dell": self.public("dell"),
+            }))
         return self.ingress
 
     def tickets(self, name):
@@ -831,3 +867,606 @@ def phone_listener_open():
 
 def set_phone_listener_open(value):
     _launch["phone_open"] = bool(value)
+
+
+# Production enrollment. The marker is durable; the binding is this process only.
+# A restart keeps the marker and drops the binding, and the next effect refuses.
+_MARKER_NAME = "continuity-managed.json"
+_MARKER_KEYS = frozenset({"managed", "schema"})
+_production_lock = threading.Lock()
+_production = {}
+# One verified local effect. Set only inside an ExecutorGuard sink, and only the
+# matching execute_local may pass. It is not a device-wide bypass.
+_bridge = contextvars.ContextVar("jarvis_continuity_local_bridge", default=None)
+ENVELOPE_KEY = "continuity_envelope"
+_ENVELOPE_FIELDS = frozenset({"schema", "kind", "signed_operation", "admission_ticket"})
+_SIGNED_FIELDS = (
+    "authority_id", "fleet_id", "main", "incarnation", "epoch", "mode_version",
+    "policy_version", "target", "operation_id", "attempt_id", "digest", "effect_class",
+    "issued_at", "admit_until", "issuer_incarnation", "admission_id", "signature",
+)
+_EFFECTS = frozenset(("ordinary", "pure_compute", "interactive"))
+_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
+_WHOLE = ("incarnation", "epoch", "mode_version", "policy_version", "issuer_incarnation",
+          "issued_at", "admit_until")
+_ADMISSION_WINDOW = 60
+
+
+def _state_dir(state):
+    return Path(state).expanduser().resolve()
+
+
+def _marker_path(state):
+    return _state_dir(state) / _MARKER_NAME
+
+
+def _directory_sync(descriptor):
+    os.fsync(descriptor)
+
+
+def _fsync_directory(directory):
+    """Durably link the marker's directory entry. Windows cannot fsync a directory."""
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        if sys.platform != "win32":
+            raise
+        return
+    try:
+        try:
+            _directory_sync(descriptor)
+        except OSError:
+            if sys.platform != "win32":
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def continuity_state(state):
+    """'legacy' when the marker is absent, 'managed' when it is a valid enrollment file.
+
+    Only a missing file is unmanaged. A symlink, directory, unreadable file, or malformed
+    document is quarantined and never treated as legacy.
+    """
+    path = _marker_path(state)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return "legacy"
+    except OSError as exc:
+        raise IntegrationError("quarantined") from exc
+    if stat.S_ISLNK(info.st_mode) or stat.S_ISDIR(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise IntegrationError("quarantined")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return "legacy"
+    except OSError as exc:
+        raise IntegrationError("quarantined") from exc
+    try:
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+    except (OSError, UnicodeError) as exc:
+        raise IntegrationError("quarantined") from exc
+    try:
+        loaded = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise IntegrationError("quarantined") from exc
+    if (not isinstance(loaded, dict) or set(loaded) != _MARKER_KEYS
+            or loaded.get("managed") is not True or type(loaded.get("schema")) is not int
+            or loaded.get("schema") != 1):
+        raise IntegrationError("quarantined")
+    return "managed"
+
+
+def _managed(state):
+    """True once this state directory has been explicitly enrolled. Quarantine propagates."""
+    return continuity_state(state) == "managed"
+
+
+def _write_marker(directory):
+    """Atomic, durable, secret-free enrollment flag. Replaces the whole file."""
+    path = directory / _MARKER_NAME
+    payload = {"managed": True, "schema": 1}
+    atomic_write(path, json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                 mode=0o600, fsync=True)
+    _fsync_directory(directory)
+    if continuity_state(directory) != "managed":
+        raise IntegrationError("bad_request")
+    return path
+
+
+def _bound(state):
+    with _production_lock:
+        found = _production.get(str(_state_dir(state)))
+        return None if found is None else dict(found)
+
+
+def configure_production(state, runtime, executor=None, handoff=None, issuer=None):
+    """Bind an already-built runtime for `state` and record managed enrollment.
+
+    Does not construct an authority, a client, a lease, or a guard. `runtime` must
+    already expose `require_authority` and `release_before_suspend`. `executor` is the
+    node's `ExecutorGuard` when this process runs fenced jobs. `handoff` is stored for
+    the later switch coordinator and is not called. `issuer` signs one admission per
+    effect. It is not called here and is not written to disk. A missing issuer refuses
+    at the effect, not at enrollment.
+    """
+    if runtime is None or not callable(getattr(runtime, "require_authority", None)):
+        raise IntegrationError("bad_request")
+    if not callable(getattr(runtime, "release_before_suspend", None)):
+        raise IntegrationError("bad_request")
+    if executor is not None and not callable(getattr(executor, "accept", None)):
+        raise IntegrationError("bad_request")
+    if issuer is not None and not callable(issuer):
+        raise IntegrationError("bad_request")
+    directory = _state_dir(state)
+    directory.mkdir(parents=True, exist_ok=True)
+    _write_marker(directory)
+    with _production_lock:
+        _production[str(directory)] = {
+            "runtime": runtime, "executor": executor, "handoff": handoff, "issuer": issuer}
+    return production_binding(directory)
+
+
+def clear_production(state=None):
+    """Drop the in-process binding. The durable marker is left in place."""
+    with _production_lock:
+        if state is None:
+            _production.clear()
+            return None
+        _production.pop(str(_state_dir(state)), None)
+    return None
+
+
+def production_binding(state):
+    """The in-process binding, or None. Never reads the marker as a substitute."""
+    return _bound(state)
+
+
+def require_production_authority(state, config, surface, target=None):
+    """Gate one legacy effect. Unmanaged state returns without calling the runtime.
+
+    `config` is not an authority source. A payload flag cannot satisfy this check.
+    Managed state with no bound runtime refuses, including after a process restart.
+    """
+    del config
+    if not _managed(state):
+        return None
+    if not isinstance(surface, str) or not surface:
+        raise IntegrationError("bad_request")
+    binding = _bound(state)
+    runtime = None if binding is None else binding.get("runtime")
+    require = getattr(runtime, "require_authority", None) if runtime is not None else None
+    if not callable(require):
+        raise IntegrationError("managed_unbound")
+    if target is not None and not isinstance(target, str):
+        raise IntegrationError("bad_request")
+    return require("ordinary", target)
+
+
+def _ident_ok(value):
+    return isinstance(value, str) and _ID.fullmatch(value) is not None
+
+
+def _whole_ok(value):
+    return type(value) is int and value >= 0
+
+
+def _device_of(config):
+    from jarvis.topology import identity
+    try:
+        local = identity(config)[0]
+    except (AttributeError, KeyError, TypeError, ValueError, OSError):
+        raise IntegrationError("bad_request") from None
+    if not _ident_ok(local):
+        raise IntegrationError("bad_request")
+    return local
+
+
+def _guard_device(guard):
+    if guard is None or not callable(getattr(guard, "accept", None)):
+        return None
+    device = getattr(guard, "device_id", None)
+    if not _ident_ok(device):
+        return None
+    return device
+
+
+def effect_digest(kind, payload):
+    """Canonical digest of one effect. The admission envelope is not part of the effect."""
+    if not isinstance(kind, str) or not kind or not isinstance(payload, dict) or ENVELOPE_KEY in payload:
+        raise IntegrationError("bad_request")
+    try:
+        raw = json.dumps({"kind": kind, "payload": payload}, sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise IntegrationError("bad_request") from exc
+    return "sha256:" + hashlib.sha256(raw.encode("ascii")).hexdigest()
+
+
+def _require_issued(signed, ticket, *, target, digest, effect_class, operation_id=None, attempt_id=None):
+    """The issuer's pair must be exactly the admission that was asked for. No extra keys."""
+    if not isinstance(signed, dict) or not isinstance(ticket, dict):
+        raise IntegrationError("bad_request")
+    if set(signed) != set(_SIGNED_FIELDS) or set(ticket) != set(TICKET_FIELDS):
+        raise IntegrationError("bad_request")
+    if effect_class not in _EFFECTS or signed.get("effect_class") != effect_class:
+        raise IntegrationError("bad_request")
+    if not _DIGEST.fullmatch(digest or "") or signed.get("digest") != digest or ticket.get("digest") != digest:
+        raise IntegrationError("bad_request")
+    if ticket.get("target") != target or signed.get("target") != target or not _ident_ok(target):
+        raise IntegrationError("bad_request")
+    for key in TICKET_FIELDS:
+        if signed.get(key) != ticket.get(key):
+            raise IntegrationError("bad_request")
+    if operation_id is not None and ticket.get("operation_id") != operation_id:
+        raise IntegrationError("bad_request")
+    if attempt_id is not None and ticket.get("attempt_id") != attempt_id:
+        raise IntegrationError("bad_request")
+    for key in ("admission_id", "operation_id", "attempt_id", "main", "authority_id", "fleet_id"):
+        if not _ident_ok(signed.get(key)):
+            raise IntegrationError("bad_request")
+    for key in _WHOLE:
+        if not _whole_ok(signed.get(key)):
+            raise IntegrationError("bad_request")
+    signature = signed.get("signature")
+    if not isinstance(signature, str) or not 1 <= len(signature) <= MAX_SIGNATURE:
+        raise IntegrationError("bad_request")
+    if signed["admit_until"] <= signed["issued_at"]:
+        raise IntegrationError("bad_request")
+    if signed["admit_until"] - signed["issued_at"] > 24 * 3600:
+        raise IntegrationError("bad_request")
+    return signed, ticket
+
+
+def _issue(issuer, target, digest, effect_class):
+    operation_id = "op-" + secrets.token_hex(8)
+    attempt_id = "at-" + secrets.token_hex(8)
+    issued = issuer(target, operation_id, attempt_id, digest, effect_class)
+    if not isinstance(issued, tuple) or len(issued) != 2:
+        raise IntegrationError("bad_request")
+    return _require_issued(
+        issued[0], issued[1], target=target, digest=digest, effect_class=effect_class,
+        operation_id=operation_id, attempt_id=attempt_id)
+
+
+def production_issuer(private_key, client, *, wall=None):
+    """Sign admissions with an explicit MAIN key. `client.status()` supplies the tuple.
+
+    The callable does not verify tickets and does not treat a boolean as a signature.
+    A MAIN that is not current and ready refuses with `stale` before anything is signed.
+    """
+    clock = time.time if wall is None else wall
+    if not callable(clock):
+        raise IntegrationError("bad_request")
+
+    def issue(target, operation_id, attempt_id, digest, effect_class):
+        try:
+            status = client.status()
+        except GatewayError as exc:
+            raise IntegrationError("managed_unbound") from exc
+        if not isinstance(status, dict):
+            raise IntegrationError("stale")
+        ready = (status.get("mode") == "V2_ACTIVE" and status.get("lease_valid") is True
+                 and status.get("main_ready") is True and _ident_ok(status.get("main")))
+        if not ready or effect_class not in _EFFECTS:
+            raise IntegrationError("stale" if effect_class in _EFFECTS else "bad_request")
+        if not _ident_ok(target) or not _ident_ok(operation_id) or not _ident_ok(attempt_id):
+            raise IntegrationError("bad_request")
+        if not _DIGEST.fullmatch(digest or ""):
+            raise IntegrationError("bad_request")
+        if not _ident_ok(status.get("authority_id")) or not _ident_ok(status.get("fleet_id")):
+            raise IntegrationError("stale")
+        numbers = {}
+        for key in ("incarnation", "epoch", "mode_version", "policy_version"):
+            value = status.get(key)
+            if not _whole_ok(value):
+                raise IntegrationError("stale")
+            numbers[key] = value
+        now = clock()
+        if isinstance(now, bool) or not isinstance(now, (int, float)):
+            raise IntegrationError("stale")
+        issued_at = int(now)
+        ticket = {
+            "admission_id": "adm-" + operation_id,
+            "target": target,
+            "operation_id": operation_id,
+            "attempt_id": attempt_id,
+            "digest": digest,
+            "main": status["main"],
+            "incarnation": numbers["incarnation"],
+            "epoch": numbers["epoch"],
+            "issued_at": issued_at,
+            "admit_until": issued_at + _ADMISSION_WINDOW,
+            "issuer_incarnation": numbers["incarnation"],
+        }
+        signed = {
+            "authority_id": status["authority_id"],
+            "fleet_id": status["fleet_id"],
+            "main": ticket["main"],
+            "incarnation": ticket["incarnation"],
+            "epoch": ticket["epoch"],
+            "mode_version": numbers["mode_version"],
+            "policy_version": numbers["policy_version"],
+            "target": target,
+            "operation_id": operation_id,
+            "attempt_id": attempt_id,
+            "digest": digest,
+            "effect_class": effect_class,
+            "issued_at": issued_at,
+            "admit_until": ticket["admit_until"],
+            "issuer_incarnation": ticket["issuer_incarnation"],
+            "admission_id": ticket["admission_id"],
+        }
+        try:
+            signed["signature"] = sign_message(TICKET_NS, private_key, _message(TICKET_NS, {
+                key: ticket[key] for key in TICKET_FIELDS}))
+        except GatewayError as exc:
+            raise IntegrationError("managed_unbound") from exc
+        return _require_issued(
+            signed, ticket, target=target, digest=digest, effect_class=effect_class,
+            operation_id=operation_id, attempt_id=attempt_id)
+
+    return issue
+
+
+def seal_job_payload(state, target, kind, payload, effect_class="ordinary"):
+    """Return the payload to enqueue. Managed state nests a signed admission envelope.
+
+    The caller's dict is not mutated. Unmanaged state is returned unchanged. The
+    envelope is inside the payload so the existing job signature covers it.
+    """
+    if continuity_state(state) != "managed":
+        return payload
+    if not isinstance(payload, dict) or ENVELOPE_KEY in payload or not _ident_ok(target):
+        raise IntegrationError("bad_request")
+    if effect_class not in _EFFECTS:
+        raise IntegrationError("bad_request")
+    binding = _bound(state)
+    issuer = None if binding is None else binding.get("issuer")
+    if not callable(issuer):
+        raise IntegrationError("managed_unbound")
+    digest = effect_digest(kind, payload)
+    signed, ticket = _issue(issuer, target, digest, effect_class)
+    wrapped = dict(payload)
+    wrapped[ENVELOPE_KEY] = {
+        "schema": 1,
+        "kind": kind,
+        "signed_operation": signed,
+        "admission_ticket": ticket,
+    }
+    return wrapped
+
+
+def _open_envelope(job, device):
+    """Strip a verified job's envelope. Digest, kind, and target must match before the guard."""
+    if not isinstance(job, dict):
+        raise IntegrationError("bad_request")
+    kind = job.get("kind")
+    payload = job.get("payload")
+    if not isinstance(kind, str) or not isinstance(payload, dict) or ENVELOPE_KEY not in payload:
+        raise IntegrationError("managed_unbound")
+    envelope = payload.get(ENVELOPE_KEY)
+    if not isinstance(envelope, dict) or set(envelope) != _ENVELOPE_FIELDS:
+        raise IntegrationError("bad_request")
+    if type(envelope.get("schema")) is not int or envelope.get("schema") != 1:
+        raise IntegrationError("bad_request")
+    if envelope.get("kind") != kind:
+        raise IntegrationError("bad_request")
+    stripped = {key: value for key, value in payload.items() if key != ENVELOPE_KEY}
+    digest = effect_digest(kind, stripped)
+    signed = envelope.get("signed_operation")
+    ticket = envelope.get("admission_ticket")
+    effect_class = signed.get("effect_class") if isinstance(signed, dict) else None
+    if effect_class not in _EFFECTS:
+        raise IntegrationError("bad_request")
+    _require_issued(signed, ticket, target=device, digest=digest, effect_class=effect_class)
+    return stripped, signed, ticket, digest
+
+
+def _bridge_matches(bridge, state, config, kind, digest):
+    if not isinstance(bridge, dict) or bridge.get("used") is not False:
+        return False
+    try:
+        device = _device_of(config)
+    except IntegrationError:
+        return False
+    return (bridge.get("state") == str(_state_dir(state)) and bridge.get("device") == device
+            and bridge.get("kind") == kind and bridge.get("digest") == digest
+            and _ident_ok(bridge.get("operation_id")) and _ident_ok(bridge.get("attempt_id")))
+
+
+def local_desktop_args():
+    """Tools and config the managed desktop bridge may pass into `run_here`. Empty otherwise."""
+    bridge = _bridge.get()
+    desktop = bridge.get("desktop") if isinstance(bridge, dict) else None
+    if not isinstance(desktop, dict):
+        return {}
+    return {key: desktop[key] for key in ("tools", "config", "state") if key in desktop}
+
+
+def authorize_local_effect(state, config, surface, local_id):
+    """MAIN authority unless this exact bridge is still unused.
+
+    A device id alone is not admission. The guard's own check, before the sink, still
+    needs MAIN authority.
+    """
+    bridge = _bridge.get()
+    if (isinstance(bridge, dict) and bridge.get("used") is False
+            and bridge.get("state") == str(_state_dir(state)) and bridge.get("device") == local_id
+            and _ident_ok(local_id)):
+        return None
+    return require_production_authority(state, config, surface, target=local_id)
+
+
+def _admit_local(state, config, device, kind, payload, digest, *, desktop=None):
+    """One guard admission, then exactly one matching `execute_local`."""
+    require_production_authority(state, config, "cluster_local", target=device)
+    binding = _bound(state)
+    issuer = None if binding is None else binding.get("issuer")
+    guard = None if binding is None else binding.get("executor")
+    if not callable(issuer) or _guard_device(guard) is None:
+        raise IntegrationError("managed_unbound")
+    if guard.device_id != device:
+        raise IntegrationError("managed_unbound")
+    signed, ticket = _issue(issuer, device, digest, "ordinary")
+    captured = {}
+
+    def sink():
+        record = {
+            "state": str(_state_dir(state)),
+            "device": device,
+            "kind": kind,
+            "digest": digest,
+            "operation_id": ticket["operation_id"],
+            "attempt_id": ticket["attempt_id"],
+            "used": False,
+            "desktop": desktop if isinstance(desktop, dict) else None,
+        }
+        token = _bridge.set(record)
+        try:
+            from jarvis.cluster import execute_local
+            captured["result"] = execute_local(kind, payload, config, state)
+        finally:
+            _bridge.reset(token)
+
+    guard.accept(signed, ticket, sink)
+    if "result" not in captured:
+        raise IntegrationError("not_run")
+    return captured["result"]
+
+
+def open_local_effect(state, config, kind, payload, run_body):
+    """Run `run_body` once. Managed state admits it through the bound guard first.
+
+    A bridge that does not match this state, device, kind, and payload digest, or that
+    was already used, refuses. Checks that decide admission stay outside the guard.
+    """
+    if not callable(run_body):
+        raise IntegrationError("bad_request")
+    bridge = _bridge.get()
+    if bridge is not None:
+        digest = effect_digest(kind, payload)
+        if _bridge_matches(bridge, state, config, kind, digest):
+            bridge["used"] = True
+            return run_body()
+        raise IntegrationError("bridge_refused")
+    if continuity_state(state) == "legacy":
+        return run_body()
+    digest = effect_digest(kind, payload)
+    return _admit_local(state, config, _device_of(config), kind, payload, digest)
+
+
+def run_managed_local(state, config, target, kind, payload, *, desktop=None):
+    """Admit one local effect and run it through `execute_local`. Unmanaged state is not this path."""
+    if continuity_state(state) != "managed":
+        raise IntegrationError("bad_request")
+    device = _device_of(config)
+    if target != device:
+        raise IntegrationError("bad_request")
+    digest = effect_digest(kind, payload)
+    return _admit_local(state, config, device, kind, payload, digest, desktop=desktop)
+
+
+def managed_node_disposition(state, job):
+    """'legacy' when unmanaged, 'admit' when the payload envelope binds this guard, else 'refuse'.
+
+    Top-level tickets and payload copies that are not the reserved envelope do not admit.
+    A quarantined marker refuses. It is not a legacy job.
+    """
+    try:
+        if continuity_state(state) != "managed":
+            return "legacy"
+    except IntegrationError:
+        return "refuse"
+    binding = _bound(state)
+    guard = None if binding is None else binding.get("executor")
+    device = _guard_device(guard)
+    if device is None or not isinstance(job, dict):
+        return "refuse"
+    try:
+        _open_envelope(job, device)
+    except IntegrationError:
+        return "refuse"
+    return "admit"
+
+
+def run_admitted_node_job(state, job, executor):
+    """`ExecutorGuard.accept` then the captured executor result. The guard's return is not the effect.
+
+    The payload the executor sees has had the envelope removed. The bridge lets the
+    default `execute_local` run that stripped payload once, without a second admission.
+    """
+    if managed_node_disposition(state, job) != "admit":
+        raise IntegrationError("managed_unbound")
+    guard = _bound(state)["executor"]
+    device = _guard_device(guard)
+    stripped, signed, ticket, digest = _open_envelope(job, device)
+    kind = job["kind"]
+    captured = {}
+
+    def sink():
+        record = {
+            "state": str(_state_dir(state)),
+            "device": device,
+            "kind": kind,
+            "digest": digest,
+            "operation_id": ticket["operation_id"],
+            "attempt_id": ticket["attempt_id"],
+            "used": False,
+            "desktop": None,
+        }
+        token = _bridge.set(record)
+        try:
+            captured["result"] = executor(kind, stripped)
+        finally:
+            _bridge.reset(token)
+
+    guard.accept(signed, ticket, sink)
+    if "result" not in captured:
+        # The guard returned without running the sink. Do not invent a result or run it here.
+        raise IntegrationError("not_run")
+    return captured["result"]
+
+
+def _release_succeeded(report):
+    """A dropped lease, or a runtime that held none and stopped admission locally."""
+    if not isinstance(report, dict):
+        return False
+    if report.get("released") is True:
+        return True
+    return (report.get("code") == "no_lease" and report.get("admission_stopped") is True
+            and report.get("invalidated") is True)
+
+
+def _release_refusal(report):
+    code = report.get("code") if isinstance(report, dict) else None
+    plain = code.replace("_", "") if isinstance(code, str) else ""
+    if (isinstance(code, str) and code != "released" and code.islower()
+            and 1 <= len(code) <= 40 and plain.isalpha()):
+        return code
+    return "not_released"
+
+
+def release_for_suspend(state):
+    """Release the bound MAIN lease before `rest.pause`. Unmanaged state does nothing.
+
+    A missing runtime, or a release that did not drop the lease, refuses. `no_lease`
+    is success: this process held nothing, and the runtime has stopped local admission.
+    """
+    if not _managed(state):
+        return None
+    binding = _bound(state)
+    runtime = None if binding is None else binding.get("runtime")
+    release = getattr(runtime, "release_before_suspend", None) if runtime is not None else None
+    if not callable(release):
+        raise IntegrationError("managed_unbound")
+    report = release()
+    if not _release_succeeded(report):
+        raise IntegrationError(_release_refusal(report))
+    return report

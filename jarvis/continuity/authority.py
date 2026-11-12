@@ -12,13 +12,20 @@ Rules this enforces (each has a failing-then-passing test in tests/continuity):
   validity ever handed out (plus a margin) has passed.
 - Handover/recovery fences before granting: renewals stop, then either every eligible
   effect-bearing participant acknowledged the fence, or the old validity ran out (+margin).
-  A candidate is granted not-ready; ordinary admission waits for a verified canary. A
-  failure after the fence leaves no MAIN (never resurrects the old lease).
+  A draining source may release its own lease without closing the transition or dropping
+  that validity margin. Any other open stage still refuses release. A candidate is granted
+  not-ready; ordinary admission waits for a verified canary. A failure after the fence
+  leaves no MAIN (never resurrects the old lease).
 - Admission is consumed once per (target, operation, attempt) under the exact current
   tuple. A retry of the same admission returns the original record, also after a later
   handover; a different digest or admission id for that attempt is a conflict.
 - Metadata only: ids, digests, numbers, booleans. No prompt, body, payload or result is
   accepted or stored (identifier shapes are validated; there is no free-text column).
+- Revocation is durable and metadata-only. disable_participant sets eligible false for
+  one installation and keeps the participant row and its fence highwater. It does not
+  drop a lease, an admission, or a transition. The current holder and any open
+  transition source or candidate are refused. Replaying register_participant on that
+  same installation does not clear the revocation.
 
 Not here: transport, caller authentication, passkey verification, signatures, PC receipt
 journals, executor guards. Callers pass identities they already authenticated.
@@ -318,7 +325,12 @@ class AuthorityStore:
             return _transition_view(t)
 
     def admission(self, admission_id):
-        """Reconciliation lookup. Returns the consumed record or None; never consumes."""
+        """Reconciliation lookup. Returns the consumed record or None; never consumes.
+
+        Historical row only. It does not check the current MAIN tuple, mode, readiness,
+        or whether that main or target is still eligible. Callers that need effect
+        permission use ``consume``, which does.
+        """
         with self._lock:
             r = self._db.execute("SELECT * FROM admissions WHERE admission_id=?",
                                  (_ident(admission_id, "admission_id"),)).fetchone()
@@ -326,26 +338,120 @@ class AuthorityStore:
 
     # --- participants and cutover -----------------------------------------------------
 
-    def register_participant(self, device_id, installation_id, kind, eligible=True):
-        """Enroll (or re-identify) a device. Servers are never MAIN candidates. A new
-        installation id resets its acknowledgements: a reinstalled machine must re-fence."""
+    def register_participant(self, device_id, installation_id, kind, eligible=True, *, reenable=False):
+        """Enroll a device, or refresh an enrollment that is already stored.
+
+        Servers are never MAIN candidates. WS5 gateway enroll calls
+        ``register_participant(device_id, installation_id, kind, True)`` and does not
+        pass ``reenable``. That replay must not undo ``disable_participant``.
+
+        - No row yet: insert this installation with the requested eligibility.
+        - New installation id: the owner enrolled a different installation. Reset
+          ``mode_version`` and ``fenced_epoch`` (the machine must re-fence) and store
+          the requested eligibility. Refused, with no write, when this device is the
+          current holder or an open transition source or candidate.
+        - Same installation: update ``kind`` only. A different kind is a membership
+          change and is refused, with no write, for the current holder or an open
+          transition source or candidate. The same kind is idempotent and is allowed
+          for those members. ``eligible=True`` does not make a revoked installation
+          eligible again, and ``eligible=False`` does not revoke.
+          Pass ``reenable=True`` together with ``eligible=True`` to mark that same
+          installation eligible again without moving the fence highwater. ``reenable``
+          is refused for the current holder and for an open transition endpoint.
+        """
         self._guard()
         _ident(device_id, "device_id"), _ident(installation_id, "installation_id")
         if kind not in ("pc", "server"):
             raise AuthorityError("bad_request", "kind must be pc or server")
+        if not isinstance(reenable, bool):
+            raise AuthorityError("bad_request", "reenable must be true or false")
+        if reenable and not eligible:
+            raise AuthorityError("bad_request", "reenable requires eligible=True")
+        want = 1 if eligible else 0
         with self._tx() as db:
             old = self._participant(db, device_id)
-            if old is None or old["installation_id"] != installation_id:
+            if old is None:
+                self._refuse_live_member(db, device_id)
+                db.execute("INSERT INTO participants(device_id, installation_id, kind, eligible)"
+                           " VALUES(?,?,?,?)", (device_id, installation_id, kind, want))
+                return
+            if old["installation_id"] != installation_id:
+                self._refuse_live_member(db, device_id)
                 db.execute("INSERT OR REPLACE INTO participants(device_id, installation_id, kind, eligible)"
-                           " VALUES(?,?,?,?)", (device_id, installation_id, kind, 1 if eligible else 0))
-            else:
-                db.execute("UPDATE participants SET kind=?, eligible=? WHERE device_id=?",
-                           (kind, 1 if eligible else 0, device_id))
+                           " VALUES(?,?,?,?)", (device_id, installation_id, kind, want))
+                return
+            if reenable:
+                self._refuse_live_member(db, device_id)
+                db.execute("UPDATE participants SET kind=?, eligible=1 WHERE device_id=? AND installation_id=?",
+                           (kind, device_id, installation_id))
+                return
+            if old["kind"] != kind:
+                self._refuse_live_member(db, device_id)
+            db.execute("UPDATE participants SET kind=? WHERE device_id=? AND installation_id=?",
+                       (kind, device_id, installation_id))
+
+    def disable_participant(self, device_id, installation_id):
+        """Durably revoke one enrolled installation. Idempotent for that pair.
+
+        Compare-and-swap on ``installation_id``. A different installation raises
+        ``installation_mismatch`` and writes nothing. An unknown device raises
+        ``unknown_participant``. The current MAIN holder (authority holder or the
+        live lease holder) raises ``active_holder``. An open transition source or
+        candidate raises ``transition_member``. Those refusals write nothing.
+
+        Success keeps the participant row and its ``mode_version`` and
+        ``fenced_epoch`` so a later enrollment still sees the fence highwater, and
+        sets ``eligible`` false. The lease, epoch, admissions, and transition rows
+        are left as they are. A second call with the same installation returns the
+        same metadata with ``already`` true.
+
+        Returned keys: ``device_id``, ``installation_id``, ``kind``, ``eligible``
+        (false), ``mode_version``, ``fenced_epoch``, ``disabled`` (true), ``already``.
+        """
+        self._guard()
+        _ident(device_id, "device_id"), _ident(installation_id, "installation_id")
+        with self._tx() as db:
+            current = self._participant(db, device_id)
+            if current is None:
+                raise AuthorityError("unknown_participant", "device is not enrolled")
+            if current["installation_id"] != installation_id:
+                raise AuthorityError("installation_mismatch",
+                                     "installation does not match the enrolled participant")
+            self._refuse_live_member(db, device_id)
+            already = not current["eligible"]
+            if not already:
+                updated = db.execute("UPDATE participants SET eligible=0"
+                                     " WHERE device_id=? AND installation_id=?",
+                                     (device_id, installation_id)).rowcount
+                if updated != 1:
+                    raise AuthorityError("bad_state", "participant installation changed")
+                current = self._participant(db, device_id)
+            return _disabled_view(current, already)
+
+    def _refuse_live_member(self, db, device_id):
+        """The current holder and open transition endpoints cannot change membership."""
+        row = self._row(db)
+        lease_holder = self._lease["holder"] if self._lease else None
+        if device_id == row["holder"] or device_id == lease_holder:
+            raise AuthorityError("active_holder", "cannot change membership of the current MAIN holder")
+        hit = db.execute("SELECT 1 FROM transitions WHERE state IN (%s) AND (source=? OR candidate=?)"
+                         % ",".join("?" * len(OPEN_STATES)),
+                         (*OPEN_STATES, device_id, device_id)).fetchone()
+        if hit is not None:
+            raise AuthorityError("transition_member",
+                                 "cannot change membership of an open transition source or candidate")
+
+    def _refuse_disabled(self, db, device_id, message):
+        """Revoke when this device's current row is ineligible. A missing row is not revoked."""
+        participant = self._participant(db, device_id)
+        if participant is not None and not participant["eligible"]:
+            raise AuthorityError("revoked", message)
 
     def acknowledge(self, device_id, installation_id, mode_version, fenced_epoch, boot_id=None):
         """A participant durably installed `mode_version` and refuses every grant whose epoch is
         <= `fenced_epoch` (it acks the epoch being fenced). Acks only move forward; a foreign
-        installation or a version/epoch the authority never issued is refused."""
+        installation or a version/epoch the authority never issued is refused. A disabled
+        installation is refused with ``revoked`` and is not recorded."""
         self._guard()
         _int(mode_version, "mode_version"), _int(fenced_epoch, "fenced_epoch")
         if boot_id is not None:
@@ -354,6 +460,8 @@ class AuthorityStore:
             p = self._participant(db, _ident(device_id, "device_id"))
             if p is None or p["installation_id"] != installation_id:
                 raise AuthorityError("unknown_participant", "device/installation not enrolled")
+            if not p["eligible"]:
+                raise AuthorityError("revoked", "disabled installation cannot acknowledge")
             row = self._row(db)
             if mode_version > row["mode_version"] + 1 or fenced_epoch > row["epoch"]:
                 raise AuthorityError("ahead", "acknowledgement names a version the authority never issued")
@@ -407,13 +515,25 @@ class AuthorityStore:
 
     def release(self, holder, lease_id, incarnation, epoch):
         """Planned stop (e.g. before suspend). MAIN gives up new-work authority now; the
-        validity it already handed out still has to drain or be acked before a successor."""
+        validity it already handed out still has to drain or be acked before a successor.
+
+        An open transition still refuses, except the matching source while that transition
+        is DRAINING. That release drops only the live lease. The transition, the mode, and
+        the old validity margin stay so the fence cannot succeed early.
+        """
         self._guard()
         with self._tx() as db:
             row = self._row(db)
             self._match(row, holder, lease_id, incarnation, epoch)
             if row["transition_id"]:
-                raise AuthorityError("busy", "a transition is open; let it fence")
+                current = self._get(db, row["transition_id"])
+                if current is None or current["state"] != "DRAINING" or current["source"] != holder:
+                    raise AuthorityError("busy", "a transition is open; let it fence")
+                self._lease = None
+                db.execute("UPDATE authority SET holder=NULL, lease_id=NULL, lease_ready=0, last_holder=?,"
+                           " updated_at=? WHERE fleet_id=?",
+                           (holder, self._wall(), self.fleet_id))
+                return
             self._lease = None
             db.execute("UPDATE authority SET holder=NULL, lease_id=NULL, lease_ready=0, last_holder=?,"
                        " mode=?, updated_at=? WHERE fleet_id=?",
@@ -594,6 +714,10 @@ class AuthorityStore:
                 # Targets already refuse this epoch: keeping the old MAIN would be a MAIN nobody obeys.
                 self._fail_after_fence(db, transition_id,
                                        "cancelled_after_fence" if t["state"] in FENCED_STATES else "cancelled_after_acks")
+            elif t["state"] == "DRAINING" and row["holder"] is None:
+                # Source released during drain. There is no lease to restore, and reporting
+                # V2_ACTIVE would claim a MAIN the store no longer has.
+                self._fail_after_fence(db, transition_id, "cancelled_after_release")
             else:
                 self._drain_since = None
                 db.execute("UPDATE authority SET transition_id=NULL, mode=CASE WHEN mode='HANDOVER' THEN"
@@ -620,7 +744,15 @@ class AuthorityStore:
     def consume(self, *, admission_id, target, operation_id, attempt_id, digest, main, incarnation, epoch,
                 issued_at, admit_until, issuer_incarnation):
         """Consume one new-operation admission under the exact current, ready MAIN tuple.
-        Same admission again -> the original record (`already`: True), even after handover."""
+
+        An identical ticket, including ``main``, ``incarnation``, and ``epoch``, returns
+        the original record (``already`` true) even after handover. That replay is
+        reconciliation, not permission to run the effect. Any changed ticket field,
+        including those three, is ``conflict``. Before the identical record is returned,
+        the named main and target are checked against current enrollment; a disabled
+        installation is ``revoked`` and the stored row is left in place. ``admission``
+        stays a historical read and does not apply that check. A disabled installation
+        named as main or target on a new consume is ``revoked`` and is not stored."""
         self._guard()
         for v, n in ((admission_id, "admission_id"), (target, "target"), (operation_id, "operation_id"),
                      (attempt_id, "attempt_id"), (main, "main")):
@@ -640,24 +772,32 @@ class AuthorityStore:
             mine = db.execute("SELECT * FROM admissions WHERE admission_id=?", (admission_id,)).fetchone()
             same_attempt = db.execute("SELECT * FROM admissions WHERE target=? AND operation_id=? AND attempt_id=?",
                                       (target, operation_id, attempt_id)).fetchone()
+            presented = (admission_id, target, operation_id, attempt_id, digest, main, incarnation, epoch,
+                         issued_at, admit_until, issuer_incarnation)
             for prior in (mine, same_attempt):
                 if prior is None:
                     continue
                 fields = (prior["admission_id"], prior["target"], prior["operation_id"], prior["attempt_id"],
-                          prior["digest"], prior["issued_at"], prior["admit_until"], prior["issuer_incarnation"])
-                if fields != (admission_id, target, operation_id, attempt_id, digest, issued_at, admit_until,
-                              issuer_incarnation):
+                          prior["digest"], prior["main"], prior["incarnation"], prior["epoch"],
+                          prior["issued_at"], prior["admit_until"], prior["issuer_incarnation"])
+                if fields != presented:
                     raise AuthorityError("conflict", "this attempt was already admitted differently")
+                # Current enrollment, not the historical row. Identical replay stays readable
+                # through admission(); a revoked main or target cannot reuse this receipt.
+                self._refuse_disabled(db, main, "disabled installation cannot be used as MAIN")
+                self._refuse_disabled(db, target, "disabled participant cannot be an admission target")
                 return dict(prior, already=True)
             row = self._row(db)
             if row["mode"] != "V2_ACTIVE" or row["transition_id"] or self._drain_since is not None:
                 raise AuthorityError("no_admission", f"no new work in {row['mode']}")
             if issuer_incarnation != row["incarnation"]:
                 raise AuthorityError("stale", "ticket from an earlier authority incarnation")
+            self._refuse_disabled(db, main, "disabled installation cannot be used as MAIN")
             if row["holder"] != main or row["incarnation"] != incarnation or row["epoch"] != epoch:
                 raise AuthorityError("stale", "not the current MAIN tuple")
             if not self._lease_valid(row, now_m) or not row["lease_ready"]:
                 raise AuthorityError("no_admission", "MAIN lease not valid and ready")
+            self._refuse_disabled(db, target, "disabled participant cannot be an admission target")
             tp = self._participant(db, target)
             if tp is None or tp["mode_version"] != row["mode_version"]:
                 raise AuthorityError("target_unfenced", "target has not acknowledged the current mode")
@@ -674,6 +814,12 @@ class AuthorityStore:
         with self._tx() as db:
             cur = db.execute("DELETE FROM admissions WHERE admit_until < ?", (self._wall() - keep_seconds,))
             return cur.rowcount
+
+
+def _disabled_view(row, already):
+    return {"device_id": row["device_id"], "installation_id": row["installation_id"], "kind": row["kind"],
+            "eligible": False, "mode_version": row["mode_version"], "fenced_epoch": row["fenced_epoch"],
+            "disabled": True, "already": bool(already)}
 
 
 def _transition_view(t):

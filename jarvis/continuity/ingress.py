@@ -24,20 +24,31 @@ open a second socket to deliver the body. Phone routes that need a body fail wit
 `body_not_relayable` and are not stored. Metadata notices are at most once per operation
 id. A lost metadata answer stays `uncertain` and is not sent again.
 
-`phone.py` is not modified and is not imported. `PhoneProtocolAdapter` maps the current
-HTTP paths and refuses where the PWA cannot be relayed. `accept_gateway_phone` is still
-the PC seam a future body channel would need. It is not implemented here.
+`phone.py` is not modified. Phone claim helpers are imported lazily inside the
+signer and the verifier. `PhoneProtocolAdapter` maps the current HTTP paths, requires
+`X-CSRF-Token`, and does not bypass that check. Pairing returns `csrf_token` once.
+`/phone/api/main/preview` and `/phone/api/main/confirm` are the manage-MAIN routes.
+`accept_gateway_phone` is the PC seam and is not implemented here.
+The signed phone envelope the PC verifier imports is `PHONE_ENVELOPE`.
 
 Optional transient relay: when the gateway object also has `relay_transient`, phone reads
 (overview, fleet, ask poll, frames) and effects (ask, session start, input, stop) go to the
 allowlisted ready MAIN through `ContinuityGateway.forward_transient`, in RAM only. The row for
 an effect keeps ids and a digest, never the text. A lost answer stays `uncertain` and is
 never sent again. `effect_authorized` is still false: MAIN's executor admits or refuses.
+An effect post is accepted or refused only. A later `effect_status` read may carry `target`
+and a trace; projection copies steps that are already there and does not invent any.
 Without `relay_transient`, the metadata-only rules above apply unchanged.
+
+Every transient envelope is the signed claim in `PHONE_ENVELOPE`. A missing or bad
+signer raises `envelope_unsigned` and the body is not relayed. `verify_phone_envelope`
+accepts only that signed shape. `production_ingress` is the factory that requires the
+concrete WebAuthn verifier, owner bridge, ticket verifier, and signer.
 
 Not operational failover. No gateway host is provisioned by this module.
 """
 
+import base64
 import contextvars
 import hashlib
 import hmac
@@ -46,7 +57,9 @@ import json
 import re
 import secrets
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -54,15 +67,22 @@ from urllib.parse import urlsplit
 
 from jarvis.continuity.authority import ACTIONS as MAIN_ACTIONS
 from jarvis.continuity.authority import PROFILES as MAIN_PROFILES
+from jarvis.continuity.authority import TICKET_FIELDS
 from jarvis.continuity.authority import AuthorityError
 from jarvis.continuity.gateway import CAPABILITIES as RELAY_CAPABILITIES
 from jarvis.continuity.gateway import DEVICE_NS
+from jarvis.continuity.gateway import OWNER_NS
+from jarvis.continuity.gateway import TICKET_NS
+from jarvis.continuity.gateway import AuthorityClient
 from jarvis.continuity.gateway import GatewayError
 from jarvis.continuity.gateway import HTTP_STATUS as GATEWAY_HTTP_STATUS
 from jarvis.continuity.gateway import OwnerProof as GatewayOwnerProof
 from jarvis.continuity.gateway import _message as gateway_message
+from jarvis.continuity.gateway import _public_key as gateway_public_key
 from jarvis.continuity.gateway import payload_digest
+from jarvis.continuity.gateway import pin_origin
 from jarvis.continuity.gateway import sign_message
+from jarvis.continuity.gateway import verify_message
 
 SCHEMA_VERSION = 1
 PHONE_COOKIE = "__Host-jarvis_phone"
@@ -143,7 +163,10 @@ CREATE TABLE IF NOT EXISTS phones(
 CREATE TABLE IF NOT EXISTS codes(
   id TEXT PRIMARY KEY, salt TEXT NOT NULL, sha256 TEXT NOT NULL, created REAL NOT NULL,
   expires REAL NOT NULL, state TEXT NOT NULL, name TEXT, allow_desktop INTEGER NOT NULL,
-  stable_id TEXT, login TEXT, os TEXT, node TEXT);
+  stable_id TEXT, login TEXT, os TEXT, node TEXT, operation_id TEXT);
+CREATE TABLE IF NOT EXISTS pair_binds(
+  operation_id TEXT PRIMARY KEY, code_id TEXT NOT NULL, state TEXT NOT NULL,
+  phone_id TEXT, updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS operations(
   operation_id TEXT PRIMARY KEY, phone_id TEXT NOT NULL, kind TEXT NOT NULL, digest TEXT NOT NULL,
   state TEXT NOT NULL, http_status INTEGER, job_id TEXT, session_id TEXT, cursor INTEGER,
@@ -156,7 +179,8 @@ CREATE TABLE IF NOT EXISTS previews(
   preview_id TEXT PRIMARY KEY, phone_id TEXT NOT NULL, action TEXT NOT NULL, candidate TEXT NOT NULL,
   profile TEXT NOT NULL, incarnation INTEGER NOT NULL, epoch INTEGER NOT NULL,
   policy_version INTEGER NOT NULL, mode_version INTEGER NOT NULL, challenge_sha256 TEXT NOT NULL,
-  expires REAL NOT NULL, transition_id TEXT, state TEXT NOT NULL, updated_at REAL NOT NULL);
+  expires REAL NOT NULL, transition_id TEXT, state TEXT NOT NULL, updated_at REAL NOT NULL,
+  authorized INTEGER NOT NULL DEFAULT 0, operation_id TEXT);
 """
 
 
@@ -253,11 +277,67 @@ class HttpResult:
 
 
 def _envelope(body):
-    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
 
 def _envelope_digest(envelope):
     return "sha256:" + hashlib.sha256(envelope).hexdigest()
+
+
+# Signed claim inside a phone envelope. Field names match phone.py
+# `_GATEWAY_PHONE_FIELDS`. `verify_message` only accepts DEVICE_NS; the phone
+# domain is a prefix inside `gateway_phone_message`. `purpose` is gateway_phone.
+# Authority status does not carry issuer_incarnation; the claim uses that field
+# when status has it, otherwise the authority incarnation.
+# A lost pair response cannot be replayed: the cookie is not stored.
+# A lost preview challenge is repeated only from process RAM, never from disk.
+# Pair, preview, and session-stop calls that omit operation_id stay valid so the
+# older phone tests still run. phone.py effect_status is read as
+# {status, body}; this module does not invent a job or a reply.
+ENVELOPE_FIELDS = (
+    "attempt_id", "authority_id", "digest", "domain", "epoch", "fleet_id",
+    "incarnation", "issuer_incarnation", "kind", "main", "manage_main",
+    "mode_version", "opener", "operation_id", "phone_id", "policy_version",
+    "purpose", "role", "target", "v",
+)
+PHONE_DOMAIN = "jarvis-continuity-gateway-phone-v1"
+PHONE_PURPOSE = "gateway_phone"
+PHONE_ENVELOPE = {
+    "version": 1,
+    "namespace": DEVICE_NS,
+    "domain": PHONE_DOMAIN,
+    "purpose": PHONE_PURPOSE,
+    "signed_fields": ENVELOPE_FIELDS,
+    "wire": "UTF-8 JSON {v:1, claim, signature, body}",
+    "unsigned": "refused; verify_phone_envelope returns None and the body is not relayed",
+    "binding": "role phone, manage_main false, opener phone:{phone_id}, digest sha256 of the canonical body, target is the active MAIN",
+    "verifier": "verify_phone_envelope(envelope_bytes, ssh-ed25519 public key) after GatewayPhoneVerifier",
+}
+NETWORK_TRANSIENT_BLOCKER = "transient_not_networked"
+# What a process on another machine can call today. Transient phone bodies and owner
+# proofs are in-process. This module does not add a gateway route for them.
+GATEWAY_SESSION_DEPENDENCIES = {
+    "in_process": "ContinuityGatewaySession",
+    "network_class": "NetworkGatewaySession",
+    "network_status": "POST /v1/authority/status via AuthorityClient",
+    "network_metadata_relay": "POST /v1/authority/relay, five metadata fields, no phone body",
+    "network_transient": "unsupported; WS5 owns the gateway HTTP route; forward_transient is not an HTTP route and MAX_BODY is 8192; blocker transient_not_networked",
+    "network_transient_blocker": NETWORK_TRANSIENT_BLOCKER,
+    "network_transition": "unsupported; OwnerProof is minted by authenticate_owner in the gateway process",
+    "ws5": "Phone bodies across a network need the in-process session, or a gateway route this module will not invent",
+}
+_TRACE_STATE = frozenset({"run", "done", "fail", "pending", "error"})
+_TRACE_KIND = frozenset({"step", "tool"})
+_SECRET_TRACE = re.compile(
+    r"\b(?:bearer|token|secret|password|passwd|api[_-]?key|authorization|cookie)\b\s*[:=]?\s*\S+",
+    re.I)
+_URL_AUTH_TRACE = re.compile(r"(https?://)[^/\s@]+@")
+_URL_TAIL_TRACE = re.compile(r"(https?://[^\s?#]+)[?#]\S*")
+_B64URL = re.compile(r"[A-Za-z0-9_-]+")
+_OPENSSL = "/usr/bin/openssl"
+_WEBAUTHN_UP = 0x01
+_WEBAUTHN_UV = 0x04
+_WEBAUTHN_AT = 0x40
 
 
 def pin_target(device_id, url, connect_ip, *, allow_loopback=False):
@@ -323,6 +403,12 @@ def _sha256(text):
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 
 
+def _safe_code(code):
+    if isinstance(code, str) and re.fullmatch(r"[a-z0-9_]{1,40}", code):
+        return code
+    return "uncertain"
+
+
 def _digest_of(kind, body):
     raw = json.dumps([kind, body], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -334,6 +420,26 @@ def _metadata_digest(operation_id, attempt_id, effect_class, main, incarnation, 
         ["metadata", operation_id, attempt_id, effect_class, main, incarnation, epoch],
         separators=(",", ":"), ensure_ascii=True)
     return "sha256:" + hashlib.sha256(raw.encode("ascii")).hexdigest()
+
+
+def _effect_replay_matches(existing, phone_id, operation_id, kind, body_digest):
+    """True when this phone is repeating the body already pinned to the row.
+
+    The pin is the MAIN tuple stored with the operation, not the tuple authority
+    has now. A moved MAIN does not turn the same body into a conflict, and it does
+    not authorize another send. A different phone, kind, or body does not match.
+    """
+    if existing["phone_id"] != phone_id or existing["kind"] != kind:
+        return False
+    target, incarnation, epoch = existing["target"], existing["incarnation"], existing["epoch"]
+    if not isinstance(target, str) or not _ID.match(target):
+        return False
+    if isinstance(incarnation, bool) or not isinstance(incarnation, int) or incarnation < 0:
+        return False
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        return False
+    pinned = _metadata_digest(operation_id, kind, body_digest, target, incarnation, epoch)
+    return existing["digest"] == pinned
 
 
 def _clean(value, limit):
@@ -439,6 +545,499 @@ def _clean_events(events):
     return out
 
 
+def _b64url_decode(value, limit):
+    """Strict unpadded base64url. None when the text is not the canonical encoding."""
+    if not isinstance(value, str) or not value or len(value) > limit or not _B64URL.fullmatch(value):
+        return None
+    pad = "=" * ((4 - len(value) % 4) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(value + pad)
+    except Exception:
+        return None
+    if base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=") != value:
+        return None
+    return raw
+
+
+def _same_text(left, right):
+    if not isinstance(left, str) or not isinstance(right, str) or len(left) != len(right):
+        return False
+    return hmac.compare_digest(left, right)
+
+
+def _sha_matches(presented, digest):
+    if not isinstance(presented, str) or not isinstance(digest, str):
+        return False
+    return _same_text(_sha256(presented), digest)
+
+
+def _phone_fields():
+    """The signed field set from phone.py. Imported lazily so this module stays loadable."""
+    from jarvis.phone import _GATEWAY_PHONE_FIELDS
+    return _GATEWAY_PHONE_FIELDS
+
+
+def _claim_fields(claim):
+    """The signed phone claim, or None when the binding does not hold."""
+    if not isinstance(claim, dict) or set(claim) != set(_phone_fields()):
+        return None
+    if claim.get("domain") != PHONE_DOMAIN or claim.get("purpose") != PHONE_PURPOSE:
+        return None
+    if claim.get("v") != 1 or claim.get("role") != "phone" or claim.get("manage_main") is not False:
+        return None
+    phone_id = claim.get("phone_id")
+    if not isinstance(phone_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", phone_id):
+        return None
+    if claim.get("opener") != "phone:" + phone_id:
+        return None
+    if not isinstance(claim.get("operation_id"), str) or not _OP.match(claim["operation_id"]):
+        return None
+    if not isinstance(claim.get("attempt_id"), str) or not _ID.match(claim["attempt_id"]):
+        return None
+    if claim.get("kind") not in EFFECT_KINDS | READ_KINDS:
+        return None
+    for key in ("main", "target", "authority_id", "fleet_id"):
+        if not isinstance(claim.get(key), str) or not _ID.match(claim[key]):
+            return None
+    for key in ("incarnation", "epoch", "mode_version", "policy_version", "issuer_incarnation"):
+        value = claim.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+    digest = claim.get("digest")
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        return None
+    return {key: claim[key] for key in ENVELOPE_FIELDS}
+
+
+def _redact_trace(value, limit):
+    """Light display text. Secrets and credentialed URLs are not copied through."""
+    text = _URL_AUTH_TRACE.sub(r"\1", str(value or ""))
+    text = _URL_TAIL_TRACE.sub(r"\1", text)
+    text = _SECRET_TRACE.sub("[hidden]", text)
+    return _CONTROL.sub("", text).strip()[:limit]
+
+
+def _project_step(step):
+    """Copy one real step. A non-step is dropped and nothing is invented in its place."""
+    if not isinstance(step, dict):
+        return None
+    ident = step.get("id")
+    if not isinstance(ident, str) or not _ID.match(ident):
+        return None
+    out = {"id": ident}
+    parent = step.get("parent")
+    if isinstance(parent, str) and _ID.match(parent):
+        out["parent"] = parent
+    if isinstance(step.get("label"), str):
+        out["label"] = _redact_trace(step["label"], 80)
+    if isinstance(step.get("detail"), str):
+        out["detail"] = _redact_trace(step["detail"], 120)
+    if step.get("state") in _TRACE_STATE:
+        out["state"] = step["state"]
+    if step.get("kind") in _TRACE_KIND:
+        out["kind"] = step["kind"]
+    return out
+
+
+def _project_trace(trace):
+    """Copy a trace object that was actually returned. Missing pieces stay missing."""
+    if not isinstance(trace, dict):
+        return None
+    out = {}
+    if isinstance(trace.get("available"), bool):
+        out["available"] = trace["available"]
+    rev = trace.get("rev")
+    if isinstance(rev, int) and not isinstance(rev, bool) and rev >= 0:
+        out["rev"] = rev
+    elapsed = trace.get("elapsed")
+    if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and elapsed >= 0:
+        out["elapsed"] = elapsed
+    if isinstance(trace.get("tier"), str):
+        out["tier"] = _redact_trace(trace["tier"], 40)
+    if isinstance(trace.get("streaming"), bool):
+        out["streaming"] = trace["streaming"]
+    reasons = trace.get("reasons")
+    if isinstance(reasons, list):
+        clean = [_redact_trace(item, 80) for item in reasons[:8] if isinstance(item, str)]
+        if clean:
+            out["reasons"] = clean
+    steps = trace.get("steps")
+    if isinstance(steps, list):
+        projected = [item for item in (_project_step(step) for step in steps[:40]) if item]
+        if projected:
+            out["steps"] = projected
+    return out or None
+
+
+def _client_challenge(proof):
+    """Challenge inside clientDataJSON, None when that field is absent, False when it is broken."""
+    if not isinstance(proof, dict):
+        return None
+    assertion = proof if isinstance(proof.get("response"), dict) else proof.get("assertion")
+    if not isinstance(assertion, dict):
+        return None
+    response = assertion.get("response")
+    if not isinstance(response, dict) or "clientDataJSON" not in response:
+        return None
+    raw = _b64url_decode(response.get("clientDataJSON"), 4096)
+    if raw is None:
+        return False
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict) or not isinstance(data.get("challenge"), str):
+        return False
+    return data["challenge"]
+
+
+def _bound_challenge(proof, digest):
+    """The challenge the client presented, when it matches the preview hash and itself."""
+    if not isinstance(proof, dict):
+        return None
+    presented = proof.get("challenge")
+    if presented is not None and not isinstance(presented, str):
+        return None
+    inner = _client_challenge(proof)
+    if inner is False:
+        return None
+    if presented is not None and inner is not None and not _same_text(presented, inner):
+        return None
+    chosen = presented if isinstance(presented, str) else inner
+    if not _sha_matches(chosen, digest):
+        return None
+    return chosen
+
+
+def _assertion_from(proof):
+    if not isinstance(proof, dict):
+        return None
+    if isinstance(proof.get("response"), dict):
+        return proof
+    inner = proof.get("assertion")
+    if isinstance(inner, dict):
+        return inner
+    return None
+
+
+class EnvelopeSigner:
+    """SSH-signs the phone claim with the ingress device key.
+
+    The signed bytes are `gateway_phone_message`: the phone domain, then the
+    DEVICE_NS canonical claim. The body is not signed on its own; its digest is.
+    """
+
+    def __init__(self, private_key_path):
+        self._key = Path(private_key_path)
+        if not self._key.is_file():
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+
+    def sign(self, claim):
+        fields = _claim_fields(claim)
+        if fields is None:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+        from jarvis.phone import gateway_phone_message
+        try:
+            message = gateway_phone_message(fields)
+        except Exception:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.") from None
+        try:
+            return sign_message(DEVICE_NS, self._key, message)
+        except Exception:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.") from None
+
+    def __repr__(self):
+        return "EnvelopeSigner(redacted)"
+
+
+def verify_phone_envelope(envelope_bytes, public_key):
+    """Return the claim when `GatewayPhoneVerifier` accepts the envelope.
+
+    An unsigned envelope, a tampered field, a true `manage_main`, or the wrong key is None.
+    This does not accept the body as work.
+    """
+    try:
+        if not isinstance(envelope_bytes, (bytes, bytearray)) or not envelope_bytes:
+            return None
+        if len(envelope_bytes) > MAX_BODY:
+            return None
+        parsed = json.loads(bytes(envelope_bytes).decode("utf-8"))
+        if not isinstance(parsed, dict) or set(parsed) != {"v", "claim", "signature", "body"}:
+            return None
+        if parsed.get("v") != 1:
+            return None
+        from jarvis.phone import GatewayPhoneVerifier
+        GatewayPhoneVerifier(public_key).verify(bytes(envelope_bytes))
+        return _claim_fields(parsed.get("claim"))
+    except Exception:
+        return None
+
+
+class TicketSignatureVerifier:
+    """True only when `signature` is an SSH signature of `TICKET_FIELDS` by that MAIN's key."""
+
+    def __init__(self, public_keys):
+        if not isinstance(public_keys, dict) or not public_keys:
+            raise IngressError("bad_request", 400, "Ticket verification needs a MAIN public key.")
+        cleaned = {}
+        try:
+            for device, key in public_keys.items():
+                cleaned[_ident(device, "device_id")] = gateway_public_key(key)
+        except (IngressError, GatewayError):
+            raise IngressError("bad_request", 400, "Ticket verification needs a MAIN public key.") from None
+        if not cleaned:
+            raise IngressError("bad_request", 400, "Ticket verification needs a MAIN public key.")
+        self._keys = cleaned
+
+    def verify(self, signed):
+        """Same check as calling the verifier. Phone's peer accepts either shape."""
+        return self(signed) is True
+
+    def __call__(self, signed):
+        try:
+            if not isinstance(signed, dict):
+                return False
+            if any(key not in signed for key in TICKET_FIELDS):
+                return False
+            signature = signed.get("signature")
+            if not isinstance(signature, str) or "BEGIN SSH SIGNATURE" not in signature:
+                return False
+            main = signed.get("main")
+            public_key = self._keys.get(main)
+            if public_key is None:
+                return False
+            fields = {key: signed[key] for key in TICKET_FIELDS}
+            return verify_message(TICKET_NS, gateway_message(TICKET_NS, fields), signature, public_key) is True
+        except Exception:
+            return False
+
+    def __repr__(self):
+        return "TicketSignatureVerifier(redacted)"
+
+
+class WebAuthnAssertionVerifier:
+    """One pinned credential. `verify` is True only after OpenSSL accepts the ES256 assertion."""
+
+    def __init__(self, *, credential_id, public_pem, rp_id, origin):
+        if not isinstance(credential_id, str) or not _B64URL.fullmatch(credential_id) or not 1 <= len(credential_id) <= 256:
+            raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+        if not isinstance(public_pem, str) or not public_pem.isascii() or len(public_pem) > 8000:
+            raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+        if "PRIVATE" in public_pem or "BEGIN PUBLIC KEY" not in public_pem or "END PUBLIC KEY" not in public_pem:
+            raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+        if not isinstance(rp_id, str) or not rp_id or len(rp_id) > 253 or rp_id != rp_id.lower():
+            raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+        if "/" in rp_id or ":" in rp_id or " " in rp_id:
+            raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+        self.credential_ids = (credential_id,)
+        self.rp_id = rp_id
+        self.origin = _webauthn_origin(origin)
+        self._pem = public_pem
+        self._counter = None
+        self._zero = set()
+        self._lock = threading.Lock()
+        if not Path(_OPENSSL).is_file():
+            raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+        self._require_public_pem()
+
+    def verify(self, assertion, challenge):
+        """True only for this credential, this challenge, and a fresh counter. Never raises."""
+        try:
+            parsed = self._parse(assertion, challenge)
+            if parsed is None:
+                return False
+            auth_data, client_raw, signature, counter = parsed
+            if not self._openssl_verify(auth_data + hashlib.sha256(client_raw).digest(), signature):
+                return False
+            marker = hashlib.sha256(auth_data + client_raw + signature).digest()
+            with self._lock:
+                return self._accept_counter(counter, marker)
+        except Exception:
+            return False
+
+    def _parse(self, assertion, challenge):
+        if not isinstance(assertion, dict) or not isinstance(challenge, str) or not challenge:
+            return None
+        if assertion.get("type") != "public-key" or not _same_text(assertion.get("id"), self.credential_ids[0]):
+            return None
+        raw_id = assertion.get("rawId", assertion.get("raw_id"))
+        if raw_id is not None and not _same_text(raw_id, self.credential_ids[0]):
+            return None
+        response = assertion.get("response")
+        if not isinstance(response, dict):
+            return None
+        client_raw = _b64url_decode(response.get("clientDataJSON"), 4096)
+        auth_data = _b64url_decode(response.get("authenticatorData"), 4096)
+        signature = _b64url_decode(response.get("signature"), 512)
+        if client_raw is None or auth_data is None or signature is None or not signature:
+            return None
+        if not 37 <= len(auth_data) <= 1024:
+            return None
+        try:
+            client = json.loads(client_raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(client, dict):
+            return None
+        if client.get("type") != "webauthn.get" or client.get("challenge") != challenge:
+            return None
+        if client.get("origin") != self.origin or client.get("crossOrigin") is not False:
+            return None
+        if hashlib.sha256(self.rp_id.encode("utf-8")).digest() != auth_data[:32]:
+            return None
+        flags = auth_data[32]
+        if not flags & _WEBAUTHN_UP or not flags & _WEBAUTHN_UV or flags & _WEBAUTHN_AT:
+            return None
+        return auth_data, client_raw, signature, int.from_bytes(auth_data[33:37], "big")
+
+    def _accept_counter(self, counter, marker):
+        if counter > 0:
+            if self._counter is not None and counter <= self._counter:
+                return False
+            self._counter = counter
+            return True
+        if self._counter not in (None, 0) or marker in self._zero:
+            return False
+        self._zero.add(marker)
+        return True
+
+    def _openssl_verify(self, message, signature):
+        try:
+            with tempfile.TemporaryDirectory(prefix="jarvis-webauthn-") as folder:
+                pub = Path(folder) / "pub.pem"
+                sig = Path(folder) / "sig.der"
+                pub.write_text(self._pem, encoding="ascii")
+                sig.write_bytes(signature)
+                out = subprocess.run(
+                    [_OPENSSL, "dgst", "-sha256", "-verify", str(pub), "-signature", str(sig)],
+                    input=message, capture_output=True, timeout=5,
+                )
+            return out.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _require_public_pem(self):
+        """P-256 (prime256v1) only. RSA and every other curve are refused."""
+        try:
+            with tempfile.TemporaryDirectory(prefix="jarvis-webauthn-") as folder:
+                pub = Path(folder) / "pub.pem"
+                pub.write_text(self._pem, encoding="ascii")
+                out = subprocess.run(
+                    [_OPENSSL, "pkey", "-pubin", "-in", str(pub), "-text", "-noout"],
+                    capture_output=True, timeout=5,
+                )
+        except (OSError, subprocess.SubprocessError):
+            raise IngressError("passkey_unavailable", 503,
+                               "Passkey checks are not configured. Nothing was changed.") from None
+        text = out.stdout.decode("ascii", "replace") if out.returncode == 0 else ""
+        if "prime256v1" not in text or "RSA Public-Key" in text or "Private-Key" in text:
+            raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+
+    def __repr__(self):
+        return "WebAuthnAssertionVerifier(redacted)"
+
+
+def _webauthn_origin(origin):
+    parts = urlsplit(str(origin or ""))
+    if (parts.scheme != "https" or parts.username or parts.password or parts.query
+            or parts.fragment or parts.path not in ("", "/")):
+        raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host or _is_ip(host):
+        raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+    if parts.port and parts.port != 443:
+        return f"https://{host}:{parts.port}"
+    return f"https://{host}"
+
+
+class OwnerAssertionBridge:
+    """Mint a gateway `OwnerProof` after the passkey has already been checked.
+
+    The owner key signs the transition payload. It is not a substitute for the assertion.
+    """
+
+    def __init__(self, gateway, owner_private_key, wall=None):
+        if not callable(getattr(gateway, "issue_challenge", None)) or not callable(
+                getattr(gateway, "authenticate_owner", None)):
+            raise IngressError("owner_proof_required", 503,
+                               "MAIN changes need a fresh owner proof. Nothing was changed.")
+        self._gateway = gateway
+        self._key = Path(owner_private_key)
+        if not self._key.is_file():
+            raise IngressError("owner_proof_required", 503,
+                               "MAIN changes need a fresh owner proof. Nothing was changed.")
+        self._wall = wall or time.time
+
+    def prove(self, payload):
+        digest = payload_digest(payload)
+        challenge = self._gateway.issue_challenge(digest)
+        issued = int(self._wall())
+        nonce = "n-" + secrets.token_hex(8)
+        signature = sign_message(OWNER_NS, self._key, gateway_message(OWNER_NS, {
+            "v": 1, "challenge_id": challenge["challenge_id"], "nonce": nonce,
+            "issued_at": issued, "payload_digest": digest,
+        }))
+        proof = self._gateway.authenticate_owner(
+            challenge_id=challenge["challenge_id"], nonce=nonce, issued_at=issued,
+            purpose="transition", payload=payload, signature=signature)
+        if not isinstance(proof, GatewayOwnerProof):
+            raise IngressError("owner_proof_required", 403,
+                               "MAIN changes need a fresh owner proof. Nothing was changed.")
+        return proof
+
+    def __repr__(self):
+        return "OwnerAssertionBridge(redacted)"
+
+
+class NetworkGatewaySession:
+    """HTTP client for gateway routes that exist today.
+
+    `status` and metadata `relay` use `AuthorityClient`. Phone bodies and owner proofs do
+    not: `forward_transient` is not an HTTP route, and an in-process `OwnerProof` cannot
+    be replayed on the wire. `transient_supported` is false. See `GATEWAY_SESSION_DEPENDENCIES`.
+    """
+
+    transient_supported = False
+    transition_supported = False
+
+    def __init__(self, origin, *, authority_id, device_id, installation_id, private_key_path,
+                 owner_private_key_path=None, wall=None):
+        self._client = AuthorityClient(
+            origin, authority_id=authority_id, wall=wall or time.time, device_id=device_id,
+            installation_id=installation_id, private_key_path=private_key_path,
+            owner_private_key_path=owner_private_key_path)
+        self.origin = self._client.origin
+
+    def status(self):
+        return self._client.status()
+
+    def relay_metadata(self, operation_id, target, attempt_id, digest, capability):
+        payload = {
+            "operation_id": operation_id, "target": target, "attempt_id": attempt_id,
+            "digest": digest, "capability": capability,
+        }
+        if set(payload) != {"operation_id", "target", "attempt_id", "digest", "capability"}:
+            raise IngressError("bad_request", 400, "That request cannot be relayed.")
+        if PERSONAL_KEYS.intersection(payload):
+            raise IngressError("personal_field", 400, "That request cannot be relayed.")
+        return self._client.relay(operation_id, target, attempt_id, digest, capability)
+
+    def relay_transient(self, operation_id, target, attempt_id, digest, capability, kind, envelope):
+        del operation_id, target, attempt_id, digest, capability, kind, envelope
+        raise IngressError(
+            NETWORK_TRANSIENT_BLOCKER, 503,
+            "WS5 owns the gateway HTTP route. NetworkGatewaySession cannot carry a phone body. Nothing was sent.")
+
+    def transition_request(self, owner_proof, payload):
+        del payload
+        if not isinstance(owner_proof, GatewayOwnerProof):
+            raise IngressError("owner_proof_required", 403,
+                               "MAIN changes need a fresh owner proof. Nothing was changed.")
+        raise IngressError(
+            "transition_not_networked", 503,
+            "An in-process owner proof cannot be presented to the HTTP gateway. Nothing was changed.")
+
+
 class ContinuityGatewaySession:
     """Signed in-process client of `ContinuityGateway`.
 
@@ -507,6 +1106,33 @@ class ContinuityGatewaySession:
         return self._gateway.relay(principal, payload)
 
 
+def production_ingress(path, gateway, *, origin, installation_id, allowed_mains, peer_verifier,
+                       blocked_stable_ids, webauthn, owner_bridge, envelope_signer, ticket_verifier,
+                       owner_verifier=None, clock=time.time, log=None):
+    """Ingress that refuses stand-in verifiers.
+
+    `webauthn`, `owner_bridge`, `envelope_signer`, and `ticket_verifier` must be the
+    concrete classes. A callback that returns true is not accepted here.
+    """
+    if not isinstance(envelope_signer, EnvelopeSigner):
+        raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+    if not isinstance(webauthn, WebAuthnAssertionVerifier):
+        raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
+    if not isinstance(owner_bridge, OwnerAssertionBridge):
+        raise IngressError("owner_proof_required", 503, "MAIN changes need a fresh owner proof. Nothing was changed.")
+    if not isinstance(ticket_verifier, TicketSignatureVerifier):
+        raise IngressError("bad_request", 400, "Ticket verification needs a MAIN public key.")
+    made = MobileIngress(
+        path, gateway, origin=origin, installation_id=installation_id, allowed_mains=allowed_mains,
+        peer_verifier=peer_verifier, blocked_stable_ids=blocked_stable_ids, owner_verifier=owner_verifier,
+        webauthn=webauthn, owner_bridge=owner_bridge, envelope_signer=envelope_signer,
+        ticket_verifier=ticket_verifier, clock=clock, log=log)
+    made._production = True
+    made._passkeys = None
+    made._owner_proof = None
+    return made
+
+
 class MobileIngress:
     """Pairing, session ownership, and metadata relay to the current ready MAIN.
 
@@ -518,7 +1144,8 @@ class MobileIngress:
 
     def __init__(self, path, gateway, *, origin, installation_id, allowed_mains,
                  peer_verifier, blocked_stable_ids, passkey_verifier=None, owner_verifier=None,
-                 owner_proof=None, clock=time.time, log=None):
+                 owner_proof=None, clock=time.time, log=None, webauthn=None, owner_bridge=None,
+                 envelope_signer=None, ticket_verifier=None):
         self.path = Path(path)
         self.origin, self.hosts = _origin_of(origin)
         self.installation_id = _ident(installation_id, "installation_id")
@@ -538,6 +1165,13 @@ class MobileIngress:
         self._peers, self._owners = peer_verifier, owner_verifier
         self._passkeys = passkey_verifier
         self._owner_proof = owner_proof
+        self._webauthn = webauthn
+        self._owner_bridge = owner_bridge
+        self._signer = envelope_signer
+        self._tickets = ticket_verifier
+        self._passkey_verified = set()
+        self._preview_challenges = {}
+        self._production = False
         self._clock = clock
         self._log = log if callable(log) else None
         self._activated = None
@@ -599,6 +1233,12 @@ class MobileIngress:
 
     def _open_schema(self):
         self._db.executescript(_SCHEMA)
+        self._ensure_column("codes", "operation_id", "TEXT")
+        self._ensure_column("previews", "authorized", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("previews", "operation_id", "TEXT")
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS previews_phone_op ON previews(phone_id, operation_id)"
+            " WHERE operation_id IS NOT NULL")
         with self._tx() as db:
             row = db.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
             if row is None:
@@ -607,6 +1247,11 @@ class MobileIngress:
                 raise IngressError("quarantined", 503, "Ingress store schema is unrecognized.")
             db.execute("UPDATE operations SET state='uncertain' WHERE state='inflight'")
             db.execute("UPDATE previews SET state='uncertain' WHERE state='sending'")
+
+    def _ensure_column(self, table, column, declaration):
+        have = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     # --- cutover -----------------------------------------------------------------------
 
@@ -849,10 +1494,17 @@ class MobileIngress:
         return {"ok": True}
 
     def pair(self, pairing_proof, client_metadata):
-        """Claim or finish a code. A pending code is not a session and sets no cookie."""
+        """Claim or finish a code. A pending code is not a session and sets no cookie.
+
+        A supplied operation id is bound to this code. The cookie is returned once.
+        A retry after that returns `pair_lost` and does not mint another phone.
+        """
         self._live()
         if not isinstance(pairing_proof, dict):
             raise IngressError("bad_request", 400, "Send the code first.")
+        operation_id = pairing_proof.get("operation_id", None)
+        if operation_id is not None and (not isinstance(operation_id, str) or not _OP.match(operation_id)):
+            raise IngressError("operation_id_required", 400, "This request needs a stable operation id.")
         who = self._peer(pairing_proof.get("peer"))
         code = _normalize_code(pairing_proof.get("code"))
         if not code:
@@ -869,7 +1521,8 @@ class MobileIngress:
         name = _clean((client_metadata or {}).get("name") if isinstance(client_metadata, dict) else "", NAME_MAX)
         now = self._clock()
         with self._tx() as db:
-            outcome, detail = self._pair_step(db, code, who, name, mobile, bool(pairing_proof.get("claim")), now)
+            outcome, detail = self._pair_step(
+                db, code, who, name, mobile, bool(pairing_proof.get("claim")), now, operation_id)
         if outcome == "desktop":
             raise IngressError("forbidden", 403, "Only a phone can pair with JARVIS.")
         if outcome == "bad":
@@ -884,11 +1537,40 @@ class MobileIngress:
             raise IngressError("forbidden", 403, "Pairing was refused on the PC.")
         if outcome == "pending":
             raise IngressError("pending", 202, "Waiting for approval on your PC.")
+        if outcome == "mismatch":
+            raise IngressError("conflict", 409, "That pairing attempt does not match this code.")
+        if outcome == "lost":
+            raise IngressError("pair_lost", 409, "That pairing session was already issued. Pair again from the PC.")
         self._note("paired")
         return detail
 
-    def _pair_step(self, db, code, who, name, mobile, claim, now):
+    def _pair_operation(self, db, entry, operation_id, now):
+        """Bind one operation id to this code. The cookie is never written here."""
+        if operation_id is None:
+            if entry["operation_id"]:
+                return "mismatch"
+            return None
+        bound = entry["operation_id"]
+        if bound and bound != operation_id:
+            return "mismatch"
+        prior = db.execute("SELECT * FROM pair_binds WHERE operation_id=?", (operation_id,)).fetchone()
+        if prior is not None and prior["code_id"] != entry["id"]:
+            return "mismatch"
+        if prior is not None and prior["state"] == "issued":
+            return "lost"
+        if not bound:
+            db.execute("UPDATE codes SET operation_id=? WHERE id=?", (operation_id, entry["id"]))
+        if prior is None:
+            db.execute("INSERT INTO pair_binds(operation_id, code_id, state, phone_id, updated_at)"
+                       " VALUES(?,?,?,?,?)", (operation_id, entry["id"], "claimed", None, now))
+        return None
+
+    def _pair_step(self, db, code, who, name, mobile, claim, now, operation_id=None):
         self._purge(db, now)
+        if operation_id is not None:
+            prior = db.execute("SELECT * FROM pair_binds WHERE operation_id=?", (operation_id,)).fetchone()
+            if prior is not None and prior["state"] == "issued":
+                return "lost", None
         rows = db.execute("SELECT * FROM codes WHERE expires>?", (now,)).fetchall()
         if not mobile and not any(r["allow_desktop"] for r in rows):
             return "desktop", None
@@ -901,6 +1583,9 @@ class MobileIngress:
             return "bad", None
         if not mobile and not entry["allow_desktop"]:
             return "desktop", None
+        bound = self._pair_operation(db, entry, operation_id, now)
+        if bound is not None:
+            return bound, None
         if entry["state"] == "waiting":
             if not claim:
                 return "unclaimed", None
@@ -926,6 +1611,9 @@ class MobileIngress:
                    (phone_id, shown, _sha256(token), _sha256(csrf), who["stable_id"], who["login"],
                     who["os"], who["node"], now, now))
         db.execute("DELETE FROM codes WHERE id=?", (entry["id"],))
+        if operation_id is not None:
+            db.execute("UPDATE pair_binds SET state='issued', phone_id=?, updated_at=? WHERE operation_id=?",
+                       (phone_id, now, operation_id))
         session = Session(phone_id, shown, token, csrf,
                           f"{PHONE_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={COOKIE_AGE}")
         return "paired", session
@@ -995,11 +1683,13 @@ class MobileIngress:
         query_body = self._read_body(principal, kind, query or {})
         if not self._transient():
             raise IngressError("body_not_relayable", 503, BODY_TEXT)
-        envelope = _envelope({"kind": kind, "query": query_body})
         operation_id = "r-" + secrets.token_hex(8)
+        attempt_id = "a-" + secrets.token_hex(8)
+        envelope = self._phone_envelope(principal, operation_id, attempt_id, kind, query_body, status, main)
+        stamp = self._authority_stamp(status, main)
         try:
             result = self._gateway.relay_transient(
-                operation_id, main, "a-" + secrets.token_hex(8), _envelope_digest(envelope),
+                operation_id, main, attempt_id, _envelope_digest(envelope),
                 "client", kind, envelope)
         except GatewayError as exc:
             raise self._from_gateway(exc) from None
@@ -1012,10 +1702,79 @@ class MobileIngress:
             self._note("relay_overclaim")
             raise IngressError("relay_overclaim", 503,
                                "The relay did not authorize an effect. Nothing more was sent.")
+        if not self._stamp_still(stamp):
+            self._note("stale_main")
+            raise IngressError("stale", 409, "The MAIN changed. That answer was not shown.")
         shaped = dict(result["result"])
         if result.get("raw") is not None:
             shaped["raw"] = result["raw"]
         return self._project(kind, shaped)
+
+    def _phone_envelope(self, principal, operation_id, attempt_id, kind, body, status, main):
+        """Signed `{v, claim, signature, body}`. A missing signer does not transmit the body.
+
+        `attempt_id` is chosen by the caller and is the same value passed to relay.
+        `target` is the active MAIN. An execution node stays in `body["device"]`.
+        `body` is the request object itself, not a `{kind, query}` wrapper.
+        """
+        if not isinstance(self._signer, EnvelopeSigner):
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+        claim = self._phone_claim(principal, operation_id, attempt_id, kind, body, status, main)
+        if _claim_fields(claim) is None:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+        try:
+            signature = self._signer.sign(claim)
+        except IngressError:
+            raise
+        except Exception:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.") from None
+        if not isinstance(signature, str) or "BEGIN SSH SIGNATURE" not in signature:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+        return _envelope({"v": 1, "claim": claim, "signature": signature, "body": body})
+
+    def _phone_claim(self, principal, operation_id, attempt_id, kind, body, status, main):
+        authority_id = status.get("authority_id")
+        fleet_id = status.get("fleet_id")
+        if not isinstance(authority_id, str) or not _ID.match(authority_id):
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+        if not isinstance(fleet_id, str) or not _ID.match(fleet_id):
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+        issuer = status.get("issuer_incarnation", status.get("incarnation"))
+        if isinstance(issuer, bool) or not isinstance(issuer, int) or issuer < 0:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.")
+        from jarvis.phone import gateway_phone_digest
+        try:
+            digest = gateway_phone_digest(body)
+        except Exception:
+            raise IngressError("envelope_unsigned", 503, "This phone request was not sent.") from None
+        return {
+            "attempt_id": attempt_id, "authority_id": authority_id, "digest": digest,
+            "domain": PHONE_DOMAIN, "epoch": status["epoch"], "fleet_id": fleet_id,
+            "incarnation": status["incarnation"], "issuer_incarnation": issuer, "kind": kind,
+            "main": main, "manage_main": False, "mode_version": status["mode_version"],
+            "opener": "phone:" + principal.phone_id, "operation_id": operation_id,
+            "phone_id": principal.phone_id, "policy_version": status["policy_version"],
+            "purpose": PHONE_PURPOSE, "role": "phone", "target": main, "v": 1,
+        }
+
+    def _authority_stamp(self, status, main):
+        return (main, status["incarnation"], status["epoch"], status["mode_version"])
+
+    def _stamp_still(self, stamp):
+        """False when a fresh status disagrees with the tuple just used, or cannot be read."""
+        try:
+            status = self._live()
+            main = self._route(status)
+        except IngressError:
+            return False
+        return self._authority_stamp(status, main) == stamp
+
+    def verify_ticket(self, signed):
+        """False unless the configured verifier is a `TicketSignatureVerifier` and the signature holds."""
+        verifier = self._tickets
+        if not isinstance(verifier, TicketSignatureVerifier):
+            return False
+        return verifier(signed) is True
 
     def _read_result_ok(self, operation_id, result):
         if not isinstance(result, dict) or not isinstance(result.get("result"), dict):
@@ -1050,7 +1809,10 @@ class MobileIngress:
             operation_id = query.get("operation_id")
             if not isinstance(operation_id, str) or not _OP.match(operation_id):
                 raise IngressError("bad_request", 400, "Unknown operation.")
-            return {"operation_id": operation_id, "kind": query.get("kind")}
+            row = self._op(operation_id)
+            if row is None or row["phone_id"] != principal.phone_id:
+                raise IngressError("not_found", 404, "No such request.")
+            return {"operation_id": operation_id}
         raise IngressError("bad_request", 400, "Unknown read.")
 
     def submit(self, principal, operation_id, request):
@@ -1092,16 +1854,20 @@ class MobileIngress:
         status = self._live()
         body = self._effect_body(principal, kind, request, status)
         main = self._route(status)
-        envelope = _envelope(body)
-        env_digest = _envelope_digest(envelope)
-        digest = _metadata_digest(operation_id, kind, env_digest, main,
+        # The row identity is the inner body pinned to the MAIN tuple at first send.
+        # A later tuple is a new operation, not a new body for this id. A signature
+        # would make every retry look new, so the row does not store the outer bytes.
+        body_digest = _envelope_digest(_envelope(body))
+        digest = _metadata_digest(operation_id, kind, body_digest, main,
                                   status["incarnation"], status["epoch"])
         existing = self._op(operation_id)
         if existing is not None:
-            if (existing["phone_id"] != principal.phone_id or existing["digest"] != digest
-                    or existing["kind"] != kind):
+            if not _effect_replay_matches(existing, principal.phone_id, operation_id, kind, body_digest):
                 raise IngressError("conflict", 409, "That request already exists with different contents.")
             return self._stored(existing)
+        attempt_id = "a-" + secrets.token_hex(8)
+        envelope = self._phone_envelope(principal, operation_id, attempt_id, kind, body, status, main)
+        env_digest = _envelope_digest(envelope)
         now = self._clock()
         try:
             with self._tx() as db:
@@ -1111,10 +1877,11 @@ class MobileIngress:
                             status["incarnation"], status["epoch"], status["mode_version"], now))
         except sqlite3.IntegrityError:
             existing = self._op(operation_id)
-            if existing is None or existing["digest"] != digest:
+            if existing is None or not _effect_replay_matches(
+                    existing, principal.phone_id, operation_id, kind, body_digest):
                 raise IngressError("conflict", 409, "That request already exists with different contents.") from None
             return self._stored(existing)
-        attempt_id = "a-" + secrets.token_hex(8)
+        stamp = self._authority_stamp(status, main)
         try:
             result = self._gateway.relay_transient(
                 operation_id, main, attempt_id, env_digest, "client", kind, envelope)
@@ -1137,8 +1904,10 @@ class MobileIngress:
             self._note("relay_overclaim")
             raise IngressError("relay_overclaim", 503,
                                "The relay did not authorize an effect. Nothing more was sent.")
-        if kind == "session_start" and result["upstream_accepted"]:
-            self._record_session(principal, operation_id, body, status, main)
+        if result["upstream_accepted"] and not self._stamp_still(stamp):
+            self._update_op(operation_id, state="uncertain")
+            self._note("stale_main")
+            raise IngressError("stale", 409, "The MAIN changed. That answer was not shown.")
         if not result["upstream_accepted"]:
             self._update_op(operation_id, state="refused", http_status=409)
             self._note("refused")
@@ -1148,17 +1917,51 @@ class MobileIngress:
         view = self._stored(self._op(operation_id))
         view["duplicate"] = False
         view["upstream_accepted"] = True
+        if kind in ("ask", "session_start"):
+            self._attach_effect_outcome(principal, operation_id, kind, body, status, main, view)
         return view
 
-    def _record_session(self, principal, operation_id, body, status, main):
-        """A started session is keyed by its operation id until MAIN reports its own."""
-        sid = hashlib.sha256(("session\n" + operation_id).encode("utf-8")).hexdigest()[:32]
+    def _attach_effect_outcome(self, principal, operation_id, kind, body, status, main, view):
+        """Read the accepted effect back. The reply and the prompt are not stored.
+
+        The effect post is accepted-only. The PC outcome travels on a later
+        `effect_status` read whose wire result is `{status, body}`. A failure
+        here does not send the effect again. A session id is the PC's id when
+        that read carries one. If the read has no id, the local hash is only a
+        handle for this phone until the PC reports one.
+        """
+        found = None
+        try:
+            found = self.read(principal, "effect_status", {"operation_id": operation_id})
+        except IngressError:
+            found = None
+        session_id = None
+        if isinstance(found, dict):
+            for key in ("job", "reply", "trace", "pending", "waiting", "device", "target", "remote_state"):
+                if key in found:
+                    view[key] = found[key]
+            if isinstance(found.get("session"), str) and _SESSION.match(found["session"]):
+                session_id = found["session"]
+                view["session"] = session_id
+            if isinstance(found.get("job"), str) and _JOB.match(found["job"]):
+                self._update_op(operation_id, job_id=found["job"])
+        if kind != "session_start":
+            return
+        if not isinstance(session_id, str):
+            session_id = hashlib.sha256(("session\n" + operation_id).encode("utf-8")).hexdigest()[:32]
+            view["session"] = session_id
+        if isinstance(body.get("device"), str):
+            view["device"] = body["device"]
+        self._record_session(principal, operation_id, session_id, body, status, main)
+
+    def _record_session(self, principal, operation_id, session_id, body, status, main):
+        """Remember the session id only. The prompt and the reply are not columns."""
         with self._tx() as db:
             db.execute("INSERT OR IGNORE INTO sessions(session_id, phone_id, device, kind, state,"
                        " incarnation, epoch, main, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                       (sid, principal.phone_id, body["device"], body["session_kind"], "live",
+                       (session_id, principal.phone_id, body["device"], body["session_kind"], "live",
                         status["incarnation"], status["epoch"], main, self._clock()))
-        self._update_op(operation_id, session_id=sid)
+        self._update_op(operation_id, session_id=session_id)
 
     def _submit_metadata(self, principal, operation_id, request):
         attempt_id = _ident(request.get("attempt_id"), "attempt_id")
@@ -1248,6 +2051,11 @@ class MobileIngress:
         """The row as the client may see it. No relay, no body, no job text."""
         view = {"operation_id": row["operation_id"], "kind": row["kind"], "state": row["state"],
                 "duplicate": True, "effect_authorized": False, "target": row["target"]}
+        if isinstance(row["session_id"], str) and _SESSION.match(row["session_id"]):
+            view["session"] = row["session_id"]
+            session = self._session(row["session_id"])
+            if session is not None and isinstance(session["device"], str) and _ID.match(session["device"]):
+                view["device"] = session["device"]
         if row["state"] in ("inflight", "uncertain"):
             view["uncertain"] = True
             view["state"] = "uncertain"
@@ -1322,14 +2130,28 @@ class MobileIngress:
                         status["incarnation"], status["epoch"], main, now))
         return sid
 
-    def logout(self, principal):
-        """Revoke this phone locally. The gateway cannot deliver a logout body to the PC."""
+    def logout(self, principal, operation_id=None):
+        """End the phone. When a transient relay exists, ask MAIN to release before the local revoke."""
         row = self._check(principal)
+        ending, release_error = "local_only", None
+        if self._transient():
+            if not isinstance(operation_id, str) or not _OP.match(operation_id):
+                operation_id = "lo-" + secrets.token_hex(8)
+            try:
+                self.submit(principal, operation_id, {"kind": "logout_end"})
+                ending = "released"
+            except IngressError as exc:
+                ending, release_error = "release_unconfirmed", _safe_code(exc.code)
+            except Exception:
+                ending, release_error = "release_unconfirmed", "uncertain"
         self._revoke(row["id"])
         self._principals.discard(principal._token)
-        self._note("logout_local")
-        return {"ok": True, "ending": "local_only", "cookie_header":
-                f"{PHONE_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"}
+        self._note("logout_local" if ending == "local_only" else "logout_release")
+        out = {"ok": True, "ending": ending, "cookie_header":
+               f"{PHONE_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0"}
+        if release_error:
+            out["release_error"] = release_error
+        return out
 
     def _revoke(self, phone_id):
         now = self._clock()
@@ -1340,12 +2162,20 @@ class MobileIngress:
     # --- MAIN management ---------------------------------------------------------------
 
     def manage_main_preview(self, principal, request):
-        """Bind a preview to the current tuple. Does not open a transition."""
+        """Bind a preview to the current tuple. Does not open a transition.
+
+        The same operation id returns the same preview. A missing operation id
+        still mints one, which is what the older tests send. The challenge is
+        kept in this process only.
+        """
         row = self._check(principal)
         if not row["manage_main"]:
             raise IngressError("forbidden", 403, "This phone cannot change MAIN.")
         if not isinstance(request, dict):
             raise IngressError("bad_request", 400, "Send a JSON object.")
+        operation_id = request.get("operation_id", None)
+        if operation_id is not None and (not isinstance(operation_id, str) or not _OP.match(operation_id)):
+            raise IngressError("operation_id_required", 400, "This request needs a stable operation id.")
         action, profile = request.get("action"), request.get("profile") or "control"
         if action not in MAIN_ACTIONS:
             raise IngressError("bad_request", 400, "Unknown action.")
@@ -1355,21 +2185,50 @@ class MobileIngress:
         status = self._live()
         if status["mode"] not in V2_SERVE:
             raise IngressError("legacy_retained", 503, LEGACY_TEXT)
+        now = self._clock()
         challenge = secrets.token_urlsafe(32)
         preview_id = "pv-" + secrets.token_hex(8)
-        now = self._clock()
         with self._tx() as db:
-            db.execute("INSERT INTO previews(preview_id, phone_id, action, candidate, profile, incarnation,"
-                       " epoch, policy_version, mode_version, challenge_sha256, expires, state, updated_at)"
-                       " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (preview_id, principal.phone_id, action, candidate, profile, status["incarnation"],
-                        status["epoch"], status["policy_version"], status["mode_version"], _sha256(challenge),
-                        now + PREVIEW_TTL, "open", now))
+            existing = None
+            if operation_id is not None:
+                existing = db.execute("SELECT * FROM previews WHERE phone_id=? AND operation_id=?",
+                                      (principal.phone_id, operation_id)).fetchone()
+            if existing is not None:
+                if (existing["action"] != action or existing["candidate"] != candidate
+                        or existing["profile"] != profile):
+                    raise IngressError("conflict", 409, "That request already exists with different contents.")
+                preview = existing
+            else:
+                try:
+                    db.execute("INSERT INTO previews(preview_id, phone_id, action, candidate, profile, incarnation,"
+                               " epoch, policy_version, mode_version, challenge_sha256, expires, state, updated_at,"
+                               " authorized, operation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                               (preview_id, principal.phone_id, action, candidate, profile, status["incarnation"],
+                                status["epoch"], status["policy_version"], status["mode_version"], _sha256(challenge),
+                                now + PREVIEW_TTL, "open", now, 0, operation_id))
+                except sqlite3.IntegrityError:
+                    existing = db.execute("SELECT * FROM previews WHERE phone_id=? AND operation_id=?",
+                                          (principal.phone_id, operation_id)).fetchone()
+                    if existing is None or existing["action"] != action or existing["candidate"] != candidate or existing["profile"] != profile:
+                        raise IngressError("conflict", 409, "That request already exists with different contents.") from None
+                    preview = existing
+                else:
+                    preview = db.execute("SELECT * FROM previews WHERE preview_id=?", (preview_id,)).fetchone()
+                    self._preview_challenges[preview_id] = challenge
         self._note("preview")
-        return {"preview_id": preview_id, "challenge": challenge, "action": action, "candidate": candidate,
-                "profile": profile, "incarnation": status["incarnation"], "epoch": status["epoch"],
-                "policy_version": status["policy_version"], "mode_version": status["mode_version"],
-                "expires": now + PREVIEW_TTL, "manage_main": True}
+        shown = self._preview_challenges.get(preview["preview_id"])
+        return self._preview_view(preview, shown)
+
+    def _preview_view(self, preview, challenge):
+        options = self._webauthn_options()
+        out = {"preview_id": preview["preview_id"], "action": preview["action"], "candidate": preview["candidate"],
+               "profile": preview["profile"], "incarnation": preview["incarnation"], "epoch": preview["epoch"],
+               "policy_version": preview["policy_version"], "mode_version": preview["mode_version"],
+               "expires": preview["expires"], "manage_main": True,
+               "rp_id": options["rp_id"], "credential_ids": options["credential_ids"]}
+        if isinstance(challenge, str) and challenge:
+            out["challenge"] = challenge
+        return out
 
     def manage_main_confirm(self, principal, preview_id, passkey_proof):
         """One transition for this preview. A second call reads that id; it does not start another."""
@@ -1385,42 +2244,113 @@ class MobileIngress:
             return {"transition_id": preview["transition_id"], "duplicate": True, "state": preview["state"]}
         status = self._live()
         self._tuple_match(preview, status)
-        if self._clock() > preview["expires"] and preview["state"] == "open":
-            raise IngressError("expired", 410, "That preview expired. Ask again.")
         if preview["state"] == "uncertain":
-            return self._reconcile_transition(principal, preview, status)
+            if not self._preview_authorized(preview["preview_id"]):
+                raise IngressError("forbidden", 403, "Passkey proof was refused.")
+            return self._send_transition(preview, reconcile=True)
+        if preview["state"] == "sending":
+            raise IngressError("uncertain", 409, "The transition outcome is unknown. It was not started again.")
         if preview["state"] != "open":
             raise IngressError("uncertain", 409, "The transition outcome is unknown. It was not started again.")
+        if self._clock() > preview["expires"]:
+            raise IngressError("expired", 410, "That preview expired. Ask again.")
+        self._accept_passkey(principal, preview, passkey_proof)
+        self._passkey_verified.add(preview["preview_id"])
+        return self._send_transition(preview, reconcile=False)
+
+    def _webauthn_options(self):
+        verifier = self._webauthn
+        if isinstance(verifier, WebAuthnAssertionVerifier):
+            return {"rp_id": verifier.rp_id, "credential_ids": list(verifier.credential_ids)}
+        return {"rp_id": "", "credential_ids": []}
+
+    def _accept_passkey(self, principal, preview, proof):
+        """Check the assertion. A configured verifier that is not the concrete class is not called."""
+        if getattr(self, "_production", False) or self._webauthn is not None:
+            if not isinstance(self._webauthn, WebAuthnAssertionVerifier):
+                raise IngressError("passkey_unavailable", 503,
+                                   "Passkey checks are not configured. Nothing was changed.")
+            challenge = _bound_challenge(proof, preview["challenge_sha256"])
+            assertion = _assertion_from(proof)
+            try:
+                ok = self._webauthn.verify(assertion, challenge) if challenge is not None else False
+            except Exception:
+                ok = False
+            if ok is not True:
+                raise IngressError("forbidden", 403, "Passkey proof was refused.")
+            return
         if not callable(self._passkeys):
             raise IngressError("passkey_unavailable", 503, "Passkey checks are not configured. Nothing was changed.")
-        if not isinstance(passkey_proof, dict):
+        if not isinstance(proof, dict):
             raise IngressError("forbidden", 403, "Passkey proof was refused.")
-        presented = passkey_proof.get("challenge")
-        if not isinstance(presented, str) or not hmac.compare_digest(_sha256(presented), preview["challenge_sha256"]):
+        presented = proof.get("challenge")
+        if not isinstance(presented, str) or not _sha_matches(presented, preview["challenge_sha256"]):
             raise IngressError("forbidden", 403, "Passkey proof was refused.")
         try:
-            receipt = self._passkeys(principal, self._preview_public(preview), passkey_proof)
+            receipt = self._passkeys(principal, self._preview_public(preview), proof)
         except IngressError:
             raise
         except Exception:
             receipt = None
         if not isinstance(receipt, str) or not _RECEIPT.match(receipt):
             raise IngressError("forbidden", 403, "Passkey proof was refused.")
-        # The receipt stays in this stack frame. It is not a gateway field.
         del receipt
-        return self._send_transition(preview)
 
-    def _reconcile_transition(self, principal, preview, status):
-        """Same client_key, a new owner proof. The store's idempotency is the reconcile."""
-        del principal
-        self._tuple_match(preview, status)
-        return self._send_transition(preview)
+    def _preview_authorized(self, preview_id):
+        """True when this process or the durable row has already checked the passkey."""
+        if preview_id in self._passkey_verified:
+            return True
+        row = self._preview(preview_id)
+        return bool(row and row["authorized"])
 
-    def _send_transition(self, preview):
+    def _claim_preview(self, preview_id, *, reconcile):
+        """One sender for this preview. `authorized` is written before the request leaves."""
+        with self._tx() as db:
+            row = db.execute("SELECT state, authorized, transition_id FROM previews WHERE preview_id=?",
+                             (preview_id,)).fetchone()
+            if row is None:
+                return "forbidden"
+            if row["transition_id"]:
+                return "done"
+            now = self._clock()
+            if reconcile:
+                if row["state"] == "sending":
+                    return "busy"
+                if row["state"] != "uncertain" or not row["authorized"]:
+                    return "forbidden"
+                cur = db.execute(
+                    "UPDATE previews SET state='sending', updated_at=? WHERE preview_id=?"
+                    " AND state='uncertain' AND authorized=1 AND transition_id IS NULL",
+                    (now, preview_id))
+            else:
+                if row["state"] == "sending":
+                    return "busy"
+                if row["state"] != "open":
+                    return "busy"
+                cur = db.execute(
+                    "UPDATE previews SET state='sending', authorized=1, updated_at=? WHERE preview_id=?"
+                    " AND state='open' AND transition_id IS NULL",
+                    (now, preview_id))
+            if cur.rowcount == 1:
+                return "ok"
+            again = db.execute("SELECT transition_id FROM previews WHERE preview_id=?", (preview_id,)).fetchone()
+            if again is not None and again["transition_id"]:
+                return "done"
+            return "busy"
+
+    def _send_transition(self, preview, *, reconcile=False):
+        """Same client_key. A second caller sees sending or the stored transition id."""
+        claimed = self._claim_preview(preview["preview_id"], reconcile=reconcile)
+        if claimed == "done":
+            current = self._preview(preview["preview_id"])
+            return {"transition_id": current["transition_id"], "duplicate": True, "state": current["state"]}
+        if claimed == "forbidden":
+            raise IngressError("forbidden", 403, "Passkey proof was refused.")
+        if claimed != "ok":
+            raise IngressError("uncertain", 409, "The transition outcome is unknown. It was not started again.")
         payload = self._transition_payload(preview)
-        proof = self._mint_owner_proof(payload)
-        self._mark_preview(preview["preview_id"], "sending")
         try:
+            proof = self._mint_owner_proof(payload)
             view = self._gateway.transition_request(proof, payload)
         except AuthorityError as exc:
             self._mark_preview(preview["preview_id"], "uncertain")
@@ -1438,6 +2368,23 @@ class MobileIngress:
         return self._accept_transition(preview["preview_id"], view)
 
     def _mint_owner_proof(self, payload):
+        if getattr(self, "_production", False) or self._owner_bridge is not None:
+            if not isinstance(self._owner_bridge, OwnerAssertionBridge):
+                raise IngressError("owner_proof_required", 403,
+                                   "MAIN changes need a fresh owner proof. Nothing was changed.")
+            if not isinstance(payload, dict) or not self._preview_authorized(payload.get("client_key")):
+                raise IngressError("owner_proof_required", 403,
+                                   "MAIN changes need a fresh owner proof. Nothing was changed.")
+            try:
+                proof = self._owner_bridge.prove(payload)
+            except IngressError:
+                raise
+            except Exception:
+                proof = None
+            if not isinstance(proof, GatewayOwnerProof):
+                raise IngressError("owner_proof_required", 403,
+                                   "MAIN changes need a fresh owner proof. Nothing was changed.")
+            return proof
         if not callable(self._owner_proof):
             raise IngressError("owner_proof_required", 503,
                                "MAIN changes need a fresh owner proof. Nothing was changed.")
@@ -1537,6 +2484,11 @@ class MobileIngress:
         cursor = body.get("cursor", body.get("rev"))
         if isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0:
             out["cursor"] = cursor
+        if isinstance(body.get("target"), str) and _ID.match(body["target"]):
+            out["target"] = body["target"]
+        traced = _project_trace(body.get("trace"))
+        if traced is not None:
+            out["trace"] = traced
         return out
 
     # --- rows --------------------------------------------------------------------------
@@ -1689,7 +2641,8 @@ class PhoneProtocolAdapter:
             proof = self.ingress.identify(headers)
             try:
                 session = self.ingress.pair({"code": payload.get("code"), "claim": path == "/phone/pair",
-                                             "peer": proof}, {"name": payload.get("name")})
+                                             "peer": proof, "operation_id": payload.get("operation_id", None)},
+                                            {"name": payload.get("name")})
             except IngressError as exc:
                 if exc.code == "pending":
                     return HttpResult(202, {"pending": True, "code": "pending"})
@@ -1718,12 +2671,27 @@ class PhoneProtocolAdapter:
         job = _JOB_PATH.match(path)
         if method == "GET" and job:
             return self._ask_poll(principal, job.group(1), parts.query)
+        effect = _EFFECT_PATH.match(path)
+        if method == "GET" and effect:
+            found = self.ingress.read(principal, "effect_status", {"operation_id": effect.group(1)})
+            return HttpResult(found.get("http_status") or 200, _public_effect(found))
         if method != "POST":
             raise IngressError("not_found", 404, "Not found.")
         payload = self._json(body)
         if path == "/phone/api/logout":
-            done = self.ingress.logout(principal)
-            return HttpResult(200, {"ok": True, "ending": done["ending"]}, {"Set-Cookie": done["cookie_header"]})
+            done = self.ingress.logout(principal, payload.get("operation_id"))
+            body = {"ok": True, "ending": done["ending"]}
+            if done.get("release_error"):
+                body["release_error"] = done["release_error"]
+            return HttpResult(200, body, {"Set-Cookie": done["cookie_header"]})
+        if path == "/phone/api/main/preview":
+            return HttpResult(200, self.ingress.manage_main_preview(principal, payload))
+        if path == "/phone/api/main/confirm":
+            proof, alias = payload.get("proof", None), payload.get("passkey_proof", None)
+            if proof is not None and alias is not None and proof != alias:
+                raise IngressError("forbidden", 403, "Passkey proof was refused.")
+            chosen = proof if proof is not None else alias
+            return HttpResult(200, self.ingress.manage_main_confirm(principal, payload.get("preview_id"), chosen))
         if path == "/phone/api/ask":
             operation_id = payload.get("key")
             result = self.ingress.submit(principal, operation_id, {
@@ -1740,8 +2708,11 @@ class PhoneProtocolAdapter:
             return self._effect_http(result)
         if path == "/phone/api/session/stop":
             sid = payload.get("session")
-            operation_id = "stop-" + sid if isinstance(sid, str) and _SESSION.match(sid) else ""
-            result = self.ingress.submit(principal, operation_id, {"kind": "session_stop", "session": sid})
+            expected = "stop-" + sid if isinstance(sid, str) and _SESSION.match(sid) else ""
+            supplied = payload.get("operation_id", None)
+            if supplied is not None and supplied != expected:
+                raise IngressError("conflict", 409, "The operation id does not match this session.")
+            result = self.ingress.submit(principal, expected, {"kind": "session_stop", "session": sid})
             return self._effect_http(result)
         raise IngressError("not_found", 404, "Not found.")
 
@@ -1814,12 +2785,18 @@ class PhoneProtocolAdapter:
 
 
 _JOB_PATH = re.compile(r"^/phone/api/ask/([0-9a-f]{6,32})$")
+_EFFECT_PATH = re.compile(r"^/phone/api/effect/([A-Za-z0-9_-]{8,64})$")
 
 
 def _public_effect(result, session=False):
-    """Phone JSON. Reply text is copied through for this response and is not a stored field."""
+    """Phone JSON. A real trace is copied through. A cursor alone is only `{rev}`."""
     if session and result.get("session"):
-        return {"id": result["session"], "device": result.get("device"), "state": result.get("remote_state") or "starting"}
+        out = {"id": result["session"], "state": result.get("remote_state") or "starting"}
+        if isinstance(result.get("device"), str):
+            out["device"] = result["device"]
+        if isinstance(result.get("target"), str):
+            out["target"] = result["target"]
+        return out
     out = {}
     if result.get("job"):
         out["job"] = result["job"]
@@ -1829,8 +2806,13 @@ def _public_effect(result, session=False):
         out["waiting"] = True
     if isinstance(result.get("reply"), str):
         out["reply"] = result["reply"]
-    if isinstance(result.get("cursor"), int):
+    trace = result.get("trace")
+    if isinstance(trace, dict):
+        out["trace"] = trace
+    elif isinstance(result.get("cursor"), int) and not isinstance(result.get("cursor"), bool):
         out["trace"] = {"rev": result["cursor"]}
+    if isinstance(result.get("target"), str):
+        out["target"] = result["target"]
     if "ok" not in out and not session:
         out.setdefault("ok", True)
     return out

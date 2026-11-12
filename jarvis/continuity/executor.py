@@ -519,7 +519,22 @@ class ExecutorGuard:
         raise AuthorityError("quarantined", "unrecognized receipt state")
 
     def _drive(self, op, sink, failpoint, already):
-        """PREPARED or CONSUMED only. ACCEPTED is the last record written before `sink`."""
+        """PREPARED or CONSUMED only. ACCEPTED is the last record written before `sink`.
+
+        ``admission()`` is a historical read and does not authorize the sink. A PREPARED
+        row still consumes the exact ticket when that lookup already found a record.
+        CONSUMED work rechecks the current tuple and consumes the same ticket again
+        before ACCEPTED. An identical consume may return the old receipt for
+        reconciliation; a stale current status still refuses the effect. Revoked, stale,
+        conflict, and bad_ticket become REJECTED. A transient error leaves CONSUMED, or
+        PREPARED if this attempt never consumed, and does not call the sink. ACCEPTED
+        is uncertain and is never retried.
+
+        The status check, the consume, and the sink are not one distributed atomic
+        effect. A revoke or fence that commits after this consume returns can still
+        overlap the sink. The contract boundary is ACCEPTED: once written, the effect
+        is not attempted again.
+        """
         row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
         if row["state"] == "PREPARED":
             if op["effect_class"] == "interactive" and self._session_state(op.get("session_id")) == "released":
@@ -527,30 +542,26 @@ class ExecutorGuard:
                 raise AuthorityError("released", "interactive session was released")
             prior = self._lookup_admission(op["admission_id"])
             if prior is not None:
-                _same_admission(prior, op)
-                self._update_receipt(op, "CONSUMED", None, prior.get("consumed_at"))
-            else:
-                status = self._status_for_ticket(op)
                 try:
-                    consumed = self._authority.consume(
-                        admission_id=op["admission_id"], target=op["target"], operation_id=op["operation_id"],
-                        attempt_id=op["attempt_id"], digest=op["digest"], main=op["main"],
-                        incarnation=op["incarnation"], epoch=op["epoch"], issued_at=op["issued_at"],
-                        admit_until=op["admit_until"], issuer_incarnation=op["issuer_incarnation"])
+                    _same_admission(prior, op)
                 except AuthorityError as exc:
                     self._on_consume_error(op, exc)
                     raise
-                except OSError:
-                    raise AuthorityError("unavailable", "authority unreachable") from None
-                _same_admission(consumed, op)
-                self._update_receipt(op, "CONSUMED", None, consumed.get("consumed_at"))
-                self._advance_high(op["incarnation"], op["epoch"], op["mode_version"])
+            consumed = self._consume_authorized(op)
+            self._update_receipt(op, "CONSUMED", None, consumed.get("consumed_at"))
+            self._advance_high(op["incarnation"], op["epoch"], op["mode_version"])
             self._crash(failpoint, "after_consume")
             row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
         if row["state"] != "CONSUMED":
             return self._finish_existing(row, op, sink, failpoint)
         if op["effect_class"] == "interactive" and self._session_state(op.get("session_id")) == "released":
             raise AuthorityError("released", "interactive session was released before the effect")
+        # Re-check immediately before ACCEPTED. A consume that already returned, including
+        # an exact historical duplicate, is not permission to run the sink.
+        self._consume_authorized(op)
+        row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
+        if row["state"] != "CONSUMED":
+            return self._finish_existing(row, op, sink, failpoint)
         # Fsync the accepted receipt before the effect. A crash here leaves ACCEPTED, which
         # is uncertain and is never fed to the sink again.
         self._update_receipt(op, "ACCEPTED", None, row["consumed_at"])
@@ -564,6 +575,29 @@ class ExecutorGuard:
             raise AuthorityError("uncertain", "effect outcome unknown") from None
         self._update_receipt(op, "COMPLETED", "completed", row["consumed_at"])
         return _public(self._receipt(op["target"], op["operation_id"], op["attempt_id"]), already=already)
+
+    def _consume_authorized(self, op):
+        """Current tuple, mode, and readiness, then an exact authenticated consume.
+
+        Status is first. A stale tuple is refused here and is not sent to ``consume``.
+        When the tuple is still current, ``consume`` rechecks membership. An identical
+        ticket can return the stored receipt; ``_same_admission`` keeps that receipt
+        bound to this attempt. ``admission()`` is not called.
+        """
+        self._status_for_ticket(op)
+        try:
+            consumed = self._authority.consume(
+                admission_id=op["admission_id"], target=op["target"], operation_id=op["operation_id"],
+                attempt_id=op["attempt_id"], digest=op["digest"], main=op["main"],
+                incarnation=op["incarnation"], epoch=op["epoch"], issued_at=op["issued_at"],
+                admit_until=op["admit_until"], issuer_incarnation=op["issuer_incarnation"])
+        except AuthorityError as exc:
+            self._on_consume_error(op, exc)
+            raise
+        except OSError:
+            raise AuthorityError("unavailable", "authority unreachable") from None
+        _same_admission(consumed, op)
+        return consumed
 
     def _status_for_ticket(self, op):
         status = self._status()
@@ -587,11 +621,11 @@ class ExecutorGuard:
         return status
 
     def _on_consume_error(self, op, exc):
-        if exc.code in ("stale", "conflict", "bad_ticket"):
+        if exc.code in ("stale", "conflict", "bad_ticket", "revoked"):
             self._update_receipt(op, "REJECTED", exc.code, None)
         elif exc.code == "ticket_expired":
             self._update_receipt(op, "EXPIRED", "ticket_expired", None)
-        # no_admission, target_unfenced, unavailable, quarantined: leave PREPARED for a later retry.
+        # no_admission, target_unfenced, unavailable, quarantined: leave PREPARED or CONSUMED.
 
     def _advance_high(self, incarnation, epoch, mode_version):
         if self._fence_boot is None:
