@@ -52,6 +52,12 @@
         "zen book"
       ],
       "screen_inches": 15.6
+    },
+    "oracle": {
+      "label": "Oracle A1 (gateway)",
+      "hostname": "oracle-vm",
+      "profile": "cloud",
+      "os": "linux"
     }
   },
   "desktop": {
