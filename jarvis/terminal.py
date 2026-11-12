@@ -27,6 +27,7 @@ import stat
 import subprocess
 from pathlib import Path
 
+from .fsio import read_json
 from .platforms import NO_WINDOW, on_windows, on_macos
 from . import platforms
 from .cluster_store import OWNER_TOKEN
@@ -454,10 +455,7 @@ def sandbox(folder=None, repo=None, config=None):
         return []
     repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
     if config is None:
-        try:
-            config = json.loads((repo / "jarvis.config.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            config = {}
+        config = read_json(repo / 'jarvis.config.json', {})
     if (config.get("terminal") or {}).get("sandbox", True) is False:
         return []
     home = str(Path.home())

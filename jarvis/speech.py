@@ -24,6 +24,7 @@ import urllib.request
 import wave
 from datetime import datetime, timezone
 from pathlib import Path
+from .fsio import read_json
 
 # Fallback if the key can't list voices: ElevenLabs' premade "Daniel" (British, calm).
 DEFAULT_VOICE = "onwK4e9ZLuTAKqWW03F9"
@@ -147,10 +148,7 @@ class Voice:
 
     def usage(self):
         month = datetime.now(timezone.utc).strftime("%Y-%m")
-        try:
-            data = json.loads(self.usage_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {}
+        data = read_json(self.usage_path, {})
         return month, data
 
     def _charge(self, chars):
@@ -324,10 +322,7 @@ def save_secrets(state_dir, **values):
     """Merge values into .jarvis/secrets.json, readable only by the owner."""
     path = Path(state_dir).resolve() / "secrets.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
+    data = read_json(path, {})
     data.update(values)
     from .credits import write_private
     write_private(path, json.dumps(data, indent=2))

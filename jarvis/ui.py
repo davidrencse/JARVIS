@@ -1204,7 +1204,6 @@ class Console:
 
     def remote_status(self):
         """Computers David can take over, whether each is ready now, and the session."""
-        from .cluster import FRESH
         from .deploy import code_fingerprint
         from .release import served_code
         from .topology import enabled, identity

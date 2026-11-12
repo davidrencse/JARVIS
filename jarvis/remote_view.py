@@ -45,6 +45,7 @@ import secrets
 import threading
 import time
 from pathlib import Path
+from .fsio import read_json
 
 QUALITY = {  # (max width, JPEG quality, frames per second at most)
     "low": (960, 45, 6),
@@ -1342,10 +1343,7 @@ def recover(state, injector=None):
     marker = Path(state) / MARKER
     if not marker.exists():
         return False
-    try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
+    data = read_json(marker, {})
     data = data if isinstance(data, dict) else {}
     # What the dead session still held, as it wrote it before each press: a fresh Injector
     # holds nothing, so without this only the backend's mouse buttons and modifiers came up.

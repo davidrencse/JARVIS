@@ -41,12 +41,12 @@ import os
 import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import second_brain as sb
 from .locking import LockBusy, exclusive_lock
+from .locking import transaction as _tx
 
 STORE_FILES = {"memory": "memory.sqlite3", "history": "history.sqlite3", "tasks": "tasks.sqlite3"}
 MARKER = "archive-capture.json"
@@ -371,17 +371,6 @@ def _open(path, readonly=False):
         conn = sqlite3.connect(path, timeout=10, isolation_level=None)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-@contextmanager
-def _tx(conn):
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except BaseException:
-        conn.execute("ROLLBACK")
-        raise
-    conn.execute("COMMIT")
 
 
 def _short(exc):

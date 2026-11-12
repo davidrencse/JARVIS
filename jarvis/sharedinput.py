@@ -29,6 +29,7 @@ import socket
 import subprocess
 from pathlib import Path
 
+from .fsio import read_json
 from .platforms import NO_WINDOW, on_windows
 from . import platforms
 
@@ -806,10 +807,7 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
     stop_fn = stop_fn or (lambda: stop(sharing_only=True))  # never the IP watcher that runs us
     clock = time.time() if now is None else now
     path = Path(state) / GUARD_FILE
-    try:
-        memo = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        memo = {}
+    memo = read_json(path, {})
     reading = nearby()
     near = reading["near"]
     # Two readings in a row: a "can't tell" between them breaks the streak (the safe side).
@@ -1023,10 +1021,7 @@ def update_guard_memo(state, tries=50, **fields):
         try:
             with exclusive_lock(state / (GUARD_FILE + ".lock")):
                 path = state / GUARD_FILE
-                try:
-                    memo = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    memo = {}
+                memo = read_json(path, {})
                 if not isinstance(memo, dict):
                     memo = {}
                 memo.update(fields)
