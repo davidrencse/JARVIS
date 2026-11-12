@@ -746,6 +746,9 @@ class PhoneServer:
         self._version = (None, "")
         self.trace = Trace()
         self._keys = {}  # (phone id, Ask key) -> (job id, text), oldest first
+        # Gateway phones are not rows in phone.json and not Tailscale identities.
+        self._gateway_phones = {}  # phone id -> {"id", "name", "via"}
+        self._gateway_ops = {}  # operation id -> outcome record; the request body is not kept
 
     # ---- lifecycle
     def start(self):
@@ -1331,6 +1334,104 @@ class PhoneServer:
         self.sync_phones()
         return Reply(200, {"ok": True}, {"Set-Cookie": set_cookie("", 0)})
 
+    def gateway_identity(self, claim):
+        """The server-owned phone for a verified gateway claim.
+
+        The same object is returned for the same phone id, so session and Ask
+        ownership stay on `phone:{phone_id}` across calls. A client dict is not
+        an identity. This does not read cookies or Tailscale headers.
+        """
+        if type(claim) is not GatewayPhoneClaim or not claim._intact():
+            raise PhoneGatewayError("forbidden", 403, "The phone identity was not verified.")
+        with self._mu:
+            found = self._gateway_phones.get(claim.phone_id)
+            if found is None:
+                found = {"id": claim.phone_id, "name": claim.phone_id, "via": "gateway"}
+                self._gateway_phones[claim.phone_id] = found
+            return found
+
+    def gateway_logout(self, phone):
+        """End this gateway phone's sessions. Does not rewrite phone.json."""
+        opener = self._opener(phone)
+        pid = phone["id"]
+        with self._mu:
+            self._gateway_phones.pop(pid, None)
+            mine = [sid for sid, meta in self._mine.items() if meta.get("phone") == pid]
+            for sid in mine:
+                self._mine.pop(sid, None)
+            self._keys = {key: value for key, value in self._keys.items() if key[0] != pid}
+        end = getattr(self.hub, "end_opener", None)
+        if callable(end):
+            try:
+                end(opener)
+            except Exception:
+                raise _refuse(503, "The phone's sessions could not be ended.") from None
+        self.publish("phone.revoked", {"name": phone.get("name")})
+        return {"ok": True, "ending": "gateway"}
+
+    def _gateway_reserve(self, claim):
+        """One in-flight record per operation id. The request body is not stored."""
+        with self._mu:
+            row = self._gateway_ops.get(claim.operation_id)
+            if row is not None:
+                if (not _eq(row["digest"], claim.digest) or row["phone_id"] != claim.phone_id
+                        or row["kind"] != claim.kind):
+                    raise PhoneGatewayError("conflict", 409, "That request already exists with different contents.")
+                if row["state"] == "inflight":
+                    raise PhoneGatewayError("uncertain", 409, "The outcome is unknown. It was not started again.")
+                if row["state"] == "error":
+                    err = row["error"]
+                    raise PhoneGatewayError(err["code"], err["status"], err["message"])
+                result = copy.deepcopy(row["result"])
+                return {"operation_id": claim.operation_id, "kind": claim.kind, "duplicate": True,
+                        "target": claim.target, "result": result}
+            if len(self._gateway_ops) >= 1024:
+                raise PhoneGatewayError("unavailable", 503, "The computer cannot take another request.")
+            self._gateway_ops[claim.operation_id] = {
+                "digest": claim.digest, "phone_id": claim.phone_id, "kind": claim.kind,
+                "state": "inflight", "result": None, "error": None,
+            }
+        return None
+
+    def _gateway_settle(self, claim, outcome):
+        with self._mu:
+            row = self._gateway_ops.get(claim.operation_id)
+            if row is None or not _eq(row["digest"], claim.digest):
+                return
+            if isinstance(outcome, PhoneGatewayError):
+                row["state"] = "error"
+                row["error"] = {"code": outcome.code, "status": outcome.status, "message": outcome.message}
+                row["result"] = None
+                return
+            row["state"] = "done"
+            row["result"] = copy.deepcopy(outcome)
+            row["error"] = None
+
+    def _gateway_status(self, phone, body):
+        """The stored projection. Does not run the handler or the guard again."""
+        operation_id = body.get("operation_id")
+        if not isinstance(operation_id, str) or not _OP_ID.fullmatch(operation_id):
+            raise PhoneGatewayError("not_found", 404, "No such request.")
+        with self._mu:
+            row = self._gateway_ops.get(operation_id)
+            if row is None or row["phone_id"] != phone["id"]:
+                raise PhoneGatewayError("not_found", 404, "No such request.")
+            if body.get("kind") not in (None, row["kind"]):
+                raise PhoneGatewayError("not_found", 404, "No such request.")
+            if row["state"] == "error":
+                err = row["error"]
+                raise PhoneGatewayError(err["code"], err["status"], err["message"])
+            if row["state"] != "done" or not isinstance(row["result"], dict):
+                raise PhoneGatewayError("uncertain", 409, "The outcome is unknown. It was not started again.")
+            return copy.deepcopy(row["result"])
+
+    def accept_gateway_phone(self, claim, kind, operation_id, body, *, guard,
+                             signed_operation=None, admission_ticket=None):
+        """PhoneServer entry for the gateway seam. No listener and no cookie check."""
+        return _accept_gateway_phone(
+            claim, kind, operation_id, body, guard=guard, signed_operation=signed_operation,
+            admission_ticket=admission_ticket, receiver=self)
+
     # ---- static shell
     def shell_version(self):
         """A short hash of the shell files: a new one makes phones fetch the new shell."""
@@ -1677,3 +1778,989 @@ def cli(args, config, state):
     if args.action == "pair":
         return pair_cli(state, args.name, args.allow_desktop)
     raise ValueError("Usage: jarvis phone on|off|status|pair|list|revoke")
+
+
+# ---- gateway phone receiver -------------------------------------------------------------
+# The PC seam for a signed transient envelope. WS5 calls GatewayPhoneReceiver.
+# This does not listen, does not read Tailscale whois, and does not import a
+# cookie. A phone mutation runs only inside ExecutorGuard.accept.
+
+GATEWAY_PHONE_NS = "jarvis-continuity-gateway-phone-v1"
+GATEWAY_PHONE_PURPOSE = "gateway_phone"
+# verify_message only accepts the namespaces gateway.py lists. The ingress
+# installation key signs in DEVICE_NS. GATEWAY_PHONE_NS is a signed prefix so
+# those bytes are not a device-authentication message.
+_GATEWAY_PHONE_FIELDS = (
+    "attempt_id", "authority_id", "digest", "domain", "epoch", "fleet_id",
+    "incarnation", "issuer_incarnation", "kind", "main", "manage_main",
+    "mode_version", "opener", "operation_id", "phone_id", "policy_version",
+    "purpose", "role", "target", "v",
+)
+# Ingress imports this tuple lazily and signs exactly these fields. There is no second schema.
+GATEWAY_PHONE_FIELDS = _GATEWAY_PHONE_FIELDS
+_READ_KINDS = frozenset({"overview", "fleet", "ask_poll", "session_frame", "effect_status"})
+_EFFECT_KINDS = frozenset({"ask", "session_start", "session_input", "session_stop", "logout_end"})
+_EFFECT_CLASS = {
+    "ask": "ordinary", "logout_end": "ordinary", "session_stop": "ordinary",
+    "session_start": "interactive", "session_input": "interactive",
+}
+_RELAY_KEYS = frozenset({
+    "operation_id", "target", "attempt_id", "digest", "capability", "kind",
+    "authority_id", "incarnation", "epoch", "main", "envelope_b64",
+})
+_ENVELOPE_KEYS = frozenset({"v", "claim", "signature", "body"})
+_BANNED_KEYS = frozenset({
+    "cookie", "cookies", "set-cookie", "x-forwarded-for", "forwarded",
+    "authorization", "proxy-authorization", "tailscale-user-login",
+    "stable_id", "whois", "csrf", "csrf_token", "password", "secret", "token",
+    "url", "host", "upstream", "connect_ip",
+})
+_BODY_REQUIRED = {
+    "ask": frozenset({"text"}),
+    "session_start": frozenset({"device", "session_kind"}),
+    "session_input": frozenset({"session", "events"}),
+    "session_stop": frozenset({"session"}),
+    "logout_end": frozenset({"phone_id"}),
+    "overview": frozenset(),
+    "fleet": frozenset(),
+    "ask_poll": frozenset({"job"}),
+    "session_frame": frozenset({"session"}),
+    "effect_status": frozenset(),
+}
+_BODY_OPTIONAL = {
+    "ask": frozenset({"device"}),
+    "session_start": frozenset({"quality"}),
+    "session_stop": frozenset({"release_only"}),
+    "ask_poll": frozenset({"after"}),
+    "session_frame": frozenset({"after"}),
+    "effect_status": frozenset({"operation_id", "kind"}),
+}
+_PHONE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_OP_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+_IDENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_JOB_RE = re.compile(r"[0-9a-f]{6,32}")
+_SESSION_RE = re.compile(r"[0-9a-f]{32}")
+_PUBLIC_KEY_RE = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]+={0,2}")
+_MARK = object()
+
+
+class PhoneGatewayError(Exception):
+    """A refusal safe to show. It never includes the request body."""
+
+    def __init__(self, code, status, message):
+        super().__init__(code)
+        self.code, self.status, self.message = code, int(status), message
+
+    def body(self):
+        return {"error": self.message, "code": self.code}
+
+
+class GatewayPhoneClaim:
+    """Opaque phone claim. Only GatewayPhoneVerifier can construct one."""
+
+    __slots__ = (
+        "_phone_id", "_opener", "_operation_id", "_attempt_id", "_kind", "_digest",
+        "_main", "_authority_id", "_fleet_id", "_incarnation", "_epoch",
+        "_mode_version", "_policy_version", "_issuer_incarnation", "_target", "_mark", "_stamp",
+    )
+
+    def __new__(cls, mark, **fields):
+        if cls is not GatewayPhoneClaim or mark is not _MARK:
+            raise PhoneGatewayError("forbidden", 403, "A phone claim is only issued by the verifier.")
+        return object.__new__(cls)
+
+    def __init__(self, mark, **fields):
+        if mark is not _MARK:
+            raise PhoneGatewayError("forbidden", 403, "A phone claim is only issued by the verifier.")
+        for name, value in fields.items():
+            object.__setattr__(self, name, value)
+        object.__setattr__(self, "_mark", _MARK)
+        object.__setattr__(self, "_stamp", self._fingerprint())
+
+    def _fingerprint(self):
+        raw = json.dumps([
+            self._phone_id, self._opener, self._operation_id, self._attempt_id, self._kind,
+            self._digest, self._main, self._authority_id, self._fleet_id, self._incarnation,
+            self._epoch, self._mode_version, self._policy_version, self._issuer_incarnation,
+            self._target,
+        ], separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(raw).hexdigest()
+
+    def _intact(self):
+        if self._mark is not _MARK:
+            return False
+        try:
+            return hmac.compare_digest(self._stamp, self._fingerprint())
+        except Exception:
+            return False
+
+    def __setattr__(self, name, value):
+        raise PhoneGatewayError("forbidden", 403, "A phone claim cannot be changed.")
+
+    def __repr__(self):
+        return f"GatewayPhoneClaim(phone_id={self._phone_id!r}, kind={self._kind!r})"
+
+    @property
+    def phone_id(self):
+        return self._phone_id
+
+    @property
+    def opener(self):
+        return self._opener
+
+    @property
+    def operation_id(self):
+        return self._operation_id
+
+    @property
+    def attempt_id(self):
+        return self._attempt_id
+
+    @property
+    def kind(self):
+        return self._kind
+
+    @property
+    def digest(self):
+        return self._digest
+
+    @property
+    def main(self):
+        return self._main
+
+    @property
+    def authority_id(self):
+        return self._authority_id
+
+    @property
+    def fleet_id(self):
+        return self._fleet_id
+
+    @property
+    def incarnation(self):
+        return self._incarnation
+
+    @property
+    def epoch(self):
+        return self._epoch
+
+    @property
+    def mode_version(self):
+        return self._mode_version
+
+    @property
+    def policy_version(self):
+        return self._policy_version
+
+    @property
+    def issuer_incarnation(self):
+        return self._issuer_incarnation
+
+    @property
+    def target(self):
+        return self._target
+
+    @property
+    def role(self):
+        return "phone"
+
+    @property
+    def manage_main(self):
+        return False
+
+
+def _gateway():
+    from jarvis.continuity import gateway
+    return gateway
+
+
+def _authority_error():
+    from jarvis.continuity.authority import AuthorityError
+    return AuthorityError
+
+
+def _pinned_key(value):
+    if not isinstance(value, str) or not _PUBLIC_KEY_RE.fullmatch(value):
+        raise PhoneGatewayError("forbidden", 403, "The pinned key is not an ed25519 public key.")
+    return value
+
+
+def _ident(value, label):
+    if not isinstance(value, str) or not _IDENT.fullmatch(value):
+        raise PhoneGatewayError("bad_request", 400, f"{label} must be a short identifier.")
+    return value
+
+
+def _nnint(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PhoneGatewayError("bad_request", 400, f"{label} must be a non-negative integer.")
+    return value
+
+
+def _eq(left, right):
+    if not isinstance(left, str) or not isinstance(right, str) or len(left) != len(right):
+        return False
+    return hmac.compare_digest(left, right)
+
+
+def _banned(value, depth=0):
+    if depth > 8:
+        raise PhoneGatewayError("bad_request", 400, "That request cannot be checked.")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise PhoneGatewayError("bad_request", 400, "That request cannot be checked.")
+            folded = key.lower().replace("_", "-")
+            if folded in _BANNED_KEYS or key.lower() in _BANNED_KEYS:
+                raise PhoneGatewayError("forbidden", 403, "That request carried an identity the gateway hop cannot present.")
+            _banned(item, depth + 1)
+    elif isinstance(value, list):
+        if len(value) > 200:
+            raise PhoneGatewayError("bad_request", 400, "That request is too large.")
+        for item in value:
+            _banned(item, depth + 1)
+
+
+def _canonical_body(body):
+    if not isinstance(body, dict):
+        raise PhoneGatewayError("bad_request", 400, "Send a JSON object.")
+    _banned(body)
+    try:
+        raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    except (TypeError, ValueError):
+        raise PhoneGatewayError("bad_request", 400, "That request cannot be checked.") from None
+    encoded = raw.encode("utf-8")
+    if len(encoded) > MAX_BODY:
+        raise PhoneGatewayError("bad_request", 400, "That request is too large.")
+    return encoded
+
+
+def gateway_phone_digest(body):
+    """sha256 of the canonical phone body. This is the admission digest, not the relay digest."""
+    return "sha256:" + hashlib.sha256(_canonical_body(body)).hexdigest()
+
+
+def gateway_phone_message(fields):
+    """Bytes the ingress key signs. The SSH namespace is DEVICE_NS."""
+    if not isinstance(fields, dict) or set(fields) != set(_GATEWAY_PHONE_FIELDS):
+        raise PhoneGatewayError("bad_request", 400, "The phone claim fields are not the signed set.")
+    gateway = _gateway()
+    try:
+        signed = gateway._message(gateway.DEVICE_NS, fields)
+    except Exception:
+        raise PhoneGatewayError("bad_request", 400, "The phone claim cannot be signed.") from None
+    raw = GATEWAY_PHONE_NS.encode("ascii") + b"\n" + signed
+    if len(raw) > gateway.MAX_BODY:
+        raise PhoneGatewayError("bad_request", 400, "The phone claim cannot be signed.")
+    return raw
+
+
+def _body_shape(kind, body):
+    if kind not in _BODY_REQUIRED:
+        raise PhoneGatewayError("bad_request", 400, "Unknown request.")
+    if not isinstance(body, dict):
+        raise PhoneGatewayError("bad_request", 400, "Send a JSON object.")
+    allowed = _BODY_REQUIRED[kind] | _BODY_OPTIONAL.get(kind, frozenset())
+    if set(body) - allowed or any(key not in body for key in _BODY_REQUIRED[kind]):
+        raise PhoneGatewayError("bad_request", 400, "That request has the wrong fields.")
+    _banned(body)
+    return body
+
+
+def _check_semantics(fields, body):
+    if fields.get("domain") != GATEWAY_PHONE_NS or fields.get("purpose") != GATEWAY_PHONE_PURPOSE:
+        raise PhoneGatewayError("forbidden", 403, "The signature is not a phone claim.")
+    if fields.get("v") != 1 or fields.get("role") != "phone" or fields.get("manage_main") is not False:
+        raise PhoneGatewayError("forbidden", 403, "This phone cannot do that.")
+    phone_id = fields.get("phone_id")
+    if not isinstance(phone_id, str) or not _PHONE_ID.fullmatch(phone_id):
+        raise PhoneGatewayError("forbidden", 403, "The phone identity was not verified.")
+    opener = "phone:" + phone_id
+    if not _eq(fields.get("opener"), opener):
+        raise PhoneGatewayError("forbidden", 403, "The phone opener does not match the signed phone.")
+    if not isinstance(fields.get("operation_id"), str) or not _OP_ID.fullmatch(fields["operation_id"]):
+        raise PhoneGatewayError("bad_request", 400, "This request needs a stable operation id.")
+    _ident(fields.get("attempt_id"), "attempt_id")
+    _ident(fields.get("main"), "main")
+    _ident(fields.get("target"), "target")
+    _ident(fields.get("authority_id"), "authority_id")
+    _ident(fields.get("fleet_id"), "fleet_id")
+    for label in ("incarnation", "epoch", "mode_version", "policy_version", "issuer_incarnation"):
+        _nnint(fields.get(label), label)
+    kind = fields.get("kind")
+    if kind not in _READ_KINDS and kind not in _EFFECT_KINDS:
+        raise PhoneGatewayError("bad_request", 400, "Unknown request.")
+    digest = fields.get("digest")
+    if not isinstance(digest, str) or not _DIGEST_RE.fullmatch(digest):
+        raise PhoneGatewayError("bad_request", 400, "The request digest is not valid.")
+    if not _eq(digest, gateway_phone_digest(body)):
+        raise PhoneGatewayError("bad_request", 400, "The request does not match the signed claim.")
+    _body_shape(kind, body)
+    return opener
+
+
+class GatewayPhoneVerifier:
+    """Verify one ingress-signed transient envelope and mint a phone claim.
+
+    The public key is pinned here. The envelope cannot choose a key.
+    """
+
+    def __init__(self, public_key):
+        self._public_key = _pinned_key(public_key)
+
+    def verify(self, envelope):
+        data = self._object(envelope)
+        claim, body, signature = data.get("claim"), data.get("body"), data.get("signature")
+        if not isinstance(claim, dict) or set(claim) != set(_GATEWAY_PHONE_FIELDS):
+            raise PhoneGatewayError("bad_request", 400, "The phone claim fields are not the signed set.")
+        if not isinstance(signature, str) or not isinstance(body, dict) or data.get("v") != 1:
+            raise PhoneGatewayError("unauthorized", 401, "The phone signature was refused.")
+        gateway = _gateway()
+        try:
+            ok = gateway.verify_message(
+                gateway.DEVICE_NS, gateway_phone_message(claim), signature, self._public_key)
+        except PhoneGatewayError:
+            raise
+        except Exception:
+            ok = False
+        if ok is not True:
+            raise PhoneGatewayError("unauthorized", 401, "The phone signature was refused.")
+        _check_semantics(claim, body)
+        return self._mint(claim)
+
+    def _object(self, envelope):
+        if isinstance(envelope, (bytes, bytearray)):
+            if not envelope or len(envelope) > MAX_BODY:
+                raise PhoneGatewayError("bad_request", 400, "That request is too large.")
+            try:
+                data = json.loads(bytes(envelope).decode("utf-8"))
+            except (UnicodeError, ValueError):
+                raise PhoneGatewayError("bad_request", 400, "That request cannot be checked.") from None
+        elif isinstance(envelope, dict):
+            data = envelope
+        else:
+            raise PhoneGatewayError("bad_request", 400, "That request cannot be checked.")
+        if not isinstance(data, dict) or set(data) != _ENVELOPE_KEYS:
+            raise PhoneGatewayError("bad_request", 400, "Unknown phone envelope.")
+        _banned(data.get("claim"))
+        _banned(data.get("body"))
+        return data
+
+    def _mint(self, fields):
+        opener = "phone:" + fields["phone_id"]
+        return GatewayPhoneClaim(
+            _MARK, _phone_id=fields["phone_id"], _opener=opener,
+            _operation_id=fields["operation_id"], _attempt_id=fields["attempt_id"],
+            _kind=fields["kind"], _digest=fields["digest"], _main=fields["main"],
+            _authority_id=fields["authority_id"], _fleet_id=fields["fleet_id"],
+            _incarnation=fields["incarnation"], _epoch=fields["epoch"],
+            _mode_version=fields["mode_version"], _policy_version=fields["policy_version"],
+            _issuer_incarnation=fields["issuer_incarnation"], _target=fields["target"])
+
+
+class GatewayTicketVerifier:
+    """MAIN admission verifier. `verify` is true only after `verify_message`.
+
+    Pass this object as `ExecutorGuard`'s verifier. When the authority client
+    needs `ticket_signature` (the gateway port), pass this same object as the
+    guard's authority too: `verify` keeps the signature and `consume` forwards it.
+    A callback that returns true is not a verifier.
+    """
+
+    def __init__(self, public_keys, authority=None):
+        if not isinstance(public_keys, dict) or not public_keys:
+            raise PhoneGatewayError("forbidden", 403, "No MAIN key is pinned.")
+        self._keys = {str(key): _pinned_key(value) for key, value in public_keys.items()}
+        self._authority = authority
+        self._signed = {}
+        self._lock = threading.Lock()
+        self._peer = _ingress_ticket_verifier(self._keys)
+
+    def __call__(self, signed):
+        return self.verify(signed)
+
+    def verify(self, signed):
+        try:
+            fields, signature, key = self._parts(signed)
+        except Exception:
+            return False
+        gateway = _gateway()
+        try:
+            ok = gateway.verify_message(gateway.TICKET_NS, gateway._message(gateway.TICKET_NS, fields), signature, key)
+        except Exception:
+            return False
+        if ok is not True:
+            return False
+        if self._peer is not None and _peer_accepts(self._peer, signed) is not True:
+            return False
+        with self._lock:
+            self._signed[fields["admission_id"]] = (dict(fields), signature)
+        return True
+
+    def _parts(self, signed):
+        from jarvis.continuity.authority import TICKET_FIELDS
+        if not isinstance(signed, dict):
+            return None
+        signature = signed.get("signature")
+        main = signed.get("main")
+        key = self._keys.get(main)
+        if not isinstance(signature, str) or key is None:
+            raise PhoneGatewayError("unauthorized", 401, "The ticket signature was refused.")
+        fields = {}
+        for name in TICKET_FIELDS:
+            if name not in signed:
+                raise PhoneGatewayError("bad_request", 400, "The ticket fields are incomplete.")
+            fields[name] = signed[name]
+        return fields, signature, key
+
+    def status(self):
+        return self._forward("status")
+
+    def acknowledge(self, *args, **kwargs):
+        if self._authority is None:
+            raise _authority_error()("no_authority", "no authority client")
+        return self._authority.acknowledge(*args, **kwargs)
+
+    def admission(self, admission_id):
+        if self._authority is None:
+            raise _authority_error()("no_authority", "no authority client")
+        return self._authority.admission(admission_id)
+
+    def consume(self, **fields):
+        """Forward a ticket this object has already verified."""
+        if self._authority is None:
+            raise _authority_error()("no_authority", "no authority client")
+        with self._lock:
+            stored = self._signed.get(fields.get("admission_id"))
+        if stored is None:
+            raise _authority_error()("signature", "ticket was not verified against a MAIN signature")
+        original, signature = stored
+        for key, value in original.items():
+            if fields.get(key) != value and not _close_number(value, fields.get(key)):
+                raise _authority_error()("signature", "ticket fields differ from the signed ticket")
+        import inspect
+        params = inspect.signature(self._authority.consume).parameters
+        if "ticket_signature" in params:
+            return self._authority.consume(**fields, ticket_signature=signature)
+        return self._authority.consume(**fields)
+
+    def _forward(self, name):
+        if self._authority is None:
+            raise _authority_error()("no_authority", "no authority client")
+        return getattr(self._authority, name)()
+
+
+def _close_number(left, right):
+    if isinstance(left, bool) or isinstance(right, bool):
+        return False
+    if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+        return False
+    return abs(float(left) - float(right)) <= 1e-6
+
+
+def _peer_accepts(peer, signed):
+    """True only when the ingress ticket verifier accepts `signed`.
+
+    `TicketSignatureVerifier` is called. It has no `verify` method.
+    """
+    try:
+        if callable(peer):
+            return peer(signed) is True
+        method = getattr(peer, "verify", None)
+        if callable(method):
+            return method(signed) is True
+    except Exception:
+        return False
+    return False
+
+
+def _ingress_ticket_verifier(public_keys):
+    """Use ingress.TicketSignatureVerifier when that class exists. Read only."""
+    try:
+        from jarvis.continuity import ingress as ingress_mod
+    except Exception:
+        return None
+    cls = getattr(ingress_mod, "TicketSignatureVerifier", None)
+    if not isinstance(cls, type):
+        return None
+    try:
+        peer = cls(dict(public_keys))
+    except Exception:
+        return None
+    if not (callable(peer) or callable(getattr(peer, "verify", None))):
+        return None
+    return peer
+
+
+def _real_guard(guard):
+    verifier = getattr(guard, "_verifier", None)
+    if isinstance(verifier, GatewayTicketVerifier):
+        return True
+    owner = getattr(verifier, "__self__", None)
+    if isinstance(owner, GatewayTicketVerifier):
+        return True
+    candidate = owner if owner is not None else verifier
+    cls = type(candidate)
+    if cls.__name__ == "TicketSignatureVerifier" and cls.__module__ == "jarvis.continuity.ingress":
+        return callable(candidate) or callable(getattr(candidate, "verify", None))
+    return False
+
+
+def _ticket_matches(claim, signed, ticket, guard):
+    from jarvis.continuity.authority import TICKET_FIELDS
+    if not isinstance(signed, dict) or not isinstance(ticket, dict):
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the phone claim.")
+    _banned(signed)
+    _banned(ticket)
+    allowed = set(TICKET_FIELDS) | {
+        "authority_id", "fleet_id", "mode_version", "policy_version", "effect_class",
+        "signature", "session_id",
+    }
+    if set(signed) - allowed or any(name not in signed for name in TICKET_FIELDS):
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the phone claim.")
+    if not isinstance(signed.get("signature"), str) or "effect_class" not in signed:
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the phone claim.")
+    if set(ticket) != set(TICKET_FIELDS):
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the phone claim.")
+    for name in TICKET_FIELDS:
+        if name in ("issued_at", "admit_until"):
+            if not _close_number(signed.get(name), ticket.get(name)):
+                raise PhoneGatewayError("bad_request", 400, "The admission does not match the phone claim.")
+            continue
+        if signed.get(name) != ticket.get(name):
+            raise PhoneGatewayError("bad_request", 400, "The admission does not match the phone claim.")
+    if not _eq(signed.get("operation_id"), claim.operation_id) or not _eq(ticket.get("operation_id"), claim.operation_id):
+        raise PhoneGatewayError("conflict", 409, "The admission is for a different request.")
+    if not _eq(signed.get("attempt_id"), claim.attempt_id):
+        raise PhoneGatewayError("conflict", 409, "The admission is for a different request.")
+    if not _eq(signed.get("digest"), claim.digest) or not _eq(ticket.get("digest"), claim.digest):
+        raise PhoneGatewayError("conflict", 409, "The admission does not match the request.")
+    if (signed.get("main") != claim.main or ticket.get("main") != claim.main
+            or signed.get("target") != claim.target or ticket.get("target") != claim.target
+            or signed.get("authority_id") != claim.authority_id
+            or signed.get("fleet_id") != claim.fleet_id):
+        raise PhoneGatewayError("stale", 409, "The admission is for a different computer.")
+    for label in ("incarnation", "epoch", "issuer_incarnation"):
+        if signed.get(label) != getattr(claim, label) or ticket.get(label) != getattr(claim, label):
+            raise PhoneGatewayError("stale", 409, "Authority moved on. Nothing was changed.")
+    if signed.get("mode_version") != claim.mode_version or signed.get("policy_version") != claim.policy_version:
+        raise PhoneGatewayError("stale", 409, "Authority moved on. Nothing was changed.")
+    if getattr(guard, "device_id", None) != claim.target or getattr(guard, "fleet_id", None) != claim.fleet_id:
+        raise PhoneGatewayError("forbidden", 403, "The admission is for a different computer.")
+    if getattr(guard, "authority_id", None) != claim.authority_id:
+        raise PhoneGatewayError("forbidden", 403, "The admission is for a different computer.")
+    effect = _EFFECT_CLASS[claim.kind]
+    if signed.get("effect_class") != effect:
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the request.")
+    session = signed.get("session_id", None)
+    if effect != "interactive" and "session_id" in signed and session is not None:
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the request.")
+    if claim.kind == "session_start" and session not in (None, claim.operation_id):
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the request.")
+    if claim.kind == "session_input" and (not isinstance(session, str) or not _SESSION_RE.fullmatch(session)):
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the session.")
+    return effect
+
+
+def _precheck(server, kind, body, phone_id):
+    if kind == "ask":
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > ASK_MAX:
+            raise PhoneGatewayError("bad_request", 400, "Type something for JARVIS to do.")
+        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text).strip()
+        if not text:
+            raise PhoneGatewayError("bad_request", 400, "Type something for JARVIS to do.")
+        try:
+            from .assistant import confirmation_words
+            words = text.lower().replace("\u2019", "'").rstrip(".!?").strip()
+            blocked = bool(confirmation_words(text)) or _APPROVALS.fullmatch(words) is not None
+        except PhoneGatewayError:
+            raise
+        except Exception:
+            blocked = True
+        if blocked:
+            raise PhoneGatewayError("bad_request", 400, "Approve on your PC.")
+        if server.console is None:
+            raise PhoneGatewayError("unavailable", 503, "Ask needs JARVIS's main runtime.")
+        target = body.get("device")
+        if target is not None:
+            if not isinstance(target, str) or target not in (server.config.get("devices") or {}):
+                raise PhoneGatewayError("bad_request", 400, "Choose a known computer.")
+            if server.hub is None:
+                raise PhoneGatewayError("unavailable", 503, "The computer link is unavailable.")
+            if target != getattr(server.hub, "main", None):
+                try:
+                    caps = server.hub.target_caps(target)
+                except Exception:
+                    raise PhoneGatewayError("conflict", 409, "That computer is unavailable.") from None
+                ok, why = caps.get("remote", (False, "Desktop actions unavailable."))
+                if not ok:
+                    raise PhoneGatewayError("conflict", 409, clean_text(why, 300) or "That computer is unavailable.")
+        return
+    if kind == "session_start":
+        if body.get("session_kind") not in KINDS:
+            raise PhoneGatewayError("bad_request", 400, "kind must be screen or camera.")
+        if body.get("quality", "low") not in QUALITIES:
+            raise PhoneGatewayError("bad_request", 400, "quality must be low, medium or high.")
+        if body.get("device") not in (server.config.get("devices") or {}):
+            raise PhoneGatewayError("bad_request", 400, "Pick one of your computers.")
+        if server.hub is None:
+            raise PhoneGatewayError("unavailable", 503, "Remote control needs JARVIS's main runtime.")
+        return
+    if kind == "session_input":
+        if not isinstance(body.get("session"), str) or not _SESSION_RE.fullmatch(body["session"]):
+            raise PhoneGatewayError("not_found", 404, "No such session.")
+        events = body.get("events")
+        if not isinstance(events, list) or len(events) > 200:
+            raise PhoneGatewayError("bad_request", 400, "events must be a list of at most 200.")
+        try:
+            from jarvis.remote_view import clean_event
+            for event in events:
+                clean_event(event)
+        except PhoneGatewayError:
+            raise
+        except Exception:
+            raise PhoneGatewayError("bad_request", 400, "Unknown input event.") from None
+        return
+    if kind == "session_stop":
+        if not isinstance(body.get("session"), str) or not _SESSION_RE.fullmatch(body["session"]):
+            raise PhoneGatewayError("not_found", 404, "No such session.")
+        if "release_only" in body and not isinstance(body.get("release_only"), bool):
+            raise PhoneGatewayError("bad_request", 400, "That request has the wrong fields.")
+        return
+    if kind == "logout_end":
+        if body.get("phone_id") != phone_id:
+            raise PhoneGatewayError("forbidden", 403, "The phone identity was not verified.")
+        return
+    if kind == "ask_poll":
+        if not isinstance(body.get("job"), str) or not _JOB_RE.fullmatch(body["job"]):
+            raise PhoneGatewayError("not_found", 404, "No such request.")
+        _after(body)
+        return
+    if kind == "session_frame":
+        if not isinstance(body.get("session"), str) or not _SESSION_RE.fullmatch(body["session"]):
+            raise PhoneGatewayError("not_found", 404, "No such session.")
+        _after(body)
+        return
+    if kind in ("overview", "fleet", "effect_status"):
+        return
+    raise PhoneGatewayError("bad_request", 400, "Unknown request.")
+
+
+def _after(body):
+    if "after" not in body:
+        return 0
+    value = body.get("after")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PhoneGatewayError("bad_request", 400, "after must be a frame or trace number.")
+    return value
+
+
+def _status_int(status, name):
+    value = status.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise PhoneGatewayError("unavailable", 503, "The computer could not read its authority.")
+    return value
+
+
+def _tuple_live(claim, guard):
+    """Refuse unless the signed tuple is the authority's current online MAIN.
+
+    This calls ``authority.status`` only. It does not consume and it does not
+    call ``guard.accept``.
+    """
+    authority = getattr(guard, "_authority", None)
+    status_fn = getattr(authority, "status", None)
+    if not callable(status_fn):
+        raise PhoneGatewayError("unavailable", 503, "The computer could not read its authority.")
+    try:
+        status = status_fn()
+    except PhoneGatewayError:
+        raise
+    except Exception:
+        raise PhoneGatewayError("unavailable", 503, "The computer could not read its authority.") from None
+    if not isinstance(status, dict):
+        raise PhoneGatewayError("unavailable", 503, "The computer could not read its authority.")
+    if (status.get("main") != claim.main or status.get("authority_id") != claim.authority_id
+            or status.get("fleet_id") != claim.fleet_id
+            or _status_int(status, "incarnation") != claim.incarnation
+            or _status_int(status, "epoch") != claim.epoch
+            or _status_int(status, "mode_version") != claim.mode_version
+            or _status_int(status, "policy_version") != claim.policy_version
+            or status.get("lease_valid") is not True or status.get("main_ready") is not True
+            or status.get("mode") != "V2_ACTIVE"):
+        raise PhoneGatewayError("stale", 409, "Authority moved on. Nothing was changed.")
+    return status
+
+
+def _gateway_wire(kind, internal):
+    """Transient JSON the gateway already accepts.
+
+    Effects are exactly ``{operation_id, accepted}``. Reads are
+    ``{operation_id, result:{status, body}}`` plus ``raw_b64`` for a frame.
+    """
+    operation_id = internal.get("operation_id")
+    if kind in _EFFECT_KINDS:
+        return {"operation_id": operation_id, "accepted": True}
+    result = internal.get("result")
+    status, raw, body = 200, None, result
+    if kind == "session_frame" and isinstance(result, dict):
+        found = result.get("http_status", 200)
+        if isinstance(found, int) and not isinstance(found, bool):
+            status = found
+        if isinstance(result.get("raw"), (bytes, bytearray)):
+            raw = bytes(result["raw"])
+        body = {key: value for key, value in result.items() if key not in ("raw", "http_status")}
+    wire = {"operation_id": operation_id, "result": {"status": status, "body": body}}
+    if raw:
+        import base64
+        wire["raw_b64"] = base64.b64encode(raw).decode("ascii")
+    return wire
+
+
+def _perform(server, phone, kind, body, operation_id=None):
+    try:
+        if kind == "overview":
+            return server.overview(phone)
+        if kind == "fleet":
+            return server.fleet(phone)
+        if kind == "ask_poll":
+            after = _after(body)
+            return server.ask_job(phone, body["job"], {"after": [str(after)]})
+        if kind == "session_frame":
+            after = _after(body)
+            frame = server.frame(phone, {"session": [body["session"]], "after": [str(after)]})
+            if frame is None:
+                return {"http_status": 204, "node_ago": server.node_ago(phone, body["session"])}
+            seq, jpeg, width, height = frame
+            if not isinstance(jpeg, (bytes, bytearray)):
+                raise PhoneGatewayError("bad_gateway", 502, "The picture was refused.")
+            return {"http_status": 200, "raw": bytes(jpeg), "frame_seq": seq,
+                    "frame_width": width, "frame_height": height}
+        if kind == "effect_status":
+            return server._gateway_status(phone, body)
+        if kind == "ask":
+            # Retry key for this operation. It is not part of the signed body.
+            payload = dict(body)
+            if isinstance(operation_id, str):
+                payload["key"] = operation_id
+            return server.ask(phone, payload)
+        if kind == "session_start":
+            payload = {"device": body["device"], "kind": body["session_kind"],
+                       "quality": body.get("quality") or "low"}
+            return server.start_session(phone, payload)
+        if kind == "session_input":
+            return server.session_input(phone, {"session": body["session"], "events": body["events"]})
+        if kind == "session_stop":
+            # release_only still closes the session and drops held input.
+            return server.stop_session(phone, {"session": body["session"]})
+        if kind == "logout_end":
+            return server.gateway_logout(phone)
+    except Reply as exc:
+        message = exc.body.get("error") if isinstance(exc.body, dict) else "Refused."
+        raise PhoneGatewayError(_reply_code(exc.status), exc.status, clean_text(message, 300) or "Refused.") from None
+    raise PhoneGatewayError("bad_request", 400, "Unknown request.")
+
+
+def _reply_code(status):
+    return {400: "bad_request", 401: "unauthorized", 403: "forbidden", 404: "not_found",
+            409: "conflict", 410: "gone", 429: "busy", 502: "bad_gateway", 503: "unavailable"}.get(status, "unavailable")
+
+
+def _project(kind, value):
+    """Handler result with identity-bearing keys removed. Frames stay bytes in RAM."""
+    if kind == "session_frame" and isinstance(value, dict):
+        return value
+    if not isinstance(value, dict):
+        return {"kind": kind}
+    out = {}
+    for key, item in value.items():
+        if not isinstance(key, str):
+            continue
+        folded = key.lower().replace("_", "-")
+        if folded in _BANNED_KEYS or key.lower() in _BANNED_KEYS:
+            continue
+        out[key] = item
+    out["kind"] = kind
+    if isinstance(out.get("reply"), str):
+        out["reply"] = out["reply"][:20000]
+    return out
+
+
+def _accept_gateway_phone(claim, kind, operation_id, body, *, guard, signed_operation=None,
+                          admission_ticket=None, receiver=None):
+    if isinstance(claim, dict) or type(claim) is not GatewayPhoneClaim or not claim._intact():
+        raise PhoneGatewayError("forbidden", 403, "The phone identity was not verified.")
+    if not isinstance(operation_id, str) or not _eq(operation_id, claim.operation_id):
+        raise PhoneGatewayError("conflict", 409, "The operation id does not match the signed claim.")
+    if kind != claim.kind:
+        raise PhoneGatewayError("conflict", 409, "The request does not match the signed claim.")
+    if not isinstance(receiver, PhoneServer):
+        raise PhoneGatewayError("unavailable", 503, "The phone receiver is not configured.")
+    _body_shape(kind, body)
+    if not _eq(claim.digest, gateway_phone_digest(body)):
+        raise PhoneGatewayError("bad_request", 400, "The request does not match the signed claim.")
+    if kind in _READ_KINDS:
+        _tuple_live(claim, guard)
+        phone = receiver.gateway_identity(claim)
+        _precheck(receiver, kind, body, claim.phone_id)
+        if kind == "effect_status":
+            result = receiver._gateway_status(phone, body)
+        else:
+            result = _perform(receiver, phone, kind, body)
+            if kind != "session_frame":
+                result = _project(kind, result)
+        _tuple_live(claim, guard)
+        return {"operation_id": claim.operation_id, "kind": kind, "duplicate": False,
+                "target": claim.target, "result": result}
+    if kind not in _EFFECT_KINDS:
+        raise PhoneGatewayError("bad_request", 400, "Unknown request.")
+    if not _real_guard(guard):
+        raise PhoneGatewayError("unavailable", 503, "The computer has no checked admission verifier.")
+    _ticket_matches(claim, signed_operation, admission_ticket, guard)
+    if claim.kind == "session_input" and signed_operation.get("session_id") != body.get("session"):
+        raise PhoneGatewayError("bad_request", 400, "The admission does not match the session.")
+    _tuple_live(claim, guard)
+    phone = receiver.gateway_identity(claim)
+    _precheck(receiver, kind, body, claim.phone_id)
+    replay = receiver._gateway_reserve(claim)
+    if replay is not None:
+        return replay
+    box = []
+
+    def sink():
+        try:
+            box.append(_perform(receiver, phone, kind, body, claim.operation_id))
+        except PhoneGatewayError as exc:
+            box.append(exc)
+        except Reply as exc:
+            message = exc.body.get("error") if isinstance(exc.body, dict) else "Refused."
+            box.append(PhoneGatewayError(_reply_code(exc.status), exc.status, clean_text(message, 300) or "Refused."))
+
+    AuthorityError = _authority_error()
+    try:
+        guard.accept(signed_operation, admission_ticket, sink)
+    except AuthorityError as exc:
+        code = exc.code if exc.code in ("signature", "unauthorized", "forbidden", "bad_request", "stale",
+                                        "conflict", "uncertain", "ticket_expired", "no_admission") else "unavailable"
+        status = {"signature": 401, "unauthorized": 401, "forbidden": 403, "bad_request": 400,
+                  "stale": 409, "conflict": 409, "uncertain": 409, "ticket_expired": 410,
+                  "no_admission": 409}.get(code, 503)
+        error = PhoneGatewayError(code if status != 503 else "unavailable", status,
+                                  "The computer did not admit that request. Nothing was changed.")
+        receiver._gateway_settle(claim, error)
+        raise error from None
+    except PhoneGatewayError as exc:
+        receiver._gateway_settle(claim, exc)
+        raise
+    except Exception:
+        error = PhoneGatewayError("uncertain", 409, "The outcome is unknown. It was not started again.")
+        receiver._gateway_settle(claim, error)
+        raise error from None
+    if not box:
+        error = PhoneGatewayError("uncertain", 409, "The outcome is unknown. It was not started again.")
+        receiver._gateway_settle(claim, error)
+        raise error
+    outcome = box[0]
+    if isinstance(outcome, PhoneGatewayError):
+        receiver._gateway_settle(claim, outcome)
+        raise outcome
+    if kind == "session_stop":
+        try:
+            guard.stop_interactive(body["session"], "phone_release")
+        except AuthorityError:
+            error = PhoneGatewayError("uncertain", 409, "The session release outcome is unknown.")
+            receiver._gateway_settle(claim, error)
+            raise error from None
+    projected = _project(kind, outcome)
+    receiver._gateway_settle(claim, projected)
+    return {"operation_id": claim.operation_id, "kind": kind, "duplicate": False,
+            "target": claim.target, "result": projected}
+
+
+def accept_gateway_phone(claim, kind, operation_id, body, *, guard, signed_operation=None,
+                         admission_ticket=None, receiver=None):
+    """Admit one signed phone request on this PC.
+
+    The return stays in-process. ``GatewayPhoneReceiver.receive`` is the
+    gateway JSON adapter. Reads call ``authority.status`` before and after the
+    handler and never call ``guard.accept``. Mutations call ``guard.accept``
+    before the handler. ``claim`` must be a ``GatewayPhoneClaim`` from
+    ``GatewayPhoneVerifier``.
+    """
+    return _accept_gateway_phone(
+        claim, kind, operation_id, body, guard=guard, signed_operation=signed_operation,
+        admission_ticket=admission_ticket, receiver=receiver)
+
+
+class GatewayPhoneReceiver:
+    """Strict adapter WS5 calls with the gateway's transient relay object.
+
+    No socket, no global registration, no cookie, no X-Forwarded-For.
+    """
+
+    def __init__(self, server, ingress_public_key, *, device_id, guard=None):
+        if not isinstance(server, PhoneServer):
+            raise PhoneGatewayError("unavailable", 503, "The phone receiver is not configured.")
+        self.server = server
+        self.verifier = GatewayPhoneVerifier(ingress_public_key)
+        self.device_id = _ident(device_id, "device_id")
+        self.guard = guard
+
+    def receive(self, relay, *, signed_operation=None, admission_ticket=None):
+        if not isinstance(relay, dict) or set(relay) != _RELAY_KEYS:
+            raise PhoneGatewayError("bad_request", 400, "The relay was refused.")
+        _banned(relay)
+        if relay.get("capability") != "client":
+            raise PhoneGatewayError("forbidden", 403, "The relay was refused.")
+        kind = relay.get("kind")
+        if kind not in _READ_KINDS and kind not in _EFFECT_KINDS:
+            raise PhoneGatewayError("bad_request", 400, "Unknown request.")
+        raw = _envelope_bytes(relay.get("envelope_b64"))
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if not _eq(digest, relay.get("digest")):
+            raise PhoneGatewayError("bad_request", 400, "The relay does not match the envelope.")
+        claim = self.verifier.verify(raw)
+        body = self._body(raw)
+        self._match_relay(relay, claim)
+        if self.device_id != claim.target or relay.get("target") != claim.target:
+            raise PhoneGatewayError("forbidden", 403, "The relay is for a different computer.")
+        internal = accept_gateway_phone(
+            claim, kind, claim.operation_id, body, guard=self.guard,
+            signed_operation=signed_operation, admission_ticket=admission_ticket,
+            receiver=self.server)
+        return _gateway_wire(kind, internal)
+
+    def _body(self, raw):
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError):
+            raise PhoneGatewayError("bad_request", 400, "That request cannot be checked.") from None
+        body = data.get("body")
+        if not isinstance(body, dict):
+            raise PhoneGatewayError("bad_request", 400, "Send a JSON object.")
+        return body
+
+    def _match_relay(self, relay, claim):
+        if not _eq(relay.get("operation_id"), claim.operation_id):
+            raise PhoneGatewayError("conflict", 409, "The relay does not match the signed claim.")
+        if not _eq(relay.get("attempt_id"), claim.attempt_id) or relay.get("kind") != claim.kind:
+            raise PhoneGatewayError("conflict", 409, "The relay does not match the signed claim.")
+        if relay.get("main") != claim.main or relay.get("authority_id") != claim.authority_id:
+            raise PhoneGatewayError("stale", 409, "Authority moved on. Nothing was changed.")
+        if relay.get("incarnation") != claim.incarnation or relay.get("epoch") != claim.epoch:
+            raise PhoneGatewayError("stale", 409, "Authority moved on. Nothing was changed.")
+
+
+def _envelope_bytes(value):
+    if not isinstance(value, str) or len(value) > (MAX_BODY * 4 // 3) + 8:
+        raise PhoneGatewayError("bad_request", 400, "That request is too large.")
+    try:
+        import base64
+        raw = base64.b64decode(value.encode("ascii"), validate=True)
+    except (UnicodeError, ValueError):
+        raise PhoneGatewayError("bad_request", 400, "That request cannot be checked.") from None
+    if not raw or len(raw) > MAX_BODY:
+        raise PhoneGatewayError("bad_request", 400, "That request is too large.")
+    return raw

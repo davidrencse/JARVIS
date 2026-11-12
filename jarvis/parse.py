@@ -110,7 +110,7 @@ VOLUME = (
     (re.compile(r"(?:set\s+)?(?:the\s+)?volume\s+(?:to\s+)?(\d{1,3})(?:\s*(?:percent|%))?\Z"),
      lambda m: m.group(1)),
     (re.compile(r"(?:turn\s+)?(?:the\s+)?volume\s+(up|down)\Z"), lambda m: m.group(1)),
-    (re.compile(r"turn\s+(?:it|the\s+volume|the\s+music|the\s+sound)\s+(up|down)\Z"),
+    (re.compile(r"turn\s+(?:it|the\s+music|the\s+sound)\s+(up|down)\Z"),
      lambda m: m.group(1)),
     (re.compile(r"(mute|unmute)(?:\s+(?:the\s+)?(?:volume|sound|audio|it|music))?\Z"),
      lambda m: m.group(1)),
@@ -244,8 +244,6 @@ BLUETOOTH = (
     (re.compile(r"what\s+bluetooth\s+devices\s+(?:do\s+i\s+have|are\s+paired)\Z"), lambda m: _bluetooth("list")),
     (re.compile(r"(connect|disconnect|pair|forget|unpair)\s+(?:with\s+|from\s+|to\s+)?" + _NOT_BT + _DEVICE_NAME + r"\Z"),
      lambda m: _bluetooth({"unpair": "forget"}.get(m.group(1), m.group(1)), _clean(m.group(2)))),
-    (re.compile(r"connect\s+to\s+" + _NOT_BT + _DEVICE_NAME + r"\Z"),
-     lambda m: _bluetooth("connect", _clean(m.group(1)))),
 )
 SYSTEM = SYSTEM + BLUETOOTH
 

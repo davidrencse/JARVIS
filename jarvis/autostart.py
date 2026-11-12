@@ -106,8 +106,47 @@ def path(name, title):
     return unit_file(f"{name}.service")
 
 
+def _supervisor(argv):
+    """Run one login-manager command. Return an error string when it fails, else None.
+
+    A stand-in that does not return an integer status counts as success: `subprocess.run`
+    applies `check` inside the real function, so a mock of `run` never raises it."""
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{' '.join(argv)} failed: {exc}"
+    code = getattr(result, "returncode", 0)
+    if not isinstance(code, int) or code == 0:
+        return None
+    detail = getattr(result, "stderr", "") or getattr(result, "stdout", "") or ""
+    if not isinstance(detail, str):
+        detail = ""
+    detail = detail.strip()
+    text = f"{' '.join(argv)} failed ({code})"
+    return f"{text}: {detail}" if detail else text
+
+
+def _drop_entry(target):
+    """Remove the launcher file. Return an error string, or None when it is gone."""
+    try:
+        Path(target).unlink(missing_ok=True)
+    except OSError as exc:
+        return f"could not remove {target}: {exc}"
+    return None
+
+
+def _raise_cleanup(*errors):
+    text = "; ".join(error for error in errors if error)
+    if text:
+        raise subprocess.SubprocessError(text)
+
+
 def install(name, title, argv, enable=True):
-    """Turn login startup on or off for argv. Returns {"autostart", "path"}."""
+    """Turn login startup on or off for argv. Returns {"autostart", "path"}.
+
+    Turning off removes the Startup entry, LaunchAgent, or user unit even when the
+    supervisor command fails, and then raises that error. It never signals a process
+    by pid: Windows deletes the launcher, launchctl and systemctl name this unit only."""
     if not NAME.fullmatch(name):
         raise ValueError("Autostart names are lowercase words joined by dashes.")
     if any("\n" in arg or "\r" in arg for arg in argv):
@@ -118,7 +157,7 @@ def install(name, title, argv, enable=True):
         if enable:
             write_launcher(target, argv, windowless=True)
         else:
-            target.unlink(missing_ok=True)
+            _raise_cleanup(_drop_entry(target))
     elif kind == "macos":
         if enable:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -129,8 +168,8 @@ def install(name, title, argv, enable=True):
             subprocess.run(["launchctl", "unload", str(target)], capture_output=True, timeout=15)
             subprocess.run(["launchctl", "load", "-w", str(target)], check=True, timeout=15)
         else:
-            subprocess.run(["launchctl", "unload", "-w", str(target)], capture_output=True, timeout=15)
-            target.unlink(missing_ok=True)
+            error = _supervisor(["launchctl", "unload", "-w", str(target)])
+            _raise_cleanup(error, _drop_entry(target))
     else:
         existed = target.is_file()
         if enable:
@@ -145,10 +184,10 @@ def install(name, title, argv, enable=True):
                 subprocess.run(["systemctl", "--user", "restart", target.name],
                                check=True, timeout=15)
         elif existed:  # never turned on: nothing to disable
-            subprocess.run(["systemctl", "--user", "disable", "--now", target.name],
-                           check=True, timeout=15)
-            target.unlink(missing_ok=True)
-            subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
+            error = _supervisor(["systemctl", "--user", "disable", "--now", target.name])
+            removed = _drop_entry(target)
+            reloaded = _supervisor(["systemctl", "--user", "daemon-reload"])
+            _raise_cleanup(error, removed, reloaded)
     return {"autostart": enable, "path": str(target)}
 
 

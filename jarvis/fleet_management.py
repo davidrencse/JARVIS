@@ -35,7 +35,8 @@ Rules (docs/design/mobile-continuity/FLEET-API.md):
     init and leave). The latest file is re-read under it and only the caller's keys are applied.
     Hand edits are not fenced.
   * MAIN is never an enroll/revoke/capability target and a cloud node is never MAIN eligible.
-    Main transfer is reported `blocked` with the protocol checks that do not exist yet.
+    Main-transfer preview is read-only. POST runs set_main only with an explicit config file
+    and a bound safe handoff; otherwise it stays blocked and does not guess a config path.
 """
 
 import contextlib
@@ -294,8 +295,34 @@ def _profile_of(device):
 
 # --- inventory -------------------------------------------------------------------------
 
-def _actions(owner, local_is_main):
-    """Every action the frontend may show, as supported | guide | blocked | unsupported."""
+def _explicit_config_file(config_path):
+    """An absolute path to a file the caller already named. Relative paths are refused
+    so a test cwd cannot select the checkout's jarvis.config.json."""
+    if config_path is None or isinstance(config_path, bool) or not isinstance(config_path, (str, Path)):
+        return None
+    path = Path(config_path)
+    if not path.is_absolute():
+        return None
+    try:
+        return path if path.is_file() else None
+    except OSError:
+        return None
+
+
+def _handoff_configured(state):
+    from .cluster_cli import configured_handoff
+    try:
+        return configured_handoff(state) is not None
+    except Exception:
+        return False
+
+
+def _actions(owner, local_is_main, state=None, config_path=None):
+    """Every action the frontend may show, as supported | guide | blocked | unsupported.
+
+    main_transfer is supported only for the owner on the local main, and only when this
+    process has a bound handoff and the caller passed an explicit config file. Inventory
+    forwards that path when it has one."""
     def entry(id_, support, why, **extra):
         return {"id": id_, "support": support, "why": why, **extra}
     if not owner:
@@ -303,6 +330,8 @@ def _actions(owner, local_is_main):
         return [entry(i, "blocked", why) for i in ("invite", "revoke", "capabilities", "main_transfer")] + [
             entry("setup_guide", "guide", "Read-only instructions for adding a PC or server.")]
     gate = None if local_is_main else "Open the console on the main PC to do this."
+    ready = bool(gate is None and state is not None and _explicit_config_file(config_path) is not None
+                 and _handoff_configured(state))
     return [
         entry("preview", "supported", "Shows exactly what an invite would change. Changes nothing.",
               method="POST", path="/api/fleet/preview"),
@@ -313,17 +342,19 @@ def _actions(owner, local_is_main):
         entry("capabilities", "supported" if gate is None else "blocked",
               gate or "Changes what an enrolled node may do. The credential stays the same.",
               method="POST", path="/api/fleet/capabilities", owner_only=True),
-        entry("main_transfer_preview", "supported", "Shows readiness and why a transfer is blocked.",
+        entry("main_transfer_preview", "supported", "Shows readiness. Changes nothing.",
               method="POST", path="/api/fleet/main-transfer/preview"),
-        entry("main_transfer", "blocked", "Safe main handoff is not built yet (see missing checks).",
-              method="POST", path="/api/fleet/main-transfer"),
+        entry("main_transfer", "supported" if ready else "blocked",
+              "Moves MAIN through the configured safe handoff." if ready else
+              (gate or "Safe main handoff is not configured, so nothing can be moved."),
+              method="POST", path="/api/fleet/main-transfer", owner_only=True),
         entry("cloud_provisioning", "unsupported", "JARVIS does not create cloud servers or install an OS. "
               "Create the server yourself, then add it as a node."),
         entry("setup_guide", "guide", "Step-by-step instructions to run on the new machine."),
     ]
 
 
-def inventory(config, state, audience="owner", now=None):
+def inventory(config, state, audience="owner", now=None, config_path=None):
     """The fleet as the frontend shows it. audience "phone" drops addresses, hostnames,
     code versions and write actions. No subprocess, no network, no writes."""
     now = now or time.time()
@@ -335,6 +366,7 @@ def inventory(config, state, audience="owner", now=None):
     busy = busy_nodes(state, now)
     code = _served_code(state) if owner else None
     devices = config.get("devices") or {}
+    handoff_configured = _explicit_config_file(config_path) is not None and _handoff_configured(state)
     out = []
     for node_id, device in devices.items():
         if not isinstance(device, dict):
@@ -344,14 +376,20 @@ def inventory(config, state, audience="owner", now=None):
         is_main = node_id == main
         row = rows.get(node_id)
         info = (row or {}).get("info") or {}
+        if is_main:
+            eligible_why = "This is the current main."
+        elif profile == "cloud":
+            eligible_why = "Inventory only by default and never becomes the main."
+        elif handoff_configured:
+            eligible_why = ("Safe handoff is configured. That is not operational proof; "
+                            "the coordinator must still verify readiness, lease expiry and the safety barrier.")
+        else:
+            eligible_why = "Safe handoff is not configured, so this machine cannot become MAIN."
         item = {"id": node_id, "label": str(device.get("label") or node_id), "role": "main" if is_main else "node",
                 "profile": profile, "profile_label": spec["label"],
                 "platform": info.get("platform") or device.get("platform"),
                 "main_eligible": False if (is_main or profile == "cloud") else "blocked",
-                "main_eligible_why": (
-                    "This is the current main." if is_main else
-                    "Inventory only by default and never becomes the main." if profile == "cloud" else
-                    "Possible later; safe handoff is not built yet.")}
+                "main_eligible_why": eligible_why}
         if is_main:
             item.update(status="main", online=True, seen=None, capabilities=[])
         else:
@@ -388,7 +426,7 @@ def inventory(config, state, audience="owner", now=None):
             "capabilities": [{"id": k, "title": v[0], "risk": v[1], "explain": v[2]}
                              for k, v in CAP_INFO.items() if owner or k != "locate"],
             "devices": out,
-            "actions": _actions(owner, bool(local and local == main and enabled)),
+            "actions": _actions(owner, bool(local and local == main and enabled), state, config_path),
             "guide": onboarding_guide(),
             "checked_at": now}
 
@@ -1001,12 +1039,26 @@ def set_node_capabilities(config, state, body, *, config_path=None):
             "note": "Camera also needs `jarvis camera allow on` on that node." if "camera" in caps else None}
 
 
-def main_transfer(config, state, body, now=None):
-    """Always `blocked`: preview of readiness, risks and the protocol checks still missing.
-    Never changes cluster.main_device (that rewrite is not a safe handoff)."""
+def _preview_can_run(config, state, readiness, config_path):
+    """True when POST would call the bound handoff for this target. Preview still writes nothing."""
+    local, main = _identity(config)
+    if not (local and local == main and (config.get("cluster") or {}).get("enabled")):
+        return False
+    if _explicit_config_file(config_path) is None or not _handoff_configured(state):
+        return False
+    needed = {"known_device", "not_cloud", "not_current_main"}
+    return all(item["state"] == "ok" for item in readiness if item["id"] in needed)
+
+
+def main_transfer(config, state, body, now=None, *, config_path=None):
+    """Read-only preview of a main transfer. Never changes cluster.main_device.
+
+    Without an explicit config file and a bound handoff, status and support stay `blocked`.
+    With both, and a known non-cloud target that is not already main, on the local main,
+    support is `supported` and status is `ready`. The preview still does not call the handoff."""
     body = _clean(body, "main_transfer")
     target = _node_id(body.get("target"), config, allow_main=True)
-    local, main = _identity(config)
+    _local, main = _identity(config)
     now = now or time.time()
     device = (config.get("devices") or {}).get(target)
     rows, _ = _db_rows(state)
@@ -1020,19 +1072,77 @@ def main_transfer(config, state, body, now=None):
         _check("online", link_state(row, now) == "online" if target != main else None,
                "Connected now." if link_state(row, now) == "online" else "Not connected right now."),
     ]
-    return {"status": "blocked", "support": "blocked", "mutated": False, "target": target, "readiness": readiness,
-            "missing": [{"id": i, "why": w} for i, w in MAIN_TRANSFER_MISSING],
+    link = link_state(row, now) if target != main else None
+    offline = link == "offline"
+    configured = _preview_can_run(config, state, readiness, config_path)
+    runnable = configured and not offline
+    if configured:
+        missing = [{"id": item["id"], "why": item["why"]} for item in readiness if item["state"] == "problem"]
+    else:
+        missing = [{"id": i, "why": w} for i, w in MAIN_TRANSFER_MISSING]
+    if offline and configured:
+        why = ("This target is offline. A missed check-in is not readiness, and this preview "
+               "has not verified it. Nothing was changed.")
+    elif runnable:
+        why = ("This preview changed nothing. Safe handoff is configured for this target. "
+               "That is not proof the target can take MAIN. POST runs the coordinator, which checks "
+               "candidate readiness, lease expiry and the safety barrier.")
+    else:
+        why = "Safe main handoff is not configured, so nothing was changed."
+    return {"status": "ready" if runnable else "blocked", "support": "supported" if configured else "blocked",
+            "mutated": False, "target": target, "readiness": readiness,
+            "missing": missing,
             "phases": list(MAIN_TRANSFER_PHASES),
             "risks": ["Two machines acting as the main could both write memory and run jobs.",
                       "Editing cluster.main_device by hand moves no data and fences nothing."],
-            "why": "Safe main handoff (leases, fencing, owner proof) is not implemented, so nothing was changed."}
+            "why": why}
 
 
-def main_transfer_refuse(config, state, body):
-    """POST /api/fleet/main-transfer: 409 with the same blocked payload."""
-    result = main_transfer(config, state, body)
-    raise FleetError("blocked", result["why"], 409, step="main_transfer", **{k: result[k] for k in
-                     ("missing", "readiness", "phases", "risks", "target", "mutated")})
+def _blocked_transfer(result, message=None):
+    return FleetError("blocked", message or result["why"], 409, step="main_transfer", **{k: result[k] for k in
+                      ("missing", "readiness", "phases", "risks", "target", "mutated")})
+
+
+def main_transfer_refuse(config, state, body, *, config_path=None):
+    """POST /api/fleet/main-transfer.
+
+    Runs set_main when `config_path` is an absolute path to an existing file and this PC
+    is the enabled local main. A missing path fails closed and does not look for a checkout
+    config. The handoff's pending or failed result does not change the role. Success returns
+    the handoff status; it does not suggest a restart."""
+    result = main_transfer(config, state, body, config_path=config_path)
+    path = _explicit_config_file(config_path)
+    if path is None:
+        raise _blocked_transfer(result)
+    _require_main(config)
+    from .cluster_cli import set_main
+    from .config_lock import ConfigBusy, ConfigDrift, ConfigUnreadable
+    try:
+        outcome = set_main(config, path, result["target"], state=state)
+    except (ConfigBusy, ConfigDrift, ConfigUnreadable) as exc:
+        raise _translate(exc) from exc
+    except ValueError as exc:
+        raise _blocked_transfer(result, str(exc)) from exc
+    if outcome.get("ok") is True and outcome.get("mutated") is True and outcome.get("main") == result["target"]:
+        return {"ok": True, "status": outcome.get("status"), "mutated": True, "target": result["target"],
+                "main": outcome.get("main"), "main_device": outcome.get("main_device"),
+                "transition_id": outcome.get("transition_id"), "epoch": outcome.get("epoch"),
+                "publication": outcome.get("publication"), "authority": outcome.get("authority")}
+    if outcome.get("status") == "publication_conflict":
+        raise FleetError("publication_conflict", outcome.get("error") or "Authority may have moved.",
+                         409, step="main_transfer", mutated=False, target=result["target"],
+                         authority=outcome.get("authority"), publication="conflict")
+    if outcome.get("status") == "publication_failed":
+        raise FleetError("publication_failed", outcome.get("error") or "The role was not published.",
+                         409, step="main_transfer", retryable=True, mutated=False, target=result["target"],
+                         authority=outcome.get("authority"), publication=outcome.get("publication"))
+    code = "pending" if outcome.get("status") == "pending" else "blocked"
+    raise FleetError(code, "Safe handoff did not move MAIN. cluster.main_device was not changed.",
+                     409, step="main_transfer", mutated=False, target=result["target"],
+                     handoff={"ok": False, "status": outcome.get("status"),
+                              "transition_id": outcome.get("transition_id"),
+                              "main": outcome.get("main"), "epoch": outcome.get("epoch")},
+                     missing=result["missing"], readiness=result["readiness"])
 
 
 # --- vault + GitHub status -------------------------------------------------------------

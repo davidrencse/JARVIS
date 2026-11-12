@@ -61,6 +61,10 @@ def _level(value):
         (not value.isdigit() or int(value) <= 100)
 
 
+def _every(value):
+    return isinstance(value, str) and bool(EVERY.match(value)) and 2 <= float(value) <= 300
+
+
 def _sys(name):
     """A sysintents validator, looked up when used (the module is imported lazily)."""
     def check(value):
@@ -122,16 +126,14 @@ INTENTS = {i.name: i for i in (
            {"direction": (lambda v: v in SCROLL_DIRECTIONS, False),
             "mode": (lambda v: v in SCROLL_MODES, False), "target": (_name, False),
             "app": (_name, False), "url": (_url, False),
-            "every": (lambda v: isinstance(v, str) and bool(EVERY.match(v))
-                      and 2 <= float(v) <= 300, False)}, None, None),
+            "every": (_every, False)}, None, None),
     # The agent browser (agent_browser.py): JARVIS's own Chrome, shown in the console.
     # Its executor reads the page back itself, so there is no window to observe.
     Intent("browse", "direct", "allow",
            {"action": (lambda v: v in BROWSE_ACTIONS, True), "url": (_http, False),
             "direction": (lambda v: v in SCROLL_DIRECTIONS, False),
             "mode": (lambda v: v in SCROLL_MODES, False),
-            "every": (lambda v: isinstance(v, str) and bool(EVERY.match(v))
-                      and 2 <= float(v) <= 300, False)}, None, None),
+            "every": (_every, False)}, None, None),
     Intent("list_apps", "direct", "allow", {"query": (_name, True)}, None, None),
     # A shell command (terminal.py): ls/cd/cat-style looking runs, anything else is confirmed.
     Intent("terminal", "direct", "confirm",

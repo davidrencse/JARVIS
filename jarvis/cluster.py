@@ -434,17 +434,16 @@ def validate_action(kind, payload):
         raise ValueError("Nodes execute only desktop, inventory, or Grokbot operations, and file transfers.")
 
 
-def execute_local(kind, payload, config, state):
-    validate_action(kind, payload)
-    try:
-        from .continuity.integration import refuse_unfenced
-    except ImportError:  # continuity is optional; without it the legacy path is the only one
-        refuse_unfenced = None
-    if refuse_unfenced is not None:
-        refuse_unfenced("cluster_local")
+def _execute_local_body(kind, payload, config, state):
     if kind == "desktop":
         from .remote import run_here
-        ok, text = run_here(payload["action"], payload["arg"])
+        extras = {}
+        try:
+            from .continuity.integration import local_desktop_args
+            extras = local_desktop_args()
+        except ImportError:
+            extras = {}
+        ok, text = run_here(payload["action"], payload["arg"], **extras)
         return {"ok": ok, "text": text}
     if kind == "inventory":
         from .inventory import collect
@@ -454,7 +453,7 @@ def execute_local(kind, payload, config, state):
         return Storage(config, state)._local(identity(config)[0], payload["path"], payload["action"])
     if kind == "transfer":
         from .transfer import run_here
-        return run_here(payload, state)
+        return run_here(payload, state, config)
     if kind == "remote":
         from .remote_view import run
         return run(payload, config, state)
@@ -466,6 +465,21 @@ def execute_local(kind, payload, config, state):
         return run_here(payload, config, state)
     from .grokbot import Grokbot
     return Grokbot(config, state).send(payload["text"], device=identity(config)[0])
+
+
+def execute_local(kind, payload, config, state):
+    validate_action(kind, payload)
+    try:
+        from .continuity.integration import open_local_effect, refuse_unfenced
+    except ImportError:  # continuity is optional; without it the legacy path is the only one
+        open_local_effect = None
+        refuse_unfenced = None
+    if refuse_unfenced is not None:
+        refuse_unfenced("cluster_local")
+    if open_local_effect is None:
+        return _execute_local_body(kind, payload, config, state)
+    return open_local_effect(
+        state, config, kind, payload, lambda: _execute_local_body(kind, payload, config, state))
 
 
 class Hub:
@@ -615,11 +629,14 @@ class Hub:
     def dispatch(self, node, kind, payload, timeout=45):
         validate_action(kind, payload)
         try:
-            from .continuity.integration import refuse_unfenced
+            from .continuity.integration import refuse_unfenced, require_production_authority
         except ImportError:  # continuity is optional; without it the legacy path is the only one
             refuse_unfenced = None
+            require_production_authority = None
         if refuse_unfenced is not None:
             refuse_unfenced("hub_dispatch")
+        if require_production_authority is not None:
+            require_production_authority(self.state, self.config, "hub_dispatch", target=node)
         if node not in self.config.get("devices", {}):
             raise ValueError("Unknown node.")
         if node == self.main:
@@ -646,6 +663,14 @@ class Hub:
             # Mismatched code can misread a newer job; refuse rather than guess.
             raise ValueError(f"{node} runs different JARVIS code ({status.get('code') or 'unknown'}, "
                              f"main {served_code(self.state)}). Run: jarvis cluster update {node}")
+        try:
+            from .continuity.integration import seal_job_payload
+        except ImportError:
+            seal_job_payload = None
+        if seal_job_payload is not None:
+            # After the job is known to be queueable. The envelope rides inside the payload
+            # the poll-time job signature already covers.
+            payload = seal_job_payload(self.state, node, kind, payload)
         with self._condition:
             job_id = self.broker.enqueue(node, self.main, kind, payload, timeout)
             self._condition.notify_all()
@@ -1146,6 +1171,11 @@ def make_server(hub, host, port):
                         if data.get("node") == hub.main and data.get("kind") != "transfer":
                             raise PermissionError("Nodes can't run actions on the main PC.")
                         payload = data.get("payload")
+                        if "console" not in caps and data.get("kind") == "transfer" \
+                                and isinstance(payload, dict):
+                            from .transfer import is_path_op
+                            if is_path_op(payload):  # storage copies are the main console's, not a node's
+                                raise PermissionError("Nodes can't read or write folders on the main PC.")
                         if (data.get("kind") == "desktop" and isinstance(payload, dict)
                                 and payload.get("action") == "terminal"):
                             raise PermissionError("Nodes can't run terminal commands.")
@@ -1404,18 +1434,57 @@ class NodeWorker:
             message = {"id": job["id"], "result": {"error": str(exc)}, "failed": True}
         else:
             try:
-                result = self.executor(job["kind"], job["payload"])
-                message = {"id": job["id"], "result": result, "failed": False}
-                try:
-                    from .continuity.integration import node_seen_mode
-                    if node_seen_mode() == "after":
-                        self._mark_seen(job["id"])
-                except ImportError:
-                    pass
-            except Exception as exc:
-                # The executor started, so part of the action may already have happened.
+                from .continuity.integration import (
+                    IntegrationError, managed_node_disposition, run_admitted_node_job)
+            except ImportError:
+                IntegrationError = None
+                managed_node_disposition = None
+                run_admitted_node_job = None
+            disposition = "legacy"
+            if managed_node_disposition is not None:
+                # After the code-key check above. A payload boolean cannot admit this job.
+                disposition = managed_node_disposition(self.state, job)
+            if disposition == "refuse":
                 message = {"id": job["id"], "failed": True, "result": {
-                    "error": f"{exc} (the node crashed mid-action; it may have run, so it wasn't retried)"}}
+                    "error": "Not run: managed continuity admission is missing."}}
+            elif disposition == "admit":
+                try:
+                    from .continuity.authority import AuthorityError
+                except ImportError:
+                    AuthorityError = None
+                try:
+                    result = run_admitted_node_job(self.state, job, self.executor)
+                except IntegrationError as exc:
+                    # Refused before the effect, including a guard that returned without running.
+                    # The same id can be repaired and offered again.
+                    message = {"id": job["id"], "failed": True, "result": {"error": f"Not run: {exc.code}"}}
+                except Exception as exc:
+                    code = getattr(exc, "code", None)
+                    ambiguous = not (AuthorityError is not None and isinstance(exc, AuthorityError)
+                                     and code not in ("uncertain", "crash"))
+                    if ambiguous:
+                        self._mark_seen(job["id"])
+                        message = {"id": job["id"], "failed": True, "result": {
+                            "error": f"{exc} (the node crashed mid-action; it may have run, so it wasn't retried)"}}
+                    else:
+                        message = {"id": job["id"], "failed": True, "result": {"error": f"Not run: {code}"}}
+                else:
+                    message = {"id": job["id"], "result": result, "failed": False}
+                    self._mark_seen(job["id"])
+            else:
+                try:
+                    result = self.executor(job["kind"], job["payload"])
+                    message = {"id": job["id"], "result": result, "failed": False}
+                    try:
+                        from .continuity.integration import node_seen_mode
+                        if node_seen_mode() == "after":
+                            self._mark_seen(job["id"])
+                    except ImportError:
+                        pass
+                except Exception as exc:
+                    # The executor started, so part of the action may already have happened.
+                    message = {"id": job["id"], "failed": True, "result": {
+                        "error": f"{exc} (the node crashed mid-action; it may have run, so it wasn't retried)"}}
         if len(json.dumps(message).encode()) > MAX_RESULT - 1000:
             # The main answers an oversized body 400 and the result would be dropped unseen.
             message = {"id": message["id"], "failed": True, "result": {
@@ -1454,13 +1523,22 @@ class NodeWorker:
         if job["id"] in seen:
             return "already run once (replayed)"
         try:
-            from .continuity.integration import node_seen_mode
+            from .continuity.integration import IntegrationError, continuity_state, node_seen_mode
             after = node_seen_mode() == "after"
         except ImportError:
             after = False
-        if after:
-            # Continuity cutover only: the job is marked after it succeeds, so a run that
-            # failed before any effect is not stranded as "already run".
+            continuity_state = None
+            IntegrationError = None
+        managed = False
+        if continuity_state is not None:
+            try:
+                managed = continuity_state(self.state) == "managed"
+            except IntegrationError:
+                return "continuity state is quarantined"
+        if after or managed:
+            # Legacy "after" waits for success. A managed job waits for the guard: a missing
+            # ticket is not seen, so the same id can be repaired. Accepted work is marked
+            # by the caller, and the guard receipt blocks a second effect.
             return None
         seen[job["id"]] = now
         save_json(seen_path, seen)

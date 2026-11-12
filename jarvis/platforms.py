@@ -12,11 +12,16 @@ windows, macos, hyprland, sway, gnome, kde, x11, wayland (another Wayland compos
 none (a headless session, e.g. reached over SSH with no desktop to borrow).
 """
 
+import errno
 import functools
 import os
 import platform
+import secrets
 import subprocess
 import sys
+import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 # creationflags for a child process that must not flash a console window (0 off Windows).
@@ -235,3 +240,275 @@ def desktop_backend(windows=None):
         return "windows"
     session = detect()["desktop"]
     return "hyprland" if session == "windows" else session
+
+
+# --- cluster membership (OS paths, key files, detached start) ---------------------------
+# Callers in cluster_setup keep their current behavior until they delegate here.
+# Branches follow _os() (same answer as detect()["os"]), except spawn_detached,
+# which follows on_windows() because cluster_setup._launch_agent does.
+
+_SSH_KEYS_THREADS = threading.Lock()  # one lock for every authorized_keys path
+_BUSY_LOCK = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+if getattr(errno, "EDEADLOCK", None) is not None:
+    _BUSY_LOCK.add(errno.EDEADLOCK)
+
+
+def host_keys_dir():
+    """Directory of this machine's SSH server host public keys.
+
+    Windows OpenSSH keeps them under ProgramData. Linux and macOS use ``/etc/ssh``.
+    The directory is not created.
+    """
+    if _os() == "windows":
+        return Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "ssh"
+    return Path("/etc/ssh")
+
+
+def _windows_process_is_admin():
+    """True when this process token is elevated. Windows only."""
+    import ctypes
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+
+
+def ssh_admin_account():
+    """True when this Windows account is in Administrators, elevated or not.
+
+    sshd logs the account in with its full token, so a UAC-filtered admin still
+    uses ``administrators_authorized_keys``. ``IsUserAnAdmin`` only reports whether
+    this process is elevated; ``whoami /groups`` lists the group either way.
+    Other operating systems return False and do not run either check.
+    """
+    if _os() != "windows":
+        return False
+    try:
+        out = run_quiet(["whoami", "/groups", "/fo", "csv", "/nh"], timeout=10)
+        text = out.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    if "S-1-5-32-544" in text:  # BUILTIN\Administrators
+        return True
+    return _windows_process_is_admin()
+
+
+def ssh_authorized_keys_path():
+    """The authorized_keys file OpenSSH will read for this account.
+
+    Windows admin accounts use ``administrators_authorized_keys``. Everyone else
+    uses ``~/.ssh/authorized_keys``. The file is not created.
+    """
+    if _os() == "windows" and ssh_admin_account():
+        return host_keys_dir() / "administrators_authorized_keys"
+    return Path.home() / ".ssh" / "authorized_keys"
+
+
+# Fixed script. Path and account are -File arguments ($args), never interpolated.
+# One Set-Acl publishes the finished DACL: inheritance off, every previous ACE
+# gone, one FullControl allow for the account argument.
+_WINDOWS_PRIVATE_KEY_ACL = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "if ($args.Count -ne 2) { throw 'expected a path and an account' }\n"
+    "$path = $args[0]\n"
+    "$account = $args[1]\n"
+    "if ([string]::IsNullOrEmpty($account)) { throw 'account is empty' }\n"
+    "$acl = Get-Acl -LiteralPath $path\n"
+    "$acl.SetAccessRuleProtection($true, $false)\n"
+    "foreach ($rule in @($acl.Access)) { [void]$acl.PurgeAccessRules($rule.IdentityReference) }\n"
+    "$grant = New-Object System.Security.AccessControl.FileSystemAccessRule($account, 'FullControl', 'Allow')\n"
+    "[void]$acl.AddAccessRule($grant)\n"
+    "Set-Acl -LiteralPath $path -AclObject $acl\n"
+)
+
+
+def _windows_private_key_account():
+    """``DOMAIN\\user`` for this logon, or ``user`` when USERDOMAIN is unset."""
+    user = os.environ.get("USERNAME", "")
+    domain = os.environ.get("USERDOMAIN") or ""
+    if not user:
+        raise ValueError("private key permissions need USERNAME of the account that reads the key.")
+    return f"{domain}\\{user}" if domain else user
+
+
+def _restrict_windows_private_key(path, account):
+    """Replace the key DACL with one allow for ``account``.
+
+    ``icacls /inheritance:r /grant:r`` drops inherited ACEs and still leaves
+    every other account's explicit allow in place. The script below edits a
+    copy of the descriptor in memory and calls Set-Acl once, so the file never
+    passes through a parent-inherited DACL. The script file is constant text.
+    ``powershell.exe -File`` receives the path and the account as data
+    arguments (execution policy applies only to this process).
+    """
+    script_path = None
+    try:
+        fd, script_path = tempfile.mkstemp(prefix="jarvis-key-acl-", suffix=".ps1")
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as handle:
+            handle.write(_WINDOWS_PRIVATE_KEY_ACL)
+        command = [
+            "powershell.exe", "-NoProfile", "-NonInteractive",
+            "-InputFormat", "None", "-ExecutionPolicy", "Bypass",
+            "-File", script_path, str(path), account,
+        ]
+        out = run_quiet(command, timeout=30, stdin=subprocess.DEVNULL)
+        if out.returncode != 0:
+            raise subprocess.CalledProcessError(out.returncode, command, out.stdout, out.stderr)
+    finally:
+        if script_path is not None:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+
+
+def private_key_permissions(path):
+    """Restrict an existing SSH private key to this account.
+
+    POSIX: mode ``0600`` (chmod ignores umask). Windows: one allow FullControl
+    ACE for this account and inheritance disabled. SYSTEM and Administrators
+    stay off the DACL. Win32-OpenSSH tolerates those SIDs on a client key and
+    accepts the key with only the current user; host keys, which those
+    accounts have to read, are a different contract. A non-zero PowerShell
+    status raises ``CalledProcessError``. Returns the path.
+    """
+    path = Path(path)
+    if _os() != "windows":
+        os.chmod(path, 0o600)
+        return path
+    _restrict_windows_private_key(path, _windows_private_key_account())
+    return path
+
+
+def _ssh_keys_lock_path(path):
+    """Sibling lock file ``cluster_setup._keys_locked`` already uses."""
+    path = Path(path)
+    return path.with_name(f".{path.name}.jarvis-lock")
+
+
+def _prepare_lock_handle(handle):
+    """Make the lock file at least one byte, without truncating it.
+
+    Windows ``msvcrt.locking`` refuses to lock a byte past EOF, so an empty
+    lock file fails with a sharing error. Append one byte only when the file
+    is empty. Two processes may both append; the lock still covers byte 0.
+    """
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+
+
+def _acquire_os_lock(handle):
+    """Block until this handle holds the OS lock. POSIX waits in the kernel.
+    Windows ``LK_LOCK`` gives up after about 10 seconds; retry those busy
+    errors so a live holder is not reported as a hard failure."""
+    _prepare_lock_handle(handle)
+    if _os() == "windows":
+        import msvcrt
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in _BUSY_LOCK:
+                    raise
+            _prepare_lock_handle(handle)
+    import fcntl
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+@contextmanager
+def locked_ssh_keys(path):
+    """Hold ``path`` for one read-modify-write of an authorized_keys file.
+
+    Threads in this process share ``_SSH_KEYS_THREADS``. Other processes take
+    the OS lock on ``_ssh_keys_lock_path(path)``. The thread lock is acquired
+    first and released only after the OS lock is gone, so the two never invert.
+
+    The OS lock is released by closing the handle. An explicit unlock and then
+    a close leaves a gap on Windows: another process can lock the file, and
+    the close drops that new lock too. There is no ``LK_UNLCK`` / ``LOCK_UN``.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _SSH_KEYS_THREADS:
+        handle = open(_ssh_keys_lock_path(path), "a+b", buffering=0)
+        try:
+            _acquire_os_lock(handle)
+            yield
+        finally:
+            handle.close()
+
+
+# Leave deletes these. Membership wires the glob; this module only creates them.
+# The fixed name cluster-node-launch.vbs is not used: two launches would share it.
+DETACHED_LAUNCH_GLOB = "cluster-node-launch-*.vbs"
+
+
+def _detached_command_line(argv):
+    """VBScript command line. CR or LF in an argument is rejected first.
+
+    ``list2cmdline`` does not escape line breaks, and ``autostart.vbs`` places
+    the line inside one double-quoted string. A CR or LF would end that
+    statement and run the rest of the argument as script. Callers must invoke
+    this before creating a launcher file or a process.
+    """
+    for arg in argv:
+        if "\n" in arg or "\r" in arg:
+            raise ValueError("spawn_detached rejects a command argument that contains a line break.")
+    line = subprocess.list2cmdline(argv).replace('"', '""')
+    if "\n" in line or "\r" in line:
+        raise ValueError("spawn_detached rejects a command argument that contains a line break.")
+    return line
+
+
+def _publish_launch_script(state, text):
+    """Write one unique launcher and publish it only when the bytes are complete.
+
+    The temp file sits in ``state`` so the replace stays on one volume. The
+    name appears after the full text is flushed. Explorer is started by the
+    caller, after this returns.
+    """
+    directory = Path(state)
+    final = directory / f"cluster-node-launch-{secrets.token_hex(16)}.vbs"
+    fd, tmp_name = tempfile.mkstemp(prefix=".cluster-node-launch-", suffix=".tmp", dir=directory)
+    published = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, final)
+        published = True
+    finally:
+        if not published:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+    return final
+
+
+def spawn_detached(argv, *, state=None):
+    """Start ``argv`` so it outlives this process. Returns the ``Popen``.
+
+    ``argv`` is an argument list, never a shell string. The caller picks the
+    interpreter (including ``pythonw.exe``). POSIX: new session, stdio discarded.
+    Windows: write a unique file matching ``DETACHED_LAUNCH_GLOB`` under
+    ``state`` and open that path with ``explorer.exe`` after the file is
+    complete. ``state`` is required on Windows and ignored elsewhere. An
+    argument that contains CR or LF raises ``ValueError`` before any launcher
+    file or process exists. Leave removes ``DETACHED_LAUNCH_GLOB`` under the
+    state directory.
+    """
+    if isinstance(argv, (str, bytes)) or not isinstance(argv, (list, tuple)):
+        raise TypeError("spawn_detached expects an argument list, not a command string.")
+    argv = [os.fsdecode(arg) if isinstance(arg, bytes) else str(arg) for arg in argv]
+    if on_windows():
+        if state is None:
+            raise ValueError("Windows detached launch needs a state directory for the Explorer launcher.")
+        from .autostart import vbs
+        script = _publish_launch_script(state, vbs(_detached_command_line(argv)))
+        return subprocess.Popen(["explorer.exe", str(script)], creationflags=NO_WINDOW)
+    return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)

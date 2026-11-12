@@ -18,6 +18,7 @@ the same file on every machine and never holds a secret.
 """
 
 import base64
+import errno
 import getpass
 import hashlib
 import json
@@ -25,16 +26,15 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import tempfile
-import threading
 import time
 import zlib
-from contextlib import contextmanager
 from pathlib import Path
 
 from .fsio import atomic_write
-from .platforms import NO_WINDOW, on_windows
+from .platforms import NO_WINDOW
 from .cluster import Client, save_json
 from .cluster_store import NODE_DEFAULT, Broker
 from .deploy import CODE_KEY, code_key
@@ -128,8 +128,8 @@ def init(config, path, state, device=None, autostart=True):
 
 def host_key():
     """This PC's SSH server key, `ssh-ed25519 AAAA...`: what nodes pin for the main."""
-    folder = (Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "ssh"
-              if _os() == "windows" else Path("/etc/ssh"))
+    from .platforms import host_keys_dir
+    folder = host_keys_dir()
     for name in ("ssh_host_ed25519_key.pub", "ssh_host_ecdsa_key.pub", "ssh_host_rsa_key.pub"):
         try:
             found = HOST_KEY.match((folder / name).read_text(encoding="ascii").strip())
@@ -187,52 +187,50 @@ def addresses(config, main, extra=()):
 
 
 def _windows_admin():
-    """Is this account in Administrators, elevated or not? sshd logs in with the full token,
-    so a UAC-filtered admin still gets administrators_authorized_keys; IsUserAnAdmin()
-    only says whether this terminal is elevated. whoami lists the group either way."""
+    """Is this account in Administrators, elevated or not?
+
+    ``platforms.ssh_admin_account`` is the authority. The whoami probe stays so a test
+    can patch ``cluster_setup.subprocess.run`` and still see the Administrators SID;
+    a hit returns before the helper, and a miss asks the helper (including the
+    elevated-token check on Windows).
+    """
     try:
         out = subprocess.run(["whoami", "/groups", "/fo", "csv", "/nh"], capture_output=True,
                              text=True, timeout=10, creationflags=FLAGS).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
-    if "S-1-5-32-544" in out:  # BUILTIN\Administrators
+    if "S-1-5-32-544" in (out or ""):  # BUILTIN\Administrators
         return True
-    import ctypes
-    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    from .platforms import ssh_admin_account
+    return ssh_admin_account()
+
+
+_windows_admin._platform_wrapper = True
 
 
 def _authorized_keys():
+    """The authorized_keys file OpenSSH reads for this account.
+
+    Unpatched, this is ``platforms.ssh_authorized_keys_path``. Tests that replace
+    ``_os`` or ``_windows_admin`` still get the path those replacements describe.
+    """
+    from . import platforms
+    if _os() == platforms._os() and getattr(_windows_admin, "_platform_wrapper", False) is True:
+        return platforms.ssh_authorized_keys_path()
     if _os() == "windows" and _windows_admin():
-        # Windows OpenSSH reads only this file for members of Administrators.
-        return Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "ssh/administrators_authorized_keys"
-    return Path.home() / ".ssh/authorized_keys"
+        root = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        return Path(root) / "ssh" / "administrators_authorized_keys"
+    return Path.home() / ".ssh" / "authorized_keys"
 
 
-_KEYS_THREADS = threading.Lock()
-
-
-@contextmanager
 def _keys_locked(path):
-    """Hold authorized_keys for one read-modify-write. `cluster invite` (its own process) and
-    the hub's redeem (a server thread) both rewrite it; unlocked, one drops the other's line.
-    Blocking, unlike locking.exclusive_lock: the other writer finishes in milliseconds."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with _KEYS_THREADS, open(path.with_name(f".{path.name}.jarvis-lock"), "a+b") as handle:
-        if _os() == "windows":
-            import msvcrt
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)  # retries for ~10 s, then OSError
-        else:
-            import fcntl
-            fcntl.flock(handle, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if _os() == "windows":
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+    """Hold authorized_keys for one read-modify-write.
+
+    The lock is ``platforms.locked_ssh_keys``: one thread lock and one OS lock
+    shared with every other writer, in this process and across processes.
+    """
+    from .platforms import locked_ssh_keys
+    return locked_ssh_keys(path)
 
 
 def restrictions(port):
@@ -621,20 +619,186 @@ def revoke(state, node):
 
 # --- node side --------------------------------------------------------------------------
 
+def _unlink_quiet(path):
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _private_file(path, text):
+    """Write an SSH private key and restrict it to this account.
+
+    Permissions are ``platforms.private_key_permissions``. If that fails, including
+    ``ValueError`` when ``USERNAME`` is missing, the new file is removed and any
+    previous key at ``path`` is left as it was.
+    """
+    from .platforms import private_key_permissions
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.unlink(missing_ok=True)
-    with open(path, "x", encoding="ascii", newline="\n") as stream:
-        if _os() != "windows":
-            path.chmod(0o600)
-        stream.write(text)
-    if _os() == "windows":
-        # Windows OpenSSH refuses a key that other accounts can read.
-        user = os.environ.get("USERNAME", "")
-        domain = os.environ.get("USERDOMAIN")
-        subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r",
-                        f"{domain}\\{user}:F" if domain else f"{user}:F"],
-                       capture_output=True, timeout=15, creationflags=FLAGS)
+    temporary = path.with_name(path.name + ".writing")
+    try:
+        temporary.unlink(missing_ok=True)
+        with open(temporary, "x", encoding="ascii", newline="\n") as stream:
+            stream.write(text)
+        private_key_permissions(temporary)
+        os.replace(temporary, path)
+    except BaseException:
+        _unlink_quiet(temporary)
+        raise
+    return path
+
+
+def _snapshot_regular(path):
+    """Bytes of a regular file, or None when it is absent.
+
+    The last path component is not followed. A symlink is refused so a join
+    cannot read, or later replace, whatever it points at.
+    """
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{path.name} is not a regular file in the state folder, so this "
+                         "join did not read or replace it.")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR):
+            raise ValueError(f"{path.name} is not a regular file in the state folder, so this "
+                             "join did not read or replace it.") from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path.name} is not a regular file in the state folder, so this "
+                             "join did not read or replace it.")
+        chunks = []
+        total = 0
+        while True:
+            block = os.read(fd, 65536)
+            if not block:
+                break
+            total += len(block)
+            if total > 1_048_576:
+                raise ValueError(f"{path.name} is too large to replace safely, so this join "
+                                 "did not change it.")
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _stage_secret(path, data, *, private):
+    """Write ``data`` to a new temp file beside ``path`` and restrict it. Do not publish."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.urandom(8).hex()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        os.write(fd, data)
+    except BaseException:
+        os.close(fd)
+        _unlink_quiet(temporary)
+        raise
+    os.close(fd)
+    try:
+        if private:
+            from .platforms import private_key_permissions
+            private_key_permissions(temporary)
+        else:
+            os.chmod(temporary, 0o600)
+    except BaseException:
+        _unlink_quiet(temporary)
+        raise
+    return temporary
+
+
+def _publish_owned(key_file, key_text, note_file, payload, owned):
+    """Snapshot the live key and note, stage the new bytes, then publish them.
+
+    ``owned`` records the snapshot and the bytes this attempt published so a later
+    config failure can put back only those bytes.
+    """
+    owned["prior"][key_file] = _snapshot_regular(key_file)
+    owned["prior"][note_file] = _snapshot_regular(note_file)
+    staged_key = _stage_secret(key_file, key_text.encode("ascii"), private=True)
+    staged_note = None
+    try:
+        staged_note = _stage_secret(note_file, json.dumps(payload, indent=2).encode("utf-8"),
+                                    private=False)
+        attempt_key = _snapshot_regular(staged_key)
+        attempt_note = _snapshot_regular(staged_note)
+        os.replace(staged_key, key_file)
+        owned["attempt"][key_file] = attempt_key
+        staged_key = None
+        os.replace(staged_note, note_file)
+        owned["attempt"][note_file] = attempt_note
+        staged_note = None
+    finally:
+        if staged_key is not None:
+            _unlink_quiet(staged_key)
+        if staged_note is not None:
+            _unlink_quiet(staged_note)
+
+
+def _drop_if_attempt(path, attempt):
+    path = Path(path)
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, OSError):
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return
+    try:
+        if _snapshot_regular(path) != attempt:
+            return
+        path.unlink()
+    except (OSError, ValueError):
+        return
+
+
+def _restore_if_attempt(path, attempt, previous):
+    """Put ``previous`` back only while ``path`` still holds this attempt's bytes."""
+    temporary = None
+    try:
+        if _snapshot_regular(path) != attempt:
+            return
+        temporary = _stage_secret(path, previous, private=str(path).endswith(".key"))
+        if _snapshot_regular(path) != attempt:
+            return
+        os.replace(temporary, path)
+        temporary = None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return
+    finally:
+        if temporary is not None:
+            _unlink_quiet(temporary)
+
+
+def _compensate_owned(owned):
+    """Undo key and note bytes this attempt still owns. Anything else stays."""
+    prior = owned.get("prior") or {}
+    for path, attempt in list((owned.get("attempt") or {}).items()):
+        if path not in prior or not isinstance(attempt, (bytes, bytearray)):
+            continue
+        try:
+            current = _snapshot_regular(path)
+        except (OSError, ValueError):
+            continue
+        if current != attempt:
+            continue
+        previous = prior[path]
+        if previous is None:
+            _drop_if_attempt(path, attempt)
+        elif isinstance(previous, (bytes, bytearray)):
+            _restore_if_attempt(path, attempt, previous)
 
 
 def _validate(note):
@@ -676,68 +840,260 @@ def _agent_running(state):
 
 
 def _launch_agent(path, state):
-    """Start `jarvis cluster run` in the background, the way the tunnel worker starts."""
+    """Start `jarvis cluster run` detached. The platform helper owns the OS handoff."""
     import sys
-    python = Path(sys.executable)
-    if on_windows() and python.with_name("pythonw.exe").is_file():
-        python = python.with_name("pythonw.exe")
-    argv = [str(python), "-m", "jarvis", "--config", str(Path(path).resolve()),
-            "--state", str(Path(state).resolve()), "cluster", "run"]
-    if on_windows():  # through Explorer, so it outlives this shell (see cluster_tunnel.start)
-        script = Path(state) / "cluster-node-launch.vbs"
-        from .autostart import vbs
-        line = subprocess.list2cmdline(argv).replace('"', '""')
-        script.write_text(vbs(line), encoding="utf-8")
-        subprocess.Popen(["explorer.exe", str(script)], creationflags=FLAGS)
-    else:
-        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
+    from .autostart import interpreter
+    from .platforms import spawn_detached
+    argv = interpreter([sys.executable, "-m", "jarvis", "--config", str(Path(path).resolve()),
+                        "--state", str(Path(state).resolve()), "cluster", "run"])
+    spawn_detached(argv, state=state)
+
+
+def _main_id(config):
+    """Device id when this enabled fleet says this PC is its main.
+
+    An enabled config whose identity cannot be read is refused. Returning None
+    would let join treat that fleet as unset and overwrite it. A disabled
+    config, or a readable config where this PC is not the main, returns None.
+    """
+    if not isinstance(config, dict):
+        return None
+    try:
+        turned_on = enabled(config)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("This PC's cluster is enabled but its identity cannot be read, so the "
+                         "config was not changed. Set cluster.local_device to a configured device "
+                         "before joining or leaving.") from exc
+    if not turned_on:
+        return None
+    try:
+        local, current = identity(config)
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("This PC's cluster is enabled but its identity cannot be read, so the "
+                         "config was not changed. Set cluster.local_device to a configured device "
+                         "before joining or leaving.") from exc
+    if local and local == current:
+        return local
+    return None
+
+
+def _under_state(state, path):
+    """True when this path's own location is inside `state`.
+
+    The last component is not resolved. A symlink cannot make another file look
+    inside state, and it cannot hide a path that is already inside state.
+    """
+    try:
+        base = Path(state).resolve()
+        candidate = Path(path)
+        candidate.parent.resolve().relative_to(base)
+    except (OSError, ValueError):
+        return False
+    name = candidate.name
+    return bool(name) and name not in (".", "..")
+
+
+_TUNNEL_LOCK = "cluster-tunnel.lock"
+_LINK_NAMES = (
+    "cluster-node.json", "cluster-node.key", "cluster-node-pending.key",
+    "cluster-node-launch.vbs", "cluster-tunnel.json", "cluster-tunnel.stop",
+    "cluster-tunnel-launch.vbs",
+)
+
+
+def _node_link_paths(state):
+    """Credential and tunnel files for one joined node, after the worker has stopped.
+
+    The tunnel lock is never listed: its inode stays so a live worker and the next
+    worker lock the same file. ``link.identity_file`` is not ownership and is never
+    listed. Only the canonical ``cluster-node.key`` and ``cluster-node-pending.key``
+    are key files. Stop marker and status are listed for removal only once the
+    caller has confirmed the worker is stopped.
+    """
+    state = Path(state).resolve()
+    paths = [state / name for name in _LINK_NAMES]
+    paths.append(state / "logs" / "cluster-tunnel.log")
+    try:
+        note = json.loads((state / "cluster-node.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        note = None
+    link = note.get("link") if isinstance(note, dict) else None
+    if isinstance(link, dict):
+        alias = "jarvis-" + str(link.get("hostname") or "peer")
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", alias):
+            paths.append(state / f"known-host-{alias}")
+    if state.is_dir():
+        paths.extend(state.glob("known-host-jarvis-*"))
+        paths.extend(state.glob("cluster-node-launch-*.vbs"))
+    unique, seen = [], set()
+    for path in paths:
+        if path.name == _TUNNEL_LOCK:
+            continue
+        if not _under_state(state, path):
+            continue
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(Path(path))
+    return unique
+
+
+def _forget_node_link(state):
+    """Delete this node's link files after the tunnel is confirmed stopped.
+
+    One failure does not keep the rest. No process is killed. The lock file is
+    never removed. A symlink is removed as a link; the file it names is not.
+    """
+    errors = []
+    for path in _node_link_paths(state):
+        if path.name == _TUNNEL_LOCK:
+            continue
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            continue
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)):
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            errors.append(f"{path.name}: {exc}")
+    return "; ".join(errors)
+
+
+def _tunnel_lock_free(state):
+    """True when no worker holds ``cluster-tunnel.lock``.
+
+    The probe is a nonblocking ``exclusive_lock``. The file is not removed: a
+    later worker has to lock the same inode. ``LockBusy`` means the worker is
+    still in the lock, even when its status heartbeat has gone stale.
+    """
+    from .locking import LockBusy, exclusive_lock
+    try:
+        with exclusive_lock(Path(state) / _TUNNEL_LOCK, timeout=0):
+            return True
+    except LockBusy:
+        return False
+
+
+def _stop_tunnel(state):
+    """Stop the tunnel worker if it is live. Return ``(confirmed_stopped, detail)``.
+
+    ``confirmed_stopped`` is true only when the status heartbeat is idle and this
+    process can take ``cluster-tunnel.lock``. A stale heartbeat alone is not
+    exit: the worker can still hold the lock. The lock file is not unlinked.
+    When the lock is busy the stop marker and status note are left in place.
+    ``detail`` is None when the worker was already gone, otherwise the stop result.
+    """
+    from . import cluster_tunnel
+    try:
+        running = bool(cluster_tunnel.status(state).get("running"))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+        return False, {"stopped": False, "error": str(exc)}
+    try:
+        free = _tunnel_lock_free(state)
+    except OSError as exc:
+        return False, {"stopped": False, "error": str(exc)}
+    if not running and free:
+        return True, None
+    if not running:
+        return False, {"stopped": False, "note": "still running"}
+    try:
+        detail = cluster_tunnel.stop(state)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return False, {"stopped": False, "error": str(exc)}
+    if not isinstance(detail, dict):
+        detail = {"stopped": False}
+    try:
+        running = bool(cluster_tunnel.status(state).get("running"))
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
+        return False, {**detail, "error": str(exc)}
+    try:
+        free = _tunnel_lock_free(state)
+    except OSError as exc:
+        return False, {**detail, "error": str(exc)}
+    if running or not free:
+        # The worker still owns the lock or the heartbeat. Do not report it
+        # stopped, and do not clear the marker ``stop`` just wrote.
+        return False, {**detail, "stopped": False, "note": detail.get("note") or "still running"}
+    return True, {**detail, "stopped": True}
 
 
 def join(config, path, state, note, autostart=True, start=True, wait=25):
-    """Pair this PC as a node from a decoded invite, then connect and check."""
+    """Pair this PC as a node from a decoded invite, then connect and check.
+
+    The role check, the credential files, and the config write are one local
+    transaction. The key and the note are staged, then published, and put back
+    if the config write does not commit. Only bytes this attempt still owns are
+    restored, so a concurrent redemption is not overwritten. The file on disk
+    decides the role, so a stale copy cannot turn a main into a node.
+    """
     targets, main_host = _validate(note)
     node, main = note["node_id"], note["main_device"]
     state = Path(state).resolve()
-    if enabled(config):
-        try:
-            local, current_main = identity(config)
-        except ValueError:
-            local = current_main = None
-        if local and local == current_main and local != node:
-            raise ValueError(f"This PC is the main ({local}). Run jarvis cluster main {main} "
-                             "first if it should become a node.")
-    here = _this_device(config)
-    if here and here != node:
-        raise ValueError(f"This PC is configured as {here} (hostname {_hostname()}), but the "
-                         f"invite is for {node}. Invite {here} instead.")
     from . import cluster_tunnel
-    if cluster_tunnel.status(state)["running"]:
-        cluster_tunnel.stop(state)  # it holds the previous link
+    from .config_lock import patch_config
     key_file = state / "cluster-node.key"
-    _private_file(key_file, note["key"])
-    save_json(state / "cluster-node.json", {
-        "node_id": node, "main_device": main, "token": note["token"], "redeem": True,
-        "code_key": note["code_key"],  # only code signed by this key is installed
-        "link": {"targets": targets, "host_key": note["host_key"], "hostname": main_host,
-                 "identity_file": str(key_file)}})
-    devices = dict(config.get("devices") or {})
-    mine = dict(devices.get(node) or {})
-    local_device = "auto"
-    if not mine.get("hostname"):
-        mine["hostname"] = _hostname()
-    elif mine["hostname"].casefold() != _hostname().casefold():
-        local_device = node  # the shared config names another hostname; don't rewrite it
-    devices[node] = mine
-    devices.setdefault(main, {k: v for k, v in (note.get("main") or {}).items()
-                              if k in ("hostname", "label", "aliases")})
-    settings = {**(config.get("cluster") or {}), "enabled": True, "main_device": main,
-                "local_device": local_device, "tunnel": "forward", "listen_host": "127.0.0.1",
-                "listen_port": note["port"], "main_url": f"http://127.0.0.1:{note['port']}"}
-    proposed = {**config, "devices": devices, "cluster": settings}
-    identity(proposed)
-    from .config_lock import save_delta
-    save_delta(state, path, config, proposed, backup="cluster-join")
+    note_file = state / "cluster-node.json"
+    owned = {"prior": {}, "attempt": {}}
+
+    def change(doc):
+        if not doc and isinstance(config, dict):
+            doc.update(json.loads(json.dumps(config)))
+        # An enabled main stays the main. Handoff is `jarvis cluster main`, not join.
+        disk_main = _main_id(doc)
+        if disk_main:
+            raise ValueError(f"This PC is the main ({disk_main}). Run jarvis cluster main {main} "
+                             "first if it should become a node.")
+        here = _this_device(doc)
+        if here and here != node:
+            raise ValueError(f"This PC is configured as {here} (hostname {_hostname()}), but the "
+                             f"invite is for {node}. Invite {here} instead.")
+        devices = dict(doc.get("devices") or {})
+        mine = dict(devices.get(node) or {})
+        local_device = "auto"
+        if not mine.get("hostname"):
+            mine["hostname"] = _hostname()
+        elif str(mine.get("hostname")).casefold() != _hostname().casefold():
+            local_device = node  # the shared config names another hostname; don't rewrite it
+        devices[node] = mine
+        devices.setdefault(main, {k: v for k, v in (note.get("main") or {}).items()
+                                  if k in ("hostname", "label", "aliases")})
+        settings = {**(doc.get("cluster") or {}), "enabled": True, "main_device": main,
+                    "local_device": local_device, "tunnel": "forward", "listen_host": "127.0.0.1",
+                    "listen_port": note["port"], "main_url": f"http://127.0.0.1:{note['port']}"}
+        identity({**doc, "devices": devices, "cluster": settings})
+        # The previous worker holds the old key. Replace nothing until the lock
+        # and the heartbeat both say it has stopped. A timeout must not swap
+        # the key, the link, or the config.
+        confirmed, detail = _stop_tunnel(state)
+        if not confirmed:
+            text = ""
+            if isinstance(detail, dict):
+                text = str(detail.get("error") or detail.get("note") or "")
+            if "still running" not in text.lower():
+                text = (text + "; " if text else "") + "still running"
+            raise ValueError("The cluster tunnel is still running, so this join did not replace "
+                             "the SSH key, the saved link, or this PC's config. " + text)
+        _publish_owned(key_file, note["key"], note_file, {
+            "node_id": node, "main_device": main, "token": note["token"], "redeem": True,
+            "code_key": note["code_key"],  # only code signed by this key is installed
+            "link": {"targets": targets, "host_key": note["host_key"], "hostname": main_host,
+                     "identity_file": str(key_file)}}, owned)
+        doc["devices"] = devices
+        doc["cluster"] = settings
+
+    try:
+        proposed, _ = patch_config(state, path, change, backup="cluster-join", create=True)
+    except BaseException:
+        _compensate_owned(owned)
+        raise
     report = {"joined": node, "main_device": main, "addresses": targets}
     if autostart:
         from .cluster_cli import autostart as role_autostart
@@ -787,29 +1143,73 @@ def _await_hub(config, state, seconds):
 
 
 def leave(config, path, state):
-    """Forget this node's link: stop the tunnel and login startup, delete the credential."""
+    """Forget this node's link: stop the tunnel and login startup, delete the credential.
+
+    One managed mutation reads the file before it decides. This PC being the main
+    on that fresh read is always refused, including when the caller already passed
+    a main config. The tunnel is stopped with its marker. No pid is signalled.
+    """
     from . import cluster_tunnel
     from .cluster_cli import autostart as role_autostart
-    state = Path(state).resolve()
-    try:
-        node = identity(config)[0]
-    except ValueError:
-        node = "NODE"
-    report = {"left": node}
-    if cluster_tunnel.status(state)["running"]:
-        report["tunnel"] = cluster_tunnel.stop(state)
-    for name, off in (("tunnel", lambda: cluster_tunnel.autostart(path, state, False)),
-                      ("node", lambda: role_autostart(path, state, False))):
-        try:
-            off()
-        except (OSError, subprocess.SubprocessError) as exc:
-            report[f"{name}_autostart_error"] = str(exc)
-    for name in ("cluster-node.json", "cluster-node.key"):
-        (state / name).unlink(missing_ok=True)
     from .config_lock import patch_config
-    patch_config(state, path, lambda doc: doc.setdefault("cluster", {}).update(enabled=False),
-                 backup="cluster-leave", create=True)
-    report["next"] = f"Restart or stop this PC's node agent. On the main: jarvis cluster revoke {node}"
+    state = Path(state).resolve()
+    box = {}
+
+    def change(doc):
+        if not doc and isinstance(config, dict):
+            doc.update(json.loads(json.dumps(config)))
+        disk_main = _main_id(doc)
+        if disk_main:
+            raise ValueError(f"This PC is the main ({disk_main}). Nodes leave; the main revokes "
+                             "them. To hand the fleet to another PC: jarvis cluster main <device>")
+        try:
+            node = identity(doc)[0]
+        except (TypeError, ValueError):
+            try:
+                node = identity(config)[0]
+            except (TypeError, ValueError):
+                node = "NODE"
+        report = {"left": node}
+        try:
+            confirmed, detail = _stop_tunnel(state)
+        except (OSError, subprocess.SubprocessError) as exc:
+            confirmed, detail = False, {"stopped": False, "error": str(exc)}
+            report["tunnel_error"] = str(exc)
+        if detail is not None:
+            report["tunnel"] = detail
+        if not confirmed:
+            text = ""
+            if isinstance(detail, dict):
+                text = str(detail.get("error") or detail.get("note") or "")
+            if "still running" not in text.lower():
+                text = (text + "; " if text else "") + "still running"
+            # The worker is live. Keep the marker it watches, the lock inode, the
+            # status note, and the credentials. Autostart and the config still go
+            # off so a new worker is not started.
+            report["tunnel_stop_error"] = text
+            report["credentials_retained"] = "retained until the tunnel stops"
+        else:
+            cleanup = _forget_node_link(state)
+            if cleanup:
+                report["cleanup_error"] = cleanup
+        for name, off in (("tunnel", lambda: cluster_tunnel.autostart(path, state, False)),
+                          ("node", lambda: role_autostart(path, state, False))):
+            try:
+                off()
+            except (OSError, subprocess.SubprocessError) as exc:
+                report[f"{name}_autostart_error"] = str(exc)
+        doc.setdefault("cluster", {})["enabled"] = False
+        box["report"] = report
+
+    patch_config(state, path, change, backup="cluster-leave", create=True)
+    report = box.get("report") or {"left": "NODE"}
+    if report.get("tunnel_stop_error"):
+        report["next"] = ("The tunnel is still running. Credentials, the stop marker, the lock, "
+                          "and the status note were kept. Autostart is off and the cluster is "
+                          "disabled so it will not start again. Stop the tunnel, then leave again.")
+    else:
+        report["next"] = (f"Restart or stop this PC's node agent. On the main: "
+                          f"jarvis cluster revoke {report['left']}")
     return report
 
 
@@ -820,30 +1220,80 @@ def _check(checks, name, ok, detail="", fix=""):
     return bool(ok)
 
 
+def _known_role(config):
+    """``main`` or ``node`` when identity can be read, else None. No network."""
+    if not isinstance(config, dict):
+        return None
+    try:
+        local, main = identity(config)
+    except (TypeError, ValueError):
+        return None
+    if not local or not main:
+        return None
+    return "main" if local == main else "node"
+
+
+def _tested_release_code(state):
+    """Fingerprint of the tested release, or None. Never the live-tree fallback."""
+    from .release import current
+    try:
+        note = current(state)
+    except (OSError, ValueError, TypeError):
+        return None
+    code = note.get("code") if isinstance(note, dict) else None
+    return code if isinstance(code, str) and code else None
+
+
+def _readiness_report(config, state, role, status):
+    """Local readiness. The expected fingerprint is a tested release or the hub's status code."""
+    from .fleet.readiness import main_readiness
+    if role == "main":
+        expected = _tested_release_code(state)
+    elif role == "node" and isinstance(status, dict):
+        code = status.get("code")
+        expected = code if isinstance(code, str) and code else None
+    else:
+        expected = None
+    return main_readiness(config if isinstance(config, dict) else {}, state, expected_code=expected)
+
+
 def doctor(config, path, state):
-    """Every link in the chain from config to a working node, in order, with a fix each."""
+    """Every link in the chain from config to a working node, in order, with a fix each.
+
+    ``main_readiness`` is the local main_readiness report on every result, including a
+    disabled cluster or an identity error. It does not change ``ok``. On a main the
+    expected fingerprint is ``release.current`` only. On a node it is the code from
+    the authenticated ``/v1/status`` already fetched for the link checks. ``served_code``
+    live-tree fallback is not a tested release.
+    """
     from . import cluster_tunnel
     from .deploy import code_fingerprint
     checks = []
+    role = None
+    status = None
     if not enabled(config):
         _check(checks, "cluster enabled", False, "cluster.enabled is false",
                "On the main: jarvis cluster init. On a node: jarvis cluster join CODE")
-        return {"ok": False, "checks": checks}
-    try:
-        local, main = identity(config)
-    except ValueError as exc:
-        _check(checks, "this PC's identity", False, str(exc),
-               f"Add this PC (hostname {_hostname()}) to devices, or set cluster.local_device")
-        return {"ok": False, "checks": checks}
-    role = "main" if local == main else "node"
-    _check(checks, "this PC's identity", True, f"{local} ({role}); main is {main}")
-    forward = cluster_tunnel.mode(config) == "forward"
-    if role == "main":
-        from .release import served_code  # nodes must match the tested release, not the live tree
-        _doctor_main(config, state, main, forward, checks, served_code(state))
+        report = {"ok": False, "checks": checks}
     else:
-        _doctor_node(config, state, local, main, forward, checks, code_fingerprint())
-    return {"ok": all(c["ok"] for c in checks), "role": role, "checks": checks}
+        try:
+            local, main = identity(config)
+        except ValueError as exc:
+            _check(checks, "this PC's identity", False, str(exc),
+                   f"Add this PC (hostname {_hostname()}) to devices, or set cluster.local_device")
+            report = {"ok": False, "checks": checks}
+        else:
+            role = "main" if local == main else "node"
+            _check(checks, "this PC's identity", True, f"{local} ({role}); main is {main}")
+            forward = cluster_tunnel.mode(config) == "forward"
+            if role == "main":
+                _doctor_main(config, state, main, forward, checks, _tested_release_code(state))
+            else:
+                status = _doctor_node(config, state, local, main, forward, checks, code_fingerprint())
+            report = {"ok": all(c["ok"] for c in checks), "role": role, "checks": checks}
+    source = role if role is not None else _known_role(config)
+    report["main_readiness"] = _readiness_report(config, state, source, status)
+    return report
 
 
 def _doctor_main(config, state, main, forward, checks, code):
@@ -879,9 +1329,13 @@ def _doctor_main(config, state, main, forward, checks, code):
                ", ".join(f"{count} {name}" for name, count in sorted(ended.items())) or "no jobs",
                f"Jobs went unanswered: on {device}, jarvis cluster doctor (look at link health)")
         if node.get("online"):
-            _check(checks, f"{device}: same code", node.get("code") == code,
-                   f"{node.get('code') or 'unknown'} vs main {code}",
-                   f"jarvis cluster update {device}   (forward nodes update themselves within a minute)")
+            if not code:
+                _check(checks, f"{device}: same code", False, "no tested release on this main",
+                       "On this main: jarvis cluster release   (a live tree is not a tested release)")
+            else:
+                _check(checks, f"{device}: same code", node.get("code") == code,
+                       f"{node.get('code') or 'unknown'} vs main {code}",
+                       f"jarvis cluster update {device}   (forward nodes update themselves within a minute)")
 
 
 def _link_hint(error, forward, main):
@@ -902,36 +1356,38 @@ def _link_hint(error, forward, main):
 
 
 def _doctor_node(config, state, local, main, forward, checks, code):
+    """Append node checks. Return the /v1/status object when that call succeeded."""
     from . import cluster_tunnel
     from .transfer import _ssh_args
+    status = None
     try:
         Client(config, state)
         _check(checks, "paired with the main", True, f"credential for {local}")
     except ValueError as exc:
         _check(checks, "paired with the main", False, str(exc),
                f"On {main}: jarvis cluster invite {local}; here: jarvis cluster join CODE")
-        return
+        return None
     if forward:
         try:
             machine = cluster_tunnel.peer(config, state)
         except ValueError as exc:
             _check(checks, "SSH link", False, str(exc), f"Join again with a new invite from {main}")
-            return
+            return None
         binary = shutil.which("ssh")
         if not _check(checks, "OpenSSH client", binary, binary or "ssh not found",
                       "Install the OpenSSH client (Windows: Settings > Optional features)"):
-            return
+            return None
         key = machine.get("identity_file")
         if key and not _check(checks, "SSH key file", Path(key).expanduser().is_file(), key,
                               f"Join again with a new invite from {main}"):
-            return
+            return None
         targets = [machine["target"], *machine.get("fallback_targets", [])]
         reachable = [t for t in targets if cluster_tunnel.reachable(t)]
         if not _check(checks, f"{main} reachable", reachable,
                       ", ".join(reachable) if reachable else "no answer on port 22 at " + ", ".join(targets),
                       f"Is {main} awake and on this network (or Tailscale)? If its address "
                       f"changed: on {main}, jarvis cluster invite {local}, then join again"):
-            return
+            return None
         argv = [*_ssh_args(binary, key), *cluster_tunnel.pinned_host(machine, state), "-T", reachable[0]]
         try:
             out = subprocess.run(argv, capture_output=True, text=True, timeout=20, creationflags=FLAGS)
@@ -954,7 +1410,7 @@ def _doctor_node(config, state, local, main, forward, checks, code):
     except (OSError, ValueError, RuntimeError) as exc:
         _check(checks, "hub answers", False, str(exc),
                f"Is JARVIS running on {main}? There: jarvis cluster doctor")
-        return
+        return None
     _check(checks, "node agent running", _agent_running(state), "jarvis cluster run",
            "jarvis cluster autostart on")
     try:
@@ -981,3 +1437,4 @@ def _doctor_node(config, state, local, main, forward, checks, code):
         _check(checks, "same code as the main", status["code"] == code,
                f"{code} vs main {status['code']}",
                "Leave the node agent running; it installs the main's code and restarts itself")
+    return status

@@ -78,6 +78,9 @@ def main():
     ph.add_argument("--name", help="pair: what to call this phone")
     ph.add_argument("--allow-desktop", action="store_true",
                     help="pair: let a computer pair instead of a phone (testing only)")
+    co = sub.add_parser("continuity", help="Operate the continuity authority")
+    from .continuity.cli import add_arguments as continuity_arguments
+    continuity_arguments(co)
     cam = sub.add_parser("camera", help="Whether the phone may view this PC's webcam: allow on|off, status")
     cam.add_argument("action", choices=("allow", "status"))
     cam.add_argument("value", nargs="?", choices=("on", "off"), help="allow: on or off")
@@ -185,6 +188,8 @@ def main():
     ar.add_argument("--limit", type=int, default=100, help="drain: events per run")
     ar.add_argument("--target", help="restore: a new or empty folder")
     ar.add_argument("--mib", type=int, help="overflow: explicit limit in MiB (17–64); 0 disables it")
+    br = sub.add_parser("brain", help="Brain transport between MAINs: sync or status (off until brainsync.enabled)")
+    br.add_argument("action", help="sync or status")
     cr = sub.add_parser("credits", help="Provider balances; `credits key deepseek` stores a key")
     cr.add_argument("action", nargs="?", default="show", choices=("show", "key"))
     cr.add_argument("provider", nargs="?", help="key: provider id, e.g. deepseek")
@@ -215,7 +220,10 @@ def main():
     st.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args()
     from .platforms import private_dir
-    private_dir(args.state)  # tokens, keys and memory live here: this account only
+    # brain status and a disabled sync must not create .jarvis. Mutating brain
+    # paths create that private directory themselves. Every other command still does.
+    if args.command != "brain":
+        private_dir(args.state)  # tokens, keys and memory live here: this account only
     if args.command in ("sleep", "wake"):  # needs no config: it stops and starts user services
         from . import rest
         try:
@@ -261,6 +269,9 @@ def main():
             from . import phone
             emit(phone.cli(args, config, args.state))
             return 0
+        if args.command == "continuity":
+            from .continuity.cli import run as continuity_run
+            return continuity_run(args)
         if args.command == "camera":  # this PC's own consent: works on the main and on nodes
             from . import camera
             if args.action == "allow":
@@ -476,6 +487,50 @@ def main():
             result, code = archive_cli(args, config, args.state)
             emit(result)
             return code
+        elif args.command == "brain":
+            from . import brainsync
+            state = Path(args.state).expanduser().resolve()
+            if state != (base / ".jarvis").resolve():
+                raise ValueError("jarvis brain uses <config parent>/.jarvis; pass --state equal to that directory.")
+            # Help lists only sync|status. Reject anything else before stdin so an
+            # open pipe cannot hang `jarvis brain nope`.
+            if args.action not in ("sync", "status", "export", "receive", "freeze"):
+                raise ValueError("Usage: jarvis brain sync|status")
+            if args.action == "status":
+                emit(brainsync.status(config, base))
+                return 0
+            if args.action == "sync":
+                result = brainsync.sync(config, base)
+                emit(result)
+                return 0 if result.get("ok") else 1
+            # export/freeze requests cap at 4096. One extra byte means the body
+            # overran the cap; refuse it whole instead of slicing a still-valid JSON prefix.
+            if args.action in ("export", "freeze"):
+                raw = sys.stdin.buffer.read(4097)
+                if len(raw) > 4096:
+                    if args.action == "freeze":
+                        emit({"ok": False, "status": "bad_request", "error": "bad_request"})
+                        return 1
+                    raise ValueError("bad_request")
+            else:
+                raw = sys.stdin.buffer.read(brainsync.MAX_BUNDLE_BYTES + 1)
+            if args.action == "export":
+                result = brainsync.export_result(config, base, raw)
+                if not result.get("ok"):
+                    raise ValueError(result.get("error") or "export failed")
+                sys.stdout.buffer.write(result["payload"].encode("ascii"))
+                return 0
+            if args.action == "receive":
+                if len(raw) > brainsync.MAX_BUNDLE_BYTES:
+                    raise ValueError("brain bundle is too large")
+                result = brainsync.receive(config, base, raw)
+                emit(result)
+                return 0 if result.get("ok") else 1
+            if args.action == "freeze":
+                result = brainsync.freeze(config, base, raw)
+                emit(result)
+                return 0 if result.get("ok") else 1
+            raise ValueError("Usage: jarvis brain sync|status")
         elif args.command in ("tasks", "task"):
             return task_command(args, config)
         elif args.command in ("send", "fetch", "inbox"):
