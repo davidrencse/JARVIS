@@ -469,7 +469,9 @@
     (scope || document).querySelectorAll(".hm-host").forEach((host) => {
       const id = host.getAttribute("data-hm");
       const d = devices.find((item) => item.id === id);
-      window.JarvisMeters.render(host, metersForCard(d, live[id]));
+      const m = metersForCard(d, live[id]);
+      if (m && Array.isArray(m.blocks) && m.blocks.length) window.JarvisMeters.render(host, m);
+      else host.innerHTML = `<p class="cx-quiet">No hardware reading yet. It appears once the node reports.</p>`;
     });
   }
   function renderMachines(o) {
@@ -710,8 +712,14 @@
     return ((c && c.nodes) || []).find((n) => n.id === id) || null;
   }
 
+  const SERVER_SVG = `<svg class="i cx-rack" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/><path d="M7 6.5h.01M7 17.5h.01M12 6.5h5M12 17.5h5"/></svg>`;
+  // Headless means no desktop to show: a cloud/headless profile, or a node that was not granted "desktop".
+  const isServer = (n) => /^(cloud|headless)$/.test(n.profile || "") || !(n.capabilities || []).some((c) => c.id === "desktop");
   function nodeCard(n, inv) {
     const d = inv[n.id] || {};
+    const caps = new Set((n.capabilities || []).map((c) => c.id));
+    const server = isServer(n);
+    const name = n.label && n.label !== n.id ? n.label : n.hostname || "";
     const jobs = n.jobs_24h || {};
     const failed = (jobs.failed || 0) + (jobs.expired || 0) + (jobs.uncertain || 0);
     const jobLine = [jobs.done ? `${jobs.done} done` : "", failed ? `${failed} failed` : "", n.running ? `${n.running} running` : ""].filter(Boolean).join(" · ") || "no jobs";
@@ -721,19 +729,36 @@
     if (st === "busy") hint = "Running a job, so it isn't checking in. Not proven online until it does.";
     else if (!n.online) hint = `Its node agent isn't polling the main. On ${esc(n.hostname || n.id)}, start JARVIS's node agent (or <code>jarvis cluster doctor</code>).`;
     else if (!n.code_ok) hint = "Runs older code. It pulls the main's code by itself on its next poll and restarts.";
-    return `<article class="cx-node ${n.online ? "on" : "off"}" aria-label="${esc(n.id)}, node">
-      <header>${icon("laptop-minimal", "i")}<div><h3>${esc(n.id)}</h3><p>${esc(n.label !== n.id ? n.label : n.hostname || "")}</p></div>
+    return `<article class="cx-node ${n.online ? "on" : "off"}${server ? " cx-server" : ""}" aria-label="${esc(n.id)}, node">
+      <header>${server ? SERVER_SVG : icon("laptop-minimal", "i")}<div><h3>${esc(n.id)}</h3><p>${esc(name)}</p></div>
         ${pill(st === "busy" ? "busy, awaiting contact" : n.online ? "online" : "offline", n.online ? "ok" : "warn", n.seen ? "last heard " + new Date(n.seen * 1000).toLocaleString() : "")}</header>
       <p class="cx-line">${dot(n.online)}${n.online ? "Polling now" : st === "busy" ? hold.text + " · last heard " + silent(n.silent_for) : "Last heard " + silent(n.silent_for)}${n.platform ? ` · ${esc(n.platform)}` : ""}${n.hostname ? ` · <span class="mono">${esc(n.hostname)}</span>` : ""}</p>
       <div class="cx-chips">${pill(n.code_ok ? "same code" : "older code", n.code_ok ? "ok" : "warn", "node code " + (n.code || "unknown"))}${pill("24 h: " + jobLine, failed ? "warn" : "")}</div>
-      <div class="cx-caps" aria-label="What the main may ask it">${n.capabilities.map((c) => `<span title="${esc(c.does)}">${esc(c.title || c.id)}</span>`).join("")}</div>
+      <div class="cx-caps" aria-label="What the main may ask it">${(n.capabilities || []).map((c) => `<span title="${esc(c.does)}">${esc(c.title || c.id)}</span>`).join("")}</div>
       ${hint ? `<p class="cx-hint">${hint}</p>` : ""}
-      <div class="cx-actions"><button type="button" class="cx-btn" data-cx-screen="${esc(n.id)}"${hold.enabled ? "" : " disabled"}${hold.text === "Busy, awaiting contact" ? ` title="${esc(hold.text)}"` : ""}>${icon("monitor")}<span>Screen</span></button>
-        <button type="button" class="cx-btn" data-cx-send="${esc(n.id)}">${icon("arrow-up-right")}<span>Send files</span></button></div>
+      ${caps.has("desktop") || caps.has("files") ? `<div class="cx-actions">${caps.has("desktop") ? `<button type="button" class="cx-btn" data-cx-screen="${esc(n.id)}"${hold.enabled ? "" : " disabled"}${hold.text === "Busy, awaiting contact" ? ` title="${esc(hold.text)}"` : ""}>${icon("monitor")}<span>Screen</span></button>` : ""}
+        ${caps.has("files") ? `<button type="button" class="cx-btn" data-cx-send="${esc(n.id)}">${icon("arrow-up-right")}<span>Send files</span></button>` : ""}</div>` : ""}
       <div class="hm-host" data-hm="${esc(n.id)}"></div>
       ${hwDetails(d)}</article>`;
   }
 
+  // Read-only line from /api/continuity/gateway (host, mode, main, lease only). Re-read at most every 30 s.
+  const gw = { data: null, at: 0, busy: false };
+  function gatewayLine() {
+    const g = gw.data; if (!g) return "";
+    if (g.state === "not_set_up") return `<p class="cx-gw"><b>Gateway</b><span>not set up</span></p>`;
+    const bits = g.state === "ok"
+      ? [g.host, g.mode, g.main ? "MAIN " + g.main : "no MAIN yet", g.lease_valid ? "lease valid" : "no lease", g.epoch != null ? "epoch " + g.epoch : ""]
+      : [g.host, "unreachable" + (g.error ? " (" + g.error + ")" : "")];
+    return `<p class="cx-gw ${g.state === "ok" ? "" : "bad"}" title="Continuity gateway, read-only"><b>Gateway</b>${bits.filter(Boolean).map((b) => `<span>${esc(b)}</span>`).join("")}</p>`;
+  }
+  async function loadGateway() {
+    if (gw.busy || Date.now() - gw.at < 30000) return;
+    gw.busy = true;
+    try { gw.data = await api("/api/continuity/gateway"); } catch (e) { gw.data = { state: "unreachable", error: "console" }; }
+    gw.at = Date.now(); gw.busy = false;
+    if (!$("#view-devices").hidden && !document.fullscreenElement && !drops.some((d) => d.cls === "pending")) renderDevices();
+  }
   function linksPanel(o, inv) {
     const c = conn.data?.cluster;
     if (!c) return `<section class="panel cx-panel cx-links"><p class="cx-empty">${conn.error ? "Couldn't read connections: " + esc(conn.error) : "Reading connections…"}</p></section>`;
@@ -742,9 +767,9 @@
     const nodes = c.nodes || [];
     const online = nodes.filter((n) => n.online).length;
     return `<section class="panel cx-panel cx-links" aria-labelledby="cx-links-h">
-      <header class="cx-h"><h2 id="cx-links-h">Computers</h2><span class="cx-meta">${plural(nodes.length, "node")} · ${online} online</span></header>
+      <header class="cx-h"><h2 id="cx-links-h">Computers</h2><span class="cx-meta">${plural(nodes.length + 1, "machine")} · ${online + 1} online</span></header>
+      ${gatewayLine()}
       <div class="cx-map">${hubCard(c, conn.data.here, inv)}
-        <div class="cx-wires" aria-hidden="true">${nodes.map((n) => `<i class="${n.online ? "on" : "off"}"></i>`).join("")}</div>
         <div class="cx-nodes">${nodes.map((n) => nodeCard(n, inv)).join("") ||
           `<p class="cx-empty">No node PCs yet. Use <a href="#fleet-root">Connect a computer or server</a> below to make an invite, then run the join command it shows on the other computer.</p>`}</div></div></section>`;
   }
@@ -823,7 +848,7 @@
     paintMeters($("#view-devices"));
     wireDropzone(); wireScreen(); wireConnections();
     if (!conn.data && !conn.error && !conn.loading) { conn.loading = true; loadConnections().finally(() => (conn.loading = false)); }
-    pollConnections();
+    pollConnections(); loadGateway();
   }
 
   function wireConnections() {

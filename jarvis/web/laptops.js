@@ -347,7 +347,7 @@ void main(){
 
   // ---------- attach to whatever app.js just drew ----------
   function scan() {
-    const cards = [...top.querySelectorAll(".cx-links .cx-node")];
+    const cards = [...top.querySelectorAll(".cx-links .cx-node:not(.cx-server)")];
     const peers = [...top.querySelectorAll(".cx-links .cx-nodes .cx-node")].map((n) => n.classList.contains("on"));
     const seen = new Set();
     cards.forEach((card, i) => {

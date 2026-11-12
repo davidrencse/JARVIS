@@ -39,11 +39,17 @@
 @media (prefers-reduced-motion: reduce) { .cx-spin { animation-duration: 2.4s; } }
 
 /* computers: hub on the left, wires, nodes on the right */
-.cx-map { display: grid; grid-template-columns: minmax(0, 1fr) 56px minmax(0, 1fr); align-items: start; }
-.cx-wires { display: flex; flex-direction: column; justify-content: center; gap: 0; align-self: stretch; padding: 46px 0; }
-.cx-wires i { flex: 1; max-height: 140px; display: block; border-top: 2px solid var(--ok); margin: auto 0; }
-.cx-wires i.off { border-top-style: dashed; border-top-color: var(--warn); opacity: .8; }
-.cx-nodes { display: grid; gap: 12px; min-width: 0; }
+.cx-map { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 370px), 1fr)); gap: 12px; align-items: start; }
+.cx-nodes { display: contents; }
+.cx-node.cx-hub { border-left: 2px solid var(--ok); }
+.cx-node.on:not(.cx-hub) { border-left: 2px solid var(--ok); }
+.cx-node.off { border-left: 2px dashed var(--warn); }
+.cx-node header > svg.cx-rack { flex: none; width: 52px; height: 52px; color: var(--ink-3); margin-right: 2px; }
+.cx-quiet { margin: 12px 0 0; color: var(--ink-3); font: 12px var(--mono); }
+.cx-gw { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 0; margin: -4px 0 12px; font: 12px var(--mono); color: var(--ink-2); }
+.cx-gw b { color: var(--ink-3); font-weight: 400; text-transform: uppercase; letter-spacing: .06em; margin-right: 8px; }
+.cx-gw span + span::before { content: "·"; margin: 0 7px; color: var(--ink-3); }
+.cx-gw.bad span:last-child { color: var(--warn); }
 .cx-node { border: 1px solid var(--line-2); border-radius: var(--r); padding: 14px 16px; background: color-mix(in srgb, var(--hover) 40%, transparent); min-width: 0; }
 .cx-node.off { border-style: dashed; }
 .cx-node header, .cx-tile header { display: flex; align-items: center; gap: 10px; }
@@ -107,12 +113,7 @@
 .cx-list li span { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 @media (max-width: 900px) {
-  .cx-map { grid-template-columns: minmax(0, 1fr); gap: 0; }
-  .cx-wires { flex-direction: row; padding: 0 0 0 28px; height: 26px; }
-  .cx-wires i { flex: none; width: 0; height: 100%; max-height: none; border-top: 0; border-left: 2px solid var(--ok); margin: 0; }
-  .cx-wires i:not(:first-child) { display: none; }
-  .cx-wires i.off { border-left-style: dashed; border-left-color: var(--warn); }
-  .cx-pair { grid-template-columns: minmax(0, 1fr); }
+          .cx-pair { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 480px) {
   .cx-panel { padding: 14px; }
