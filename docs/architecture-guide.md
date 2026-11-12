@@ -72,12 +72,12 @@ a module is not listed, so add new modules to `sysview.py`.
 |---|---|---|
 | Hear | listen, daemon, overlay | mic capture, VAD, speaker ID, Whisper, background listener, Windows overlay |
 | Decide | router, assistant, instant, briefing, parse, registry, gates, pipeline, confirm, decide, interpret, selfmodel | turn words into checked actions or a conversation |
-| Remember | vault, knowledge, memory, vault_mcp, tasks, history, embed | memory heap, semantic recall, David's vault, tasks, action history |
+| Remember | vault, knowledge, memory, second_brain, second_brain_queue, second_brain_runtime, brainsync, vault_mcp, tasks, history, embed | memory heap, semantic recall, David's vault, tasks, action history |
 | Think | chatgpt, fastlane, runner, orchestrator, prompts, adapters, claude_auth, grok_preflight | model lanes, failover, agent runs |
-| Act | actions, terminal, agent_browser, remote, grokbot, transfer, storage, clipsync, showcase, observe, sharedinput | executors per OS, cross-machine calls, Grok Bot, files, clipboard, Lan Mouse |
+| Act | actions, control, terminal, agent_browser, remote, remote_view, grokbot, transfer, dropzone, storage, clipsync, showcase, observe, sharedinput, fleet_management | executors per OS, cross-machine calls, Grok Bot, files, clipboard, Lan Mouse |
 | Speak | speech, voice, agent | Kokoro TTS (local), speech queue, ElevenLabs live agent |
 | Log | store, events, locking, cluster_store | task ledger, event feed, file locks, cluster job store |
-| Console / ops | ui, __main__, sysview, cluster_cli, cluster_proxy, cluster_tunnel, deploy, node, platforms, autostart | CLI, web console, cluster control, code deploy, OS detection, login startup |
+| Console / ops | ui, __main__, phone, sysview, cluster_cli, cluster_proxy, cluster_tunnel, deploy, node, platforms, autostart, rest | CLI, web console, cluster control, code deploy, OS detection, login startup |
 
 Key files in plain words:
 - `assistant.py`: one turn end to end; `_interpret`, `_direct_turn`, `_shadow`, `_failover_reply`.
@@ -111,6 +111,75 @@ Key files in plain words:
   It's a heuristic over the command text, not a sandbox.
 - `cluster.py`: the hub (main) and node client; long polling; liveness; code-mismatch refusal.
 - `deploy.py`: code fingerprint, `cluster update` (tar over SSH, keeps the previous copy for `--rollback`).
+- `phone.py`: the phone PWA's server. It binds 127.0.0.1:7787 by default; David publishes that
+  port with `tailscale serve`. If funnel publishes the port, the server stays shut. Each
+  request must match this PC's tailnet name and `tailscale whois`, and `/phone/api/*` also
+  needs the cookie of a phone paired at the main's terminal. It does not serve console routes.
+- `second_brain.py`: the archive storage engine. Nothing runs on import. Changed personal
+  records are appended as immutable revision notes under `<vault>/reference/jarvis-records/`;
+  an existing note is never opened for writing. `validate()` checks the notes. `restore()`
+  rebuilds memory, history, tasks, plans, runs and knowledge files into a new empty state
+  directory. SQLite stays the reader unless `second_brain.canonical_read` is literal true
+  (this config does not set it).
+- `second_brain_queue.py`: the write-through outbox for memory, history and tasks. The
+  personal mutation and its full revision commit in the same SQLite transaction. `drain()`
+  publishes that revision and acknowledges it only after the note was written, fsynced and
+  read back.
+- `second_brain_runtime.py`: the drainer the voice daemon starts, and `jarvis archive`. A
+  cycle writes nothing unless `second_brain.enabled` is true (it is, in this config), this
+  PC is the configured main, `vault.enabled` is not false, and the vault directory exists
+  and carries a sentinel. It never reads `vault.write`. Status `state` is `current` only
+  when nothing is pending, held or failing, a drain has succeeded, every published head was
+  opened through the archive loader, and no published record has a revision gap or duplicate.
+- `brainsync.py`: a private git snapshot (`<base>/.jarvis/brain-git`, not the Obsidian vault)
+  and a SQLite memory handoff. Off unless `brainsync.enabled` is true; this config has no
+  `brainsync` key. Safe vault files are copied in with exclusive create. The same path with
+  different bytes becomes a side-by-side `conflict-<sha256>` copy. Nothing is overwritten
+  or deleted. Secret-shaped names and `state/memory.sqlite3` are not pushed unless that
+  exact path is on `remote_allowlist` (empty by default).
+- `continuity/`: MAIN continuity prototype. `authority` is the single-writer lease store;
+  `clock` is the PC-side cached-validity view. Tested on loopback, not deployed. Hooks in
+  `cluster_cli`, `cluster`, `remote`, `rest` and `phone` are lazy and default-off, and do
+  nothing until a cutover closes them. `cluster.main_device` stays the live authority.
+  `gateway` binds nothing on import, and `executor` is not wired into `Remote.call`.
+  This is not failover.
+- `fleet/`: P1 facades over today's single main. `legacy_topology` names the config-driven
+  roles and does not treat `cluster.main_device` as a lease. `readiness` is a read-only
+  report on a possible MAIN candidate and does not authorize promotion, failover, sleep or
+  cutover.
+- `fleet_management.py`: node onboarding, and a read-only fleet picture for the console and
+  a safe subset of it for the paired phone. Invite, revoke and capability changes wrap the
+  existing cluster calls. The invite code is returned once and is not stored. MAIN is never
+  an enroll, revoke or capability target.
+- `rest.py`: `jarvis sleep` on Linux. It stops this PC's JARVIS user units (the IP watcher
+  first, then Lan Mouse, clipboard, voice and the hub) and any other user unit holding a
+  block sleep lock, asks logind for `suspend-then-hibernate` by default, then starts exactly
+  those units again. `--no-suspend` only pauses; `jarvis wake` restores. Nodes stay up.
+- `control.py`: the `computer` tool (screenshot, click, drag, type, key, scroll) on Hyprland,
+  Win32 or macOS. `jarvis control stop` refuses further actions for 10 minutes. A spoken
+  "stop controlling my computer" hits the same stop (`assistant.STOP_CONTROL`). A pointer
+  JARVIS did not leave where it is pauses control. At most 120 actions per 10 minutes. An
+  error releases the mouse buttons and modifier keys.
+- `remote_view.py`: David drives a node, or the main, from the console. Frames and input ride
+  the cluster hub; nothing new listens. The node runs one signed `remote` job. Only the
+  main's console can open a session, and the brain has no tool for it. Ending the session
+  releases every button and key the node held.
+- `sharedinput.py`: Lan Mouse for the console, and `jarvis lanmouse start|stop|pair`.
+  `guard()` stops sharing after two apart readings in a row, and starts it again only if the
+  guard was what stopped it. While this console drives another computer, `ControllerPause` stops
+  Lan Mouse here (`remote-controlling.json`). The captured-input fail-safe is the daemon
+  `release_bind`, which `desktop.lan_mouse_config` writes next to `authorized_fingerprints`.
+- `hostmeter.py`: read-only RAM, swap, disk, CPU load and battery health for one computer
+  (`sysview` lists it on the Machines side). Health is full-charge capacity divided by
+  design capacity, and only when both numbers exist in the same unit. The same summary
+  rides inventory and the node heartbeat.
+- `dropzone.py`: a thin Wayland strip just inside the Lan Mouse edge. A file dropped on it
+  is copied to the other laptop through `transfer.push`. It accepts COPY only, so the file
+  manager does not delete the original.
+- `transfer.py`: files between the laptops, over chunked hub `transfer` jobs, or over SSH
+  when the cluster is off or the node is offline. `jarvis send` lands in `~/JARVIS-Drop`;
+  `jarvis fetch` pulls a file back to `~/Downloads/JARVIS-Drop`. The receiver keeps a hidden
+  `.part` file until the last chunk is in.
 
 ## Main and nodes
 
@@ -336,8 +405,10 @@ Add new model calls through it, never as a bare `ChatGPTLane`/`FastLane`:
   the decider's labels and the console's command history.
 - **David's personal vault** (`vault.path`, per OS): his notes, calendar and tasks. JARVIS
   reads it (`vault.world()` overview goes into every brain call) and writes only when he
-  asks, additively. **Currently off** (`vault.enabled`, `recall` and `write` are all
-  `false` in config): nothing is read or written until he turns it on. Protected paths are in `vault.protected`. Its own `CLAUDE.md` is its rulebook.
+  asks, additively. **On, read-only** in `jarvis.config.json`: `enabled` and `recall` are
+  true, `write` is false. `Vault.writable` is true only when `write` is exactly true, so
+  capture and append stay off and the brain is told vault writes are off
+  (`chatgpt.VAULT_READ_ONLY`). Protected paths are in `vault.protected`. Its own `CLAUDE.md` is its rulebook.
 - **JARVIS memory vault** (`jarvis-memory/` in this repo): rules, machines, decisions and
   Claude's memory notes. Committed, so it moves with git. Open it in Obsidian as its own vault.
 
@@ -394,7 +465,7 @@ Cluster actions: `configure`, `main`, `roles`, `status`, `run` (main), `node`, `
 ## 13 Tests
 
 `python -m unittest discover -s tests` with an interpreter that has the voice extras
-(the project `.venv`: `.venv/bin/python` on Linux, `.venv\Scripts\python.exe` on Windows). About 880 tests, all mocked: none touch the real
+(the project `.venv`: `.venv/bin/python` on Linux, `.venv\Scripts\python.exe` on Windows). About 4,000 tests, all mocked: none touch the real
 desktop, microphone or accounts. Test configs turn off semantic recall, shadow mode and the
 interpreter. Live checks are `jarvis selftest keyboard` and `jarvis doctor`.
 
@@ -402,6 +473,6 @@ interpreter. Live checks are `jarvis selftest keyboard` and `jarvis doctor`.
 
 - Backends for macOS, sway and X11 desktops are unit-tested only.
 - The interpreter has not yet been tested live end to end.
-- Lan Mouse fixes are pending (a fail-safe cursor approach first).
+- Lan Mouse is in service (`lan_mouse.enabled` is true). `sharedinput.guard` stops it after two apart readings, and the captured-input fail-safe is the daemon `release_bind` written by `desktop.lan_mouse_config` (with `authorized_fingerprints`).
 - Instant greetings ("hi", "thanks" with no model) were offered, not built.
 - The decider stays in shadow mode until it has enough labels to calibrate.

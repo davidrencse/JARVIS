@@ -8,8 +8,11 @@ Written 2026-11-07, after the overhaul in [audit-2026-11.md](audit-2026-11.md).
 | [voice.md](voice.md) | "Jarvis, ..." doesn't wake, or the wrong voice gets in |
 | [remote-control.md](remote-control.md) | Driving a node's screen from the main's console |
 | [phone.md](phone.md) | The phone app over Tailscale: setup, pairing, camera, locate, turning it off |
+| [mobile-targeting-changes.md](mobile-targeting-changes.md) | Send-to a PC from mobile Ask, and native Spotify and desktop routing |
 | [input-sharing.md](input-sharing.md) | Lan Mouse, the apart guard, a stuck cursor |
+| [drag-drop-design.md](drag-drop-design.md) | Design spike for dragging one file between the Arch main and the Windows node |
 | [cluster.md](cluster.md) | Main and nodes, the hub, tunnels, `cluster update` |
+| [continuity.md](continuity.md) | Continuity gateway: one HTTP process in front of one authority database |
 | [fleet-ui.md](fleet-ui.md) | Connections and the phone: add a computer, invite codes, archive vs Git |
 | [battery-health.md](battery-health.md) | Battery health, and RAM, swap, disk and CPU, on each computer |
 | [operations.md](operations.md) | Restarts, fail-safes, troubleshooting |
