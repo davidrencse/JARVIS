@@ -1,7 +1,10 @@
-"""Isolated loopback of Arch sleep, Dell promotion, and replay refusal.
+"""Composed loopback of Arch sleep, Dell promotion, one phone session and replay refusal.
 
-The temp store uses the real authority rules. Production ContinuityIntegration
-stays legacy, and a passing test is not a live failover.
+Everything here is the real module: `AuthorityStore` behind `ContinuityGateway`,
+`AuthorityClient` with installation-key signatures, `MainRuntime`, `ExecutorGuard`,
+`ContinuityGatewaySession` and `MobileIngress`. The stand-ins are a loopback MAIN
+relay sink per PC and a fake `Clock`. A passing run is not a live failover: no Oracle
+gateway, Tailscale or Dell has been exercised.
 """
 
 import json
@@ -9,27 +12,63 @@ import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.request import Request, urlopen
 
 from jarvis.continuity.authority import SAFETY_MARGIN, AuthorityError, AuthorityStore
+from jarvis.continuity.executor import ExecutorGuard
+from jarvis.continuity.gateway import AuthorityClient, GatewayError
 from jarvis.continuity.integration import (
+    AUTHORITY_ID,
     CONTRACT_HTTP,
     EXTRA_HTTP,
+    FLEET_ID,
     HTTP_STATUS,
     INCOMPATIBILITIES,
     ORIGIN,
     ContinuityIntegration,
     IntegrationError,
     IsolatedFleet,
-    LocalExecutor,
     deployment_facts,
+    apply_node_seen,
+    close_unfenced,
     http_status,
+    node_seen_mode,
+    open_unfenced,
     peer_report,
+    phone_listener_open,
+    refuse_unfenced,
+    set_node_seen_mode,
 )
+from jarvis.continuity.ingress import PHONE_COOKIE, IngressError, PhoneProtocolAdapter
+from jarvis.continuity.runtime import RuntimeRefusal
 from tests.continuity._fleet import Clock
 
-
 SECRET = "SECRET-PROMPT-do-not-store"
-POINTER = "POINTER-9-do-not-persist"
+HOST = "oracle.tailnet.ts.net"
+PHONE_ORIGIN = "https://" + HOST
+
+
+def peer_from(headers):
+    if (headers.get("X-Test-Peer") or "phone") == "none":
+        return None
+    return {"stable_id": "phone-stable", "login": "david@example.com", "os": "iOS",
+            "node": "iPhone", "address": "100.64.0.2"}
+
+
+def owner_from(material):
+    if material != "owner-token":
+        return None
+    return {"role": "owner", "installation_id": "zenbook-inst", "device_id": "zenbook"}
+
+
+def hdr(cookie=None, csrf=None):
+    out = {"Host": HOST, "Origin": PHONE_ORIGIN, "X-JARVIS-Phone": "1", "Sec-Fetch-Site": "same-origin",
+           "Tailscale-User-Login": "david@example.com", "X-Test-Peer": "phone"}
+    if cookie:
+        out["Cookie"] = "%s=%s" % (PHONE_COOKIE, cookie)
+    if csrf:
+        out["X-CSRF-Token"] = csrf
+    return out
 
 
 class ProductionBlocked(unittest.TestCase):
@@ -44,16 +83,12 @@ class ProductionBlocked(unittest.TestCase):
         self.assertFalse(report["activated"])
         self.assertTrue(report["ignored_tuple"])
         ids = {row["id"] for row in report["blockers"]}
-        self.assertIn("peer_gateway", ids)
-        self.assertIn("peer_ingress", ids)
-        self.assertIn("peer_runtime", ids)
-        self.assertIn("peer_executor", ids)
-        self.assertIn("gateway_host_unverified", ids)
-        self.assertIn("dell_provider_unverified", ids)
-        self.assertIn("luna_grok_unverified", ids)
-        self.assertIn("signature_verifier_absent", ids)
-        self.assertIn("passkey_verifier_absent", ids)
-        self.assertIn("legacy_paths_unfenced", ids)
+        for blocker in ("gateway_host_unverified", "hub_loopback", "phone_origin_arch_loopback",
+                        "dell_provider_unverified", "luna_grok_unverified", "safety_margin_unmeasured",
+                        "windows_clock_untested", "legacy_paths_unfenced", "passkey_verifier_absent",
+                        "signature_verifier_absent", "automatic_failover_disabled"):
+            self.assertIn(blocker, ids)
+        self.assertFalse(any(name.startswith("peer_") for name in ids))
         self.assertFalse(integration.v2_request({"role": "phone"}, "op-1", {"target": "dell"})["ok"])
         legacy = integration.legacy_request({"target": "dell", "effect_class": "control"})
         self.assertFalse(legacy["acted"])
@@ -65,11 +100,11 @@ class ProductionBlocked(unittest.TestCase):
         self.assertFalse(integration.quiesce_legacy(1)["applied"])
         self.assertFalse(integration.rollback_quiesced("drill", 1)["applied"])
 
-    def test_peers_missing_and_repo_has_no_oracle_gateway(self):
+    def test_peers_behave_and_repo_has_no_oracle_gateway(self):
         peers = peer_report()
         for name in ("gateway", "ingress", "runtime", "executor"):
-            self.assertFalse(peers[name]["present"])
-            self.assertFalse(peers[name]["compatible"])
+            self.assertTrue(peers[name]["present"], name)
+            self.assertTrue(peers[name]["compatible"], (name, peers[name]))
         facts = deployment_facts()
         self.assertTrue(facts["config_read"])
         self.assertFalse(facts["oracle_device"])
@@ -77,13 +112,11 @@ class ProductionBlocked(unittest.TestCase):
         self.assertEqual(facts["phone_bind"], "127.0.0.1:7787")
         self.assertFalse(facts["provider_verified"])
         self.assertFalse(facts["windows_clock_tested"])
-        self.assertIn("zenbook", facts["device_ids"])
-        self.assertIn("dell", facts["device_ids"])
         ids = {row["id"] for row in INCOMPATIBILITIES}
-        self.assertIn("peers_absent", ids)
-        self.assertIn("no_signatures", ids)
-        self.assertIn("store_states", ids)
-        self.assertIn("no_passkey", ids)
+        for kept in ("no_signatures", "store_states", "no_passkey"):
+            self.assertIn(kept, ids)
+        self.assertNotIn("peers_absent", ids)
+        self.assertNotIn("inprocess_auth_double", ids)
 
     def test_store_codes_fail_closed(self):
         source = Path("jarvis/continuity/authority.py").read_text(encoding="utf-8")
@@ -93,302 +126,378 @@ class ProductionBlocked(unittest.TestCase):
         for code in codes:
             status, _ = http_status(code, 1.5)
             self.assertNotEqual(status, 200)
-            self.assertIn(status, (400, 401, 403, 409, 410, 503))
+            self.assertIn(status, (400, 401, 403, 404, 409, 410, 503))
         self.assertEqual(CONTRACT_HTTP["ticket_expired"], 410)
         self.assertEqual(CONTRACT_HTTP["not_quiet"], 409)
         self.assertEqual(http_status("not_quiet", 3)[1], 3)
         self.assertEqual(http_status("stale", 3)[1], None)
         self.assertEqual(EXTRA_HTTP["writer_busy"], 503)
+        self.assertEqual(http_status("not_found")[0], 404)
+        self.assertEqual(http_status("unknown_participant")[0], 403)
         self.assertEqual(http_status("never_heard_of")[0], 503)
 
 
-class LoopbackCase(unittest.TestCase):
+class Composed(unittest.TestCase):
+    """A real fleet with Arch (`zenbook`) as MAIN and the phone paired through real ingress."""
+
     def setUp(self):
         self.tmp = TemporaryDirectory()
         self.clock = Clock()
         self.fleet = IsolatedFleet(self.tmp.name, self.clock)
-
-    def tearDown(self):
-        self.fleet.close()
-        self.tmp.cleanup()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.fleet.close)
+        self.arch = self.fleet.nodes["zenbook"]
+        self.dell = self.fleet.nodes["dell"]
+        self.fleet.cutover()
+        _, self.arch_lease = self.fleet.promote("zenbook")
+        self.arch.runtime.start()
+        self.arch.runtime.accept_lease(self.arch_lease)
+        self.ingress = self.fleet.phone_ingress(
+            Path(self.tmp.name) / "phone.sqlite", peer_verifier=peer_from, owner_verifier=owner_from,
+            origin=PHONE_ORIGIN)
+        self.ingress.activate(self.fleet.status()["mode_version"], legacy_phone_fenced=True)
+        self.http = PhoneProtocolAdapter(self.ingress)
+        self.cookie, self.csrf = self._pair()
 
     def _pair(self):
-        proof = self.fleet.ingress.pairing_code
-        session = self.fleet.ingress.pair(proof, {"name": "phone"})
-        principal = self.fleet.ingress.authenticate(session["cookie"], session["csrf"], ORIGIN)
-        return session, principal
+        self.ingress.identify(hdr())
+        owner = self.ingress.authenticate_owner("owner-token")
+        issued = self.ingress.issue_code(owner, "Pixel")
+        first = self.http.handle("POST", "/phone/pair", hdr(),
+                                 json.dumps({"code": issued["code"], "name": "Pixel"}).encode())
+        self.assertEqual(first.status, 202)
+        self.ingress.decide_pairing(owner, issued["code_id"], True)
+        done = self.http.handle("POST", "/phone/pair/status", hdr(),
+                                json.dumps({"code": issued["code"]}).encode())
+        self.assertEqual(done.status, 200, done.body)
+        cookie = done.headers["Set-Cookie"].split(";", 1)[0].split("=", 1)[1]
+        return cookie, done.body["csrf_token"]
 
-    def test_arch_sleep_promotes_dell_and_phone_session_survives(self):
-        fleet = self.fleet
-        booted = fleet.boot_zenbook()
-        self.assertEqual(booted["not_ready"]["code"], "no_admission")
-        self.assertEqual(booted["status"]["main"], "zenbook")
-        self.assertTrue(booted["status"]["main_ready"])
-        self.assertFalse(fleet.dispatch_flags()["both"])
-        self.assertEqual(fleet.production.mode()["mode"], "LEGACY_ACTIVE")
-        renews = fleet.gateway.renew_calls
-        self.assertTrue(fleet.arch.require_authority("control")["ok"])
-        self.assertEqual(fleet.gateway.renew_calls, renews)
-        session, principal = self._pair()
-        accepted = fleet.ingress.submit(principal, "op-accepted",
-                                        {"target": "dell", "effect_class": "control"})
-        self.assertEqual(accepted["state"], "accepted")
-        self.assertEqual(accepted["run_count"], 1)
-        self.assertFalse(accepted.get("signature_verified", False))
-        held = fleet.ingress.hold(principal, "op-held", {"target": "dell", "effect_class": "control"})
-        self.assertEqual(held["state"], "held")
-        noted = fleet.ingress.note_input(principal, POINTER)
-        self.assertTrue(noted["accepted"])
-        self.assertFalse(noted["persisted"])
+    def call(self, method, path, body=None):
+        raw = json.dumps(body).encode() if body is not None else b""
+        return self.http.handle(method, path, hdr(self.cookie, self.csrf), raw)
 
-        def during_sleep():
-            return fleet.ingress.submit(principal, "op-while-asleep",
-                                        {"target": "dell", "effect_class": "control"})
+    def ask(self, key, text="open the pod bay doors"):
+        return self.call("POST", "/phone/api/ask", {"key": key, "text": text})
 
-        report = fleet.sleep_promote_dell(during_sleep)
-        self.assertEqual(report["early_local"]["code"], "admission_stopped")
-        self.assertGreater(report["cache_while_asleep"], 0)
-        self.assertEqual(report["early"]["code"], "main_alive")
-        self.assertEqual(report["still_alive"]["code"], "main_alive")
-        self.assertEqual(report["waited"]["code"], "not_quiet")
-        self.assertGreater(report["waited"]["retry_after"], 0)
-        self.assertEqual(report["not_ready"]["code"], "no_admission")
-        self.assertEqual(report["during_sleep"]["code"], "admission_stopped")
-        self.assertEqual(fleet.dell_exec.runs("op-while-asleep"), 0)
-        self.assertEqual(report["status"]["main"], "dell")
-        self.assertTrue(report["status"]["main_ready"])
-        self.assertGreater(report["status"]["epoch"], report["old_lease"]["epoch"])
-        self.assertEqual(report["dell_cached_seconds"], 0)
-        self.assertEqual(fleet.dell_exec.runs("op-before-canary"), 0)
-        again = fleet.ingress.authenticate(session["cookie"], session["csrf"], ORIGIN)
-        self.assertEqual(again["session_id"], session["session_id"])
-        self.assertFalse(again["manage_main"])
-        pinned = fleet.ingress.submit(again, "op-held", {"target": "dell", "effect_class": "control"})
-        self.assertEqual(pinned["state"], "held")
-        self.assertEqual(fleet.dell_exec.runs("op-held"), 0)
-        queried = fleet.ingress.operation(again, "op-accepted")
-        self.assertEqual(queried["run_count"], 1)
-        self.assertEqual(fleet.dell_exec.runs("op-accepted"), 1)
-        continued = fleet.ingress.submit(again, "op-after", {"target": "dell", "effect_class": "control"})
-        self.assertEqual(continued["state"], "accepted")
-        self.assertEqual(continued["run_count"], 1)
-        ai = fleet.ingress.submit(again, "op-ai", {"target": "dell", "effect_class": "ai"})
-        self.assertEqual(ai["code"], "ai_not_ready")
-        self.assertEqual(fleet.dell_exec.runs("op-ai"), 0)
-        self.assertFalse(fleet.dell.readiness("ai")["ai_ready"])
-        self.assertIsNone(fleet.dell.readiness("ai")["provider"])
-        stopped = fleet.ingress.disconnect(session["cookie"])
-        self.assertEqual(stopped["input_open"], False)
-        self.assertFalse(fleet.ingress.note_input(again, POINTER)["accepted"])
-        fleet.arch.admitting = True
-        fleet.arch.lease = report["old_lease"]
-        stale_local = fleet.arch.require_authority("control")
-        self.assertFalse(stale_local["ok"])
-        self.assertEqual(stale_local["code"], "stale")
-        stale_renew = fleet.capture(lambda: fleet.gateway.renew(
-            fleet.identities["zenbook"], report["old_lease"]))
-        self.assertEqual(stale_renew["code"], "stale")
-        stale_effect = fleet.capture(lambda: fleet.arch_exec.accept(
-            fleet.identities["zenbook"], {}, fleet.ticket(
-                "zenbook", "op-stale-arch", "zenbook", report["old_lease"])))
-        self.assertEqual(stale_effect["code"], "stale")
-        self.assertEqual(fleet.arch_exec.runs("op-stale-arch"), 0)
-        self.assertFalse(fleet.production.v2_request(again, "op-live", {"target": "dell"})["ok"])
-        self.assertFalse(fleet.production.activate_v2(report["status"], True)["applied"])
-        self.assertFalse(fleet.dispatch_flags()["both"])
-        self.assertNotIn(SECRET.encode(), fleet.persisted_bytes())
-        self.assertNotIn(POINTER.encode(), fleet.persisted_bytes())
+    def renew_arch(self):
+        return self.arch.runtime.renew_once()
+
+    def sleep_arch_promote_dell(self):
+        """Arch stops renewing without releasing; Dell waits out the lease and the margin."""
+        self.clock.tick(15 - 1)
+        early = self.request_dell()
+        self.clock.tick(2 + SAFETY_MARGIN)
+        self.dell.runtime.start()
+        _, lease = self.fleet.promote("dell")
+        self.dell.runtime.accept_lease(lease)
+        return early, lease
+
+    def request_dell(self):
+        status = self.fleet.status()
+        try:
+            self.fleet.owner.transition_request(
+                "early-dell", "recover", "dell", status["incarnation"], status["epoch"],
+                status["policy_version"])
+        except GatewayError as exc:
+            return exc.code
+        return None
+
+    # --- the headline property --------------------------------------------------
+
+    def test_arch_sleep_promotes_dell_same_phone_session_sink_once_stale_arch_refused(self):
+        first = self.ask("op-ask-0001")
+        self.assertEqual(first.status, 200, first.body)
+        self.assertEqual(self.arch.effects, ["op-ask-0001"])
+        again = self.ask("op-ask-0001")
+        self.assertEqual(again.status, 200, again.body)
+        self.assertEqual(self.arch.effects, ["op-ask-0001"], "same operation id reached the sink twice")
+        overview = self.call("GET", "/phone/api/overview")
+        self.assertEqual(overview.status, 200)
+        self.assertEqual(overview.body["main"], "zenbook")
+        me = self.call("GET", "/phone/api/me")
+        self.assertTrue(me.body["relay"])
+        self.assertFalse(me.body["metadata_only"])
+
+        early, dell_lease = self.sleep_arch_promote_dell()
+        self.assertEqual(early, "main_alive")
+        status = self.fleet.status()
+        self.assertEqual(status["main"], "dell")
+        self.assertGreater(status["epoch"], self.arch_lease["epoch"])
+
+        # same phone cookie, same csrf: the paired session survived the failover
+        me = self.call("GET", "/phone/api/me")
+        self.assertEqual(me.status, 200)
+        self.assertEqual(me.body["main"]["id"], "dell")
+        after = self.ask("op-ask-0002")
+        self.assertEqual(after.status, 200, after.body)
+        self.assertEqual(self.dell.effects, ["op-ask-0002"])
+        self.assertEqual(self.arch.effects, ["op-ask-0001"])
+        replay = self.ask("op-ask-0002")
+        self.assertEqual(replay.status, 200)
+        self.assertEqual(self.dell.effects, ["op-ask-0002"])
+
+        # stale Arch: the old holder wakes up believing it is MAIN
+        self.arch.runtime.invalidate_after_resume()
+        with self.assertRaises(Exception) as local:
+            self.arch.runtime.require_authority("ordinary", target="zenbook")
+        self.assertIn(getattr(local.exception, "code", ""), ("stale", "not_holder", "no_lease_id", "legacy"))
+        code, body = self.arch.handle_relay(self.relay_body("op-stale-arch", "zenbook", "zenbook"))
+        self.assertEqual(body.get("accepted"), False)
+        self.assertEqual(self.arch.effects, ["op-ask-0001"])
+        with self.assertRaises(GatewayError) as renew:
+            self.arch.client.renew("zenbook", self.arch_lease["lease_id"],
+                                   self.arch_lease["incarnation"], self.arch_lease["epoch"])
+        self.assertIn(renew.exception.code, ("stale", "expired", "not_holder"))
+
+    # --- reboot, partition, restart ---------------------------------------------
 
     def test_reboot_partition_and_restart_do_not_replay(self):
-        fleet = self.fleet
-        fleet.boot_zenbook()
-        session, principal = self._pair()
-        fleet.ingress.submit(principal, "op-accepted", {"target": "dell", "effect_class": "control"})
-        report = fleet.sleep_promote_dell()
-        principal = fleet.ingress.authenticate(session["cookie"], session["csrf"], ORIGIN)
-        fleet.ingress.submit(principal, "op-after", {"target": "dell", "effect_class": "control"})
-        crashed = fleet.dell_exec.accept(
-            fleet.identities["dell"], {"crash": True},
-            fleet.ticket("dell", "op-crash", "dell", fleet.dell.lease))
-        self.assertEqual(crashed["state"], "uncertain")
-        self.assertEqual(crashed["run_count"], 0)
-        again = fleet.dell_exec.accept(
-            fleet.identities["dell"], {}, fleet.ticket("dell", "op-crash", "dell", fleet.dell.lease))
-        self.assertEqual(again["run_count"], 0)
-        prior = fleet.dell_exec.reconcile("op-after", "a-1")
-        fleet.reboot_executor("dell")
-        fleet.gateway.up = False
-        replay_ticket = {"target": "dell", "operation_id": "op-after", "attempt_id": "a-1",
-                         "admission_id": prior["admission_id"], "digest": prior["digest"],
-                         "incarnation": prior["incarnation"], "epoch": prior["epoch"], "main": "dell"}
-        replayed = fleet.dell_exec.accept(fleet.identities["dell"], {}, replay_ticket)
-        self.assertEqual(replayed["state"], "accepted")
-        self.assertEqual(fleet.dell_exec.runs("op-after"), 1)
-        old = fleet.capture(lambda: fleet.dell_exec.accept(
-            fleet.identities["zenbook"], {}, fleet.ticket(
-                "zenbook", "op-old-offline", "dell", report["old_lease"])))
-        self.assertEqual(old["code"], "stale")
-        fresh = fleet.capture(lambda: fleet.dell_exec.accept(
-            fleet.identities["dell"], {}, fleet.ticket("dell", "op-offline-new", "dell", fleet.dell.lease)))
-        self.assertEqual(fresh["code"], "authority_unavailable")
-        self.assertEqual(fleet.dell_exec.runs("op-offline-new"), 0)
-        self.assertEqual(fleet.dell_exec.runs("op-old-offline"), 0)
-        blocked = fleet.ingress.submit(principal, "op-partition",
-                                       {"target": "dell", "effect_class": "control"})
-        self.assertEqual(blocked["code"], "authority_unavailable")
-        quiet = fleet.ingress.status(principal)
-        self.assertFalse(quiet["commands"])
-        self.assertEqual(quiet["code"], "authority_unavailable")
-        fleet.gateway.up = True
-        restarted = fleet.restart_authority()
-        self.assertIsNone(restarted["main"])
-        self.assertGreater(restarted["grant_barrier"], 0)
-        self.assertGreater(restarted["incarnation"], report["status"]["incarnation"])
-        survived = fleet.ingress.authenticate(session["cookie"], session["csrf"], ORIGIN)
-        self.assertEqual(survived["session_id"], session["session_id"])
-        refused = fleet.ingress.submit(survived, "op-after-restart",
-                                       {"target": "dell", "effect_class": "control"})
-        self.assertEqual(refused["code"], "no_admission")
-        self.assertEqual(fleet.dell_exec.runs("op-after"), 1)
-        self.assertEqual(fleet.dell_exec.runs("op-after-restart"), 0)
-        stale_ticket = fleet.capture(lambda: fleet.gateway.consume(
-            fleet.identities["dell"], fleet.ticket("dell", "op-reborn", "dell", {
-                "incarnation": prior["incarnation"], "epoch": prior["epoch"]})))
-        self.assertEqual(stale_ticket["code"], "stale")
-        self.assertEqual(fleet.dell_exec.runs("op-reborn"), 0)
-        self.assertNotIn(POINTER.encode(), fleet.persisted_bytes())
+        self.assertEqual(self.ask("op-before-01").status, 200)
+        _, dell_lease = self.sleep_arch_promote_dell()
+        self.assertEqual(self.ask("op-after-001").status, 200)
+        self.assertEqual(self.dell.effects, ["op-after-001"])
+        old = self.fleet.status()
 
-    def test_canary_failure_ai_profile_and_rollback_leave_one_or_none(self):
-        fleet = self.fleet
-        fleet.boot_zenbook()
-        self.assertFalse(fleet.dispatch_flags()["both"])
-        opened = fleet._request("dell", "ai-1", "ai")
-        fleet.gateway.transition_readiness(fleet.identities["dell"], opened["transition_id"], {
-            "control_ready": True, "ai_ready": False, "checkpoint": "cp-1"})
-        refused = fleet.capture(lambda: fleet.gateway.transition_step(
-            fleet.identities["owner-pc"], opened["transition_id"], "drain"))
-        self.assertEqual(refused["code"], "not_ready")
-        fleet.gateway.transition_step(fleet.identities["owner-pc"], opened["transition_id"], "cancel")
-        self.assertEqual(fleet.store.status()["main"], "zenbook")
-        moved = fleet._request("dell", "handover-1", "control")
-        fleet.prepare_candidate(moved["transition_id"], "dell", control=True, ai=False)
-        fleet.ack_awake()
-        fenced = fleet.try_fence(moved["transition_id"])
-        self.assertTrue(fenced["ok"])
-        lease = fleet.grant_candidate(moved["transition_id"], "dell")
-        fleet.finish(moved["transition_id"], "dell", False)
-        status = fleet.store.status()
+        self.dell.reboot()
+        code, replay = self.dell.handle_relay(self.relay_body("op-after-001", "dell", "dell", attempt="a-other"))
+        self.assertEqual(replay["accepted"], False)
+        self.assertEqual(self.ask("op-after-001").status, 200)  # stored outcome, not a resend
+        self.assertEqual(self.dell.effects, ["op-after-001"])
+        self.assertEqual(self.ask("op-after-002").status, 200)
+        self.assertEqual(self.dell.effects, ["op-after-001", "op-after-002"])
+
+        self.dell.client.up = False
+        cut = self.ask("op-partition")
+        self.assertEqual(cut.status, 409)
+        self.assertEqual(cut.body["code"], "refused")
+        self.assertEqual(self.dell.effects, ["op-after-001", "op-after-002"])
+        self.assertIn("partition", self.dell.refusals)
+        self.dell.client.up = True
+
+        restarted = self.fleet.restart_gateway()
+        self.assertIsNone(restarted["main"])
+        self.assertGreater(restarted["incarnation"], old["incarnation"])
+        self.assertGreater(restarted["grant_barrier"], 0)
+        me = self.call("GET", "/phone/api/me")
+        self.assertEqual(me.status, 200, "the paired phone session must survive a gateway restart")
+        self.assertFalse(me.body["relay"])
+        refused = self.ask("op-after-restart")
+        self.assertEqual(refused.status, 503)
+        self.assertEqual(refused.body["code"], "no_main")
+        self.assertEqual(self.dell.effects, ["op-after-001", "op-after-002"])
+        code, direct = self.dell.handle_relay(self.relay_body("op-direct-01", "dell", "dell"))
+        self.assertEqual(direct["accepted"], False)
+
+        ticket = {"admission_id": "adm-old", "target": "dell", "operation_id": "op-reborn",
+                  "attempt_id": "a-0001", "digest": "sha256:" + "ab" * 32, "main": "dell",
+                  "incarnation": old["incarnation"], "epoch": old["epoch"],
+                  "issued_at": self.clock.wall() - 1, "admit_until": self.clock.wall() + 60,
+                  "issuer_incarnation": old["incarnation"]}
+        signature = self.dell.client.sign_ticket(ticket)
+        with self.assertRaises(GatewayError) as stale:
+            self.dell.client.consume(ticket, signature)
+        self.assertIn(stale.exception.code, ("stale", "no_admission"))
+        self.assertEqual(self.dell.effects, ["op-after-001", "op-after-002"])
+
+    def test_ambiguous_effect_is_never_sent_again(self):
+        self.arch.server.shutdown()  # the relay target dies after the gateway picked it
+        calls = []
+        real = self.ingress._gateway.relay_transient
+
+        def counting(*args, **kwargs):
+            calls.append(args[0])
+            return real(*args, **kwargs)
+
+        self.ingress._gateway.relay_transient = counting
+        first = self.ask("op-ambiguous-1")
+        self.assertNotEqual(first.status, 200)
+        self.assertEqual(calls, ["op-ambiguous-1"])
+        second = self.ask("op-ambiguous-1")
+        self.assertEqual(calls, ["op-ambiguous-1"], "an ambiguous effect was retried")
+        self.assertIn(second.status, (409, 503))
+        changed = self.ask("op-ambiguous-1", text="something else")
+        self.assertEqual(changed.status, 409)
+        self.assertEqual(changed.body["code"], "conflict")
+        self.assertEqual(self.arch.effects, [])
+
+    # --- canary and rollback ----------------------------------------------------
+
+    def test_canary_failure_leaves_no_main_and_no_effect(self):
+        self.sleep_arch_promote_dell_until_canary()
+        status = self.fleet.status()
         self.assertIsNone(status["main"])
         self.assertEqual(status["mode"], "V2_ONLY_NO_MAIN")
-        self.assertFalse(fleet.dispatch_flags()["legacy"])
-        self.assertFalse(fleet.dispatch_flags()["v2"])
-        self.assertFalse(fleet.dispatch_flags()["both"])
-        stale = fleet.capture(lambda: fleet.gateway.renew(fleet.identities["zenbook"], fleet.arch.lease))
-        self.assertEqual(stale["code"], "stale")
-        ghost = fleet.capture(lambda: fleet.gateway.renew(fleet.identities["dell"], lease))
-        self.assertIn(ghost["code"], ("stale", "expired"))
-        with self.assertRaises(AuthorityError) as caught:
-            fleet.store.set_mode("ROLLBACK_QUIESCED", status["mode_version"])
-        self.assertEqual(caught.exception.code, "bad_edge")
-        self.assertFalse(fleet.production.rollback_quiesced("drill", status["mode_version"])["applied"])
-        self.assertEqual(fleet.production.mode()["mode"], "LEGACY_ACTIVE")
+        self.assertEqual(self.ask("op-canary-01").status, 503)
+        for node in (self.arch, self.dell):
+            code, body = node.handle_relay(self.relay_body("op-direct-" + node.name, node.name, node.name))
+            self.assertEqual(body["accepted"], False)
+            self.assertEqual(node.effects, [])
+        with self.assertRaises(GatewayError):
+            self.dell.client.renew("dell", self.dell_lease["lease_id"],
+                                   self.dell_lease["incarnation"], self.dell_lease["epoch"])
+        with self.assertRaises(GatewayError):
+            self.arch.client.renew("zenbook", self.arch_lease["lease_id"],
+                                   self.arch_lease["incarnation"], self.arch_lease["epoch"])
+
+    def sleep_arch_promote_dell_until_canary(self):
+        self.clock.tick(14)
+        self.clock.tick(2 + SAFETY_MARGIN)
+        self.dell.runtime.start()
+        _, self.dell_lease = self.fleet.promote("dell", canary=False)
+
+    # --- authentication gaps ----------------------------------------------------
 
     def test_auth_gaps_do_not_open_a_transition_or_extend_a_lease(self):
-        fleet = self.fleet
-        fleet.boot_zenbook()
-        before = fleet.store.status()["lease_remaining"]
-        calls = fleet.gateway.renew_calls
-        bad = dict(fleet.identities["zenbook"])
-        bad["secret"] = "0" * len(bad["secret"])
-        refused = fleet.capture(lambda: fleet.gateway.renew(bad, fleet.arch.lease))
-        self.assertEqual(refused["http"], 401)
-        self.assertEqual(fleet.gateway.renew_calls, calls)
-        self.assertEqual(fleet.store.status()["lease_remaining"], before)
-        session, principal = self._pair()
-        with self.assertRaises(IntegrationError):
-            fleet.ingress.authenticate(session["cookie"], "csrf-wrong", ORIGIN)
-        owner = {"manage_main": True, "role": "owner"}
-        view = fleet.store.status()
-        request = {"action": "make_main_now", "candidate": "dell", "profile": "control", "client_key": "admin-1",
-                   "expected_incarnation": view["incarnation"], "expected_epoch": view["epoch"],
-                   "expected_policy": view["policy_version"]}
-        preview = fleet.ingress.manage_main_preview(owner, request)
-        self.assertFalse(preview["mutates"])
-        self.assertFalse(preview["passkey_verifier"])
-        self.assertIsNone(fleet.store.status()["transition"])
-        with self.assertRaises(IntegrationError) as phone_admin:
-            fleet.ingress.manage_main_confirm(principal, preview["preview_id"], preview["challenge"])
-        self.assertEqual(phone_admin.exception.code, "not_manage_main")
-        self.assertIsNone(fleet.store.status()["transition"])
-        with self.assertRaises(IntegrationError):
-            fleet.ingress.manage_main_confirm(owner, preview["preview_id"], "ch-wrong")
-        self.assertIsNone(fleet.store.status()["transition"])
-        first = fleet.ingress.manage_main_confirm(owner, preview["preview_id"], preview["challenge"])
-        second = fleet.ingress.manage_main_confirm(owner, preview["preview_id"], preview["challenge"])
-        self.assertEqual(first["transition_id"], second["transition_id"])
-        self.assertEqual(fleet.store.status()["transition"]["transition_id"], first["transition_id"])
-        fleet.gateway.transition_step(fleet.identities["owner-pc"], first["transition_id"], "cancel")
-        epoch = fleet.store.status()["epoch"]
-        with self.assertRaises(IntegrationError) as step:
-            fleet.gateway.transition_step(fleet.identities["owner-pc"], first["transition_id"], "catching_up")
-        self.assertEqual(step.exception.code, "bad_request")
-        self.assertEqual(fleet.store.status()["epoch"], epoch)
-        ineligible = fleet.try_request("oracle", "oracle-main")
-        self.assertEqual(ineligible["code"], "ineligible")
+        before = self.fleet.status()
+        calls = self.arch.client.renew_count()
+        forged = AuthorityClient(
+            self.fleet.origin, authority_id=AUTHORITY_ID, wall=self.clock.wall, device_id="zenbook",
+            installation_id="zenbook-inst", private_key_path=self.fleet._keys["dell"][1])
+        with self.assertRaises(GatewayError) as caught:
+            forged.renew("zenbook", self.arch_lease["lease_id"], self.arch_lease["incarnation"],
+                         self.arch_lease["epoch"])
+        self.assertEqual(caught.exception.code, "unauthorized")
+        self.assertEqual(self.arch.client.renew_count(), calls)
+        self.assertEqual(self.fleet.status()["lease_remaining"], before["lease_remaining"])
 
-    def test_personal_fields_never_reach_the_store(self):
-        fleet = self.fleet
-        fleet.boot_zenbook()
-        _, principal = self._pair()
-        with self.assertRaises(IntegrationError) as caught:
-            fleet.ingress.submit(principal, "op-secret",
-                                 {"target": "dell", "effect_class": "control", "prompt": SECRET})
-        self.assertEqual(caught.exception.code, "personal_field")
-        blob = fleet.persisted_bytes()
+        # a phone without the separate grant cannot even preview a MAIN change
+        self.ingress.identify(hdr())
+        principal = self.ingress.authenticate(self.cookie, self.csrf, PHONE_ORIGIN)
+        request = {"action": "make_main_now", "candidate": "dell", "profile": "control"}
+        with self.assertRaises(IngressError) as denied:
+            self.ingress.manage_main_preview(principal, request)
+        self.assertEqual(denied.exception.status, 403)
+        self.assertIsNone(self.fleet.status()["transition"])
+
+        # granted, but with no passkey verifier nothing may open
+        owner = self.ingress.authenticate_owner("owner-token")
+        me = self.call("GET", "/phone/api/me").body["phone"]["id"]
+        self.ingress.grant_manage_main(owner, me)
+        principal = self.ingress.authenticate(self.cookie, self.csrf, PHONE_ORIGIN)
+        preview = self.ingress.manage_main_preview(principal, request)
+        with self.assertRaises(IngressError) as nopass:
+            self.ingress.manage_main_confirm(principal, preview["preview_id"], {"challenge": preview["challenge"]})
+        self.assertEqual(nopass.exception.code, "passkey_unavailable")
+        self.assertIsNone(self.fleet.status()["transition"])
+        self.assertEqual(self.fleet.status()["main"], "zenbook")
+
+        # a phone device key is a client, not a PC: it cannot renew or acknowledge a lease
+        for call in (lambda: self.fleet.phone_client.renew("zenbook", self.arch_lease["lease_id"],
+                                                          self.arch_lease["incarnation"], self.arch_lease["epoch"]),):
+            with self.assertRaises(GatewayError):
+                call()
+        self.assertEqual(self.fleet.status()["lease_remaining"], before["lease_remaining"])
+
+    # --- personal content -------------------------------------------------------
+
+    def test_personal_content_never_reaches_a_store_or_log(self):
+        self.assertEqual(self.ask("op-personal-1", text=SECRET).status, 200)
+        self.assertEqual(self.arch.effects, ["op-personal-1"])
+        blob = self.fleet.persisted_bytes()
         self.assertNotIn(SECRET.encode(), blob)
-        self.assertNotIn(b"prompt", blob)
-        text = json.dumps(fleet.gateway.log)
-        self.assertNotIn(SECRET, text)
-        for secret in fleet.secrets.values():
-            self.assertNotIn(secret.encode(), blob)
+        self.assertNotIn(SECRET, json.dumps(self.fleet.gateway.audit_events()))
+        for name in ("owner", "zenbook", "dell", "oracle", "ingress"):
+            private = (self.fleet.root / "keys" / name).read_bytes()
+            self.assertNotIn(private.strip(), blob)
+        # personal key names are refused at the real gateway, not by a double
+        for key in ("prompt", "secret", "text", "path", "url"):
+            with self.assertRaises(GatewayError) as bad:
+                self.ingress._gateway._device(
+                    "relay", {"operation_id": "op-bad-0001", "target": "dell", "attempt_id": "a-0001",
+                              "digest": "sha256:" + "cd" * 32, "capability": "client", key: SECRET})
+            self.assertEqual(bad.exception.code, "bad_request", key)
+        self.assertNotIn(SECRET.encode(), self.fleet.persisted_bytes())
+
+    # --- the store, the executor, the margin ------------------------------------
 
     def test_second_writer_and_live_state_are_refused(self):
         with self.assertRaises(AuthorityError) as caught:
-            AuthorityStore(self.fleet.db_path, "home", "oracle-auth", monotonic=self.clock.mono,
-                           wall=self.clock.wall)
+            AuthorityStore(self.fleet.root / "authority.sqlite", FLEET_ID, AUTHORITY_ID,
+                           monotonic=self.clock.mono, wall=self.clock.wall)
         self.assertEqual(caught.exception.code, "writer_busy")
         live = Path(__file__).resolve().parents[2] / ".jarvis"
         with self.assertRaises(IntegrationError) as blocked:
             IsolatedFleet(live, self.clock)
         self.assertEqual(blocked.exception.code, "refuses_live_state")
 
-    def test_default_executor_refuses_without_a_signature_verifier(self):
-        guard = LocalExecutor(Path(self.tmp.name) / "strict.sqlite", self.fleet.gateway, "dell")
+    def test_default_executor_refuses_and_tampered_signatures_are_refused(self):
+        status = self.fleet.status()
+        wall = self.clock.wall()
+        ticket = {"admission_id": "adm-tamper", "target": "zenbook", "operation_id": "op-tamper-1",
+                  "attempt_id": "a-0001", "digest": "sha256:" + "ee" * 32, "main": "zenbook",
+                  "incarnation": status["incarnation"], "epoch": status["epoch"], "issued_at": wall - 1,
+                  "admit_until": wall + 60, "issuer_incarnation": status["incarnation"]}
+        signed = {**ticket, "authority_id": AUTHORITY_ID, "fleet_id": FLEET_ID,
+                  "mode_version": status["mode_version"], "policy_version": status["policy_version"],
+                  "effect_class": "ordinary", "signature": self.dell.client.sign_ticket(ticket)}
+        bare = ExecutorGuard(Path(self.tmp.name) / "bare.sqlite", device_id="dell", installation_id="dell-inst",
+                             fleet_id=FLEET_ID, authority_id=AUTHORITY_ID)
         try:
-            with self.assertRaises(IntegrationError) as caught:
-                guard.accept(self.fleet.identities["dell"], {}, {
-                    "target": "dell", "operation_id": "op-sig", "attempt_id": "a-1",
-                    "admission_id": "adm-op-sig", "digest": "sha256:" + "ab" * 32,
-                    "main": "dell", "incarnation": 1, "epoch": 1})
-            self.assertEqual(caught.exception.code, "signature_unverified")
-            self.assertEqual(guard.runs("op-sig"), 0)
+            with self.assertRaises(AuthorityError) as closed:
+                bare.accept(signed, ticket, lambda: None)
+            self.assertEqual(closed.exception.code, "legacy")
+            ran_bare = []
+            self.assertEqual(bare.legacy_effect(lambda: ran_bare.append(1)), None)
+            self.assertEqual(ran_bare, [1])
         finally:
-            guard.close()
+            bare.close()
+        ran = []
+        with self.assertRaises(AuthorityError):
+            self.arch.executor.accept(signed, ticket, lambda: ran.append(1))  # signed by Dell, not MAIN
+        signed["signature"] = self.arch.client.sign_ticket(ticket)
+        signed["digest"] = "sha256:" + "ff" * 32
+        with self.assertRaises(AuthorityError):
+            self.arch.executor.accept(signed, ticket, lambda: ran.append(2))
+        self.assertEqual(ran, [])
+        self.assertEqual(self.arch.effects, [])
 
     def test_dell_validates_online_and_safety_margin_is_the_placeholder(self):
         self.assertEqual(SAFETY_MARGIN, 2.0)
-        fleet = self.fleet
-        fleet.boot_zenbook()
-        fleet.sleep_promote_dell()
-        calls = fleet.gateway.renew_calls
-        first = fleet.dell.require_authority("control")
-        second = fleet.dell.require_authority("control")
-        self.assertTrue(first["ok"])
-        self.assertEqual(first["source"], "online")
-        self.assertTrue(second["ok"])
-        self.assertEqual(fleet.gateway.renew_calls, calls + 2)
-        self.assertEqual(fleet.dell.cache.remaining("dell"), 0.0)
-        self.assertTrue(fleet.dell.online_only)
+        self.sleep_arch_promote_dell()
+        before = self.dell.client.calls.count("/v1/authority/status")
+        self.dell.runtime.require_authority("ordinary", target="dell")
+        self.dell.runtime.require_authority("ordinary", target="dell")
+        self.assertEqual(self.dell.client.calls.count("/v1/authority/status") - before, 2)
+        self.dell.client.up = False
+        with self.assertRaises(RuntimeRefusal) as cut:
+            self.dell.runtime.require_authority("ordinary", target="dell")
+        self.assertEqual(cut.exception.code, "partition")
+
+    # --- opt-in launch contract -------------------------------------------------
+
+    def test_launch_contract_is_off_until_explicitly_closed(self):
+        self.assertTrue(phone_listener_open())
+        self.assertEqual(node_seen_mode(), "before")
+        refuse_unfenced("remote")  # default: legacy keeps working, nothing raised
+        close_unfenced("remote")
+        try:
+            with self.assertRaises(IntegrationError) as shut:
+                refuse_unfenced("remote")
+            self.assertEqual(shut.exception.code, "legacy_retained")
+            refuse_unfenced("sleep")  # only the named surface closed
+        finally:
+            open_unfenced()
+        refuse_unfenced("remote")
+        seen, ran = [], []
+        set_node_seen_mode("after")
+        try:
+            with self.assertRaises(RuntimeError):
+                apply_node_seen(lambda: seen.append(1), lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+            self.assertEqual(seen, [], "'after' recorded a job whose run failed")
+        finally:
+            set_node_seen_mode("before")
+
+    def relay_body(self, op, target, main, attempt="a-0001", text="stale"):
+        import base64
+        import hashlib
+        envelope = json.dumps({"text": text}).encode()
+        status = self.fleet.status()
+        return {"operation_id": op, "target": target, "attempt_id": attempt,
+                "digest": "sha256:" + hashlib.sha256(envelope).hexdigest(), "capability": "client",
+                "kind": "ask", "authority_id": AUTHORITY_ID, "incarnation": status["incarnation"],
+                "epoch": status["epoch"], "main": main,
+                "envelope_b64": base64.b64encode(envelope).decode("ascii")}
 
 
 if __name__ == "__main__":
