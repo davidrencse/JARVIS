@@ -301,6 +301,36 @@ class EnrollOrderTests(Base):
         self.assertIsNone(Broker(self.state).authenticate(old))
         self.assertEqual(report["pairing_file"], str(output))
 
+    def test_receipt_written_during_code_key_does_not_enroll(self):
+        """The audit injection: code_key records an uncertain receipt, then returns a key.
+        Admission is checked again under the fleet lock before any credential effect."""
+        config, old = self.prepare()
+        enrolled = []
+
+        def code_key(state):
+            fm.note_uncertain_attempt(state, "pixel")
+            return HOST_KEY
+
+        def enroll(broker, *args, **kwargs):
+            enrolled.append(args)
+            raise AssertionError("enroll ran")
+
+        output = self.tmp / "pixel.pair.json"
+        with mock.patch.object(cluster_cli, "code_key", side_effect=code_key), \
+                mock.patch.object(Broker, "enroll", enroll):
+            with self.assertRaises(fm.AdmissionBlocked) as caught:
+                cluster_cli.run(self.args(), config, self.tmp)
+        self.assertEqual(caught.exception.node, "pixel")
+        self.assertEqual(enrolled, [])
+        self.assertFalse(output.exists())
+        self.assertEqual(_job_state(Broker(self.state), RUN), "running")
+        self.assertEqual(_job_state(Broker(self.state), DONE), "done")
+        self.assertEqual(Broker(self.state).authenticate(old)[0], "pixel")
+        self.assertTrue(fm.uncertain_for(fm._load_receipts(self.state), "pixel"))
+        ledgers = sorted(p.name for p in self.state.iterdir()
+                         if "receipt" in p.name or "ledger" in p.name)
+        self.assertEqual(ledgers, ["cluster-invite-receipts.json"])
+
     def test_default_enroll_still_settles_running_jobs(self):
         broker = Broker(self.state)
         broker.enroll("pixel", ["desktop"])
@@ -410,6 +440,176 @@ class SurfaceWordingTests(Base):
         proc = subprocess.run(["node", "--input-type=module", "-e", script], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
         self.assertIn("ok", proc.stdout)
+
+
+class ReceiptFenceTests(Base):
+    """CLI revoke, the enroll re-check, and receipt writers share one locked ledger."""
+
+    def args(self, action, **kw):
+        base = dict(action=action, config=str(self.path), state=str(self.state), value=None,
+                    main_device=None, local_device=None, url=None, hostname=None, capability=None,
+                    output=None, device_id=None, address=[], no_autostart=True, no_start=True,
+                    port=7777, rollback=False, autostart=False)
+        return argparse.Namespace(**{**base, **kw})
+
+    def plant(self, **rows):
+        fm._store_receipts(self.state, {
+            key: {"node": node, "state": "uncertain", "at": 1.0} for key, node in rows.items()})
+
+    def test_receipt_during_device_delta_blocks_before_enroll(self):
+        enrolled = []
+        real_save = config_lock.save_delta
+
+        def save_delta(*args, **kwargs):
+            fm.note_uncertain_attempt(self.state, "pixel9")
+            return real_save(*args, **kwargs)
+
+        def enroll(broker, *args, **kwargs):
+            enrolled.append(args)
+            raise AssertionError("enroll ran")
+
+        output = self.tmp / "pixel9.pair.json"
+        with mock.patch.object(cluster_cli, "code_key", return_value=HOST_KEY), \
+                mock.patch.object(config_lock, "save_delta", side_effect=save_delta), \
+                mock.patch.object(Broker, "enroll", enroll):
+            with self.assertRaises(fm.AdmissionBlocked):
+                cluster_cli.run(self.args("enroll", value="pixel9", hostname="phone",
+                                           output=str(output)), self.disk(), self.tmp)
+        self.assertEqual(enrolled, [])
+        self.assertFalse(output.exists())
+        self.assertTrue(fm.uncertain_for(fm._load_receipts(self.state), "pixel9"))
+
+    def test_cli_revoke_clears_that_fence_and_leaves_the_other(self):
+        self.plant(**{"pixel-row": "pixel9", "oracle-row": "oracle1"})
+        with mock.patch.object(cluster_setup, "unauthorize", return_value=True):
+            report = cluster_cli.run(self.args("revoke", value="pixel9"), self.disk(), self.tmp)
+        self.assertEqual((report["revoked"], report["ssh_key_removed"]), ("pixel9", True))
+        receipts = fm._load_receipts(self.state)
+        self.assertFalse(fm.uncertain_for(receipts, "pixel9"))
+        self.assertTrue(fm.uncertain_for(receipts, "oracle1"))
+        fm.assert_node_admitted(self.state, "pixel9")
+        with self.assertRaises(fm.AdmissionBlocked):
+            fm.assert_node_admitted(self.state, "oracle1")
+        # The console uses the same revoke. A cli-* row for pixel9 goes; oracle1 stays.
+        self.plant(**{"cli-pixel9": "pixel9", "oracle-row": "oracle1"})
+        with mock.patch.object(cluster_setup, "unauthorize", return_value=True):
+            console = fm.revoke_node(self.disk(), self.state, {"node": "pixel9", "confirm": "pixel9"},
+                                     config_path=self.path)
+        self.assertTrue(console["ok"])
+        self.assertTrue(console["ssh_key_removed"])
+        receipts = fm._load_receipts(self.state)
+        self.assertFalse(fm.uncertain_for(receipts, "pixel9"))
+        self.assertTrue(fm.uncertain_for(receipts, "oracle1"))
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()
+                                if "receipt" in p.name or "ledger" in p.name),
+                         ["cluster-invite-receipts.json"])
+
+    def test_revoke_failure_does_not_clear_the_fence(self):
+        self.plant(**{"pixel-row": "pixel9", "oracle-row": "oracle1"})
+        removed = []
+
+        def boom(broker, node):
+            raise RuntimeError("db down")
+
+        with mock.patch.object(Broker, "revoke", boom), \
+                mock.patch.object(cluster_setup, "unauthorize",
+                                  side_effect=lambda node: removed.append(node)):
+            with self.assertRaises(RuntimeError) as caught:
+                cluster_cli.run(self.args("revoke", value="pixel9"), self.disk(), self.tmp)
+        self.assertIn("db down", str(caught.exception))
+        self.assertEqual(removed, [])
+        receipts = fm._load_receipts(self.state)
+        self.assertTrue(fm.uncertain_for(receipts, "pixel9"))
+        self.assertTrue(fm.uncertain_for(receipts, "oracle1"))
+        with self.assertRaises(fm.AdmissionBlocked):
+            fm.assert_node_admitted(self.state, "pixel9")
+        with mock.patch.object(Broker, "revoke", boom), \
+                mock.patch.object(cluster_setup, "unauthorize",
+                                  side_effect=lambda node: removed.append(node)):
+            with self.assertRaises(RuntimeError):
+                fm.revoke_node(self.disk(), self.state, {"node": "pixel9", "confirm": "pixel9"},
+                               config_path=self.path)
+        self.assertEqual(removed, [])
+        receipts = fm._load_receipts(self.state)
+        self.assertTrue(fm.uncertain_for(receipts, "pixel9"))
+        self.assertTrue(fm.uncertain_for(receipts, "oracle1"))
+
+    def test_concurrent_writers_under_a_barrier_keep_every_fence(self):
+        self.plant(**{"dell-row": "dell"})
+        inside = threading.Barrier(2)
+        at_gate = threading.Barrier(2)
+        release = threading.Event()
+        done_b = threading.Event()
+        errors = []
+        real_load = fm._load_receipts
+        paused = {"done": False}
+
+        def load(state):
+            data = real_load(state)
+            if not paused["done"]:
+                paused["done"] = True
+                inside.wait(5)
+                if not release.wait(5):
+                    raise AssertionError("receipt writer was not released")
+            return data
+
+        def add(node, mark=None):
+            try:
+                if mark is not None:
+                    at_gate.wait(5)
+                fm.note_uncertain_attempt(self.state, node)
+                if mark is not None:
+                    mark.set()
+            except Exception as exc:  # noqa: BLE001 - the join asserts this list
+                errors.append(exc)
+
+        with mock.patch.object(fm, "_load_receipts", side_effect=load):
+            first = threading.Thread(target=add, args=("pixel9",))
+            second = threading.Thread(target=add, args=("oracle1", done_b))
+            first.start()
+            inside.wait(5)
+            second.start()
+            at_gate.wait(5)
+            try:
+                self.assertFalse(done_b.wait(0.25))
+                midway = real_load(self.state)
+                self.assertTrue(fm.uncertain_for(midway, "dell"))
+                self.assertFalse(fm.uncertain_for(midway, "pixel9"))
+                self.assertFalse(fm.uncertain_for(midway, "oracle1"))
+            finally:
+                release.set()
+            first.join(5)
+            second.join(5)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        receipts = fm._load_receipts(self.state)
+        self.assertTrue(fm.uncertain_for(receipts, "dell"))
+        self.assertTrue(fm.uncertain_for(receipts, "pixel9"))
+        self.assertTrue(fm.uncertain_for(receipts, "oracle1"))
+
+    def test_reentrant_writer_does_not_store_a_stale_snapshot(self):
+        self.plant(**{"dell-row": "dell"})
+        real_sha = fm.hashlib.sha256
+        gate = {"open": True}
+
+        def sha256(data=b"", **kwargs):
+            raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+            if gate["open"] and b"pixel9" in raw:
+                gate["open"] = False
+                fm.note_uncertain_attempt(self.state, "oracle1")
+            return real_sha(data, **kwargs)
+
+        with mock.patch.object(fm.hashlib, "sha256", side_effect=sha256):
+            fm.note_uncertain_attempt(self.state, "pixel9")
+        self.assertFalse(gate["open"])
+        receipts = fm._load_receipts(self.state)
+        self.assertTrue(fm.uncertain_for(receipts, "dell"))
+        self.assertTrue(fm.uncertain_for(receipts, "pixel9"))
+        self.assertTrue(fm.uncertain_for(receipts, "oracle1"))
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()
+                                if "receipt" in p.name or "ledger" in p.name),
+                         ["cluster-invite-receipts.json"])
 
 
 if __name__ == "__main__":
