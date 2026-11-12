@@ -138,7 +138,16 @@
     <section class="scr" id="s-fleet" hidden aria-labelledby="fl-h">
       <a class="back" href="#/devices"><svg class="i i-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg>Devices</a>
       <div class="ph"><h1 id="fl-h" tabindex="-1">Manage computers</h1><span class="meta mono" id="fl-meta"></span></div>
-      <p class="notice"><span>This phone can look, not change. Adding, changing or removing a computer is finished on the main PC.</span></p>
+      <p class="notice"><span id="fl-note">This phone can look, not change. Adding, changing or removing a computer is finished on the main PC.</span></p>
+      <div id="fl-auth">
+        <p class="fine" id="fl-main-status" role="status"></p>
+        <p class="fine" id="fl-transition" role="status"></p>
+        <div id="fl-promote" hidden>
+          <label class="ask-target" for="fl-candidate"><span>New main</span><select id="fl-candidate"></select></label>
+          <button type="button" class="btn wide" id="fl-promote-go">Promote to main</button>
+          <p class="msg" id="fl-promote-msg" role="status"></p>
+        </div>
+      </div>
       <p class="fine" id="fl-state" role="status"></p>
       <div class="fl-retry-row" id="fl-retry-row" hidden><button type="button" class="btn" id="fl-retry">Try again</button></div>
       <ul class="rows" id="fl-list" aria-label="Computers and servers"></ul>
@@ -146,7 +155,7 @@
       <div class="sub" id="fl-guide-wrap" hidden>
         <div class="ph sm"><h2>Add a computer or server</h2></div>
         <ol class="fl-guide" id="fl-guide"></ol>
-        <p class="fine">Pairing this phone doesn't give it admin rights, so the steps that change the fleet stay on the main PC. Moving the main to another computer isn't available yet.</p>
+        <p class="fine" id="fl-limit">Pairing this phone doesn't give it admin rights, so the steps that change the fleet stay on the main PC. Moving the main to another computer isn't available yet.</p>
       </div>
     </section>
 

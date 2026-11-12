@@ -634,6 +634,13 @@ input, textarea { caret-color: var(--ink); }
 .fl-caps:empty, .fl-next:empty { display: none; }
 .fl-who { display: block; margin-top: 2px; color: var(--ink-2); }
 .fl-retry-row { margin: 0 0 12px; }
+#fl-auth { min-width: 0; margin: 0 0 14px; }
+#fl-main-status, #fl-transition, #fl-promote-msg { overflow-wrap: anywhere; }
+#fl-main-status:empty, #fl-transition:empty, #fl-promote-msg:empty { display: none; }
+#fl-promote { display: grid; gap: 10px; min-width: 0; margin-top: 8px; }
+#fl-promote .ask-target { margin: 0; min-width: 0; }
+#fl-promote .ask-target select { max-width: 100%; }
+#fl-promote-go { width: 100%; }
 .fl-guide { margin: 0 0 12px; padding-left: 22px; display: grid; gap: 10px; font-size: 14px; line-height: 1.45; }
 .fl-guide b { display: block; font-weight: 500; }
 .fl-step { display: block; color: var(--ink-3); font-size: 12.5px; line-height: 1.4; overflow-wrap: anywhere; }

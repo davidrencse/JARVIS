@@ -4,6 +4,8 @@
 // - Every server or node string is set with textContent, never parsed as HTML.
 // - Only a 401 {pair:true} shows Pair. A failed fetch means the phone can't reach the tailnet: it
 //   says so and keeps the cookie and the shell.
+// - A 403 whose code is csrf means the cookie is not enough. The app stays closed and offers
+//   Pair again. Ordinary network failures and other 403s keep the saved check.
 // - One frame long-poll and one input batch in flight. Held keys and buttons are let go on every
 //   way out (blur, cancel, hidden, failed batch, end); the server's quiet and idle timers are the
 //   real guarantee when the phone simply vanishes.
@@ -51,7 +53,8 @@
   const pad = (n) => String(n).padStart(2, "0");
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
-    set(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* private mode: a convenience only */ } },
+    set(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } },
+    del(k) { try { localStorage.removeItem(k); } catch (e) { try { localStorage.setItem(k, ""); } catch (e2) { /* private mode */ } } },
   };
   const media = (q) => { try { return !!(window.matchMedia && window.matchMedia(q).matches); } catch (e) { return false; } };
   const reduced = () => media("(prefers-reduced-motion: reduce)");
@@ -108,7 +111,7 @@
   const el = {};
   for (const id of ["boot", "down", "down-h", "down-p", "down-retry", "down-when", "pair", "pair-ios", "pair-form", "p-code", "p-name",
     "p-go", "p-msg", "pair-wait", "pw-time", "pw-bar", "pw-cancel", "pw-msg", "app", "main-label", "link", "link-dot", "link-ms", "hb", "net",
-    "net-retry", "main", "dv-meta", "st-online", "st-sess", "dv-list", "dv-empty", "dv-sess", "dv-sess-list", "fl-meta", "fl-state", "fl-retry-row", "fl-retry", "fl-list", "fl-empty", "fl-guide-wrap", "fl-guide", "ak-meta", "a-thread", "a-empty", "a-text", "a-send", "a-count", "a-note", "pn-name", "pn-paired", "pn-host",
+    "net-retry", "main", "dv-meta", "st-online", "st-sess", "dv-list", "dv-empty", "dv-sess", "dv-sess-list", "fl-meta", "fl-note", "fl-auth", "fl-main-status", "fl-transition", "fl-promote", "fl-candidate", "fl-promote-go", "fl-promote-msg", "fl-limit", "fl-state", "fl-retry-row", "fl-retry", "fl-list", "fl-empty", "fl-guide-wrap", "fl-guide", "ak-meta", "a-thread", "a-empty", "a-text", "a-send", "a-count", "a-note", "pn-name", "pn-paired", "pn-host",
     "pn-main", "th-system", "th-light", "th-dark", "pn-sess", "pn-sess-empty", "pn-forget", "pn-forget-t", "pn-msg", "d-dot", "d-h",
     "d-sub", "d-sess", "d-sess-t", "d-sess-open", "d-sess-end", "d-status", "d-role", "d-platform", "d-r-ssid", "d-ssid", "d-r-lan",
     "d-lan", "d-r-ts", "d-ts", "d-q-low", "d-q-medium", "d-q-high", "d-control", "d-control-why",
@@ -134,21 +137,162 @@
   class Fail extends Error {
     constructor(message, kind, status, data) { super(message); this.kind = kind; this.status = status || 0; this.data = data || {}; }
   }
+  // The pair response hands the CSRF token over once. It lives in this origin's storage and is
+  // sent only as a header on same-origin calls. Forget and a revoke (401 pair) clear it.
+  const CSRF_KEY = "jarvis.phone.csrf";
+  const CSRF_RE = /^[A-Za-z0-9_-]{16,128}$/;
+  const OP_RE = /^[A-Za-z0-9_-]{8,64}$/;
+  let csrfToken = "", csrfUnsaved = false, csrfHold = null, repairing = false;
+  function readCsrf() {
+    const v = store.get(CSRF_KEY, "");
+    csrfToken = CSRF_RE.test(v) ? v : "";
+    if (v && !csrfToken) store.del(CSRF_KEY);
+  }
+  function saveCsrf(token) {
+    if (!CSRF_RE.test(token)) return;
+    csrfToken = token;
+    const wrote = store.set(CSRF_KEY, token);
+    csrfUnsaved = !(wrote && store.get(CSRF_KEY, "") === token);
+    if (!csrfUnsaved && csrfHold) csrfHold.hidden = true;
+  }
+  function clearCsrf() { csrfToken = ""; csrfUnsaved = false; if (csrfHold) csrfHold.hidden = true; store.del(CSRF_KEY); }
+  function isCsrf(e) {
+    return !!(e && e.kind === "http" && e.status === 403 && e.data && e.data.code === "csrf");
+  }
+  readCsrf();
+  function operationId() {
+    try {
+      const c = window.crypto;
+      if (c && typeof c.randomUUID === "function") {
+        const id = String(c.randomUUID()).replace(/-/g, "");
+        if (OP_RE.test(id)) return id;
+      }
+      if (c && typeof c.getRandomValues === "function") {
+        const bytes = new Uint8Array(16);
+        c.getRandomValues(bytes);
+        let id = "";
+        for (let i = 0; i < bytes.length; i++) id += bytes[i].toString(16).padStart(2, "0");
+        if (OP_RE.test(id)) return id;
+      }
+    } catch (e) { /* a private webview still gets the fallback below */ }
+    let id = "";
+    while (id.length < 16) id += Math.random().toString(36).slice(2);
+    return id.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32);
+  }
+  function sessionStopId(id) {
+    const raw = String(id || "");
+    if (/^[0-9a-f]{32}$/.test(raw)) return "stop-" + raw;
+    const cleaned = ("stop-" + raw.replace(/[^A-Za-z0-9_-]/g, "")).slice(0, 64);
+    return OP_RE.test(cleaned) ? cleaned : operationId();
+  }
+  function stampBody(path, body, fixedId) {
+    const next = Object.assign({}, body);
+    let id = fixedId || next.operation_id || "";
+    if (path === "/phone/api/ask") id = next.key || id;
+    if (path === "/phone/api/session/stop" && typeof next.session === "string") id = sessionStopId(next.session);
+    if (!OP_RE.test(id)) id = operationId();
+    next.operation_id = id;
+    if (path === "/phone/api/ask") next.key = id;
+    return next;
+  }
+  function phoneHeaders(json) {
+    const headers = { "X-JARVIS-Phone": "1" };
+    if (json) headers["Content-Type"] = "application/json";
+    if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+    return headers;
+  }
+  function frameUrl(id, after) {
+    return "/phone/api/session/frame?session=" + encodeURIComponent(id) + "&after=" + encodeURIComponent(String(after || 0));
+  }
+  function b64urlToBytes(s) {
+    const clean = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
+    if (!clean || /[^A-Za-z0-9+/=]/.test(clean)) throw new Error("bad");
+    const pad = clean.length % 4 === 0 ? "" : "=".repeat(4 - (clean.length % 4));
+    const bin = atob(clean + pad);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  function bytesToB64url(buf) {
+    const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf || []);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  function passkeyOptions(preview) {
+    const src = preview && typeof preview === "object" ? (preview.passkey && typeof preview.passkey === "object" ? preview.passkey : preview) : null;
+    if (!src) return null;
+    const rp = typeof src.rp_id === "string" ? src.rp_id : "";
+    const ids = Array.isArray(src.credential_ids) ? src.credential_ids : null;
+    const challenge = typeof src.challenge === "string" ? src.challenge : "";
+    if (!rp || !challenge || !ids || !ids.length || ids.some((id) => typeof id !== "string" || !id)) return null;
+    return { rp_id: rp, credential_ids: ids, challenge };
+  }
+  function packProof(cred, challenge) {
+    const response = cred && cred.response;
+    if (!cred || !response || cred.rawId == null || response.clientDataJSON == null || response.authenticatorData == null || response.signature == null) return null;
+    try {
+      const rawId = bytesToB64url(cred.rawId);
+      // The adapter reads `passkey_proof`. The verifier reads a WebAuthn assertion: id, type, and response.
+      return {
+        type: "public-key",
+        id: rawId,
+        rawId,
+        challenge,
+        response: {
+          clientDataJSON: bytesToB64url(response.clientDataJSON),
+          authenticatorData: bytesToB64url(response.authenticatorData),
+          signature: bytesToB64url(response.signature),
+        },
+      };
+    } catch (e) { return null; }
+  }
+  async function readPasskey(opt) {
+    let challenge;
+    try { challenge = b64urlToBytes(opt.challenge); } catch (e) { return null; }
+    if (!challenge.length) return null;
+    const creds = navigator.credentials;
+    if (!creds || typeof creds.get !== "function") return null;
+    let allow;
+    try { allow = opt.credential_ids.map((id) => ({ type: "public-key", id: b64urlToBytes(id) })); }
+    catch (e) { return null; }
+    let cred;
+    try {
+      cred = await creds.get({ publicKey: { challenge, rpId: opt.rp_id, allowCredentials: allow, userVerification: "required" } });
+    } catch (e) { return null; }
+    return packProof(cred, opt.challenge);
+  }
+  // call() and the frame loop share this. max caps an error body so it cannot be treated as a document.
+  async function readJson(res, max) {
+    if (!res || res.status === 204 || typeof res.text !== "function") return {};
+    const t = await res.text();
+    let raw = typeof t === "string" ? t : "";
+    if (max > 0 && raw.length > max) raw = raw.slice(0, max);
+    let data = {};
+    try { data = raw ? JSON.parse(raw) : {}; } catch (e) { data = {}; }
+    if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+    return data;
+  }
   async function call(path, body, opts = {}) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), opts.timeout || 20000);
-    const init = { method: body === undefined ? "GET" : "POST", credentials: "same-origin", cache: "no-store",
-      signal: ctl.signal, headers: { "X-JARVIS-Phone": "1" } };
-    if (body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(body); }
+    const payload = body === undefined ? undefined : stampBody(path, body, opts.operationId);
+    const init = { method: payload === undefined ? "GET" : "POST", credentials: "same-origin", cache: "no-store",
+      signal: ctl.signal, headers: phoneHeaders(payload !== undefined) };
+    if (payload !== undefined) init.body = JSON.stringify(payload);
     let res, data = {};
     try {
       res = await fetch(path, init);
-      if (res.status !== 204) { const t = await res.text(); try { data = t ? JSON.parse(t) : {}; } catch (e) { data = {}; } }
+      data = await readJson(res);
     } catch (e) {
       throw new Fail(UNREACHABLE, "net");
     } finally { clearTimeout(timer); }
     if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
-    if (res.status === 401 && data.pair) throw new Fail(str(data.error) || "This phone isn't paired.", "auth", 401, data);
+    if (res.status === 401 && data.pair) {
+      clearCsrf();
+      throw new Fail(str(data.error) || "This phone isn't paired.", "auth", 401, data);
+    }
+    if (res.ok && (path === "/phone/pair" || path === "/phone/pair/status") && CSRF_RE.test(data.csrf_token)) saveCsrf(data.csrf_token);
     if (!res.ok) throw new Fail(str(data.error) || `JARVIS refused that (HTTP ${res.status}).`, "http", res.status, data);
     return { status: res.status, data };
   }
@@ -158,6 +302,7 @@
     catch (e) {
       reachable(e.kind !== "net");
       if (e.kind === "auth") toPair();
+      else if (isCsrf(e)) showCsrfRecovery();
       throw e;
     }
   }
@@ -176,28 +321,77 @@
     me = d && typeof d === "object" ? d : {};
     enterApp();
   }
+  let repairBtn = null;
+  function repairButton() {
+    if (repairBtn) return repairBtn;
+    repairBtn = h("button", { type: "button", class: "btn strong wide", id: "csrf-repair" }, "Pair again");
+    repairBtn.hidden = true;
+    repairBtn.addEventListener("click", () => repairPair());
+    const host = (el.downRetry && (el.downRetry.parentNode || el.downRetry.parent)) || el.down;
+    if (host) host.append(repairBtn);
+    return repairBtn;
+  }
+  // The user chooses this. It is the only path from a csrf refusal back to Pair.
+  function repairPair() {
+    pauseForRepair();
+    toPair("Pair this phone again. On the main computer, run jarvis phone pair and enter the code it prints.");
+  }
+  function pauseForRepair() {
+    repairing = true;
+    clearInterval(pollTimer); pollTimer = 0;
+    clearTimeout(downTimer); downTimer = 0;
+    detachLoop();
+  }
+  function showCsrfRecovery() {
+    repairing = true;
+    showDown(new Fail("", "http", 403, { code: "csrf" }));
+  }
+  function renderCsrfHold() {
+    if (!el.app) return;
+    if (!csrfUnsaved) { if (csrfHold) csrfHold.hidden = true; return; }
+    if (!csrfHold) {
+      csrfHold = h("div", { class: "notice", id: "csrf-hold", role: "status" });
+      const msg = h("span", { id: "csrf-hold-msg" });
+      const go = h("button", { type: "button", class: "mini", id: "csrf-hold-repair" }, "Pair again");
+      csrfHold.append(msg, go);
+      csrfHold.msg = msg;
+      go.addEventListener("click", () => repairPair());
+      if (typeof el.app.prepend === "function") el.app.prepend(csrfHold);
+      else el.app.append(csrfHold);
+    }
+    text(csrfHold.msg, "This tab can keep working. The site check could not be saved on this phone, so the next time you open JARVIS you will need to pair again.");
+    csrfHold.hidden = false;
+  }
   function showDown(e) {
     stageTo("down");
-    const net = e.kind === "net";
+    const csrf = isCsrf(e);
+    const net = !csrf && e.kind === "net";
     // Tailscale serve answers 502 with no message while JARVIS restarts or isn't listening.
-    const silent = !net && e.status >= 502 && e.status <= 504 && !str(e.data && e.data.error);
-    text(el.downH, net ? UNREACHABLE : silent ? "JARVIS isn't answering" : "JARVIS didn't let this phone in");
-    text(el.downP, net ? "Your phone reaches JARVIS through Tailscale. Turn it on, then try again."
+    const silent = !csrf && !net && e.status >= 502 && e.status <= 504 && !str(e.data && e.data.error);
+    if (el.downRetry) el.downRetry.hidden = csrf;
+    if (csrf) repairButton().hidden = false;
+    else if (repairBtn) repairBtn.hidden = true;
+    text(el.downH, csrf ? "Pair this phone again" : net ? UNREACHABLE : silent ? "JARVIS isn't answering" : "JARVIS didn't let this phone in");
+    text(el.downP, csrf ? "This phone is still paired, but the check for this site is missing. Pair again from the main computer. This screen does not open the app on the saved sign-in."
+      : net ? "Your phone reaches JARVIS through Tailscale. Turn it on, then try again."
       : silent ? "Tailscale reached the PC, but JARVIS there didn't answer. It may be restarting." : e.message);
-    text(el.downWhen, "Trying again every 15 s.");
-    clearTimeout(downTimer);
-    downTimer = setTimeout(() => { if (!document.hidden && !el.down.hidden) boot(); }, DOWN_RETRY_MS);
+    text(el.downWhen, csrf ? "" : "Trying again every 15 s.");
+    clearTimeout(downTimer); downTimer = 0;
+    if (csrf) { pauseForRepair(); return; }
+    downTimer = setTimeout(() => { if (!repairing && !document.hidden && !el.down.hidden) boot(); }, DOWN_RETRY_MS);
   }
   function enterApp() {
+    repairing = false;
     stageTo("app");
     reachable(true);
+    renderCsrfHold();
     text(el.mainLabel, (me.main && str(me.main.label, 60)) || "");
     renderPhone();
     route(true);
     refresh();
     resumeAsk();
     clearInterval(pollTimer);
-    pollTimer = setInterval(() => { if (!document.hidden && !sess && !starting) refresh(); }, POLL_MS);
+    pollTimer = setInterval(() => { if (!repairing && !document.hidden && !sess && !starting) refresh(); }, POLL_MS);
   }
   // Everything that talks to the server stops; the shell stays.
   function quiesce() {
@@ -209,6 +403,7 @@
   // ---------- pairing ----------
   let pairing = null;
   function toPair(msg) {
+    clearCsrf();
     quiesce();
     me = null;
     stageTo("pair");
@@ -231,8 +426,8 @@
     }
     el.pGo.disabled = true;
     pairNote("Checking the code…", "");
-    pairing = { code, t0: now(), timer: 0, tick: 0 };
-    pairStep("/phone/pair", { code, name });
+    pairing = { code, operationId: operationId(), t0: now(), timer: 0, tick: 0 };
+    pairStep("/phone/pair", { code, name, operation_id: pairing.operationId });
   }
   async function pairStep(path, body) {
     const p = pairing;
@@ -242,7 +437,7 @@
     catch (e) {
       if (pairing !== p) return;
       // While waiting, a dropped request is retried: the approval on the main still counts.
-      if (e.kind === "net" && p.tick) { p.timer = setTimeout(() => pairStep("/phone/pair/status", { code: p.code }), PAIR_POLL_MS); return; }
+      if (e.kind === "net" && p.tick) { p.timer = setTimeout(() => pairStep("/phone/pair/status", { code: p.code, operation_id: p.operationId }), PAIR_POLL_MS); return; }
       pairFail(e.message);
       return;
     }
@@ -251,7 +446,7 @@
     if (r.status === 202 || r.data.pending) {
       if (now() - p.t0 > PAIR_GIVE_UP_MS) { pairFail("Nobody allowed it in time. Run jarvis phone pair again for a new code."); return; }
       pairWaiting(p);
-      p.timer = setTimeout(() => pairStep("/phone/pair/status", { code: p.code }), PAIR_POLL_MS);
+      p.timer = setTimeout(() => pairStep("/phone/pair/status", { code: p.code, operation_id: p.operationId }), PAIR_POLL_MS);
       return;
     }
     pairFail("JARVIS didn't pair this phone. Run jarvis phone pair again.");
@@ -386,21 +581,228 @@
     drawPulse(r.beat, hist.get(d.id) || []);
   }
 
-  // ---------- manage computers (read-only; GET /phone/api/fleet only) ----------
-  // Writes (invite, revoke, permissions, MAIN transfer) are owner-console actions. This screen never calls them
-  // and never shows addresses, hostnames, invite codes or anything about location.
+  // ---------- manage computers (read-only legacy fleet; GET /phone/api/fleet for the list) ----------
+  // Invite, revoke and permission changes stay on the main PC. A promote control is shown only when
+  // this phone's server record says manage_main. A stored flag or can_write does not grant it.
   const fleetRows = new Map();
   let fleet = null, fleetErr = "", fleetBusy = false, fleetAt = 0;
+  let promote = null, promoteBusy = false, promoteView = null, candidateKey = "";
+  const FLEET_LOOK = "This phone can look, not change. Adding, changing or removing a computer is finished on the main PC.";
+  const FLEET_OWNER = "This phone may ask to promote a computer. JARVIS still checks the owner grant and a passkey before anything changes.";
+  const FLEET_LIMIT = "Pairing this phone doesn't give it admin rights, so the steps that change the fleet stay on the main PC. Moving the main to another computer isn't available yet.";
+  const FLEET_LIMIT_OWNER = "Pairing alone does not change MAIN. A passkey proof is sent to the server, and the server decides.";
   const FLEET_STATUS = { main: "MAIN", online: "Online", offline: "Offline", busy: "Busy, awaiting contact", waiting_for_first_contact: "Waiting to connect", invite_pending: "Invite pending", invite_expired: "Invite expired", not_enrolled: "Not connected", unconfigured: "Not set up" };
+  const PENDING_STATES = new Set(["pending", "requested", "validating", "draining", "fencing", "granted_not_ready", "sending", "uncertain", "open"]);
+  const REFUSED_STATES = new Set(["refused", "failed", "cancelled", "forbidden"]);
+  const DONE_STATES = new Set(["succeeded", "completed", "committed", "done"]);
   function publicFleet(v, max) {
     return str(v, max).replace(/jarvis-invite-1:\S+/gi, "").replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, "").replace(/[ \t]{2,}/g, " ").trim();
+  }
+  function serverOwner() { return !!(me && me.manage_main === true); }
+  function authorityView() {
+    if (me && me.authority && typeof me.authority === "object" && !Array.isArray(me.authority)) return me.authority;
+    if (fleet && fleet.authority && typeof fleet.authority === "object" && !Array.isArray(fleet.authority)) return fleet.authority;
+    return null;
+  }
+  function transitionObject() {
+    const a = authorityView();
+    if (a && a.transition && typeof a.transition === "object") return a.transition;
+    if (fleet && fleet.transition && typeof fleet.transition === "object") return fleet.transition;
+    return null;
+  }
+  function classifyState(state) {
+    const s = String(state || "").toLowerCase();
+    if (PENDING_STATES.has(s)) return "pending";
+    if (REFUSED_STATES.has(s)) return "refused";
+    if (s === "stale") return "stale";
+    return "";
+  }
+  function transitionKind(code, message) {
+    const c = String(code || "").toLowerCase();
+    const m = String(message || "").toLowerCase();
+    if (c === "stale" || m.includes("moved on") || /\bstale\b/.test(m)) return "stale";
+    if (c === "uncertain" || c === "pending") return "pending";
+    if (c === "forbidden" || c === "owner_proof_required") return "refused";
+    return "";
+  }
+  function authoritativeMainId() {
+    const a = authorityView();
+    return a && typeof a.main === "string" ? a.main : "";
+  }
+  function mainStatusLine() {
+    const a = authorityView();
+    if (!a) return "No authoritative MAIN status on this link.";
+    if (a.main_ready === false || typeof a.main !== "string" || !a.main) return "No authoritative MAIN.";
+    const id = str(a.main, 64);
+    const row = (fleet && Array.isArray(fleet.devices) ? fleet.devices : []).find((d) => d && d.id === id);
+    const fromMe = me && me.main && me.main.id === id ? str(me.main.label, 80) : "";
+    const label = (row && publicFleet(row.label, 80)) || publicFleet(fromMe, 80) || id;
+    return "MAIN is " + label + ".";
+  }
+  function mainReadyId() {
+    const a = authorityView();
+    if (!a || a.main_ready === false || typeof a.main !== "string" || !a.main) return "";
+    return a.main;
+  }
+  // A local pending request settles only when the authoritative MAIN is that candidate,
+  // or the server's terminal transition names that same candidate. Any other MAIN stays pending.
+  function promotionBound(server, view) {
+    if (!view || view.kind !== "pending") return true;
+    const cand = server && typeof server.candidate === "string" ? server.candidate : "";
+    return !!(view.candidate && cand && cand === view.candidate);
+  }
+  function promotionOutcome() {
+    const server = transitionObject();
+    const raw = String(server && (server.state || server.status) || "").toLowerCase();
+    const serverKind = classifyState(raw);
+    const reported = String(server && server.outcome || "").toLowerCase();
+    const terminal = serverKind === "refused" || serverKind === "stale" ? serverKind
+      : (DONE_STATES.has(raw) || reported === "new_main" ? "done" : "");
+    const main = mainReadyId();
+    const view = promoteView;
+    if (view && view.candidate && main && main === view.candidate) return "done";
+    if (terminal && promotionBound(server, view)) return terminal;
+    if (view && view.kind === "pending" && view.candidate && main && main !== view.candidate && main !== view.source) return "uncertain";
+    if (serverKind === "pending" || (view && view.kind === "pending")) return "pending";
+    return "";
+  }
+  function applyPromoteOutcome(outcome) {
+    if (!promoteView || promoteView.kind !== "pending") return;
+    if (outcome !== "done" && outcome !== "refused" && outcome !== "stale") return;
+    const detail = promoteView.detail || "";
+    const candidate = promoteView.candidate;
+    const source = promoteView.source;
+    promoteView = outcome === "done" ? null : { kind: outcome, detail, candidate, source };
+    if (outcome === "done" && el.flPromoteMsg && el.flPromoteMsg.textContent === "Promotion pending.") {
+      text(el.flPromoteMsg, "JARVIS finished that request.");
+    }
+  }
+  function transitionLine() {
+    const outcome = promotionOutcome();
+    applyPromoteOutcome(outcome);
+    if (outcome === "done") return "";
+    if (outcome === "uncertain") return "Promotion pending. This request is uncertain.";
+    const server = transitionObject();
+    const kind = outcome || (promoteView && promoteView.kind) || "";
+    if (kind === "pending") return "Promotion pending.";
+    if (kind === "stale") return "Promotion stale. Nothing was changed.";
+    if (kind === "refused") {
+      const why = server && (typeof server.outcome === "string" ? server.outcome : typeof server.error === "string" ? server.error : "");
+      const bit = publicFleet(why || (promoteView && promoteView.detail) || "", 160);
+      return bit ? "Promotion refused. " + bit : "Promotion refused.";
+    }
+    return "";
+  }
+  function fleetCandidates() {
+    const list = fleet && Array.isArray(fleet.devices) ? fleet.devices.filter((d) => d && typeof d.id === "string") : [];
+    const current = authoritativeMainId();
+    return list.filter((d) => {
+      if (current && d.id === current) return false;
+      if (d.role === "main" || d.status === "main") return false;
+      const profile = typeof d.profile === "string" ? d.profile : "";
+      if (profile && profile !== "pc" && profile !== "control") return false;
+      return true;
+    }).sort((a, b) => str(a.label || a.id).localeCompare(str(b.label || b.id)));
+  }
+  function promoteAction() {
+    const a = authorityView();
+    return a && a.main_ready === false ? "recover" : "make_main_now";
+  }
+  function renderPromote() {
+    if (!el.flMainStatus) return;
+    text(el.flMainStatus, mainStatusLine());
+    text(el.flTransition, transitionLine());
+    if (el.flNote) text(el.flNote, serverOwner() ? FLEET_OWNER : FLEET_LOOK);
+    if (el.flLimit) text(el.flLimit, serverOwner() ? FLEET_LIMIT_OWNER : FLEET_LIMIT);
+    const owner = serverOwner();
+    if (el.flPromote) el.flPromote.hidden = !owner;
+    if (!owner || !el.flCandidate) return;
+    const list = fleetCandidates();
+    const key = list.map((d) => d.id + "\n" + str(d.label, 80)).join("|");
+    if (key !== candidateKey) {
+      candidateKey = key;
+      const selected = el.flCandidate.value || (promote && promote.candidate) || "";
+      el.flCandidate.replaceChildren(...list.map((d) => h("option", { value: d.id }, publicFleet(d.label, 80) || str(d.id, 64))));
+      el.flCandidate.value = list.some((d) => d.id === selected) ? selected : (list[0] ? list[0].id : "");
+    }
+    if (el.flPromoteGo) {
+      text(el.flPromoteGo, promote && promote.previewId ? "Try again" : "Promote to main");
+      el.flPromoteGo.disabled = promoteBusy || !el.flCandidate.value;
+    }
   }
   async function loadFleet() {
     if (fleetBusy) return;
     fleetBusy = true; renderFleet();
-    try { fleet = await api("/phone/api/fleet"); fleetErr = ""; fleetAt = now(); }
+    try {
+      fleet = await api("/phone/api/fleet");
+      fleetErr = ""; fleetAt = now();
+      try {
+        const who = await api("/phone/api/me");
+        if (who && typeof who === "object") me = who;
+      } catch (e) { /* the list stands; the MAIN line keeps the last server record */ }
+    }
     catch (e) { fleetErr = e && e.kind === "net" ? UNREACHABLE : str(e && e.message) || "Couldn't load the computers."; }
     fleetBusy = false; renderFleet();
+  }
+  async function promoteGo() {
+    if (!serverOwner() || promoteBusy) return;
+    const candidate = el.flCandidate ? el.flCandidate.value : "";
+    if (!candidate) return;
+    if (!promote || promote.candidate !== candidate) promote = { candidate, previewOp: operationId(), confirmOp: "", previewId: "", proof: null };
+    promoteBusy = true;
+    text(el.flPromoteMsg, "Asking JARVIS…");
+    renderFleet();
+    try {
+      if (!promote.previewId) {
+        const preview = await api("/phone/api/main/preview", {
+          operation_id: promote.previewOp, action: promoteAction(), candidate, profile: "control",
+        });
+        const opt = passkeyOptions(preview);
+        if (!opt) {
+          promote = null;
+          text(el.flPromoteMsg, "Passkey checks are not configured. Nothing was changed.");
+          return;
+        }
+        const proof = await readPasskey(opt);
+        if (!proof) {
+          promote = null;
+          text(el.flPromoteMsg, "This phone couldn't use a passkey. Nothing was changed.");
+          return;
+        }
+        promote.previewId = str(preview && preview.preview_id, 80);
+        promote.proof = proof;
+        if (!promote.confirmOp) promote.confirmOp = operationId();
+      }
+      const done = await api("/phone/api/main/confirm", {
+        operation_id: promote.confirmOp, preview_id: promote.previewId, passkey_proof: promote.proof,
+      });
+      const chosen = promote.candidate;
+      const source = authoritativeMainId();
+      const reported = String(done && (done.state || done.status) || "").toLowerCase();
+      const reportedKind = classifyState(reported);
+      const reportedDone = DONE_STATES.has(reported) || String(done && done.outcome || "").toLowerCase() === "new_main";
+      promote = null;
+      promoteView = { kind: reportedKind || (reportedDone ? "done" : "pending"), detail: "", candidate: chosen, source };
+      text(el.flPromoteMsg, promoteView.kind === "pending" ? "Promotion pending." : "JARVIS accepted the request.");
+    } catch (e) {
+      if (e && e.kind === "auth") return;
+      const code = e && e.data && e.data.code;
+      const kind = transitionKind(code, e && e.message);
+      const keep = e && (e.kind === "net" || code === "uncertain");
+      if (kind === "stale" || code === "expired") {
+        promote = null;
+        promoteView = kind === "stale" ? { kind: "stale", detail: "" } : null;
+      } else if (kind === "refused") {
+        promote = null;
+        promoteView = { kind: "refused", detail: str(e && e.message, 180) };
+      } else if (keep || kind === "pending") {
+        promoteView = { kind: "pending", detail: "" };
+      }
+      text(el.flPromoteMsg, str(e && e.message, 200) || "JARVIS didn't change MAIN.");
+    } finally {
+      promoteBusy = false;
+      renderFleet();
+    }
   }
   function fleetCaps(d) {
     const titles = new Map();
@@ -442,9 +844,11 @@
       h("b", { text: publicFleet(s.title, 80) }),
       s.who ? h("span", { class: "fl-who", text: "Who: " + publicFleet(s.who, 40) }) : null,
       h("span", { class: "fl-step", text: publicFleet(s.body, 400) }))));
+    renderPromote();
   }
   el.flRetry.addEventListener("click", () => loadFleet());
-  setInterval(() => { if (me && cur.name === "fleet" && !document.hidden && !fleetBusy) loadFleet(); }, 20000);
+  if (el.flPromoteGo) el.flPromoteGo.addEventListener("click", () => { promoteGo(); });
+  setInterval(() => { if (!repairing && me && cur.name === "fleet" && !document.hidden && !fleetBusy) loadFleet(); }, 20000);
 
   // ---------- this phone's sessions ----------
   const sessRowsA = new Map(), sessRowsB = new Map();
@@ -785,7 +1189,15 @@
     m.li.append(m.act);
     keepInView();
   }
+  let heldAsk = null;
   function saveAsk(job, t, at, target) { store.set(ASK_KEY, job ? JSON.stringify({ job, text: t, at, target: target || "" }) : ""); }
+  function rememberAsk(key, text, target) {
+    const rec = { key: String(key || ""), text: str(text, 2000), at: now(), target: str(target, 64), held: true };
+    if (!OP_RE.test(rec.key)) return;
+    heldAsk = rec;
+    store.set(ASK_KEY, JSON.stringify(rec));
+    if (rec.target) store.set("jarvis.phone.target", rec.target);
+  }
 
   function paintAsk(m, d, t0) {
     renderUsage(m, d && d.usage, true);
@@ -846,7 +1258,7 @@
         d = await api("/phone/api/ask/" + encodeURIComponent(job) + "?after=" + (m.rev || 0), undefined, { timeout: 20000 });
         misses = 0;
       } catch (e) {
-        if (e.kind === "auth") return;
+        if (e.kind === "auth" || isCsrf(e)) return;
         if (e.kind === "net" && ++misses <= 5) { d = { pending: true, job, trace: { rev: m.rev || 0 } }; await sleep(ASK_POLL_MS * misses); continue; }
         if (e.kind === "net") {
           setMsg(m, "Lost contact with JARVIS — is Tailscale on? Your request may still be running.", "bad");
@@ -879,6 +1291,7 @@
       await pumpAsk(m, d, t0, t);
     } catch (e) {
       if (e.kind === "auth") return;
+      if (isCsrf(e)) { rememberAsk(key, t, target); return; }
       renderUsage(m, e.data && e.data.usage);
       const tr = e.data && e.data.trace;
       if (tr) renderFlow(m, cleanSteps(tr.steps), { working: false, secs: isFinite(tr.elapsed) ? Math.round(tr.elapsed) : NaN });
@@ -895,15 +1308,29 @@
     const t = el.aText.value.trim();
     if (!t || asking) return;
     if (t.length > MAX_ASK) { text(el.aNote, "That's over 2000 characters."); return; }
-    addMsg("you", (askTarget.value ? label(askTarget.value) + ": " : "") + t, "");
+    const target = askTarget.value || "";
+    let key = newKey();
+    if (heldAsk && heldAsk.text === t && (heldAsk.target || "") === target && OP_RE.test(heldAsk.key)) key = heldAsk.key;
+    heldAsk = null;
+    addMsg("you", (target ? label(target) + ": " : "") + t, "");
     el.aText.value = ""; autosize(); text(el.aNote, ""); countAsk();
-    return send(addMsg("jarvis", "Working…", "busy"), t, newKey());
+    return send(addMsg("jarvis", "Working…", "busy"), t, key, target);
   }
   // The app was closed or reloaded while a request ran on the PC: pick it up again.
   async function resumeAsk() {
     if (asking || !me) return;
     let saved = null;
     try { saved = JSON.parse(store.get(ASK_KEY, "") || "null"); } catch (e) { saved = null; }
+    if (saved && saved.held === true) {
+      if (OP_RE.test(String(saved.key || "")) && now() - saved.at < ASK_STALE_MS) {
+        heldAsk = { key: String(saved.key), text: str(saved.text, 2000), target: str(saved.target, 64) };
+        if (el.aText && !el.aText.value) { el.aText.value = heldAsk.text; autosize(); countAsk(); }
+        if (heldAsk.target) store.set("jarvis.phone.target", heldAsk.target);
+        return;
+      }
+      saveAsk("");
+      return;
+    }
     if (!saved || typeof saved !== "object" || !/^[0-9a-f]{6,32}$/.test(String(saved.job)) || !(now() - saved.at < ASK_STALE_MS)) { if (saved) saveAsk(""); return; }
     asking = true; renderAskMeta();
     if (el.aThread.textContent.indexOf(str(saved.text, 2000)) < 0 || !el.aThread.children.length) addMsg("you", str(saved.text, 2000), "");
@@ -919,7 +1346,7 @@
   el.aSend.addEventListener("click", ask);
 
   // ---------- this phone ----------
-  let forgetArm = 0;
+  let forgetArm = 0, logoutOp = "";
   function renderPhone() {
     const p = me && me.phone && typeof me.phone === "object" ? me.phone : {};
     text(el.pnName, str(p.name, 40) || "–");
@@ -948,8 +1375,12 @@
     }
     clearTimeout(forgetArm); forgetArm = 0;
     text(el.pnForgetT, "Forget this phone");
-    try { await api("/phone/api/logout", {}, { timeout: 15000 }); }
-    catch (e) { if (e.kind !== "auth") { text(el.pnMsg, e.message); return; } }
+    if (!OP_RE.test(logoutOp)) logoutOp = operationId();
+    try { await api("/phone/api/logout", { operation_id: logoutOp }, { timeout: 15000 }); }
+    catch (e) {
+      if (e.kind !== "auth") { text(el.pnMsg, e.message); return; }
+    }
+    logoutOp = "";
     toPair("This phone is forgotten. Pair it again to use JARVIS here.");
   });
 
@@ -1026,13 +1457,17 @@
     if (me && !document.hidden) refresh();
   }
   // pagehide and the background stop: requests that outlive the page.
+  function beacon(path, body) {
+    const payload = stampBody(path, body);
+    try {
+      fetch(path, { method: "POST", keepalive: true, credentials: "same-origin", headers: phoneHeaders(true), body: JSON.stringify(payload) }).catch(() => {});
+    } catch (e) { /* the page is going away */ }
+  }
   function stopBeacon() {
     if (!sess) return;
-    const id = sess.id, o = { method: "POST", keepalive: true, credentials: "same-origin", headers: { "X-JARVIS-Phone": "1", "Content-Type": "application/json" } };
-    try {
-      if (sess.kind === "screen") fetch("/phone/api/session/input", Object.assign({ body: JSON.stringify({ session: id, events: [{ t: "release" }] }) }, o)).catch(() => {});
-      fetch("/phone/api/session/stop", Object.assign({ body: JSON.stringify({ session: id }) }, o)).catch(() => {});
-    } catch (e) { /* the page is going away */ }
+    const id = sess.id;
+    if (sess.kind === "screen") beacon("/phone/api/session/input", { session: id, events: [{ t: "release" }] });
+    beacon("/phone/api/session/stop", { session: id });
   }
   function backgroundStop() { if (!sess) return; stopBeacon(); finish(null, BG_REASON); }
   function armHiddenStop() {
@@ -1052,8 +1487,8 @@
       frameCtl = ctl;
       const timer = setTimeout(() => ctl.abort(), 15000);
       try {
-        const res = await fetch(`/phone/api/session/frame?session=${encodeURIComponent(id)}&after=${sess.lastSeq || 0}`,
-          { signal: ctl.signal, credentials: "same-origin", cache: "no-store", headers: { "X-JARVIS-Phone": "1" } });
+        const res = await fetch(frameUrl(id, sess.lastSeq || 0),
+          { signal: ctl.signal, credentials: "same-origin", cache: "no-store", headers: phoneHeaders(false) });
         if (g !== gen) return;
         if (res.status === 204) {
           fails = 0; reachable(true);
@@ -1062,13 +1497,23 @@
           continue;
         }
         if (res.status === 401 || res.status === 404 || res.status === 410) {
-          const d = await res.json().catch(() => ({}));
+          const d = await readJson(res, 8192);
           if (g !== gen) return;
           if (res.status === 401 && d && d.pair) { toPair(); return; }
           finish(res.status === 404 ? GONE : str(d && d.error) || "The computer ended the session.", "");
           return;
         }
-        if (!res.ok) throw Object.assign(new Error(`JARVIS couldn't send the picture (HTTP ${res.status}).`), { http: true });
+        if (!res.ok) {
+          const d = await readJson(res, 8192);
+          if (g !== gen || repairing) return;
+          // A csrf refusal is not a bad picture: stop the loop, release locally, and pair again.
+          if (isCsrf(new Fail("", "http", res.status, d))) {
+            finish(null, "Ended.");
+            showCsrfRecovery();
+            return;
+          }
+          throw Object.assign(new Error(`JARVIS couldn't send the picture (HTTP ${res.status}).`), { http: true });
+        }
         const blob = await res.blob();
         if (g !== gen || !sess) return;
         const seq = parseInt(res.headers.get("X-Frame-Seq"), 10);
@@ -1081,7 +1526,7 @@
         frameTimes.push(now()); lastFrameAt = now();
         if (!gotFrame) { gotFrame = true; renderSess(); announce("Live."); }
       } catch (e) {
-        if (g !== gen) return;
+        if (g !== gen || repairing) return;
         if (!e || !e.http) reachable(false);
         if (++fails >= 6) { finish(e && e.http ? e.message : LOST, ""); return; }
         await sleep(Math.min(3000, 300 * fails));
