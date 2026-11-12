@@ -79,7 +79,7 @@ def _nodes(config, state, main):
         except Exception:  # a broken job table must not hide the node
             busy = False
         out.append({
-            "id": node["id"], "label": device.get("label") or node["id"],
+            "id": node["id"], "label": device.get("label") or node["id"], "profile": device.get("profile"),
             "hostname": node.get("hostname") or device.get("hostname"),
             "platform": node.get("platform"), "online": node["online"], "seen": seen,
             "presence": presence(seen, busy), "busy": busy,

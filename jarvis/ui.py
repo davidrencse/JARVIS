@@ -1131,6 +1131,10 @@ class Console:
         return fleet_management.inventory(
             self.config, self.state, config_path=self.base / "jarvis.config.json")
 
+    def continuity_gateway(self):
+        from .continuity.console import gateway_status
+        return gateway_status(self.config)
+
     def fleet_vault(self):
         from . import fleet_management
         return fleet_management.vault_status(self.config, self.state)
@@ -1600,6 +1604,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/input/shared": lambda: c.ttl.get("shared", 12, c.shared_input),
             "/api/connections": c.connections,
             "/api/fleet": c.fleet,
+            "/api/continuity/gateway": c.continuity_gateway,
             "/api/fleet/vault": c.fleet_vault,
             "/api/peripherals": lambda: c.ttl.get("peripherals", 12, lambda: __import__(
                 "jarvis.peripherals", fromlist=["overview"]).overview(
