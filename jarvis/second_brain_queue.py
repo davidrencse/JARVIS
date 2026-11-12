@@ -539,8 +539,9 @@ def rescan(state_dir):
     """Re-queue every current record of every capturing store through the bounded baseline
     backlog (e.g. after rows changed while capture was off, or to re-verify publication).
     This only seeds. The next drain that can read the vault drops a matching head only after
-    SecondBrain.publication_sound reads the note back through _load; a damaged chunk stays
-    immutable and is republished as the next revision. Returns {"ok", "seeded": {store: rows}}."""
+    SecondBrain.publication_sound reads the newest note back through _load. A revision gap does
+    not make that head sound and is not filled in. A damaged chunk stays immutable and is
+    republished as the next revision. Returns {"ok", "seeded": {store: rows}}."""
     state, out = Path(state_dir).expanduser(), {"ok": True, "seeded": {}}
     for store, fname in STORE_FILES.items():
         path = state / fname

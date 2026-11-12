@@ -17,13 +17,19 @@ Rules (docs/design/mobile-continuity/FLEET-API.md):
     joined is refused (revoke first); a still-unused invite is replaced only when asked.
   * Lost reply: the same request_id never issues a second code, including after a restart.
     The receipt file state/cluster-invite-receipts.json (request id, node, state, digest; no
-    code and no key) is the only ledger: there is no in-memory copy. Replacing an invite needs
-    a new request_id. pending and uncertain receipts are not a way to rotate a credential that
-    is still there, and an uncertain receipt blocks every new request for that node id until the
-    node is revoked (the explicit reconciliation). The same file is the admission check for
-    `jarvis cluster invite` and `jarvis cluster enroll`. A different node id is not blocked:
-    this is the configured id, not a physical machine, and one uncertain receipt is not a
-    global stop.
+    code and no key) is the only ledger: there is no in-memory copy and no second file.
+    Every read-modify-write takes the fleet lock (config_mutation on fleet-manage.lock) and
+    merges only that caller's delta onto the file as it is after the change, so a stale full
+    snapshot cannot drop another writer's fence. Replacing an invite needs a new request_id.
+    pending and uncertain receipts are not a way to rotate a credential that is still there,
+    and an uncertain receipt blocks every new request for that node id until the node is
+    revoked (the explicit reconciliation). The same file is the admission check for
+    `jarvis cluster invite` and `jarvis cluster enroll`. Enroll checks again under that lock
+    after the signing key and any device delta, and before it rotates a credential.
+    `jarvis cluster revoke` and the console both clear that node's receipts only after
+    Broker.revoke returns; if that revoke raises, the fence stays. A different node id is
+    not blocked: this is the configured id, not a physical machine, and one uncertain
+    receipt is not a global stop.
   * Every managed config write goes through jarvis/config_lock.py: the cross-process lock
     `<state>/fleet-manage.lock` (shared with Settings, `jarvis cluster configure|main|invite|enroll|join`,
     init and leave). The latest file is re-read under it and only the caller's keys are applied.
@@ -673,12 +679,72 @@ def _store_receipts(state, receipts):
         pass
 
 
+_MISSING = object()
+
+
+def _merge_receipt_delta(latest, before, after):
+    """Apply only the edits from `before` to `after` onto `latest`.
+
+    A key the caller did not change keeps the value in `latest`, including a fence
+    stored after the caller read. A key the caller removed is removed only when
+    `latest` is still the value they saw. A third value on a key they changed is
+    left as `latest`, so a stale pending or issued write cannot cover an uncertain row.
+    """
+    merged = copy.deepcopy(latest)
+    for key in set(before) | set(after):
+        old = before.get(key, _MISSING)
+        new = after.get(key, _MISSING)
+        if old == new:
+            continue
+        current = merged.get(key, _MISSING)
+        if new is _MISSING:
+            if current == old:
+                merged.pop(key, None)
+            continue
+        if current is _MISSING or current == old or current == new:
+            merged[key] = copy.deepcopy(new)
+    return merged
+
+
+def mutate_receipts(state, change):
+    """Read-modify-write the one receipt file under the fleet lock.
+
+    `change(receipts)` mutates a copy of the file as it was read under the lock.
+    The file is read again after `change` returns. Only this caller's delta is
+    written, so a same-thread re-entry that already stored a fence is kept.
+    The caller's earlier full snapshot is never what hits the disk.
+    """
+    from .config_lock import config_mutation
+    with config_mutation(state):
+        before = _load_receipts(state)
+        after = copy.deepcopy(before)
+        change(after)
+        latest = _load_receipts(state)
+        merged = _merge_receipt_delta(latest, before, after)
+        if merged != latest:
+            _store_receipts(state, merged)
+        return merged
+
+
 def _drop_receipt(state, request_id):
-    receipts = _load_receipts(state)
-    if request_id not in receipts:
-        return
-    del receipts[request_id]
-    _store_receipts(state, receipts)
+    def change(receipts):
+        receipts.pop(request_id, None)
+    mutate_receipts(state, change)
+
+
+def _put_receipt(state, request_id, item):
+    def change(receipts):
+        receipts[request_id] = item
+    mutate_receipts(state, change)
+
+
+def clear_node_receipts(state, node):
+    """Drop every receipt for this node id. Other ids stay. One ledger, no second file."""
+    def change(receipts):
+        for key in [k for k, item in receipts.items()
+                    if isinstance(item, dict) and item.get("node") == node]:
+            del receipts[key]
+    mutate_receipts(state, change)
 
 
 def uncertain_for(receipts, node):
@@ -690,22 +756,26 @@ def uncertain_for(receipts, node):
 def assert_node_admitted(state, node):
     """Refuse issuance for this node id when an uncertain receipt is on the one ledger.
 
-    A different node id is admitted. Nothing here stops every invite on the machine."""
-    if uncertain_for(_load_receipts(state), node):
-        raise AdmissionBlocked(node)
+    The read takes the fleet lock, same as every receipt write. A different node id is
+    admitted. Nothing here stops every invite on the machine."""
+    from .config_lock import config_mutation
+    with config_mutation(state):
+        if uncertain_for(_load_receipts(state), node):
+            raise AdmissionBlocked(node)
 
 
 def note_uncertain_attempt(state, node):
     """Record one uncertain receipt for this node id when cleanup could not be verified.
 
-    Same file as issue_invite. No second ledger, no code, no key. A receipt that is already
-    uncertain for the id is left as it is."""
-    receipts = _load_receipts(state)
-    if uncertain_for(receipts, node):
-        return
-    receipts["cli-" + hashlib.sha256(f"{node}\n{time.time_ns()}".encode()).hexdigest()[:24]] = {
-        "node": node, "state": "uncertain", "at": time.time()}
-    _store_receipts(state, receipts)
+    Same file as issue_invite, under the fleet lock. No second ledger, no code, no key.
+    A receipt that is already uncertain for the id is left as it is. A fence another
+    writer stored during this call is not replaced."""
+    def change(receipts):
+        if uncertain_for(receipts, node):
+            return
+        receipts["cli-" + hashlib.sha256(f"{node}\n{time.time_ns()}".encode()).hexdigest()[:24]] = {
+            "node": node, "state": "uncertain", "at": time.time()}
+    mutate_receipts(state, change)
 
 
 def _node_has_row(state, node):
@@ -748,9 +818,13 @@ def issue_invite(config, path, state, body):
                              step="invite", retryable=False)
         if prior is not None and prior["state"] == "issued":
             if prior.get("digest") != _digest(request_id, node):
-                prior["state"] = "uncertain"
-                prior.pop("digest", None)
-                _store_receipts(state, receipts)
+                def mark(found, _request_id=request_id, _node=node):
+                    item = found.get(_request_id)
+                    if (isinstance(item, dict) and item.get("state") == "issued"
+                            and item.get("digest") != _digest(_request_id, _node)):
+                        item["state"] = "uncertain"
+                        item.pop("digest", None)
+                mutate_receipts(state, mark)
                 raise FleetError("invite_failed",
                                  "This request's receipt does not match. It was not retried.",
                                  409, step="invite", retryable=False)
@@ -790,8 +864,7 @@ def issue_invite(config, path, state, body):
             entry["os"] = os_name
         wrote_pending = False
         try:
-            receipts[request_id] = {"node": node, "state": "pending", "at": time.time()}
-            _store_receipts(state, receipts)
+            _put_receipt(state, request_id, {"node": node, "state": "pending", "at": time.time()})
             wrote_pending = True
             def still_main(doc):  # runs on the file as it is on disk, under the config lock
                 current = _require_main(doc)
@@ -820,9 +893,7 @@ def issue_invite(config, path, state, body):
                 report = cluster_setup.invite(live, path, state, node, extra=addresses, capabilities=caps)
             except cluster_setup.InviteIncomplete as exc:
                 if not exc.retryable:
-                    receipts = _load_receipts(state)
-                    receipts[request_id] = {"node": node, "state": "uncertain", "at": time.time()}
-                    _store_receipts(state, receipts)
+                    _put_receipt(state, request_id, {"node": node, "state": "uncertain", "at": time.time()})
                     wrote_pending = False
                 raise FleetError("invite_failed", _public_failure(exc), 409, step="invite",
                                  retryable=bool(exc.retryable)) from exc
@@ -840,9 +911,7 @@ def issue_invite(config, path, state, body):
                                  step="invite", retryable=True) from exc
             issued = {"node": node, "state": "issued", "digest": _digest(request_id, node), "at": time.time()}
             try:
-                receipts = _load_receipts(state)
-                receipts[request_id] = issued
-                _store_receipts(state, receipts)
+                _put_receipt(state, request_id, issued)
             except (OSError, FleetError) as exc:
                 # The credential exists and the client has not been given the code. Leave the
                 # pending receipt so the same id cannot rotate it.
@@ -886,15 +955,9 @@ def revoke_node(config, state, body, *, config_path=None):
             _node_id(node, config)
         rows, jobs = _db_rows(state)
         was = node in rows
+        # Credential first, then this node's receipts, inside cluster_setup.revoke.
+        # The CLI calls that same function. A raise from Broker.revoke leaves the fence.
         result = cluster_setup.revoke(state, node)
-        try:
-            receipts = _load_receipts(state)
-        except FleetError:
-            receipts = None  # a damaged ledger must not block cutting the credential
-        if receipts is not None:
-            kept = {k: v for k, v in receipts.items() if v.get("node") != node}
-            if len(kept) != len(receipts):
-                _store_receipts(state, kept)
     return {"ok": True, "node": node, "was_enrolled": was, "ssh_key_removed": bool(result.get("ssh_key_removed")),
             "active_jobs_cancelled": jobs.get(node, 0),
             **({"warning": "The credential is gone but the SSH key could not be removed. Remove its "

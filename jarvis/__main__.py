@@ -363,6 +363,9 @@ def main():
                 if here or not args.position:
                     raise ValueError("Usage: jarvis lanmouse pair --device PEER --position left|right|top|bottom "
                                      "(the side of this screen the peer sits on)")
+                blocked = sharedinput.pair_blocked(args.state, config)
+                if blocked:
+                    raise RuntimeError(blocked)
                 emit(sharedinput.pair(config, args.state, remote.resolve(args.device), args.position, remote))
             elif args.action in ("elevate", "unelevate"):  # this computer only, from an admin terminal
                 emit(getattr(sharedinput, args.action)(args.state))

@@ -952,10 +952,14 @@ class SecondBrain:
                 current = latest.get(stem)
                 line = _canonical(obj)
                 p_full = _sha(line)
-                if current and current.get("conflict"):
-                    report["failures"].append({"record": rid, "error": "revision-gap-or-duplicate: owner must resolve"})
-                    report["ok"] = False
-                    return
+                if current and current.get("conflict") and not current.get("tomb"):
+                    # Missing or duplicate numbers stay missing. Do not synthesize them.
+                    # A damaged newest note may still be repaired by appending the next
+                    # revision from this payload; the gap remains the owner's.
+                    if not self._damaged_matching_head(current, p_full):
+                        report["failures"].append({"record": rid, "error": "revision-gap-or-duplicate: owner must resolve"})
+                        report["ok"] = False
+                        return
                 if current and current["tomb"]:
                     # Never resurrected by sync, changed source or not. Reviving needs an explicit
                     # owner action that does not exist yet (open blocker C1).
@@ -1049,16 +1053,23 @@ class SecondBrain:
     def publication_sound(self, store, kind, key, payload_sha):
         """True when the queue may leave this payload acknowledged without a new revision.
 
-        A tombstone stays acknowledged: sync and drain must not resurrect it. A revision conflict
-        stays the owner's; republishing would not resolve it. Anything else has to read back
-        through _load as exactly this payload. Missing or damaged means False, so the caller
-        queues a repair revision instead of trusting the head hash."""
+        A tombstone stays acknowledged: sync and drain must not resurrect it. A gap or a
+        duplicate revision number is not itself a sound head. The newest note is read through
+        _load. Intact means leave it acknowledged: the missing numbers are not filled in.
+        Damaged means False, so the caller appends the next revision and leaves the old bytes."""
         info = self._latest_info(store, kind, key)
         if not info:
             return False
-        if info.get("tomb") or info.get("conflict"):
+        if info.get("tomb"):
             return True
         return self._note_intact(info, payload_sha)
+
+    def _damaged_matching_head(self, current, payload_sha):
+        """The newest filename claims this payload, and _load says the note does not hold it.
+        A tombstone is not damage to repair. A gap alone is not damage."""
+        return bool(current and not current.get("tomb")
+                    and current.get("payload") == payload_sha[:12]
+                    and not self._note_intact(current, payload_sha))
 
     def _status_candidate(self, info):
         """Status does not open a large plain note. A missing note, a note at most
@@ -1078,16 +1089,25 @@ class SecondBrain:
     def published_readable(self, store, kind, key, payload_sha):
         """Bounded head check for status. None: not opened. True/False: _load verdict.
 
-        Tombstones and revision conflicts are True (not chunk damage). A head with no note is
-        False. The damaged bytes of an older revision are not opened here; validate() lists those."""
+        A tombstone is True and is not opened, so a damaged chunk cannot block a deletion.
+        A revision gap does not skip the head and is not a healthy read: the newest note goes
+        through _load. True means that note holds this payload. It does not mean the revision
+        list is 1..n; revision_conflict is that fact. A head with no note is False. Damaged
+        bytes of an older revision are not opened here; validate() lists those."""
         info = self._latest_info(store, kind, key)
         if not self._status_candidate(info):
             return None
         if not info:
             return False
-        if info.get("tomb") or info.get("conflict"):
+        if info.get("tomb"):
             return True
         return self._note_intact(info, payload_sha)
+
+    def revision_conflict(self, store, kind, key):
+        """True when this record's note names are not 1..n. Filenames only; the head bytes
+        are published_readable's job. A missing record is False."""
+        info = self._latest_info(store, kind, key)
+        return bool(info and info.get("conflict"))
 
     def _refresh(self, latest, stem, store, kind, digest12):
         folder = self.area / store / _slug(kind, 20) / digest12[:2]

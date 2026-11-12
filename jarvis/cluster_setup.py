@@ -485,6 +485,25 @@ def _role_guard(node):
     return check
 
 
+def _fence_unverified(state, node, reason):
+    """Record one uncertain receipt, then fail closed.
+
+    A failed fence write is not treated as recorded: the error stays non-retryable and
+    says the receipt could not be saved. It does not clear any fence already on disk."""
+    from .fleet_management import note_uncertain_attempt
+    try:
+        note_uncertain_attempt(state, node)
+    except (OSError, ValueError) as exc:
+        raise InviteIncomplete(
+            "The invite stopped after a credential change and the uncertain receipt could not be saved. "
+            "It was not atomic. Retrying this request would not be safe.",
+            retryable=False) from exc
+    raise InviteIncomplete(
+        "The invite stopped after a credential change and the cleanup could not be verified. "
+        "It was not atomic. Retrying this request would not be safe.",
+        retryable=False) from reason
+
+
 def _ensure_invite_holds(state, path, node, public, prior_lines, keys_path, prior_row, token):
     """Re-read role and admission after a step that can itself write the config.
 
@@ -493,7 +512,7 @@ def _ensure_invite_holds(state, path, node, public, prior_lines, keys_path, prio
     allows the invite. Compensation restores only this attempt's row and key. Jobs are
     settled only after a code exists, so a finished job is never resurrected here."""
     from .config_lock import read_config
-    from .fleet_management import assert_node_admitted, note_uncertain_attempt
+    from .fleet_management import assert_node_admitted
     reason = None
     try:
         _role_guard(node)(read_config(path))
@@ -507,14 +526,7 @@ def _ensure_invite_holds(state, path, node, public, prior_lines, keys_path, prio
     key_ok = _restore_key(node, public, prior_lines, keys_path)
     if node_ok and key_ok:
         raise InviteIncomplete(str(reason), retryable=True) from reason
-    try:
-        note_uncertain_attempt(state, node)
-    except (OSError, ValueError):
-        pass
-    raise InviteIncomplete(
-        "The invite stopped after a credential change and the cleanup could not be verified. "
-        "It was not atomic. Retrying this request would not be safe.",
-        retryable=False) from reason
+    _fence_unverified(state, node, reason)
 
 
 def _invite_locked(config, path, state, node, caps, found, target, signing, host, private,
@@ -522,7 +534,7 @@ def _invite_locked(config, path, state, node, caps, found, target, signing, host
     """The part of an invite that changes things. Runs under the managed config lock, on the
     config as it is on disk now (a role or tunnel flip while the keys were made is seen)."""
     from .config_lock import patch_config, read_config
-    from .fleet_management import assert_node_admitted, note_uncertain_attempt
+    from .fleet_management import assert_node_admitted
     disk = read_config(path)
     _role_guard(node)(disk)
     assert_node_admitted(state, node)
@@ -580,23 +592,31 @@ def _invite_locked(config, path, state, node, caps, found, target, signing, host
         key_ok = _restore_key(node, public, prior_lines, keys_path)
         if node_ok and key_ok:
             raise InviteIncomplete(_public_invite_error(exc), retryable=True) from exc
-        try:
-            note_uncertain_attempt(state, node)
-        except (OSError, ValueError):
-            pass
-        raise InviteIncomplete(
-            "The invite stopped after a credential change and the cleanup could not be verified. "
-            "It was not atomic. Retrying this request would not be safe.",
-            retryable=False) from exc
+        _fence_unverified(state, node, exc)
 
 
 def revoke(state, node):
-    Broker(state).revoke(node)
-    try:
-        removed = unauthorize(node)
-    except OSError as exc:
-        return {"revoked": node, "ssh_key_removed": False, "error": str(exc)}
-    return {"revoked": node, "ssh_key_removed": bool(removed)}
+    """Cut the credential, then this node's receipts. CLI and console both use this.
+
+    Broker.revoke runs first. If it raises, the receipt file is not opened and no fence
+    is cleared. SSH key removal is reported and does not by itself keep the fence: the
+    credential is already gone. A damaged receipt file does not undo the credential cut
+    and does not wipe another node's rows. Other node ids stay."""
+    from .config_lock import config_mutation
+    with config_mutation(state):
+        Broker(state).revoke(node)
+        try:
+            removed = unauthorize(node)
+        except OSError as exc:
+            result = {"revoked": node, "ssh_key_removed": False, "error": str(exc)}
+        else:
+            result = {"revoked": node, "ssh_key_removed": bool(removed)}
+        from .fleet_management import FleetError, clear_node_receipts
+        try:
+            clear_node_receipts(state, node)
+        except FleetError:
+            pass  # a damaged ledger must not block cutting the credential
+        return result
 
 
 # --- node side --------------------------------------------------------------------------

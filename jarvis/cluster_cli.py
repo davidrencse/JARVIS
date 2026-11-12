@@ -74,6 +74,12 @@ def set_main(config, path, device, state=None):
     state defaults to `.jarvis` next to the config. The lock is local: it is not a lease and
     it does not fence the old main."""
     from .config_lock import patch_config
+    try:
+        from .continuity.integration import refuse_unfenced
+    except ImportError:  # continuity is optional; without it the legacy path is the only one
+        refuse_unfenced = None
+    if refuse_unfenced is not None:
+        refuse_unfenced("set_main")
     state = Path(state) if state is not None else Path(path).resolve().parent / ".jarvis"
 
     def change(doc):
@@ -234,6 +240,8 @@ def run(args, config, base):
         if output.exists():
             raise ValueError("Pairing output already exists; choose a new filename.")
         # Same receipt file as the console. This id only; a different id is not blocked.
+        # The check before code_key is a fast refuse. It is not the one that fences the
+        # rotation: code_key and the optional device delta both run before that.
         from .fleet_management import assert_node_admitted, note_uncertain_attempt
         assert_node_admitted(state, node)
         # Signing material before any token or job change. A failure here leaves both alone.
@@ -254,23 +262,31 @@ def run(args, config, base):
         bundle = {"node_id": node, "main_device": main, "main_url": endpoint(config),
                   "capabilities": caps, "devices": safe, "code_key": signing}
         from .cluster_setup import _node_snapshot, _restore_node
-        prior = _node_snapshot(state, node)
-        token = Broker(state).enroll(node, caps, settle_jobs=False)
-        bundle["token"] = token
-        try:
-            save_json(output, bundle)
-        except Exception as exc:
-            attempt = hashlib.sha256(token.encode()).hexdigest()
-            if _restore_node(state, node, prior, attempt):
-                output.unlink(missing_ok=True)
-                raise
+        from .config_lock import config_mutation
+        # After the expensive key prep and the device delta, under the fleet lock, before
+        # any credential or pairing-file effect. A fence written during code_key is seen here.
+        with config_mutation(state):
+            assert_node_admitted(state, node)
+            prior = _node_snapshot(state, node)
+            token = Broker(state).enroll(node, caps, settle_jobs=False)
+            bundle["token"] = token
             try:
-                note_uncertain_attempt(state, node)
-            except (OSError, ValueError):
-                pass
-            raise ValueError(
-                "Enrollment stopped after a credential change and the cleanup could not be verified. "
-                "It was not atomic. Revoke the node to reconcile it, then enroll again.") from exc
+                save_json(output, bundle)
+            except Exception as exc:
+                attempt = hashlib.sha256(token.encode()).hexdigest()
+                if _restore_node(state, node, prior, attempt):
+                    output.unlink(missing_ok=True)
+                    raise
+                try:
+                    note_uncertain_attempt(state, node)
+                except (OSError, ValueError) as fence_exc:
+                    raise ValueError(
+                        "Enrollment stopped after a credential change and the uncertain receipt "
+                        "could not be saved. It was not atomic. Revoke the node to reconcile it, "
+                        "then enroll again.") from fence_exc
+                raise ValueError(
+                    "Enrollment stopped after a credential change and the cleanup could not be verified. "
+                    "It was not atomic. Revoke the node to reconcile it, then enroll again.") from exc
         # The file holds the new token. Only now are running jobs uncertain. A job that
         # finished during the write stays done. Best effort: the old token is already dead.
         try:

@@ -436,6 +436,12 @@ def validate_action(kind, payload):
 
 def execute_local(kind, payload, config, state):
     validate_action(kind, payload)
+    try:
+        from .continuity.integration import refuse_unfenced
+    except ImportError:  # continuity is optional; without it the legacy path is the only one
+        refuse_unfenced = None
+    if refuse_unfenced is not None:
+        refuse_unfenced("cluster_local")
     if kind == "desktop":
         from .remote import run_here
         ok, text = run_here(payload["action"], payload["arg"])
@@ -608,6 +614,12 @@ class Hub:
 
     def dispatch(self, node, kind, payload, timeout=45):
         validate_action(kind, payload)
+        try:
+            from .continuity.integration import refuse_unfenced
+        except ImportError:  # continuity is optional; without it the legacy path is the only one
+            refuse_unfenced = None
+        if refuse_unfenced is not None:
+            refuse_unfenced("hub_dispatch")
         if node not in self.config.get("devices", {}):
             raise ValueError("Unknown node.")
         if node == self.main:
@@ -1394,6 +1406,12 @@ class NodeWorker:
             try:
                 result = self.executor(job["kind"], job["payload"])
                 message = {"id": job["id"], "result": result, "failed": False}
+                try:
+                    from .continuity.integration import node_seen_mode
+                    if node_seen_mode() == "after":
+                        self._mark_seen(job["id"])
+                except ImportError:
+                    pass
             except Exception as exc:
                 # The executor started, so part of the action may already have happened.
                 message = {"id": job["id"], "failed": True, "result": {
@@ -1435,9 +1453,29 @@ class NodeWorker:
         seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and now - v < 3600}
         if job["id"] in seen:
             return "already run once (replayed)"
+        try:
+            from .continuity.integration import node_seen_mode
+            after = node_seen_mode() == "after"
+        except ImportError:
+            after = False
+        if after:
+            # Continuity cutover only: the job is marked after it succeeds, so a run that
+            # failed before any effect is not stranded as "already run".
+            return None
         seen[job["id"]] = now
         save_json(seen_path, seen)
         return None
+
+    def _mark_seen(self, job_id):
+        seen_path = self.state / "cluster-jobs-seen.json"
+        try:
+            seen = json.loads(seen_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            seen = {}
+        now = time.time()
+        seen = {k: v for k, v in seen.items() if isinstance(v, (int, float)) and now - v < 3600}
+        seen[job_id] = now
+        save_json(seen_path, seen)
 
     def _input_guard(self):
         """Lan Mouse off while this laptop and its peer are apart (sharedinput.guard), checked

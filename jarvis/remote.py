@@ -212,6 +212,12 @@ class Remote:
         """(ok, text): `action` on `device` (None or this laptop: run here)."""
         if action not in ACTIONS:
             return False, f"Unknown desktop action {action}."
+        try:
+            from .continuity.integration import refuse_unfenced
+        except ImportError:  # continuity is optional; without it the legacy path is the only one
+            refuse_unfenced = None
+        if refuse_unfenced is not None:
+            refuse_unfenced("remote_call")
         device = self.resolve(device)
         from .topology import ORIGIN, Roles, enabled, identity
         if enabled(self.config):

@@ -1427,6 +1427,12 @@ class PhoneHandler(BaseHTTPRequestHandler):
 
     def _handle(self, method):
         try:
+            try:
+                from .continuity.integration import phone_listener_open
+            except ImportError:
+                phone_listener_open = None
+            if phone_listener_open is not None and not phone_listener_open():
+                raise Reply(503, {"error": "The phone listener is closed for continuity.", "code": "legacy_retained"})
             self._route(method)
         except Reply as reply:
             if reply.status >= 400 and method == "POST":

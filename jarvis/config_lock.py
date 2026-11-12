@@ -22,7 +22,9 @@ re-reads the file before it issues a code.
 
 The lock is re-entrant per thread (flock is per open file, so a second open in the same thread
 would wait on itself), which lets the console invite hold it and call `cluster_setup.invite`,
-which takes it again. Different threads and processes are serialised."""
+which takes it again. Different threads and processes are serialised. Receipt read-modify-write
+uses this same lock and merges its delta onto the latest receipt file, so a full snapshot
+from an earlier read cannot drop a fence another writer stored."""
 
 import contextlib
 import copy

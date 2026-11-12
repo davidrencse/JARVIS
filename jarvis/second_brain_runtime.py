@@ -16,10 +16,11 @@ Gates, re-checked every cycle (nothing is written when any fails):
 
 Status is read-only and numeric: counts, ages, a reason code. No record bodies, ids or paths. It
 never says "saved to Obsidian": `state` is `current` only when nothing is pending, held or
-failing, a drain has succeeded, AND every published head this process could open through the
-archive loader read back. A chunked note or any note up to 64 KiB is opened; a larger plain note
-is not. Stage is C2 transitional: SQLite is still the source and authoritative reads/rebuild
-(C3) are not cut over.
+failing, a drain has succeeded, every published head this process could open through the
+archive loader read back, AND no published record has a revision gap or duplicate. A gap is
+`conflict`, not `current`, even when the newest note reads back. A chunked note or any note up
+to 64 KiB is opened; a larger plain note is not. Stage is C2 transitional: SQLite is still the
+source and authoritative reads/rebuild (C3) are not cut over.
 """
 
 import atexit
@@ -438,11 +439,13 @@ def status(config, state, queue=None):
     out["archive_held_oversize_bytes"] = _num(counts, ("held_oversize_bytes",)) or 0
     out["archive_chunk_checked"] = 0
     out["archive_chunk_damaged"] = 0
+    out["archive_revision_conflict"] = 0
     if out["enabled"] and out["gate"] == "ok" and out["queue"] == "ok":
         try:
-            checked, damaged = _published_integrity(state, gate["root"])
+            checked, damaged, conflicts = _published_integrity(state, gate["root"])
             out["archive_chunk_checked"] = checked
             out["archive_chunk_damaged"] = damaged
+            out["archive_revision_conflict"] = conflicts
         except Exception:
             out["archive_integrity"] = "unverified"  # class only; do not claim the heads read back
     files = _files_state(state)
@@ -456,7 +459,8 @@ def status(config, state, queue=None):
 
 
 def _verdict(out):
-    """One word, never an overclaim: `current` needs zero backlog AND a proven success."""
+    """One word, never an overclaim: `current` needs zero backlog, a proven success, a head
+    that read back, and no revision gap."""
     if not out["enabled"]:
         return "disabled"
     if out["gate"] != "ok":
@@ -477,6 +481,8 @@ def _verdict(out):
         return "unverified"
     if out.get("archive_chunk_damaged"):
         return "error"   # a published head did not read back; the queue being empty is not enough
+    if out.get("archive_revision_conflict"):
+        return "conflict"   # a gap is not a healthy current, even when the newest note reads back
     if out["files_stale"]:
         return "partial"   # database stores are current, plans/runs/knowledge have not been verified
     if ((out["last_drain"] or out["last_success"]) and out["archive_pending"] == 0
@@ -487,19 +493,22 @@ def _verdict(out):
 
 def _published_integrity(state, root):
     """Bounded read-back of acknowledged heads. Counts only. Each opened note goes through
-    SecondBrain.published_readable (_load). Heads left unopened are not counted as checked
-    and cannot by themselves cancel `current`."""
+    SecondBrain.published_readable (_load). A revision gap is counted even when the note is
+    left unopened, so a gap cannot by itself become `current`. Heads left unopened are not
+    counted as checked."""
     from .second_brain import SecondBrain
     brain = SecondBrain(root)
-    checked = damaged = 0
+    checked = damaged = conflicts = 0
     for store, kind, key, digest in _queue().published_heads(Path(state)):
+        if brain.revision_conflict(store, kind, key):
+            conflicts += 1
         verdict = brain.published_readable(store, kind, key, digest)
         if verdict is None:
             continue
         checked += 1
         if not verdict:
             damaged += 1
-    return checked, damaged
+    return checked, damaged, conflicts
 
 
 # -- CLI (`jarvis archive ...`); returns (result, exit_code), counts and codes only ------
