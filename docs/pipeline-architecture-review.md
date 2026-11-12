@@ -88,7 +88,7 @@ The plan store, task ledger and memory database are still separate stores. If in
 
 Baseline: **183 tests passed** in 35.333 seconds. Final verification: **196 tests passed** in 37.061 seconds with warnings enabled and no observed resource warnings. An earlier full run exposed an existing unclosed pipe in the local-server test harness; its cleanup was corrected before this final run. The complete result and interpreter path are recorded in `audit-evidence/final-tests.txt`.
 
-The thirteen new tests cover stale Claude output, callback failure in both lanes, process/pipe/reader cleanup, post-kill reaping, busy-stream deadlines, overview response/query compatibility, streaming log extraction, plan-memory failure, failed execution, uncertain dispatch, and atomic replacement failure. The auditor also ran eight separate edge-case checks and the existing 33-test pipeline suite. See [the independent audit](pipeline-independent-audit.md).
+The thirteen new tests cover stale Claude output, callback failure in both lanes, process/pipe/reader cleanup, post-kill reaping, busy-stream deadlines, overview response/query compatibility, streaming log extraction, plan-memory failure, failed execution, uncertain dispatch, and atomic replacement failure. The auditor also ran eight separate edge-case checks and the existing 33-test pipeline suite. (The independent audit report was retired; see git history.)
 
 Synthetic task-summary benchmark, fifteen alternating samples per implementation, same local temporary database, medians:
 
@@ -145,4 +145,4 @@ Already-running JARVIS processes retain their loaded Python code. Apply these ch
 
 The only schema addition is the task timestamp index, created on the next Store initialization. Existing task records, memory and plan formats remain compatible. The intentional behavior change is refusal to automatically retry an uncertain plan step.
 
-Pre-change copies of the six production modules are in `%TEMP%\jarvis-pipeline-baseline-20261021`; a unified diff is stored at `audit-evidence/production-changes.patch`. To roll back, stop active work, restore those six source files and restart JARVIS. The additive index can remain. Do not restore or delete `.jarvis` data to roll back code. The temporary backup is not a substitute for permanent version control.
+Pre-change copies of the six production modules are in `%TEMP%\jarvis-pipeline-baseline-20261021`; the change itself is in git history. To roll back, stop active work, restore those six source files and restart JARVIS. The additive index can remain. Do not restore or delete `.jarvis` data to roll back code. The temporary backup is not a substitute for permanent version control.

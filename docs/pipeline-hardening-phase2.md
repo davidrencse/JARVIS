@@ -38,9 +38,9 @@ The feature-validation agent found that failed AudioWorklet startup could leave 
 
 ## Independent review and verification
 
-Three agents worked on feature validation, pipeline audit, and provider limits. The [independent phase 2 audit](pipeline-phase2-independent-audit.md) passed 13 recovery, 12 collision, and 13 existing storage tests. It independently exercised OS-process exclusion and crash release and identified two naming cases corrected before final validation.
+Three agents worked on feature validation, pipeline audit, and provider limits. The independent phase 2 audit (retired; see git history) passed 13 recovery, 12 collision, and 13 existing storage tests. It independently exercised OS-process exclusion and crash release and identified two naming cases corrected before final validation.
 
-The [feature matrix](feature-validation.md) distinguishes actual local process/HTTP/SQLite checks from mocked providers, browser APIs, and untested physical devices. Provider implementation added 12 focused tests; microphone work added 10 Node-backed regression scenarios including console cancellation wiring. The final combined run passed **243 tests in 143.212 seconds, with no failures or skips** (`python -m unittest discover -s tests -v`). Results are recorded in [phase2-final-tests.txt](audit-evidence/phase2-final-tests.txt). This is 47 additional tests beyond the phase 1 total of 196.
+The [feature matrix](feature-validation.md) distinguishes actual local process/HTTP/SQLite checks from mocked providers, browser APIs, and untested physical devices. Provider implementation added 12 focused tests; microphone work added 10 Node-backed regression scenarios including console cancellation wiring. The final combined run passed **243 tests in 143.212 seconds, with no failures or skips** (`python -m unittest discover -s tests -v`). The raw log was retired; see git history. This is 47 additional tests beyond the phase 1 total of 196.
 
 All 30 Python modules parsed and all eight browser JavaScript files passed `node --check`; see [syntax evidence](audit-evidence/phase2-syntax.json). A final account-only check found Codex quotas live and Claude's sign-in expired; the [provider report](provider-limits.md) clearly separates that final result from the earlier successful Claude snapshot.
 

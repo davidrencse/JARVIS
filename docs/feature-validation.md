@@ -4,7 +4,7 @@ Validation date: 2026-10-21. Independent feature-validation agent, Windows, Pyth
 
 ## Results and scope
 
-The initial offline suite passed **196 tests in 38.399 seconds, with no skips**. The complete output is in [feature-validation-baseline.txt](audit-evidence/feature-validation-baseline.txt). These tests exercise real temporary SQLite databases, local HTTP/SSE servers, CLI subprocesses, and fake provider subprocess protocols. Live model inference and physical hardware were not exercised.
+The initial offline suite passed **196 tests in 38.399 seconds, with no skips**. The raw output was retired; see git history. These tests exercise real temporary SQLite databases, local HTTP/SSE servers, CLI subprocesses, and fake provider subprocess protocols. Live model inference and physical hardware were not exercised.
 
 Additional checks completed during this review:
 
