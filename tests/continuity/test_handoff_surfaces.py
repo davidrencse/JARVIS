@@ -178,6 +178,24 @@ class HandoffSurfaces(unittest.TestCase):
     def intent(self):
         return json.loads((self.state / "main-handoff.json").read_text(encoding="utf-8"))
 
+    def test_cutover_refusal_explains_ack_mode_and_lease_before_readiness(self):
+        self.bind(self.handoff)
+        self.auth.readiness = mock.Mock(side_effect=AssertionError("must not probe"))
+        for mode in ("LEGACY_ACTIVE", "PREPARING_V2", "QUIESCED"):
+            with self.subTest(mode=mode):
+                self.auth.mode = mode
+                before = self.path.read_bytes()
+                out = cluster_cli.set_main(self.stale(), self.path, "dell", state=self.state)
+                self.assertEqual(out["code"], "cutover_required")
+                for phrase in (mode, "continuity ack --next-version", "while QUIESCED",
+                               "V2_ONLY_NO_MAIN", "--expect-version", "ready MAIN lease",
+                               "manual recover", "canary"):
+                    self.assertIn(phrase, out["error"])
+                self.assertEqual(before, self.path.read_bytes())
+                self.assertFalse((self.state / "main-handoff.json").exists())
+        self.assertEqual(self.calls, [])
+        self.auth.readiness.assert_not_called()
+
     def handoff(self, old, new, config, base, *, status="ready", ok=True, main=None, add=None, action=None):
         recorded = {"old": old, "new": new, "config": config, "base": base, "held": held(self.state)}
         path = self.state / "main-handoff.json"

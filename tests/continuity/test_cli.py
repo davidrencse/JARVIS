@@ -2,6 +2,7 @@ import argparse
 import json
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from jarvis.continuity import cli
 
@@ -31,6 +32,20 @@ class CliTests(unittest.TestCase):
         code,calls,_=self.invoke("mode", mode="V2_ACTIVE", expect_version=4)
         self.assertEqual(code,1); self.assertFalse(any(c[0]=="mode" for c in calls))
 
+    def test_ack_next_version_requires_quiescence(self):
+        code, calls, out = self.invoke("ack", next_version=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(any(c[0] == "ack" for c in calls))
+        self.assertIn("requires QUIESCED", out[0])
+
+    def test_ack_next_version_fences_the_upcoming_mode(self):
+        for mode in ("QUIESCED", "ROLLBACK_QUIESCED"):
+            with self.subTest(mode=mode), mock.patch.object(
+                    FakeClient, "status", return_value={"mode": mode, "mode_version": 4, "epoch": 2}):
+                code, calls, _ = self.invoke("ack", next_version=True)
+                self.assertEqual(code, 0)
+                self.assertEqual(calls, [("ack", 5, 2)])
+
     def test_enroll_remove_fallback(self):
         self.assertEqual(self.invoke("enroll", device="node")[0],0)
         code,_,out=self.invoke("remove", device="node")
@@ -52,6 +67,8 @@ class CliTests(unittest.TestCase):
         parser = argparse.ArgumentParser(); cli.add_arguments(parser)
         args = parser.parse_args(["--config", "c.json", "remove", "node"])
         self.assertEqual(args.config, "c.json")
+        args = parser.parse_args(["--config", "c.json", "ack", "--next-version"])
+        self.assertTrue(args.next_version)
 
 
 if __name__ == "__main__": unittest.main()

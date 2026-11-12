@@ -96,9 +96,84 @@ class Cached(unittest.TestCase):
         self.assertFalse(c.observe(holder="dell", incarnation=1, epoch=1, valid_for=15, ready=True,
                                    request_started=self.f.t))
 
-    def test_only_linux_boottime_counts_as_suspend_aware(self):
-        self.assertIsNone(C.suspend_aware_clock("win32"))
+    def test_macos_has_no_suspend_aware_clock(self):
         self.assertIsNone(C.suspend_aware_clock("darwin"))
+
+
+class FakeKernel32:
+    def __init__(self, ms=5_000):
+        self.ms = ms
+
+    def GetTickCount64(self):
+        return self.ms
+
+
+class FakeKey:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeWinreg:
+    HKEY_LOCAL_MACHINE = "HKLM"
+    REG_DWORD = 4
+    REG_SZ = 1
+
+    def __init__(self, value=17, kind=4, fail=False):
+        self.value, self.kind, self.fail, self.opened = value, kind, fail, None
+
+    def OpenKey(self, root, path):
+        if self.fail:
+            raise OSError("no key")
+        self.opened = (root, path)
+        return FakeKey()
+
+    def QueryValueEx(self, key, name):
+        assert name == "BootId"
+        return self.value, self.kind
+
+
+class Windows(unittest.TestCase):
+    def test_tick_count_is_seconds_and_counts_sleep(self):
+        k = FakeKernel32(5_000)
+        clock = C.suspend_aware_clock("win32", kernel32=k)
+        self.assertEqual(clock(), 5.0)
+        k.ms += 3_600_000  # an hour asleep still advances GetTickCount64
+        self.assertEqual(clock(), 3605.0)
+
+    def test_broken_or_zero_tick_count_means_no_clock(self):
+        self.assertIsNone(C.suspend_aware_clock("win32", kernel32=FakeKernel32(0)))
+        self.assertIsNone(C.suspend_aware_clock("win32", kernel32=object()))
+
+    def test_boot_id_from_registry(self):
+        reg = FakeWinreg(17)
+        self.assertEqual(C.boot_id(platform="win32", winreg=reg), "win-boot-17")
+        self.assertEqual(reg.opened, ("HKLM", C.WIN_BOOT_KEY))
+
+    def test_unreadable_or_wrong_type_boot_id_means_none(self):
+        self.assertIsNone(C.boot_id(platform="win32", winreg=FakeWinreg(fail=True)))
+        self.assertIsNone(C.boot_id(platform="win32", winreg=FakeWinreg("17", kind=1)))
+
+    def test_cache_voids_on_windows_reboot(self):
+        k, reg = FakeKernel32(10_000), FakeWinreg(17)
+        c = C.CachedAuthority(clock=C.suspend_aware_clock("win32", kernel32=k),
+                              boot=lambda: C.boot_id(platform="win32", winreg=reg))
+        self.assertTrue(c.observe(holder="zenbook", incarnation=1, epoch=1, valid_for=15, ready=True,
+                                  request_started=c.now()))
+        self.assertGreater(c.remaining("zenbook"), 0)
+        reg.value = 18
+        self.assertEqual(c.remaining("zenbook"), 0)
+        self.assertEqual(c.reason, "reboot")
+
+    def test_sleep_past_deadline_expires_grant(self):
+        k = FakeKernel32(10_000)
+        c = C.CachedAuthority(clock=C.suspend_aware_clock("win32", kernel32=k), boot=lambda: "b")
+        c.observe(holder="zenbook", incarnation=1, epoch=1, valid_for=15, ready=True, request_started=c.now())
+        k.ms += 20_000
+        self.assertEqual(c.remaining("zenbook"), 0)
+        self.assertEqual(c.reason, "expired")
 
 
 if __name__ == "__main__":
