@@ -81,7 +81,7 @@ const css = fs.readFileSync(path.join(root, "connections.css"), "utf8") + "\n" +
 const chunk = css.split(".hm-host")[1] || "";
 check("meter css uses ink tokens", chunk.includes("var(--ink)") && chunk.includes("var(--ink-3)") && chunk.includes("var(--line)"));
 check("meter css has no painted icon colour", !/#([0-9a-f]{3,8})/i.test(chunk.split("@media (max-width: 900px)")[0].split(".cx-tiles")[0]));
-check("wide cards get four columns", css.includes(".cx-node .hm-meters"));
+check("wide cards get several columns", /\.hm-meters\s*\{[^}]*repeat\(auto-fit,\s*minmax\(140px/.test(css));
 check("narrow width wraps to one column", css.includes("max-width: 360px"));
 
 if (failed) process.exit(1);
