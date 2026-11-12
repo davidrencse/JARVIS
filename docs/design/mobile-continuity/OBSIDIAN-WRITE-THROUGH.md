@@ -36,7 +36,10 @@ Not guaranteed:
 - No cross-store atomic checkpoint (memory, history, tasks queue independently).
 - No fleet/lease fencing (single MAIN legacy check only); concurrent drains on one machine are
   serialized by `<state>/archive.lock`.
-- The vault is not yet the read path (C3); SQLite remains the source of truth.
+- SQLite remains the source of truth for every caller except the opt-in recall below.
+  `second_brain.canonical_read: true` makes `vault.recall` search the latest archived
+  memory/history/tasks payloads, and only when `vault.enabled` and `vault.recall` are not
+  literal false. It does not cut other readers over. It is not a C3 cutover.
 
 ## Schema (in each store's own database)
 
@@ -86,9 +89,11 @@ check `remaining`/`held`/`failed`. Reports contain record ids and counts, never 
 
 ## Remaining blockers for canonical status
 
-C3 read path / retention policy; fleet-wide single-writer lease fence; a revive API for tombstoned
-records; cross-store checkpoint; restart-required activation of existing processes; plans, runs and
-knowledge files are still backfill-only (`sync`), not write-through.
+Full C3 cutover is not done: every caller other than the scoped recall below still reads
+SQLite, and retention policy is still open. Also still open: a fleet-wide single-writer lease
+fence; a revive API for tombstoned records; a cross-store checkpoint; restart-required
+activation of existing processes. Plans, runs and knowledge files are still backfill-only
+(`sync`), not write-through.
 
 
 ## Parent integration review
@@ -108,4 +113,32 @@ regressions cover actual enqueue rollback and the visible response. Targeted pip
 
 Activation requires loading hooked code in all long-lived processes. Until restart, triggers
 provide eventual latest-state reconciliation only, not exact intermediate revision capture.
-Credentials/authority remain operational state; no C3 canonical read/rebuild cutover is claimed.
+Credentials/authority remain operational state. There is no full C3 cutover: legacy SQLite
+callers are unchanged. The only canonical read is the opt-in described below.
+
+## Scoped read and the oversize head (2026-11-11)
+
+- **Superseded oversize.** A held `oversize` row whose bytes still exceed the cap is marked
+  `state='superseded'`, `held_reason='superseded-oversize'` when a later pending revision of
+  the same record fits. The payload stays. It is excluded from pending, held, and `remaining`,
+  and `status` exposes `superseded`. Secret and conflict holds still block. Dry-run does not
+  mark or publish. A transaction over the cap still raises `ArchiveCaptureError`.
+- **Heads.** Status opens every non-tombstone published head through `_load`, including gaps,
+  duplicates, and plain notes over 64 KiB. `current` is refused for a gap, a bad chunk, or a
+  plain-note hash mismatch. `publication_sound` is never true across a gap. An intact gap is
+  not filled in.
+- **Opt-in recall.** `second_brain.canonical_read: true` (literal boolean) makes `vault.recall`
+  search the latest archived memory/history/tasks payloads and cite
+  `[vault:archive:store/kind/key]`. `vault.enabled: false` and `vault.recall: false` are
+  checked first and apply to this path and to ordinary note search. Only a literal false
+  closes either gate. Recall streams one validated payload at a time and does not retain the
+  whole store. The scan keeps filenames. One payload is in hand. A search JSON of that
+  payload's fields and children is built only while the output still has room, then dropped.
+  Chunked payloads stop at `MAX_OVERFLOW_BYTES` (64 MiB). The retained lines are at most 8
+  and 4000 characters. After that bound, later heads are still validated. A later gap, bad
+  hash, or bad identity discards any lines already chosen. Tombstones are skipped. A conflict
+  or an unreadable head returns no lines and does not fall back to SQLite or to an older
+  revision. When the databases cannot be opened, the vault notes are the source and the same
+  refusal still applies. `status.canonical` is true only for that opt-in plus a fully healthy
+  verified archive (`state: current`, every head opened, no gap, no damage). `verify` does
+  not report canonical. No other caller has been cut over. This is not a C3 cutover.

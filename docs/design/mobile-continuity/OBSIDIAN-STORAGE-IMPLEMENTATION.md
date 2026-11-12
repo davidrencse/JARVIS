@@ -1,11 +1,13 @@
 # Obsidian second-brain storage engine (implementation note)
 
 Code: `jarvis/second_brain.py`. Tests: `tests/data/test_second_brain.py`.
-Status 2026-11-11: **archive with C2 write-through; not a canonical cutover (C3).** The engine,
+Status 2026-11-11: **archive with C2 write-through, plus one scoped opt-in read.** The engine,
 the write-through outbox (`second_brain_queue.py`), the drainer/CLI (`second_brain_runtime.py`),
 the `second_brain` config key and a real-vault C1 backfill exist. Memory/history/tasks are captured
-transactionally; plans/runs/knowledge get a scoped periodic file sync. SQLite/JSON state stays
-authoritative: C3 (vault as canonical read source, edits/deletions/activation) is not done.
+transactionally; plans/runs/knowledge get a scoped periodic file sync. SQLite/JSON stays the source
+for every caller except `vault.recall` when `second_brain.canonical_read` is literal true and
+neither `vault.enabled` nor `vault.recall` is literal false. That read is not a cutover: see
+"Scoped canonical read" below. `jarvis archive verify` still reports `canonical: false`.
 
 ## Owner requirement and split
 
@@ -183,3 +185,75 @@ Remaining implemented policy: tombstones block all automatic resurrection; no re
 Coverage excludes operational state, media/biometrics, provider credentials and unreviewed
 personal-domain files as listed above. Complete means the declared archive scope, not every
 byte on a PC or across nodes. New personal mutations still require C2 transactional integration.
+
+## Held oversize head, integrity, scoped canonical read (2026-11-11)
+
+### Held oversize
+
+A baseline or reconciled payload over the archive cap (and over the ledger overflow policy)
+stays in `archive_outbox` as `held` / `oversize`. It used to remain the head forever, so a
+later smaller revision of the same record never published. Drain now marks that row
+`superseded` / `superseded-oversize` when a later `pending` revision of the same record fits
+the cap. The old payload bytes stay in the row. `superseded` is not pending, not held, and
+not part of `remaining`. `status` reports the count. A dry-run does not change the row.
+
+Rows that fit the cap are still released back to `pending` and published (`released_oversize`),
+so a legal record that was only parked by an older smaller cap is not dropped. A secret-like,
+conflict, or other hold is never superseded. A mutation whose own payload is over the cap
+still raises `ArchiveCaptureError` and rolls the transaction back.
+
+### Published-head integrity
+
+`published_readable` opens every non-tombstone head through `_load`. That includes a revision
+gap, a duplicate revision number, and a plain note larger than 64 KiB. A hash mismatch or a
+damaged chunk makes `archive_chunk_damaged` at least 1 and `state` `error`. A gap or duplicate
+makes `archive_revision_conflict` at least 1 and `state` `conflict`. Neither word is `current`.
+`publication_sound` is false whenever the revision list is not `1..n`, including when the newest
+note is a tombstone. A contiguous tombstone stays acknowledged and is not opened, so a damaged
+chunk cannot block a deletion.
+
+An intact gap is not auto-repaired. Rescan does not synthesize the missing numbers and does not
+append another copy of a head `_load` already accepts. A damaged newest note is still repaired
+by appending the next revision; the old bytes stay. `validate` still lists the gap and the
+damaged older chunk. `latest()` still raises on a gap.
+
+### Scoped canonical read
+
+This is the only canonical read. It is not a C3 cutover. SQLite remains the source for every
+other caller. There is no revive API and no lease fence.
+
+`SecondBrain.iter_canonical_records(store=None, kind=None)` yields one verified latest live
+payload at a time. `canonical_records(...)` is `list` of that iterator, so existing callers
+still get a list. Both skip tombstones without opening them. Both raise `SecondBrainError`
+on a gap, a duplicate, or a head that does not `_load`, including a payload hash mismatch.
+They do not return an older revision and they do not read SQLite. A problem outside the
+store/kind limit is not that call's error.
+
+Each yielded payload has passed `_valid_payload` (schema, kind in `KINDS`, key), the
+directory placement (`store` and `_slug(kind, 20)`), and `stem_for(store/kind/key)` against
+the filename. The scan keeps filenames. One payload is open at a time. A chunked payload
+above `MAX_OVERFLOW_BYTES` (64 MiB) does not load. `KINDS` is unchanged. No two kinds in one
+store share a slug. A kind filter selects folders by that slug. If a future valid kind shared
+the slug, the filter skips that other valid payload. It does not report an identity mismatch.
+A malformed kind, a folder that disagrees with the payload, or a filename stem that disagrees
+with the key still raises `record-identity-mismatch`.
+
+`vault.recall` checks `vault.enabled` and `vault.recall` before either path. Only a literal
+false turns either gate off. A missing value stays on. With `second_brain.canonical_read`
+literal true, recall then streams memory, history, and tasks through the iterator into a
+bounded line list. It does not collect every payload first. Plans, runs, and knowledge are
+not on this path. Matching may build one JSON string of the current payload's fields and
+children, and only while the output still has room. That string is dropped before the next
+payload. Retained lines are clamped to 1..8 lines and 80..4000 characters (defaults 4 and
+900). A hit keeps an 80-character label and a 160-character window of the search text (40
+before the hit, 120 after). After the output is full, later heads are still validated and
+are not kept. If one of them is a gap, a bad hash, or a bad identity, the lines already
+chosen are discarded and recall returns nothing. While the queue is readable, a backlog, a
+gap, or a damaged head also makes recall return nothing: no older note and no SQLite. When
+the personal databases cannot be read, recall still uses those latest verified payloads, and
+a gap or a bad head still returns nothing. Lines cite `vault:archive:<store>/<kind>/<key>`.
+
+`second_brain_runtime.status` sets `canonical` true only when that opt-in is on, `state` is
+`current`, every acknowledged head was opened, and there is no gap and no damaged head.
+`jarvis archive verify` stays `canonical: false`. Memory, history, tasks, and every other
+SQLite caller are not cut over.
