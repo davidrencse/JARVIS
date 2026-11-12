@@ -135,6 +135,13 @@ class Pins(unittest.TestCase):
             pin_relay("https://127.0.0.1:9")
         with self.assertRaises(GatewayError):
             pin_relay("http://10.1.2.3:9")
+        self.assertEqual(pin_relay("https://zen.tail.ts.net:443"), "https://zen.tail.ts.net:443")
+        for bad in ("http://zen.tail.ts.net:80", "https://1.2.3.4:443", "https://[fd7a::1]:443",
+                    "https://u@zen.tail.ts.net:443", "https://zen.tail.ts.net:443/?a=1",
+                    "https://zen.tail.ts.net:443#f", "https://evilts.net:443", "https://ts.net:443",
+                    "https://ts.net.evil.com:443", "https://zen.tail.ts.net:443/relay"):
+            with self.assertRaises(GatewayError, msg=bad):
+                pin_relay(bad)
         with self.assertRaises(GatewayError):
             AuthorityClient("http://example.com:443", authority_id="oracle-auth")
 
@@ -510,6 +517,150 @@ class Authentication(GatewayCase):
         with self.assertRaises(GatewayError) as raised:
             self.gw.status(forged, {})
         self.assertEqual(raised.exception.code, "unauthorized")
+
+
+class Removal(GatewayCase):
+    """Owner-proven participant removal. A removed installation stays out until the store re-enables it."""
+
+    def _disable_raw(self, payload, *, sign_payload=None, key="owner", nonce="n-rm"):
+        from jarvis.continuity.gateway import _OWNER_PATH, payload_digest
+        signed = payload if sign_payload is None else sign_payload
+        digest_value = payload_digest(signed)
+        challenge = self.gw.issue_challenge(digest_value)
+        issued = int(self.clock.w)
+        signature = sign_message("jarvis-continuity-owner-v1", _keys()[key][1], _message(
+            "jarvis-continuity-owner-v1", {
+                "v": 1, "challenge_id": challenge["challenge_id"], "nonce": nonce,
+                "issued_at": issued, "payload_digest": digest_value,
+            }))
+        envelope = {"payload": payload, "owner": {
+            "challenge_id": challenge["challenge_id"], "nonce": nonce, "issued_at": issued,
+            "signature": signature,
+        }}
+        return envelope, _exchange(self.origin, _OWNER_PATH["disable"], envelope)
+
+    def _still_enrolled(self, name):
+        """Eligible means the store has not revoked it: its ack is accepted, not `revoked`."""
+        status = self._client("zenbook").status()
+        return self._client(name).acknowledge(status["mode_version"], 0)
+
+    def test_owner_proof_removal_works_over_http_and_is_idempotent(self):
+        self.cutover()
+        self.promote("zenbook", "k-boot")
+        payload = {"device_id": "dell", "installation_id": "dell-inst"}
+        _envelope, (code, headers, body) = self._disable_raw(payload)
+        self.assertEqual(code, 200, body)
+        self.assertEqual((body["device_id"], body["installation_id"]), ("dell", "dell-inst"))
+        self.assertTrue(body["disabled"])
+        self.assertFalse(body["eligible"])
+        self.assertFalse(body["already"])
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertNotIn(str(self.db), json.dumps(body))
+        again = self.owner.disable_participant("dell", "dell-inst")
+        self.assertTrue(again["already"])
+        self.assertEqual(self._client("zenbook").status()["main"], "zenbook")
+
+    def test_removed_participant_cannot_acknowledge_or_be_given_a_lease(self):
+        self.cutover()
+        self.promote("zenbook", "k-boot")
+        status = self._client("zenbook").status()
+        self.owner.disable_participant("dell", "dell-inst")
+        with self.assertRaises(GatewayError) as acked:
+            self._client("dell").acknowledge(status["mode_version"], status["epoch"])
+        self.assertEqual((acked.exception.code, acked.exception.status), ("revoked", 403))
+        with self.assertRaises(GatewayError) as moved:
+            self.owner.transition_request(
+                "k-to-dell", "make_main_now", "dell", status["incarnation"], status["epoch"],
+                status["policy_version"])
+        self.assertEqual((moved.exception.code, moved.exception.status), ("ineligible", 409))
+        with self.assertRaises(GatewayError) as took:
+            self.owner.transition_request(
+                "k-rec-dell", "recover", "dell", status["incarnation"], status["epoch"],
+                status["policy_version"])
+        self.assertEqual(took.exception.code, "ineligible")
+        self.assertEqual(took.exception.status, 409)
+        after = self._client("zenbook").status()
+        self.assertEqual((after["main"], after["lease_holder"], after["transition"]),
+                         ("zenbook", "zenbook", None))
+        # Another enrolled device is untouched.
+        self.assertEqual(self._still_enrolled("oracle")["device_id"], "oracle")
+
+    def test_removed_participant_stays_removed_after_restart_and_re_enroll(self):
+        self.cutover()
+        self.owner.disable_participant("dell", "dell-inst")
+        self.gw.close()
+        self.gw = ContinuityGateway.open(
+            self.db, "home", "oracle-auth", [_keys()["owner"][0]],
+            monotonic=self.clock.mono, wall=self.clock.wall)
+        self.addCleanup(self.gw.close)
+        self.origin = self.gw.serve()
+        self.owner = self._client(owner=True)
+        for name, kind, caps in (("zenbook", "pc", PC), ("dell", "pc", PC), ("oracle", "server", SERVER)):
+            self.enroll(name, kind, caps)
+        status = self._client("zenbook").status()
+        with self.assertRaises(GatewayError) as acked:
+            self._client("dell").acknowledge(status["mode_version"], status["epoch"])
+        self.assertEqual(acked.exception.code, "revoked")
+        self.assertTrue(self.owner.disable_participant("dell", "dell-inst")["already"])
+
+    def test_current_main_cannot_be_removed(self):
+        self.cutover()
+        _tid, lease, _done = self.promote("zenbook", "k-boot")
+        _envelope, (code, _headers, body) = self._disable_raw(
+            {"device_id": "zenbook", "installation_id": "zenbook-inst"})
+        self.assertEqual((code, body["error"]), (409, "active_holder"))
+        self.assertEqual(HTTP_STATUS["active_holder"], 409)
+        with self.assertRaises(GatewayError) as raised:
+            self.owner.disable_participant("zenbook", "zenbook-inst")
+        self.assertEqual((raised.exception.code, raised.exception.status), ("active_holder", 409))
+        zen = self._client("zenbook")
+        self.assertEqual(zen.status()["main"], "zenbook")
+        self.assertEqual(
+            zen.renew("zenbook", lease["lease_id"], lease["incarnation"], lease["epoch"])["valid_for"], 15.0)
+        self.assertEqual(self._still_enrolled("zenbook")["device_id"], "zenbook")
+
+    def test_a_non_owner_or_bad_proof_removes_nothing(self):
+        from jarvis.continuity.integration import EXTRA_HTTP
+        self.assertEqual(EXTRA_HTTP["active_holder"], 409)
+        self.cutover()
+        self.promote("zenbook", "k-boot")
+        payload = {"device_id": "dell", "installation_id": "dell-inst"}
+        # A device key is not the owner key.
+        envelope, (code, _headers, body) = self._disable_raw(payload, key="stranger", nonce="n-bad-key")
+        self.assertEqual((code, body["error"]), (401, "unauthorized"))
+        # An owner proof for another payload does not cover this one.
+        _envelope, (code, _headers, body) = self._disable_raw(
+            payload, sign_payload={"device_id": "oracle", "installation_id": "oracle-inst"}, nonce="n-wrong-body")
+        self.assertEqual((code, body["error"]), (401, "unauthorized"))
+        # No owner client: no key, no request.
+        with self.assertRaises(GatewayError) as keyless:
+            self._client("zenbook").disable_participant("dell", "dell-inst")
+        self.assertEqual(keyless.exception.code, "unauthorized")
+        # A device-signed envelope on the owner route is not a proof.
+        code, _headers, body = self._device_post_to_disable("zenbook", payload)
+        self.assertIn(code, (400, 401))
+        # A valid proof is single use.
+        good, (code, _headers, body) = self._disable_raw(payload, nonce="n-good")
+        self.assertEqual(code, 200, body)
+        from jarvis.continuity.gateway import _OWNER_PATH
+        code, _headers, body = _exchange(self.origin, _OWNER_PATH["disable"], good)
+        self.assertEqual((code, body["error"]), (401, "unauthorized"))
+        # Extra fields are not silently ignored.
+        _envelope, (code, _headers, body) = self._disable_raw(
+            {"device_id": "oracle", "installation_id": "oracle-inst", "force": True}, nonce="n-extra")
+        self.assertEqual((code, body["error"]), (400, "bad_request"))
+        self.assertEqual(self._still_enrolled("oracle")["device_id"], "oracle")
+        self.assertEqual(self._client("zenbook").status()["main"], "zenbook")
+
+    def _device_post_to_disable(self, name, payload):
+        from jarvis.continuity.gateway import _OWNER_PATH, payload_digest
+        issued = int(self.clock.w)
+        signature = sign_message(DEVICE_NS, _keys()[name][1], _message(DEVICE_NS, {
+            "v": 1, "device_id": name, "installation_id": name + "-inst", "nonce": "n-dev-rm",
+            "issued_at": issued, "purpose": "status", "payload_digest": payload_digest(payload)}))
+        return _exchange(self.origin, _OWNER_PATH["disable"], {"payload": payload, "device": {
+            "device_id": name, "installation_id": name + "-inst", "nonce": "n-dev-rm",
+            "issued_at": issued, "signature": signature}})
 
 
 class Handover(GatewayCase):

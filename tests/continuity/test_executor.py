@@ -1,4 +1,7 @@
-"""Executor fence and admission: legacy until cutover, then one online consume before an effect."""
+"""Executor fence and admission: legacy until cutover, then a current-tuple consume before the effect.
+
+A successful accept consumes twice: once to record CONSUMED, and again immediately before ACCEPTED.
+"""
 
 import sqlite3
 import tempfile
@@ -254,13 +257,13 @@ class Admission(Base):
         receipt = guard.accept(signed, admit, sink)
         self.assertEqual(calls, ["ran"])
         self.assertEqual((receipt["state"], receipt["effect"], receipt["already"]), ("COMPLETED", "completed", False))
-        self.assertEqual(self.spy.consumes, 1)
+        self.assertEqual(self.spy.consumes, 2)
         self.assertNotIn(SECRET.encode(), self.files_text())
         self.assertNotIn(SIGN.encode(), self.files_text())
         again = guard.accept(signed, admit, sink)
         self.assertTrue(again["already"])
         self.assertEqual(calls, ["ran"])
-        self.assertEqual(self.spy.consumes, 1)
+        self.assertEqual(self.spy.consumes, 2)
         self.assertEqual(guard.reconcile("op-1", "a-1")["issued_at"], receipt["issued_at"])
         refreshed, refreshed_ticket = self.work(body=SECRET)
         refreshed["admit_until"] = self.clock.w + 10
@@ -279,7 +282,7 @@ class Admission(Base):
         retry, retry_ticket = self.work(attempt="a-2")
         self.refuse("conflict", guard.accept, retry, retry_ticket, sink)
         self.assertEqual(calls, ["ran"])
-        self.assertEqual(self.spy.consumes, 1)
+        self.assertEqual(self.spy.consumes, 2)
 
     def test_expired_ticket_is_pinned_and_not_consumed(self):
         self.activate()
@@ -486,6 +489,114 @@ class Crash(Base):
         self.refuse("crash", guard.accept, running, running_ticket, sink, failpoint="during_effect")
         self.refuse("uncertain", guard.accept, running, running_ticket, sink)
         self.assertEqual(calls, ["ran", "ran"])
+
+    def test_prepared_revoke_between_admission_and_effect_does_not_run(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-prep-revoke")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_prepare")
+        self.assertEqual(self.spy.consumes, 0)
+        stored = self.store.consume(**admit)
+        self.assertFalse(stored["already"])
+        self.store.disable_participant("dell", "dell-inst")
+        self.refuse("revoked", guard.accept, signed, admit, sink)
+        self.refuse("revoked", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.spy.consumes, 1)
+        receipt = guard.reconcile("op-prep-revoke", "a-1")
+        self.assertEqual((receipt["state"], receipt["result_code"], receipt["effect"]),
+                         ("REJECTED", "revoked", "not_run"))
+        self.assertEqual(self.store.admission(admit["admission_id"])["consumed_at"], stored["consumed_at"])
+
+    def test_consumed_revoke_between_consume_and_effect_does_not_run(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-cons-revoke")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_consume")
+        self.assertEqual(calls, [])
+        self.store.disable_participant("dell", "dell-inst")
+        self.refuse("revoked", guard.accept, signed, admit, sink)
+        self.refuse("revoked", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        receipt = guard.reconcile("op-cons-revoke", "a-1")
+        self.assertEqual((receipt["state"], receipt["result_code"], receipt["effect"]),
+                         ("REJECTED", "revoked", "not_run"))
+        self.assertIsNotNone(self.store.admission(admit["admission_id"]))
+
+    def test_prepared_handover_duplicate_is_readable_without_effect(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-prep-fence")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_prepare")
+        stored = self.store.consume(**admit)
+        status = self.store.status()
+        ack(self.store, epoch=status["epoch"])
+        promote(self.store, "make_main_now", "dell", "k-prep-fence")
+        historical = self.store.admission(admit["admission_id"])
+        replay = self.store.consume(**admit)
+        self.assertTrue(replay["already"])
+        self.assertEqual(replay["consumed_at"], stored["consumed_at"])
+        self.assertEqual((historical["main"], historical["incarnation"], historical["epoch"]),
+                         (signed["main"], signed["incarnation"], signed["epoch"]))
+        self.assertNotIn("already", historical)
+        self.refuse("stale", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.spy.consumes, 0)
+        receipt = guard.reconcile("op-prep-fence", "a-1")
+        self.assertEqual((receipt["state"], receipt["effect"]), ("REJECTED", "not_run"))
+        self.assertEqual(self.store.admission(admit["admission_id"])["consumed_at"], stored["consumed_at"])
+
+    def test_consumed_handover_duplicate_is_readable_without_effect(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-cons-fence")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_consume")
+        consumed_at = self.store.admission(admit["admission_id"])["consumed_at"]
+        status = self.store.status()
+        ack(self.store, epoch=status["epoch"])
+        promote(self.store, "make_main_now", "dell", "k-cons-fence")
+        replay = self.store.consume(**admit)
+        self.assertTrue(replay["already"])
+        self.assertEqual((replay["main"], replay["epoch"], replay["consumed_at"]),
+                         (signed["main"], signed["epoch"], consumed_at))
+        self.refuse("stale", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        receipt = guard.reconcile("op-cons-fence", "a-1")
+        self.assertEqual((receipt["state"], receipt["effect"]), ("REJECTED", "not_run"))
+        self.assertEqual(self.store.admission(admit["admission_id"])["epoch"], signed["epoch"])
+
+    def test_drain_between_consume_and_effect_can_retry(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-drain")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_consume")
+        tid = transition(self.store, "make_main_now", "dell", "k-drain")
+        self.store.readiness(tid, True, True, "cp-1")
+        self.store.drain(tid)
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        self.assertEqual(guard.reconcile("op-drain", "a-1")["state"], "CONSUMED")
+        self.store.cancel(tid)
+        guard.accept(signed, admit, sink)
+        self.assertEqual(calls, ["ran"])
+        self.assertEqual(guard.reconcile("op-drain", "a-1")["state"], "COMPLETED")
+
+    def test_accepted_effect_stays_uncertain_after_revoke(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-accepted")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_accept")
+        self.store.disable_participant("dell", "dell-inst")
+        self.refuse("uncertain", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        receipt = guard.reconcile("op-accepted", "a-1")
+        self.assertEqual((receipt["state"], receipt["effect"]), ("ACCEPTED", "uncertain"))
 
     def test_sink_exception_is_uncertain_and_not_replayed(self):
         self.activate()
