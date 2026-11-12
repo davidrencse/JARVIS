@@ -10,7 +10,9 @@ def add_arguments(parser):
     sub = parser.add_subparsers(dest="continuity_action", required=True)
     sub.add_parser("status")
     en = sub.add_parser("enroll"); en.add_argument("device")
-    sub.add_parser("ack")
+    ack = sub.add_parser("ack")
+    ack.add_argument("--next-version", action="store_true",
+                     help="acknowledge fencing for the next mode version while QUIESCED")
     mode = sub.add_parser("mode"); mode.add_argument("mode"); mode.add_argument("--expect-version", type=int, required=True)
     rm = sub.add_parser("remove"); rm.add_argument("device")
     rm.add_argument("--installation", help="installation id (default: from the config's enrollment record)")
@@ -42,7 +44,10 @@ def run(args, client_factory=build_client, output=print, confirm=input):
         if action == "status": result = client.status()
         elif action == "ack":
             status = client.status()
-            result = client.acknowledge(status["mode_version"], status["epoch"])
+            next_version = getattr(args, "next_version", False)
+            if next_version and status["mode"] not in ("QUIESCED", "ROLLBACK_QUIESCED"):
+                raise ValueError("ack --next-version requires QUIESCED or ROLLBACK_QUIESCED")
+            result = client.acknowledge(status["mode_version"] + int(next_version), status["epoch"])
         elif action == "mode":
             target = args.mode.upper()
             current = client.status()["mode"]

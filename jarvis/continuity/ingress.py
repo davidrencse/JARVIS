@@ -2093,20 +2093,6 @@ class MobileIngress:
             raise IngressError("not_found", 404, "No such session.")
         return row
 
-    def _note_session(self, principal, body, projected, status, main):
-        sid = projected.get("session")
-        if not isinstance(sid, str) or not _SESSION.match(sid):
-            return None
-        if projected.get("device") not in (None, body.get("device")):
-            return None
-        now = self._clock()
-        with self._tx() as db:
-            db.execute("INSERT OR REPLACE INTO sessions(session_id, phone_id, device, kind, state,"
-                       " incarnation, epoch, main, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                       (sid, principal.phone_id, body["device"], body["session_kind"], "live",
-                        status["incarnation"], status["epoch"], main, now))
-        return sid
-
     def logout(self, principal, operation_id=None):
         """End the phone. When a transient relay exists, ask MAIN to release before the local revoke."""
         row = self._check(principal)

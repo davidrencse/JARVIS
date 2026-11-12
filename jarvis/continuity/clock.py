@@ -1,8 +1,10 @@
 """PC-side cached MAIN validity (MAIN-HANDOFF.md §3.3).
 
 A PC may act on a granted validity only while all of these hold:
-- the elapsed-time source counts suspended time (Linux CLOCK_BOOTTIME). Elsewhere there is
-  no tested adapter yet, so nothing is cached and every check must go online;
+- the elapsed-time source counts suspended time (Linux CLOCK_BOOTTIME, Windows
+  GetTickCount64). Elsewhere there is no adapter, so nothing is cached and every check must
+  go online. The Windows adapter still needs an on-device sleep check before cutover
+  (blocker `windows_clock_untested`);
 - the boot id is the one seen when the grant arrived (reboot = void);
 - nothing invalidated it (suspend/resume, link loss, process restart, newer tuple seen);
 - the deadline, anchored at the *request start* (not the response), has not passed.
@@ -17,9 +19,27 @@ from pathlib import Path
 from .authority import LEASE_SECONDS
 
 BOOT_ID = "/proc/sys/kernel/random/boot_id"
+# DWORD the kernel raises on every boot. Fast-startup resumes keep it, but GetTickCount64
+# also kept counting through that hibernate, so an old deadline has still passed.
+WIN_BOOT_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"
 
 
-def boot_id(path=BOOT_ID):
+def _windows_boot_id(winreg=None):
+    try:
+        if winreg is None:
+            import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WIN_BOOT_KEY) as key:
+            value, kind = winreg.QueryValueEx(key, "BootId")
+    except (ImportError, OSError):
+        return None
+    if kind != getattr(winreg, "REG_DWORD", 4) or isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return "win-boot-%d" % value
+
+
+def boot_id(path=BOOT_ID, platform=None, winreg=None):
+    if (platform or sys.platform) == "win32":
+        return _windows_boot_id(winreg)
     try:
         value = Path(path).read_text().strip()
     except OSError:
@@ -27,9 +47,28 @@ def boot_id(path=BOOT_ID):
     return value or None
 
 
-def suspend_aware_clock(platform=None):
-    """Callable seconds counter that includes suspend, or None if none is tested here."""
+def _windows_ticks(kernel32=None):
+    """GetTickCount64 in seconds: milliseconds since boot, sleep and hibernate included."""
+    try:
+        if kernel32 is None:
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32")
+            kernel32.GetTickCount64.restype = ctypes.c_uint64
+            kernel32.GetTickCount64.argtypes = []
+        fn = kernel32.GetTickCount64
+        first = fn()
+    except (ImportError, OSError, AttributeError):
+        return None
+    if isinstance(first, bool) or not isinstance(first, int) or first <= 0:
+        return None
+    return lambda: fn() / 1000.0
+
+
+def suspend_aware_clock(platform=None, kernel32=None):
+    """Callable seconds counter that includes suspend, or None if this OS has no adapter."""
     platform = platform or sys.platform
+    if platform == "win32":
+        return _windows_ticks(kernel32)
     cid = getattr(time, "CLOCK_BOOTTIME", None)
     if cid is None or not platform.startswith("linux"):
         return None

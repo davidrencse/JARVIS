@@ -1285,15 +1285,16 @@ class _HandoffJournal:
                 return False
             self.doc = updated
             return True
-        import fcntl
+        from jarvis.platforms import _acquire_os_lock
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_name("." + self.path.name + ".jarvis-lock")
-        fd = None
+        handle = None
         try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            if os.fstat(fd).st_size == 0:
-                os.write(fd, b"\0")
+            # Closing the handle releases the lock on both OSes. An explicit
+            # LK_UNLCK before close would let another process slip in on Windows.
+            handle = os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600),
+                               "r+b", buffering=0)
+            _acquire_os_lock(handle)
             current = self.doc
             if self.path.exists():
                 loaded = _journal_load_text(self.path)
@@ -1311,9 +1312,8 @@ class _HandoffJournal:
         except (OSError, RuntimeRefusal):
             return False
         finally:
-            if fd is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+            if handle is not None:
+                handle.close()
 
 
 def _public_snapshot(runtime):
