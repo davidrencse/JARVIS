@@ -177,8 +177,8 @@ function page(opt = {}) {
     const key = method + " " + p;
     const route = state.routes[key] || defaults[key] || (p.startsWith("/phone/api/ask/") && state.routes["GET /phone/api/ask/*"]);
     if (!route) return reply(404, { error: "no route " + key });
-    const [status, data] = await route(body, u);
-    return reply(status, data);
+    const [status, data, headers] = await route(body, u);
+    return reply(status, data, Object.assign({}, state.replyHeaders || {}, headers || {}));
   }
   // The hub holds a frame request until a frame comes or 2.5 s pass (then 204).
   let waiting = null;
@@ -1333,6 +1333,40 @@ const scenarios = {
     assert.equal(chunk.includes('id !== "locate"'), true);
     assert.equal(chunk.includes("localStorage"), false);
     assert.equal(/console\.(log|debug|info|warn|error)/.test(chunk), false);
+  },
+
+  async csrf_is_kept_per_main_behind_the_phone_front() {
+    const arch = "csrf-arch-0123456789abcdef", dell = "csrf-dell-0123456789abcdef";
+    const p = page({ storage: { "jarvis.phone.csrf.by-main": JSON.stringify({ zenbook: arch, "bad key!": dell }) } });
+    p.state.replyHeaders = { "X-Jarvis-Main": "zenbook" };
+    await p.settle(10);
+    const me = p.state.calls.find((c) => c.path === "/phone/api/me");
+    assert.equal(me.headers["X-Jarvis-Csrf-zenbook"], arch);
+    assert.equal(me.headers["X-Jarvis-Csrf-bad key!"], undefined);
+    // MAIN moved to the Dell, which this phone never paired with: only the Dell's slot clears.
+    p.state.replyHeaders = { "X-Jarvis-Main": "dell" };
+    p.state.routes["GET /phone/api/overview"] = () => [401, { error: "Pair first.", pair: true }];
+    await p.settle(5100);
+    assert.deepEqual(JSON.parse(p.storage("jarvis.phone.csrf.by-main")), { zenbook: arch });
+    p.state.routes["GET /phone/api/me"] = () => [401, { error: "Pair first.", pair: true }];
+    p.state.routes["POST /phone/pair"] = () => [202, { pending: true }];
+    p.state.routes["POST /phone/pair/status"] = () => {
+      p.state.routes["GET /phone/api/me"] = () => [200, p.state.me];
+      p.state.routes["GET /phone/api/overview"] = () => [200, p.state.overview];
+      return [200, { ok: true, csrf_token: dell, phone: { id: "p1", name: "Pocket" } }];
+    };
+    await p.settle(10);
+    if (!p.els.pair.hidden) {
+      p.els["p-code"].value = "ABCD2345";
+      p.els["p-name"].value = "Pocket";
+      p.click("p-go");
+      await p.settle(4010);
+    }
+    assert.deepEqual(JSON.parse(p.storage("jarvis.phone.csrf.by-main")), { zenbook: arch, dell });
+    assert.equal(p.storage("jarvis.phone.csrf"), undefined, "a front pairing never writes the plain slot");
+    const last = p.state.calls.filter((c) => c.path === "/phone/api/me").at(-1);
+    assert.equal(last.headers["X-Jarvis-Csrf-dell"], dell);
+    assert.equal(last.headers["X-Jarvis-Csrf-zenbook"], arch);
   },
 
   async csrf_is_captured_on_pair_reused_and_cleared_only_on_forget_or_revoke() {

@@ -1059,6 +1059,10 @@ class Wiring(unittest.TestCase):
                 phone.cli(args("pair"), CONFIG, self.state)
         with mock.patch("jarvis.topology.is_node", return_value=True), self.assertRaisesRegex(ValueError, "main PC"):
             phone.cli(args("on"), CONFIG, self.state)
+        # A continuity-managed node is a standby MAIN: it keeps its own pairing store.
+        with mock.patch("jarvis.topology.is_node", return_value=True), \
+                mock.patch("jarvis.continuity.integration.continuity_state", return_value="managed"):
+            self.assertTrue(phone.cli(args("on"), CONFIG, self.state)["on"])
         with self.assertRaisesRegex(ValueError, "cluster"):
             phone.cli(args("on"), {"devices": {}}, self.state)
 
