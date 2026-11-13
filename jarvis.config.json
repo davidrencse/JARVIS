@@ -25,7 +25,8 @@
         "dell g15"
       ],
       "lan_ip": "172.1.43.16",
-      "screen_inches": 15.6
+      "screen_inches": 15.6,
+      "brain_transfer_dir": "C:\\Users\\jdoe\\AppData\\Local\\JARVIS\\continuity-transfer"
     },
     "zenbook": {
       "transport": "ssh",
@@ -51,7 +52,8 @@
         "linux laptop",
         "zen book"
       ],
-      "screen_inches": 15.6
+      "screen_inches": 15.6,
+      "brain_transfer_dir": "/home/jdoe/.local/share/jarvis/continuity-transfer"
     },
     "oracle": {
       "label": "Oracle A1 (gateway)",
@@ -258,5 +260,11 @@
   },
   "second_brain": {
     "enabled": true
+  },
+  "brainsync": {
+    "enabled": true
+  },
+  "continuity": {
+    "operator_config": "/home/jdoe/.config/jarvis/continuity/operator.json"
   }
 }
