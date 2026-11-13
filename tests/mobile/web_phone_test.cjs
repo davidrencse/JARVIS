@@ -1104,8 +1104,11 @@ const scenarios = {
     await p.open();
     const frame = p.state.calls.find((c) => c.path === "/phone/api/session/frame");
     assert.equal(frame.headers["X-CSRF-Token"], token);
-    assert.match(frame.url, /^\/phone\/api\/session\/frame\?session=[^&]+&after=\d+$/);
-    assert.doesNotMatch(frame.url, /csrf|token|operation_id/i);
+    assert.equal(frame.headers["X-JARVIS-Session"], SID);
+    assert.equal(frame.headers["X-JARVIS-Phone"], "1");
+    assert.match(frame.url, /^\/phone\/api\/session\/frame\?after=\d+$/);
+    assert.equal(frame.url.includes(SID), false);
+    assert.doesNotMatch(frame.url, /session=|csrf|token|operation_id/i);
     await p.go("#/phone");
     p.click("pn-forget");
     await p.settle(10);
