@@ -249,7 +249,14 @@ class GatewayHttp(unittest.TestCase):
         self.gw = ContinuityGateway.open(
             Path(self.tmp.name) / "authority.sqlite", "home", "oracle-auth", [self.pubkey])
         self.addCleanup(self.gw.close)
-        self.origin = self.gw.serve()
+        import socketserver
+        orig = socketserver.BaseServer.serve_forever
+
+        def fast(self, poll_interval=0.5):
+            return orig(self, min(poll_interval, 0.01))
+
+        with unittest.mock.patch.object(socketserver.BaseServer, "serve_forever", fast):
+            self.origin = self.gw.serve()
         self.port = int(self.origin.rsplit(":", 1)[1])
 
     def _send(self, raw):

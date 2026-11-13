@@ -32,7 +32,8 @@ class StrayStateTests(unittest.TestCase):
         with mock.patch.object(terminal, "_stray_state",
                                return_value=([str(self.copy / ".jarvis")], [str(self.repo / "old" / "cluster-owner.token")])):
             try:
-                argv = terminal.sandbox(None, self.repo, {"terminal": {"sandbox": True}})
+                with mock.patch.object(terminal, "SOCKET_DIRS", ()):
+                    argv = terminal.sandbox(None, self.repo, {"terminal": {"sandbox": True}})
             except TypeError:
                 self.skipTest("sandbox() signature differs")
             except Exception as exc:  # no bwrap here
