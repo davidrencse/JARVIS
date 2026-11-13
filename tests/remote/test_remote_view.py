@@ -427,6 +427,7 @@ class EndToEndTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=5)
         self.assertEqual(caught.exception.code, 403)
+        caught.exception.close()
 
     def test_remote_job_is_validated_and_not_a_desktop_action(self):
         with self.assertRaises(ValueError):
@@ -472,9 +473,11 @@ class EndToEndTests(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as caught:
             call(f"/api/remote/frame?session={session['id']}&after=0")
         self.assertEqual(caught.exception.code, 410)
+        caught.exception.close()
         with self.assertRaises(urllib.error.HTTPError) as caught:  # no X-JARVIS header: refused
             opener.open(urllib.request.Request(base + "/api/remote/start", data=b"{}"), timeout=5)
         self.assertEqual(caught.exception.code, 403)
+        caught.exception.close()
 
     def test_old_code_on_the_node_is_not_ready(self):
         with patch("jarvis.release.served_code", return_value="different"):
