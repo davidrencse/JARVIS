@@ -202,8 +202,33 @@
     return counts;
   }
 
+  // Everything render() paints, except the clock minute is inside so a same-minute reload
+  // of the same plan does not rebuild the view (and reset the dependency graph).
+  function stamp(plan, events, overview) {
+    const steps = plan?.steps || [];
+    const plans = overview?.plans || [];
+    const r = overview?.routing || {};
+    const five = ((J.state.credits || []).find((c) => c.id === "codex")?.meters || [])[0];
+    return JSON.stringify([
+      plan?.id, plan?.state, plan?.goal, plan?.summary, hhmm(Date.now()),
+      overview?.brain?.name, overview?.models?.claude?.high?.model,
+      overview?.orchestration?.lanes, !!overview?.desktop, !!overview?.tools?.claude,
+      overview?.tasks?.states?.finished, overview?.memory?.items,
+      !!r.auto_escalate, r.brain, r.simple_power, r.web_power, five?.pct,
+      steps.map((s) => [s.id, s.specialist, s.state, s.power || "", s.task || "",
+        (s.acceptance || []).length, s.depends_on || [], s.objective || ""]),
+      plans.map((p) => [p.id, p.state]),
+      (events || []).length,
+      (events || []).slice(-40).map((e) => [e.at, e.kind, e.step, e.specialist]),
+    ]);
+  }
+
+  let drawn = "";
   function render() {
     const { overview, plan, events } = data;
+    const sig = stamp(plan, events, overview);
+    if (sig === drawn && $("#rv-spine-canvas")) return;
+    drawn = sig;
     const counts = tally(plan);
     const cmd = plan
       ? `jarvis orchestrate run ${plan.id}`
@@ -242,21 +267,35 @@
     });
   }
 
-  let openSeq = 0, openTimer = 0;
+  let openSeq = 0, openTimer = 0, loading = false, again = false, againId;
+  let stale = false, staleId;
   async function open(id) {
     const host = $("#rv");
     if (!host) return false;
+    if (document.hidden) { stale = true; staleId = id ?? planId; return false; }  // one refresh when the tab is back
+    if (loading) { again = true; againId = id; return false; }  // one load at a time; this id runs when it finishes
+    again = false;
+    loading = true;
+    stale = false;
     const seq = ++openSeq;  // only the newest request may draw
+    let failed = null, loaded = null;
     try {
-      const loaded = await load(id);
-      if (seq !== openSeq) return false;
-      data = loaded;
-      planId = data.plan?.id || null;
+      loaded = await load(id);
     } catch (e) {
-      if (seq !== openSeq) return false;
-      host.innerHTML = `<div class="rv-card"><div class="rv-empty"><b>Couldn't read the run.</b>${esc(e.message)}</div></div>`;
+      failed = e;
+    } finally {
+      loading = false;
+    }
+    if (document.hidden) { stale = true; staleId = again ? againId : (id ?? planId); again = false; return false; }
+    if (again) { const next = againId; again = false; return open(next); }
+    if (seq !== openSeq) return false;
+    if (failed) {
+      host.innerHTML = `<div class="rv-card"><div class="rv-empty"><b>Couldn't read the run.</b>${esc(failed.message)}</div></div>`;
+      drawn = "";
       return false;
     }
+    data = loaded;
+    planId = data.plan?.id || null;
     render();
     return true;
   }
@@ -265,10 +304,23 @@
   addEventListener("jarvis:live", (e) => {
     const kind = e.detail?.kind;
     if (!$("#view-run") || $("#view-run").hidden) return;
-    if (kind === "plan.updated" || kind === "task.event") {  // a burst of step events becomes one reload
-      clearTimeout(openTimer);
-      openTimer = setTimeout(() => open(planId), 300);
-    }
+    if (kind !== "plan.updated" && kind !== "task.event") return;
+    if (document.hidden) { stale = true; staleId = planId; return; }
+    clearTimeout(openTimer);
+    openTimer = setTimeout(() => {  // a burst of step events becomes one reload
+      if (document.hidden) { stale = true; staleId = planId; return; }
+      open(planId);
+    }, 300);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden || !stale) return;
+    const view = $("#view-run");
+    if (!view || view.hidden) return;
+    stale = false;
+    clearTimeout(openTimer);
+    const id = staleId;
+    staleId = undefined;
+    open(id);
   });
 
   window.JarvisRun = { open };

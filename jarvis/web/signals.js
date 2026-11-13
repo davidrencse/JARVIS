@@ -11,7 +11,20 @@
   const { esc } = J;
   const on = (name, fn) => addEventListener("jarvis:" + name, (e) => fn(e.detail));
   const reduce = matchMedia("(prefers-reduced-motion: reduce)");
-  const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  // getComputedStyle forces style work; the animation reads the same variables every frame.
+  const css = (() => {
+    let theme = null, cache = new Map();
+    return (v) => {
+      const now = document.documentElement.getAttribute("data-theme") || "";
+      if (now !== theme) { theme = now; cache = new Map(); }
+      let hit = cache.get(v);
+      if (hit === undefined) {
+        hit = getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+        cache.set(v, hit);
+      }
+      return hit;
+    };
+  })();
   const fmt = new Intl.NumberFormat();
   const compact = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2) + "M" : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e5 ? 0 : 1) + "K" : String(Math.round(n)));
 
@@ -93,27 +106,54 @@
     $("#sig-agent-flag").textContent = agent.active.size > 1 ? `${agent.active.size} turns` : "";
     $("#sig-agent").dataset.mood = agent.mood;
   }
+  let statsSig = "";
   function agentStats() {
     const o = J.state.overview;
     const rows = [["Today", String(agent.today)], ["Memory", o ? fmt.format(o.memory.items) : "—"], ["Listener", agent.listening ? "On" : "Off"]];
+    const sig = rows.map(([k, v]) => k + "\n" + v).join("\n");
+    if (sig === statsSig) return;
+    statsSig = sig;
     $("#sig-agent-stats").innerHTML = rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join("");
   }
   on("live", (e) => {
     const d = e.data || {};
     if (e.kind === "turn.start") agent.active.add(d.message || d.job || Math.random());
-    if (e.kind === "turn.done" || e.kind === "turn.error") { agent.active.delete(d.message); agent.active.delete(d.job); if (!d.message && !d.job) agent.active.clear(); loadToday(); }
+    if (e.kind === "turn.done" || e.kind === "turn.error") {
+      agent.active.delete(d.message); agent.active.delete(d.job);
+      if (!d.message && !d.job) agent.active.clear();
+      // turn.done already reloads history in app.js, which emits jarvis:history. Errors do not.
+      if (e.kind === "turn.error") loadToday();
+    }
     if (e.kind === "voice.state") agent.listening = !!d.listening;
     if (e.kind === "hello") { agent.live = true; agent.active.clear(); }
     mood(); agentStats();
   });
   on("overview", (o) => { agent.listening = !!o?.voice?.listening; mood(); agentStats(); });
-  async function loadToday() {
-    try {
-      const h = await J.api("/api/history?limit=60"), start = new Date(); start.setHours(0, 0, 0, 0);
-      agent.today = h.filter((x) => Date.parse(x.at) >= start).length; agentStats();
-      activityRequests = h; if (actTab === "requests") drawActivity();
-    } catch (e) {}
+  let histGen = 0, todayFlight = null, todayAgain = false;
+  function applyHistory(h) {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const rows = h || [];
+    agent.today = rows.filter((x) => Date.parse(x.at) >= start).length; agentStats();
+    activityRequests = rows; if (actTab === "requests") drawActivity();
   }
+  // app.js owns /api/history and emits the wider page. This fetch is only for a turn that
+  // failed, which does not reload history on its own.
+  async function loadToday() {
+    if (todayFlight) { todayAgain = true; return todayFlight; }
+    todayFlight = (async () => {
+      try {
+        do {
+          todayAgain = false;
+          const gen = ++histGen;
+          const h = await J.api("/api/history?limit=60");
+          if (gen === histGen) applyHistory(h);
+        } while (todayAgain);
+      } catch (e) {}
+      finally { todayFlight = null; }
+    })();
+    return todayFlight;
+  }
+  on("history", (h) => { histGen++; applyHistory(h); });
   // The live chip already tracks the stream; mirror it so "Offline" means the console lost it.
   new MutationObserver(() => { const c = $("#live-chip"); agent.live = !c || !/reconnect|connecting|offline/i.test(c.textContent); mood(); })
     .observe($("#live-chip") || document.body, { subtree: true, childList: true, characterData: true });
@@ -128,15 +168,25 @@
     // on most of the day, so the motion runs at ~15 fps rather than every frame.
     if (!reduce.matches && (agent.mood === "thinking" || agent.mood === "listening")) raf = setTimeout(() => requestAnimationFrame(animate), 66);
   }
-  const kick = () => { if (!raf) raf = requestAnimationFrame(animate); };
+  const kick = () => {
+    if (document.hidden || $("#view-console")?.hidden) return;
+    if (!raf) raf = requestAnimationFrame(animate);
+  };
   on("live", kick); on("view", kick); addEventListener("resize", kick);
-  setInterval(kick, 4000); // the occasional blink while idle
+  setInterval(() => { if (!document.hidden && !$("#view-console")?.hidden) kick(); }, 4000); // the occasional blink while idle
 
   // ---------- 02 Claude output, 24 h (a row under the Claude window) ----------
+  let tokensAt = 0, tokenFlight = null;
   async function loadTokens() {
-    let u; try { u = await J.api("/api/usage?hours=24"); } catch (e) { return; }
-    const total = u.output.slice(-24).reduce((a, b) => a + b, 0);
-    if (claudeTokens !== total) { claudeTokens = total; limit(); }
+    if (tokenFlight) return tokenFlight;
+    tokensAt = Date.now();
+    tokenFlight = (async () => {
+      let u; try { u = await J.api("/api/usage?hours=24"); } catch (e) { return; }
+      const total = u.output.slice(-24).reduce((a, b) => a + b, 0);
+      if (claudeTokens !== total) { claudeTokens = total; limit(); }
+    })();
+    try { return await tokenFlight; }
+    finally { tokenFlight = null; }
   }
 
   // ---------- 03 Codex window ----------
@@ -211,6 +261,7 @@
   // ---------- activity table (the reference's order book) ----------
   let actTab = "requests", activityRequests = [];
   const hhmm = (t) => new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+  let actSig = "";
   function drawActivity() {
     const t = $("#act-table");
     let head = "", rows = [];
@@ -231,7 +282,10 @@
       rows = (J.state.overview?.memory?.recent || []).slice(0, 6).map((m) =>
         `<tr><td class="ident" title="${esc(m.title)}">${esc(m.title)}</td><td class="num">${esc(m.kind)}</td><td class="num">${esc(J.ago(m.created_at))}</td></tr>`);
     }
-    t.innerHTML = `<thead>${head}</thead><tbody>${rows.join("") || `<tr><td class="muted" colspan="4">Nothing here yet.</td></tr>`}</tbody>`;
+    const html = `<thead>${head}</thead><tbody>${rows.join("") || `<tr><td class="muted" colspan="4">Nothing here yet.</td></tr>`}</tbody>`;
+    if (html === actSig) return;
+    actSig = html;
+    t.innerHTML = html;
   }
   const tabs = $$("#w-activity [data-act-tab]");
   tabs.forEach((b, i) => {
@@ -245,6 +299,11 @@
   addEventListener("resize", () => { clearTimeout(redrawAll.t); redrawAll.t = setTimeout(() => { limit(); trace($("#dm-trace"), pings); }, 200); });
   $("#theme-toggle").addEventListener("click", () => setTimeout(() => { limit(); trace($("#dm-trace"), pings); kick(); }, 40));
   document.fonts?.ready.then(() => kick());
-  mood(); agentStats(); redrawAll(); loadToday(); drawActivity();
+  mood(); agentStats(); redrawAll(); drawActivity();
   setInterval(() => { if (!document.hidden) loadTokens(); }, 5 * 60 * 1000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    kick();
+    if (Date.now() - tokensAt >= 5 * 60 * 1000) loadTokens();
+  });
 })();

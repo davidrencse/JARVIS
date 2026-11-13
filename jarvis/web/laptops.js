@@ -262,8 +262,16 @@ void main(){
   function render(it, t) {
     const { g, s, meshes, canvas } = it, { gl, u, a } = g;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
-    if (!w || !h) return;
+    // clientWidth forces layout; the CSS size is fixed until resize, theme, or zoom.
+    let w = it.cssW, h = it.cssH;
+    if (!it.sized || it.dirty || dpr !== it.dpr) {
+      it.dpr = dpr;
+      w = Math.round(canvas.clientWidth * dpr);
+      h = Math.round(canvas.clientHeight * dpr);
+      it.cssW = w; it.cssH = h;
+    }
+    if (!w || !h) { it.sized = false; return; }
+    it.sized = true;
     if (w !== it.w || h !== it.h) { canvas.width = it.w = w; canvas.height = it.h = h; }
     gl.viewport(0, 0, w, h);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
@@ -323,20 +331,22 @@ void main(){
       it.yaw += (yawTarget - it.yaw) * (1 - Math.exp(-dt * (it.hover == null ? 1.6 : 5)));
     }
     render(it, t);
-    it.dirty = false;
+    if (it.sized) it.dirty = false;
   }
 
   function frame(now) {
     raf = 0;
+    if (document.visibilityState !== "visible") return;
     const dt = Math.min(0.05, (now - last) / 1000); last = now;
     const t = now / 1000;
     let live = false;
+    const buried = !!top.closest("[hidden]");
     for (const it of inst.values()) {
-      if (!it.canvas.isConnected || !it.visible || top.closest("[hidden]")) continue;
+      if (buried || !it.canvas.isConnected || !it.visible) continue;
       if (reduce.matches && !it.dirty) continue;
       step(it, dt, t); live = true;
     }
-    if (live && !reduce.matches && document.visibilityState === "visible") raf = requestAnimationFrame(frame);
+    if (live && !reduce.matches) raf = requestAnimationFrame(frame);
   }
   function kick() { if (!raf) { last = performance.now(); raf = requestAnimationFrame(frame); } }
 
@@ -379,12 +389,19 @@ void main(){
     .observe(top, { childList: true });
 
   // pointer: the hovered card's laptop turns to follow the cursor
+  let hoverCard = null, hoverRect = null;
+  document.addEventListener("scroll", () => { hoverRect = null; }, true);
   document.addEventListener("pointermove", (e) => {
     const card = e.target.closest?.(".cx-links .cx-node");
+    if (card !== hoverCard) { hoverCard = card; hoverRect = null; }
     let changed = false;
     for (const it of inst.values()) {
       let h = null;
-      if (card && it.card === card) { const r = card.getBoundingClientRect(); h = Math.max(-1, Math.min(1, ((e.clientX - r.left) / r.width) * 2 - 1)); }
+      if (card && it.card === card) {
+        if (!hoverRect) hoverRect = card.getBoundingClientRect();
+        const width = hoverRect.width || 1;
+        h = Math.max(-1, Math.min(1, ((e.clientX - hoverRect.left) / width) * 2 - 1));
+      }
       if (h !== it.hover) { it.hover = h; it.dirty = true; changed = true; }
     }
     if (changed) kick();
@@ -396,7 +413,7 @@ void main(){
   reduce.addEventListener?.("change", () => { for (const it of inst.values()) it.dirty = true; kick(); });
   document.addEventListener("visibilitychange", kick);
   addEventListener("hashchange", () => setTimeout(kick, 50));
-  addEventListener("resize", () => { for (const it of inst.values()) it.dirty = true; kick(); });
+  addEventListener("resize", () => { hoverRect = null; for (const it of inst.values()) it.dirty = true; kick(); });
   // Opening the Connections tab un-hides #view-devices; watch for that too.
   const view = document.getElementById("view-devices");
   if (view) new MutationObserver(() => { for (const it of inst.values()) it.dirty = true; kick(); })

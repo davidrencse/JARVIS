@@ -5,7 +5,9 @@
 // browser error or a blank screen. Pairing and the API (/phone/*) never touch the cache. No push,
 // no background sync.
 // The phone server replaces __SHELL_VERSION__ with a hash of the shell files, so every release
-// gets its own cache and the old one is dropped on activate.
+// gets its own cache and the old one is dropped on activate. phone.js is part of that hash.
+// The page that first sees the new worker may still be running the previous script; the next
+// load is the one that runs the new phone.js.
 "use strict";
 
 const CACHE = "jarvis-phone-__SHELL_VERSION__";
@@ -41,7 +43,9 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
-  if (url.pathname === "/phone" || url.pathname.startsWith("/phone/")) return;  // pairing and the API: network only, never cached
+  // Pairing and /phone/api/* (frame long-poll included) stay on the network. Never cached.
+  if (url.pathname === "/phone/api" || url.pathname.startsWith("/phone/api/")) return;
+  if (url.pathname === "/phone" || url.pathname.startsWith("/phone/")) return;
   const key = req.mode === "navigate" ? (url.pathname === "/" ? "/" : null) : url.pathname;
   if (!key || !SHELL.includes(key)) return;
   const live = fetchShell(req, key);
@@ -69,6 +73,7 @@ function cacheable(res, key) {
   if (!res || !res.ok || res.type !== "basic") return false;
   let path = key;
   try { path = new URL(res.url).pathname; } catch (e) { /* keep the request key */ }
+  if (path === "/phone/api" || path.startsWith("/phone/api/")) return false;
   if (path === "/phone" || path.startsWith("/phone/")) return false;
   if (res.headers.has("Set-Cookie")) return false;
   const control = (res.headers.get("Cache-Control") || "").toLowerCase();

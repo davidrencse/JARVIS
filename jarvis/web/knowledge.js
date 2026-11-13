@@ -42,6 +42,12 @@ function hash(text) {
   for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
   return h >>> 0;
 }
+function sigOf(obj) {
+  if (obj == null) return "0";
+  let s;
+  try { s = JSON.stringify(obj); } catch (e) { return String(Math.random()); }
+  return hash(s) + ":" + s.length;
+}
 function rng(seed) {  // mulberry32: stable positions for the same record across reloads
   let a = seed >>> 0;
   return () => {
@@ -458,16 +464,22 @@ function project(x, y, z, o) {  // same maths as the shader
   return o;
 }
 let timeNow = 0;
+// one scratch for the per-node breathe: the hot loop must not allocate a point per note per frame
+const wobPt = { x: 0, y: 0, z: 0 };
+const ovPt = { sx: 0, sy: 0, depth: 0, f: 1 };
 function wobJ(n, R) {  // the shader's breathing, so labels and picks sit on the dots
   const k = reduced ? 0 : R * 0.035, s = n.seed;
-  return [n.x + k * Math.sin(timeNow * 0.5 + s * 40), n.y + k * Math.sin(timeNow * 0.43 + s * 71 + 1), n.z + k * Math.sin(timeNow * 0.37 + s * 23 + 2)];
+  wobPt.x = n.x + k * Math.sin(timeNow * 0.5 + s * 40);
+  wobPt.y = n.y + k * Math.sin(timeNow * 0.43 + s * 71 + 1);
+  wobPt.z = n.z + k * Math.sin(timeNow * 0.37 + s * 23 + 2);
+  return wobPt;
 }
 function projectAll() {
   camUpdate();
   for (const c of scene.clusters) project(c.c[0], c.c[1], c.c[2], c);
   for (const n of scene.nodes) {
-    const R = scene.clusters[n.ci].R, p = wobJ(n, R);
-    project(p[0], p[1], p[2], n);
+    const p = wobJ(n, scene.clusters[n.ci].R);
+    project(p.x, p.y, p.z, n);
   }
 }
 
@@ -609,6 +621,7 @@ void main() { o = vec4(texture(u_scene, v).rgb + texture(u_bloom, v).rgb * u_amt
 const renderer = (() => {
   let gl = null, progs = null, bufs = [], mesh = null, strand = null, nodesVao = null, dynBuf = null, ok = false;
   let post = null;  // {ms, msRb, scene, sceneTex, a, aTex, b, bTex, w, h, hw, hh}
+  const endA = {}, endB = {}, tintCol = [0, 0, 0];  // 2D fallback scratches: reused across every edge
   const tex = (w, h) => {
     const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
@@ -754,20 +767,22 @@ const renderer = (() => {
     c.setTransform(DPR, 0, 0, DPR, 0, 0); c.globalCompositeOperation = "source-over"; c.fillStyle = "#000"; c.fillRect(0, 0, W, H);
     if (!scene.nodes.length) return;
     c.globalCompositeOperation = "lighter"; c.lineWidth = 0.6;
-    const a = {}, b = {}, cl = scene.clusters;
+    const cl = scene.clusters;
     const run = (arr, N, strands) => {
       for (let i = 0; i < N; i++) {
         const o = i * 14, cA = arr[o + 8], cB = arr[o + 9], kind = arr[o + 10], w = arr[o + 11];
         const dA = ST.cur[cA * 4], dB = ST.cur[cB * 4], tA = ST.cur[cA * 4 + 1], lA = ST.cur[cA * 4 + 2], lB = ST.cur[cB * 4 + 2], rd = ST.cur[cA * 4 + 3] + ST.cur[cB * 4 + 3];
-        project(arr[o], arr[o + 1], arr[o + 2], a); project(arr[o + 4], arr[o + 5], arr[o + 6], b);
+        project(arr[o], arr[o + 1], arr[o + 2], endA); project(arr[o + 4], arr[o + 5], arr[o + 6], endB);
         let col, alpha;
-        if (!strands) { col = w > 0.8 ? CYAN : cl[cA].base; alpha = (0.1 + 0.2 * w) * dA; if (tA > 0.05) col = [ST.tc[cA * 3], ST.tc[cA * 3 + 1], ST.tc[cA * 3 + 2]]; }
-        else {
+        if (!strands) {
+          col = w > 0.8 ? CYAN : cl[cA].base; alpha = (0.1 + 0.2 * w) * dA;
+          if (tA > 0.05) { tintCol[0] = ST.tc[cA * 3]; tintCol[1] = ST.tc[cA * 3 + 1]; tintCol[2] = ST.tc[cA * 3 + 2]; col = tintCol; }
+        } else {
           const lit = ST.mode ? Math.max(lA, lB) : Math.min(lA, lB);
           col = lit > 0.3 ? (rd > 0.5 ? RED : AMBER) : WHITE;
           alpha = (kind < 1.5 ? 0.12 + 0.1 * w : (0.04 + 0.03 * w) * ST.ambient) * (lit > 0.3 ? 2.6 : Math.min(dA, dB));
         }
-        c.strokeStyle = rgba(col, alpha); c.beginPath(); c.moveTo(a.sx, a.sy); c.lineTo(b.sx, b.sy); c.stroke();
+        c.strokeStyle = rgba(col, alpha); c.beginPath(); c.moveTo(endA.sx, endA.sy); c.lineTo(endB.sx, endB.sy); c.stroke();
       }
     };
     run(scene.strands, scene.strandN, true); run(scene.mesh, scene.meshN, false);
@@ -818,16 +833,16 @@ function drawOverlay(now) {
     return;
   }
   // a faint orbit ring round the whole scene, with a slow marker on it
-  const ring = scene.extent * 1.02, o = {};
+  const ring = scene.extent * 1.02;
   c.strokeStyle = "rgba(255,255,255,.07)"; c.lineWidth = 1; c.setLineDash([2, 7]); c.beginPath();
   for (let i = 0; i <= 120; i++) {
-    const a = (i / 120) * 6.2832; project(Math.cos(a) * ring, 0, Math.sin(a) * ring, o);
-    i ? c.lineTo(o.sx, o.sy) : c.moveTo(o.sx, o.sy);
+    const a = (i / 120) * 6.2832; project(Math.cos(a) * ring, 0, Math.sin(a) * ring, ovPt);
+    i ? c.lineTo(ovPt.sx, ovPt.sy) : c.moveTo(ovPt.sx, ovPt.sy);
   }
   c.stroke(); c.setLineDash([]);
   if (!reduced) {
-    const a = timeNow * 0.12; project(Math.cos(a) * ring, 0, Math.sin(a) * ring, o);
-    c.fillStyle = rgba(CYAN, 0.7); c.beginPath(); c.arc(o.sx, o.sy, 2, 0, 6.2832); c.fill();
+    const a = timeNow * 0.12; project(Math.cos(a) * ring, 0, Math.sin(a) * ring, ovPt);
+    c.fillStyle = rgba(CYAN, 0.7); c.beginPath(); c.arc(ovPt.sx, ovPt.sy, 2, 0, 6.2832); c.fill();
   }
   const placed = [];
   const free = (x, y, w, h) => {
@@ -842,11 +857,11 @@ function drawOverlay(now) {
     const dim = Math.min(ST.cur[b.a * 4], ST.cur[b.b * 4]), alpha = 0.35 * dim + 0.65 * lit;
     if (alpha < 0.12) continue;
     const t = 0.38 + b.seed * 0.24;
-    project(A.c[0] + (B.c[0] - A.c[0]) * t, A.c[1] + (B.c[1] - A.c[1]) * t, A.c[2] + (B.c[2] - A.c[2]) * t, o);
+    project(A.c[0] + (B.c[0] - A.c[0]) * t, A.c[1] + (B.c[1] - A.c[1]) * t, A.c[2] + (B.c[2] - A.c[2]) * t, ovPt);
     const text = `${b.rel} ×${b.n}`, w = c.measureText(text).width;
-    if (o.sx < 4 || o.sx + w > W - 4 || !free(o.sx, o.sy - 10, w + 4, 12)) continue;
+    if (ovPt.sx < 4 || ovPt.sx + w > W - 4 || !free(ovPt.sx, ovPt.sy - 10, w + 4, 12)) continue;
     c.fillStyle = (ST.cur[b.a * 4 + 3] + ST.cur[b.b * 4 + 3]) > 0.5 && lit > 0.3 ? rgba(RED, alpha) : rgba(AMBER, alpha);
-    halo(text, o.sx, o.sy);
+    halo(text, ovPt.sx, ovPt.sy);
   }
   // cluster labels
   for (const cl of scene.clusters.slice().sort((p, q) => p.depth - q.depth)) {
@@ -948,10 +963,22 @@ function tooltip(n) {
 
 /* ---------- loop ---------- */
 let frames = 0, fpsAt = performance.now(), lastDraw = 0, lastT = performance.now();
-let lastClock = "", lastTickAt = -1e9, lastTickLast = "", frameOn = true;
+let lastClock = "", lastTickAt = -1e9, lastTickLast = "", lastAngle = "", frameOn = false, frameId = 0;
+let graphSeen = true, graphIo = null;  // graphSeen stays true when IntersectionObserver is missing
+function graphShown() { return graphSeen && !document.hidden; }
+function stopFrame() {
+  frameOn = false;
+  if (frameId) { cancelAnimationFrame(frameId); frameId = 0; }
+}
+function kickFrame() {  // resume paints one frame immediately, then the loop carries on
+  if (!graphShown() || frameOn) return;
+  view.dirty = true; frameOn = true; lastT = performance.now();
+  frameId = requestAnimationFrame(frame);
+}
 function frame(now) {
-  if (document.hidden) { frameOn = false; return; }
-  requestAnimationFrame(frame);
+  frameId = 0;
+  if (!graphShown()) { frameOn = false; return; }
+  frameId = requestAnimationFrame(frame);
   const active = cam.drag || cam.pan || cam.panTo || cam.anchor || now < view.activeUntil || ST.busy || Math.abs(cam.spin) > 1e-5 || Math.abs(cam.zoomTo - cam.zoom) > 0.002 || view.pulses.length;
   const clk = new Date().toTimeString().slice(0, 8);
   if (clk !== lastClock) { lastClock = clk; $("clock").textContent = clk; }
@@ -989,7 +1016,8 @@ function frame(now) {
   frames++;
   if (now - fpsAt > 1000) { $("fps").textContent = `${frames}FPS`; frames = 0; fpsAt = now; }
   const deg = (((cam.az * 180) / Math.PI + 180) % 360) - 180;
-  $("graph-angle").textContent = `AZ ${deg.toFixed(1)}° · ZOOM ${cam.zoom < 10 ? cam.zoom.toFixed(1) : Math.round(cam.zoom)}× · ${quality.bloom ? "GLOW" : "FAST"} ${Math.round(DPR * 10) / 10}x`;
+  const angle = `AZ ${deg.toFixed(1)}° · ZOOM ${cam.zoom < 10 ? cam.zoom.toFixed(1) : Math.round(cam.zoom)}× · ${quality.bloom ? "GLOW" : "FAST"} ${Math.round(DPR * 10) / 10}x`;
+  if (angle !== lastAngle) { lastAngle = angle; $("graph-angle").textContent = angle; }
 }
 function tuneQuality(now, dt) {
   // Only frames that really animate count (the loop idles otherwise).
@@ -1409,19 +1437,32 @@ function renderAge() {
 }
 
 /* ---------- live data ---------- */
-let stateTimer = 0, graphTimer = 0;
+let stateTimer = 0, graphTimer = 0, seenScene = "", seenPanel = "";
 // No vault configured makes the endpoint answer 400: ask again only now and then, not every refresh.
 const vaultWanted = () => !view.vaultFailed || Date.now() - view.vaultFailed > 600000;
+let refreshBusy = false, refreshQueued = 0;
 async function refresh(withGraph) {
+  if (refreshBusy) { refreshQueued = Math.max(refreshQueued, withGraph ? 2 : 1); return; }
+  refreshBusy = true;
   try {
     const [snap, graph, vault, heap] = await Promise.all([api("/api/kb/state"), withGraph ? api("/api/kb/graph") : null,
       withGraph && vaultWanted() ? api("/api/vault/graph").catch(() => { view.vaultFailed = Date.now(); return null; }) : null, withGraph ? api("/api/graph/heap").catch(() => null) : null]);
-    if (graph) { ingestKB(graph, vault); if (heap) ingestHeap(heap); }
+    if (graph) {
+      const sceneKey = sigOf(graph) + "|" + sigOf(vault) + "|" + sigOf(heap);
+      if (sceneKey !== seenScene) {
+        seenScene = sceneKey;
+        ingestKB(graph, vault); if (heap) ingestHeap(heap);
+        buildScene(); renderTabs();
+      }
+    }
     view.snap = snap; view.loaded = true;
-    if (graph) { buildScene(); renderTabs(); }
-    renderAll();
+    const panelKey = sigOf(snap) + "|" + seenScene + "|" + Math.floor(Date.now() / 3600000);
+    if (panelKey !== seenPanel) { seenPanel = panelKey; renderAll(); }
   } catch (err) {
     view.last = `jarvis :: ${err.message}`;
+  } finally {
+    refreshBusy = false;
+    if (refreshQueued) { const again = refreshQueued > 1; refreshQueued = 0; refresh(again); }
   }
 }
 function soon(withGraph) {
@@ -1429,13 +1470,21 @@ function soon(withGraph) {
   if (withGraph) { clearTimeout(graphTimer); graphTimer = setTimeout(() => refresh(true), 350); }
   else stateTimer = setTimeout(() => refresh(false), 250);
 }
+let memBusy = false, memAgain = false;
 async function refreshMemory() {  // JARVIS's own memory moves on its own: redraw when it does
+  if (memBusy) { memAgain = true; return; }
+  memBusy = true;
   try {
     const heap = await api("/api/graph/heap");
     const sig = `${(heap.nodes || []).length}:${(heap.edges || []).length}:${heap.nodes && heap.nodes[0] ? heap.nodes[0].id : ""}`;
     if (sig === view.heapSig) return;
     ingestHeap(heap); buildScene(); renderTabs(); renderAll();
+    seenPanel = "";
   } catch { /* the console server may be restarting */ }
+  finally {
+    memBusy = false;
+    if (memAgain) { memAgain = false; refreshMemory(); }
+  }
 }
 
 function onEvent(kind, data) {
@@ -1494,12 +1543,44 @@ resize();
 renderTabs();
 refresh(true);
 connect();
-setInterval(() => { if (!document.hidden) refresh(true); }, 60000);  // the nightly checker may run in another process
-setInterval(() => { if (!document.hidden) refreshMemory(); }, 15000);
+let graphPoll = 0, memPoll = 0;
+function markVis() {
+  const root = document.documentElement;
+  if (!root || !root.setAttribute) return;
+  if (document.hidden) root.setAttribute("data-vis", "hidden");
+  else root.removeAttribute("data-vis");
+}
+function armKnowledgePolls() {
+  if (graphPoll) clearInterval(graphPoll);
+  if (memPoll) clearInterval(memPoll);
+  graphPoll = memPoll = 0;
+  if (document.hidden) return;
+  graphPoll = setInterval(() => refresh(true), 60000);  // the nightly checker may run in another process
+  memPoll = setInterval(() => refreshMemory(), 15000);
+}
 document.addEventListener("visibilitychange", () => {
+  markVis();
+  armKnowledgePolls();
   if (!document.hidden) { refresh(true); refreshMemory(); }  // catch up once on return
 });
-requestAnimationFrame(frame);
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && !frameOn) { frameOn = true; lastT = performance.now(); requestAnimationFrame(frame); }
-});
+markVis();
+armKnowledgePolls();
+function armGraphLoop() {
+  if (!graphIo && typeof IntersectionObserver !== "undefined") {
+    const host = canvas.parentElement || canvas;
+    graphIo = new IntersectionObserver((entries) => {
+      graphSeen = entries.some((e) => e.isIntersecting);
+      if (graphSeen) kickFrame(); else stopFrame();
+    });
+    graphIo.observe(host);
+  }
+  kickFrame();
+}
+function disarmGraphLoop() {  // page teardown: drop the observer and the frame
+  stopFrame();
+  if (graphIo) { graphIo.disconnect(); graphIo = null; }
+}
+armGraphLoop();
+addEventListener("pagehide", disarmGraphLoop);
+addEventListener("pageshow", (ev) => { if (ev.persisted) armGraphLoop(); });
+document.addEventListener("visibilitychange", () => { if (document.hidden) stopFrame(); else kickFrame(); });

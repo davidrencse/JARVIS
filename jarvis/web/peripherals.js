@@ -123,7 +123,23 @@
     return `<div class="pe-block"><h4>Link between the computers</h4><ul class="pe-checks">${checks}</ul>${repair}</div>`;
   }
 
+  let drawnSig = "";
+  function payloadSig() {
+    let body = "", invite = "";
+    try { body = JSON.stringify(view.data); } catch (e) { body = String(Math.random()); }
+    try { invite = JSON.stringify(view.invite); } catch (e) { invite = "x"; }
+    return (view.error || "") + "\n" + [...view.busy].sort().join(",") + "\n" + body + "\n" + invite;
+  }
+  function paintLive() {
+    const meta = $(".ph-meta", root);
+    if (meta) meta.textContent = view.loading ? "checking…" : view.at ? "checked " + new Date(view.at).toLocaleTimeString() : "";
+    const btn = $("[data-refresh]", root);
+    if (btn) btn.disabled = !!view.loading;
+  }
   function draw() {
+    const sig = payloadSig();
+    if (sig === drawnSig && $(".ph-meta", root)) { paintLive(); return; }
+    drawnSig = sig;
     const o = view.data;
     const head = `<header class="ph">${icon("link")}<h2>Connect &amp; share</h2>
       ${o ? word(o.ok ? "linked" : "needs attention", o.ok) : ""}
@@ -169,11 +185,15 @@
   // Check when Devices opens, then every 20 s while it's open and the tab is visible.
   function tick() {
     clearTimeout(view.timer);
-    if ($("#view-devices").hidden) return;
-    if (document.visibilityState === "visible" && !view.busy.size && !view.invite) load();
+    view.timer = 0;
+    if ($("#view-devices").hidden || document.visibilityState !== "visible") return;
+    if (!view.busy.size && !view.invite) load();
     view.timer = setTimeout(tick, 20000);
   }
   addEventListener("hashchange", tick);
-  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") tick(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") tick();
+    else { clearTimeout(view.timer); view.timer = 0; }
+  });
   tick();
 })();

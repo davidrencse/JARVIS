@@ -66,7 +66,7 @@
   let gen = 0, loopCtl = null, pollTimer = 0, listTimer = 0, tick = 0, hiddenTimer = 0;
   let aliveAt = 0;  // the hub said the node checked in lately, though the screen didn't change
   let fw = 0, fh = 0, lastFrameAt = 0, attachedAt = 0, frames = [], prevUrl = "", gotFrame = false;
-  let busy = false;
+  let busy = false, refreshing = false, refreshSoon = false;
   const visible = () => !section.hidden;
   if (!["low", "medium", "high"].includes(quality)) quality = "medium";
   el.q.value = quality;
@@ -94,10 +94,13 @@
     const now = performance.now();
     while (frames.length && now - frames[0] > 2000) frames.shift();
     const fps = frames.length > 1 ? (frames.length - 1) / ((frames[frames.length - 1] - frames[0]) / 1000) : 0;
-    el.fps.textContent = sess && gotFrame && st !== "stale" ? `${fps.toFixed(fps < 10 ? 1 : 0)} fps` : "– fps";
-    el.res.textContent = fw && sess ? `${fw}×${fh}` : "–";
+    const fpsText = sess && gotFrame && st !== "stale" ? `${fps.toFixed(fps < 10 ? 1 : 0)} fps` : "– fps";
+    const resText = fw && sess ? `${fw}×${fh}` : "–";
     const age = lastFrameAt && sess ? Date.now() - lastFrameAt : -1;
-    el.age.textContent = age < 0 ? "no frame yet" : `last frame ${age < 10000 ? Math.round(age) + " ms" : Math.round(age / 1000) + " s"} ago`;
+    const ageText = age < 0 ? "no frame yet" : `last frame ${age < 10000 ? Math.round(age) + " ms" : Math.round(age / 1000) + " s"} ago`;
+    if (el.fps.textContent !== fpsText) el.fps.textContent = fpsText;
+    if (el.res.textContent !== resText) el.res.textContent = resText;
+    if (el.age.textContent !== ageText) el.age.textContent = ageText;
     el.age.classList.toggle("warn", st === "stale");
     renderPlaceholder(st);
   }
@@ -164,6 +167,8 @@
   // ---------- server state ----------
   async function refresh() {
     if (!visible() || (sess && document.hidden)) return;  // a hidden tab's session is the hidden timer's
+    if (refreshing) { refreshSoon = true; return; }       // one status read at a time; a skipped call runs once after
+    refreshing = true;
     try {
       const d = await J().api("/api/remote");
       devices = d.devices || [];
@@ -180,6 +185,9 @@
       renderDevices(); renderControls(); renderStatus();
     } catch (e) {
       if (!sess) setNote(e.message, "bad");
+    } finally {
+      refreshing = false;
+      if (refreshSoon) { refreshSoon = false; refresh(); }
     }
   }
   function syncSession(s) {
@@ -217,18 +225,20 @@
     quality = s.quality || quality;
     if (s.device && devices.some((d) => d.id === s.device)) { pick = s.device; devKey = ""; renderDevices(); }
     if (s.quality && ["low", "medium", "high"].includes(s.quality)) el.q.value = s.quality;
-    inputErr = "";
+    inputErr = ""; inputFails = 0; releaseAfterStop = false; inputStopped = false;
     const g = ++gen;
     if (document.hidden) {
       // The tab went to the background while Connect waited: no frames until it's back, and
       // the same background stop as a session that was already running (visibilitychange
-      // set hiddenAt; it restarts the frame loop on return).
+      // set hiddenAt; it restarts the frame loop on return). No status poll either.
       clearTimeout(hiddenTimer);
       const left = HIDDEN_STOP_MS - (hiddenAt ? Date.now() - hiddenAt : 0);
       hiddenTimer = setTimeout(() => { if (document.hidden && sess) backgroundStop(); }, Math.max(0, left));
-    } else frameLoop(s.id, g);
-    clearInterval(pollTimer); pollTimer = setInterval(refresh, 3000);
-    clearInterval(tick); tick = setInterval(renderStatus, 250);
+    } else {
+      frameLoop(s.id, g);
+      clearInterval(pollTimer); pollTimer = setInterval(refresh, 3000);
+      clearInterval(tick); tick = setInterval(renderStatus, 250);
+    }
     renderControls(); renderStatus();
     try { el.view.focus({ preventScroll: true }); } catch (e) {}
     kbState();  // a view that already had focus fires no focus event
@@ -238,7 +248,8 @@
   function finish(error, reason) {
     detachLoop();
     clearInterval(pollTimer); pollTimer = 0; clearInterval(tick); tick = 0;
-    q = []; held.clear(); heldKeys.clear(); inputErr = "";
+    clearTimeout(flushTimer); flushTimer = 0;
+    q = []; held.clear(); heldKeys.clear(); inputErr = ""; inputFails = 0; releaseAfterStop = false; inputStopped = false;
     sess = null; gotFrame = false; closing = false;
     ended = { error: error || null, reason: reason || "" };
     if (prevUrl) { el.img.removeAttribute("src"); URL.revokeObjectURL(prevUrl); prevUrl = ""; }
@@ -304,15 +315,39 @@
   }
 
   // ---------- input ----------
-  let q = [], closing = false, flushTimer = 0, lastSend = 0, inputErr = "";
+  // HTTP 4xx (CSRF, 400/401/403/404/409, …) is permanent: drop ordinary events, send one
+  // release, and do not reschedule. Network errors and HTTP 5xx back off from 300 ms,
+  // doubling to 5 s. A success starts that delay back at 300 ms.
+  let q = [], closing = false, flushTimer = 0, lastSend = 0, inputErr = "", inputFails = 0, releaseAfterStop = false, inputStopped = false;
   const held = new Set(), heldKeys = new Set();
   // In-flight input requests per session id: one stalled request must not block another session.
   const inflight = new Set();
   const flying = () => !!sess && inflight.has(sess.id);
   // closing: Disconnect has queued its final release; nothing new may be accepted after it.
   const canSend = () => !!sess && sess.state !== "ended" && gotFrame && !closing;
+  // ok / err / fails / events (the batch just sent) / queue (still waiting).
+  // 4xx: stop. The first time, queue is exactly one release (releaseOnce) so the node lets go.
+  // A lone release that itself 4xxs clears the queue and does not ask for another try.
+  function inputPumpPlan(ok, err, fails, events, queue) {
+    const q = Array.isArray(queue) ? queue.slice() : [];
+    const sent = Array.isArray(events) ? events : [];
+    if (ok) return { queue: q, fails: 0, delay: 0, stop: false, releaseOnce: false, clearNote: true };
+    const status = err && typeof err.status === "number" ? err.status : 0;
+    if (status >= 400 && status < 500) {
+      const sentRelease = sent.length === 1 && sent[0] && sent[0].t === "release";
+      if (sentRelease) return { queue: [], fails: 0, delay: 0, stop: true, releaseOnce: false, clearNote: false };
+      return { queue: [{ t: "release" }], fails: 0, delay: 0, stop: true, releaseOnce: true, clearNote: false };
+    }
+    const n = fails > 0 ? Math.floor(fails) : 0;
+    const shift = n > 16 ? 16 : n;
+    let delay = 300 * Math.pow(2, shift);
+    if (delay > 5000) delay = 5000;
+    if (!q.length || !q[0] || q[0].t !== "release") q.unshift({ t: "release" });
+    return { queue: q, fails: n + 1, delay, stop: false, releaseOnce: false, clearNote: false };
+  }
   function push(ev, urgent) {
     if (!canSend()) return;
+    if (inputStopped && ev.t !== "release") return;
     if (ev.t === "move" && q.length && q[q.length - 1].t === "move") q[q.length - 1] = ev; else q.push(ev);
     if (urgent) pump();
     else if (!flushTimer && !flying()) flushTimer = setTimeout(pump, Math.max(0, FLUSH_MS - (performance.now() - lastSend)));
@@ -321,25 +356,37 @@
     clearTimeout(flushTimer); flushTimer = 0;
     if (!q.length || !sess || inflight.has(sess.id)) return;
     const events = q, id = sess.id; q = [];
+    const preserveNote = releaseAfterStop && events.length === 1 && events[0] && events[0].t === "release";
+    releaseAfterStop = false;
     inflight.add(id); lastSend = performance.now();
-    let failed = false;
-    try { await J().api("/api/remote/input", { session: id, events }); if (inputErr) { inputErr = ""; setNote(""); } }
-    catch (e) {
-      failed = true;
+    let plan = null;
+    try {
+      await J().api("/api/remote/input", { session: id, events });
+      plan = inputPumpPlan(true, null, inputFails, events, q);
+      inputFails = plan.fails;
+      q = plan.queue;
+      if (!preserveNote) inputStopped = false;
+      if (plan.clearNote && inputErr && !preserveNote) { inputErr = ""; setNote(""); }
+    } catch (e) {
       if (/Unknown remote session/.test(e.message || "")) { if (sess && sess.id === id) finish(GONE, ""); return; }
+      plan = inputPumpPlan(false, e, inputFails, events, q);
+      inputFails = plan.fails;
+      q = plan.queue;
+      inputStopped = !!plan.stop;
+      releaseAfterStop = !!plan.releaseOnce;
       const fresh = e.message !== inputErr;
       if (fresh) { inputErr = e.message; setNote("Input was not delivered: " + e.message, "bad"); }
       // The lost batch may have held a key-up or button-up: tell the node to let go of everything,
       // then count as held only what the events still queued after that release press again.
-      if (!q.length || q[0].t !== "release") q.unshift({ t: "release" });
       heldFrom(q);
       if (fresh) refresh();  // the session may be over (410): let the server say so
-    }
-    finally {
+    } finally {
       inflight.delete(id);
-      if (q.length && sess && sess.id === id && sess.state !== "ended") {
-        if (failed) flushTimer = setTimeout(pump, 300);  // retry, gently
-        else if (q.some((e) => e.t !== "move")) pump(); else flushTimer = setTimeout(pump, FLUSH_MS);
+      const live = plan && sess && sess.id === id && sess.state !== "ended";
+      if (live && plan.releaseOnce && q.length) pump();
+      else if (live && !plan.stop && q.length) {
+        if (plan.delay) flushTimer = setTimeout(pump, plan.delay);
+        else if (q.some((ev) => ev.t !== "move")) pump(); else flushTimer = setTimeout(pump, FLUSH_MS);
       }
     }
   }
@@ -538,17 +585,36 @@
   const backgroundStop = () => { stopBeacon(); finish(null, BG_REASON); };
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
-      releaseInput();
+      releaseInput();  // held keys and buttons go first; the polls stopping must not drop this
       clearTimeout(hiddenTimer);
       hiddenAt = Date.now();
-      // Frames pause with the tab; if nobody comes back for a while, end the session.
-      if (sess) { detachLoop(); hiddenTimer = setTimeout(() => { if (document.hidden && sess) backgroundStop(); }, HIDDEN_STOP_MS); }
+      clearInterval(listTimer); listTimer = 0;
+      // Frames and the status/device polls pause with the tab. The hidden timer still ends
+      // the session, and pagehide still beacons a release plus stop.
+      if (sess) {
+        detachLoop();
+        clearInterval(pollTimer); pollTimer = 0; clearInterval(tick); tick = 0;
+        hiddenTimer = setTimeout(() => { if (document.hidden && sess) backgroundStop(); }, HIDDEN_STOP_MS);
+      }
     } else {
       clearTimeout(hiddenTimer);
       // A throttled background timer may not have fired yet: the hub has ended it by now.
-      if (sess && hiddenAt && Date.now() - hiddenAt >= HIDDEN_STOP_MS) backgroundStop();
-      else if (sess && sess.state !== "ended" && visible()) { const g = ++gen; frameLoop(sess.id, g); refresh(); }
+      const aged = !!(sess && hiddenAt && Date.now() - hiddenAt >= HIDDEN_STOP_MS);
+      if (aged) backgroundStop();
+      else if (sess && sess.state !== "ended" && visible()) {
+        const g = ++gen; frameLoop(sess.id, g);
+        clearInterval(pollTimer); pollTimer = setInterval(refresh, 3000);
+        clearInterval(tick); tick = setInterval(renderStatus, 250);
+        renderStatus();
+        refresh();
+      }
       hiddenAt = 0;
+      if (visible()) {
+        clearInterval(listTimer); listTimer = setInterval(() => { if (!sess && !document.hidden) refresh(); }, 8000);
+        // Not after a background stop: that stop is still in flight, and a status read can
+        // still see the session and offer Reattach over the "background too long" message.
+        if (!sess && !aged) refresh();
+      }
     }
   });
 

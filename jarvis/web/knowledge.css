@@ -295,3 +295,7 @@ body.dropping::after { content: "Drop into raw/ — read only"; position: fixed;
   .role { flex: 1 1 auto; min-height: 30px; }
   .role.cmd { flex-basis: 100%; }
 }
+/* Hidden tab: the role and clock dots keep a compositor layer awake. */
+html[data-vis="hidden"] *,
+html[data-vis="hidden"] *::before,
+html[data-vis="hidden"] *::after { animation-play-state: paused !important; }

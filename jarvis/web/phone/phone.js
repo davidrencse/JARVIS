@@ -201,8 +201,9 @@
     if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
     return headers;
   }
-  function frameUrl(id, after) {
-    return "/phone/api/session/frame?session=" + encodeURIComponent(id) + "&after=" + encodeURIComponent(String(after || 0));
+  // The remote-view session id is X-JARVIS-Session on the request, never a query parameter.
+  function frameUrl(after) {
+    return "/phone/api/session/frame?after=" + encodeURIComponent(String(after || 0));
   }
   function b64urlToBytes(s) {
     const clean = String(s || "").replace(/-/g, "+").replace(/_/g, "/");
@@ -1487,8 +1488,9 @@
       frameCtl = ctl;
       const timer = setTimeout(() => ctl.abort(), 15000);
       try {
-        const res = await fetch(frameUrl(id, sess.lastSeq || 0),
-          { signal: ctl.signal, credentials: "same-origin", cache: "no-store", headers: phoneHeaders(false) });
+        const res = await fetch(frameUrl(sess.lastSeq || 0),
+          { signal: ctl.signal, credentials: "same-origin", cache: "no-store",
+            headers: Object.assign(phoneHeaders(false), { "X-JARVIS-Session": id }) });
         if (g !== gen) return;
         if (res.status === 204) {
           fails = 0; reachable(true);
@@ -1639,16 +1641,38 @@
   // ---------- input ----------
   // Batched like the console: moves merge, other events go at once, one request in flight, at
   // most 200 events each. A failed batch puts a release first, so nothing stays held.
-  let q = [], inflight = false, flushTimer = 0, lastSend = 0, inputErr = "";
+  // HTTP 4xx is permanent: drop ordinary events, send one release, and do not reschedule.
+  // A network error or HTTP 5xx backs off from 300 ms, doubling to 5 s. Success starts again at 300 ms.
+  let q = [], inflight = false, flushTimer = 0, lastSend = 0, inputErr = "", inputFails = 0, releaseAfterStop = false, inputStopped = false;
   const held = new Set(), heldKeys = new Set(), sticky = new Set(), keyBtns = new Map();
   const canSend = () => !!sess && sess.kind === "screen" && gotFrame;
   function resetInput() {
     clearTimeout(flushTimer); flushTimer = 0; clearTimeout(longTimer);
-    q = []; held.clear(); heldKeys.clear(); sticky.clear(); ptrs.clear(); gest = null; inputErr = ""; wheelAcc = 0;
+    q = []; held.clear(); heldKeys.clear(); sticky.clear(); ptrs.clear(); gest = null; inputErr = "";
+    inputFails = 0; releaseAfterStop = false; inputStopped = false; wheelAcc = 0;
     text(el.cNote, "");
+  }
+  // Same decision as the console pump. ok / err / fails / events (batch just sent) / queue (still waiting).
+  function inputPumpPlan(ok, err, fails, events, queue) {
+    const q = Array.isArray(queue) ? queue.slice() : [];
+    const sent = Array.isArray(events) ? events : [];
+    if (ok) return { queue: q, fails: 0, delay: 0, stop: false, releaseOnce: false, clearNote: true };
+    const status = err && typeof err.status === "number" ? err.status : 0;
+    if (status >= 400 && status < 500) {
+      const sentRelease = sent.length === 1 && sent[0] && sent[0].t === "release";
+      if (sentRelease) return { queue: [], fails: 0, delay: 0, stop: true, releaseOnce: false, clearNote: false };
+      return { queue: [{ t: "release" }], fails: 0, delay: 0, stop: true, releaseOnce: true, clearNote: false };
+    }
+    const n = fails > 0 ? Math.floor(fails) : 0;
+    const shift = n > 16 ? 16 : n;
+    let delay = 300 * Math.pow(2, shift);
+    if (delay > 5000) delay = 5000;
+    if (!q.length || !q[0] || q[0].t !== "release") q.unshift({ t: "release" });
+    return { queue: q, fails: n + 1, delay, stop: false, releaseOnce: false, clearNote: false };
   }
   function push(ev, urgent) {
     if (!canSend()) return false;
+    if (inputStopped && ev.t !== "release") return false;
     if (ev.t === "move" && q.length && q[q.length - 1].t === "move") q[q.length - 1] = ev; else q.push(ev);
     if (urgent) pump();
     else if (!flushTimer && !inflight) flushTimer = setTimeout(pump, Math.max(0, FLUSH_MS - (now() - lastSend)));
@@ -1659,26 +1683,38 @@
     if (!q.length || !sess || inflight) return;
     const id = sess.id, events = q.slice(0, MAX_EVENTS);
     q = q.slice(MAX_EVENTS);
+    const preserveNote = releaseAfterStop && events.length === 1 && events[0] && events[0].t === "release";
+    releaseAfterStop = false;
     inflight = true; lastSend = now();
-    let failed = false;
+    let plan = null;
     try {
       await api("/phone/api/session/input", { session: id, events }, { timeout: 10000 });
-      if (inputErr) { inputErr = ""; text(el.cNote, ""); }
+      plan = inputPumpPlan(true, null, inputFails, events, q);
+      inputFails = plan.fails;
+      q = plan.queue;
+      if (!preserveNote) inputStopped = false;
+      if (plan.clearNote && inputErr && !preserveNote) { inputErr = ""; text(el.cNote, ""); }
     } catch (e) {
-      failed = true;
       if (e.kind === "auth") return;
       if (!sess || sess.id !== id) return;
       if (e.status === 404 || e.status === 410) { finish(e.status === 404 ? GONE : e.message, ""); return; }
+      plan = inputPumpPlan(false, e, inputFails, events, q);
+      inputFails = plan.fails;
+      q = plan.queue;
+      inputStopped = !!plan.stop;
+      releaseAfterStop = !!plan.releaseOnce;
       if (e.message !== inputErr) { inputErr = e.message; text(el.cNote, "Input didn't arrive: " + e.message); el.cNote.setAttribute("data-st", "bad"); }
       // The lost batch may have held a key-up or button-up: let go of everything first, then
       // count as held only what the events still queued after that release press again.
-      if (!q.length || q[0].t !== "release") q.unshift({ t: "release" });
       heldFrom(q);
     } finally {
       inflight = false;
-      if (q.length && sess && sess.id === id) {
-        if (failed) flushTimer = setTimeout(pump, 300);
-        else if (q.some((e) => e.t !== "move")) pump(); else flushTimer = setTimeout(pump, FLUSH_MS);
+      const live = plan && sess && sess.id === id;
+      if (live && plan.releaseOnce && q.length) pump();
+      else if (live && !plan.stop && q.length) {
+        if (plan.delay) flushTimer = setTimeout(pump, plan.delay);
+        else if (q.some((ev) => ev.t !== "move")) pump();
+        else flushTimer = setTimeout(pump, FLUSH_MS);
       }
     }
   }

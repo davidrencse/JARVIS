@@ -185,19 +185,24 @@
     return m.same_code ? ["ok", "Online · checked in " + ago(m.seen)] : ["warn", "Online · updating to the main's code"];
   }
 
+  let machinesHtml = "";
   function renderMachines() {
     const box = $("#st-machines");
     if (!box) return;
     const list = (state.machines || []).slice().sort((a, b) => (b.role === "main") - (a.role === "main"));
-    if (!list.length) { box.innerHTML = '<p class="st-empty">No computers configured. Add them under devices in jarvis.config.json.</p>'; return; }
-    box.innerHTML = list.map((m) => {
-      const main = m.role === "main", [tone, line] = machineStatus(m);
-      const action = main ? "" : '<span class="st-status">MAIN transfer unavailable. See Connections for readiness.</span>';
-      return `<div class="st-row st-mc" data-role="${main ? "main" : "node"}">
+    const html = !list.length
+      ? '<p class="st-empty">No computers configured. Add them under devices in jarvis.config.json.</p>'
+      : list.map((m) => {
+        const main = m.role === "main", [tone, line] = machineStatus(m);
+        const action = main ? "" : '<span class="st-status">MAIN transfer unavailable. See Connections for readiness.</span>';
+        return `<div class="st-row st-mc" data-role="${main ? "main" : "node"}">
         <div class="st-label"><b>${esc(m.label || m.id)}<span class="st-badge">${main ? "Main" : "Node"}</span>${m.this ? '<span class="st-badge st-badge-soft">This PC</span>' : ""}</b>
         <small class="st-status" data-tone="${tone}"><i aria-hidden="true"></i>${esc(line)}</small></div>
         <div class="st-ctl">${action}</div></div>`;
-    }).join("");
+      }).join("");
+    if (html === machinesHtml) return;
+    machinesHtml = html;
+    box.innerHTML = html;
   }
 
   function applyState(d) {
@@ -355,16 +360,36 @@
     catch (e) {
       const msg = '<p class="st-empty">Couldn’t load settings: ' + esc(e.message) + ' <button type="button" class="st-btn" data-retry>Retry</button></p>';
       SECS.forEach((s) => { const b = $("#st-rows-" + s); if (b) b.innerHTML = msg; });
-      $("#st-machines").innerHTML = msg;
+      $("#st-machines").innerHTML = msg; machinesHtml = "";
     }
     finally { loading = false; }
   }
 
   // Machine status is live: refresh just that list while it is on screen.
-  setInterval(async () => {
-    if (view.hidden || $("#st-panel-machines").hidden || loading || pending.size || confirmFor || document.hidden) return;
-    try { state.machines = (await api("/api/settings")).machines || state.machines; renderMachines(); } catch (e) {}
-  }, 10000);
+  // The interval pauses while the tab is hidden and catches up once on return.
+  let machinesTimer = 0, machinesBusy = false;
+  async function pollMachines() {
+    if (view.hidden || $("#st-panel-machines").hidden || loading || machinesBusy || pending.size || confirmFor || document.hidden) return;
+    machinesBusy = true;
+    try { state.machines = (await api("/api/settings")).machines || state.machines; renderMachines(); }
+    catch (e) {}
+    finally { machinesBusy = false; }
+  }
+  function armMachines() {
+    if (machinesTimer) clearInterval(machinesTimer);
+    machinesTimer = 0;
+    if (document.hidden) return;
+    machinesTimer = setInterval(pollMachines, 10000);
+  }
+  function markVis() {
+    const root = document.documentElement;
+    if (!root || !root.setAttribute) return;
+    if (document.hidden) root.setAttribute("data-vis", "hidden");
+    else root.removeAttribute("data-vis");
+  }
+  document.addEventListener("visibilitychange", () => { markVis(); armMachines(); if (!document.hidden) pollMachines(); });
+  markVis();
+  armMachines();
 
   // ?st=<section> opens a section directly (links from elsewhere); else the last one used.
   let saved = new URLSearchParams(location.search).get("st") || "machines";
