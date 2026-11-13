@@ -171,15 +171,27 @@ class ClusterBundleTransport:
         if checked.get('ok') is not True:
             raise ValueError('Peer refused brain staging.')
         name = 'brain-' + uuid.uuid4().hex + '.bundle'
-        sent = push(self.config, self.state, node, io.BytesIO(bundle), len(bundle),
-                    name=name, dest='path', folder=folder,
-                    **({'call_fn': lambda cfg, state, peer, body: self._call(peer, body)}
-                       if self._caller is not None else {}))
-        # Join using the peer's path convention, independent of this host's OS.
-        import ntpath, posixpath
-        join = ntpath.join if '\\' in folder else posixpath.join
-        return self._call(node, {'action': 'brain_receive',
-            'path': join(folder, sent['sent']), 'sha256': hashlib.sha256(bundle).hexdigest()})
+        # A drop after staging may already have uploaded the bundle. That is
+        # not source_offline: a retry could deliver the snapshot twice.
+        uploaded = name
+        try:
+            sent = push(self.config, self.state, node, io.BytesIO(bundle), len(bundle),
+                        name=name, dest='path', folder=folder,
+                        **({'call_fn': lambda cfg, state, peer, body: self._call(peer, body)}
+                           if self._caller is not None else {}))
+            remote = sent['sent']
+            if isinstance(remote, str) and BUNDLE_NAME.fullmatch(remote):
+                uploaded = remote
+            # Join using the peer's path convention, independent of this host's OS.
+            import ntpath, posixpath
+            join = ntpath.join if '\\' in folder else posixpath.join
+            return self._call(node, {'action': 'brain_receive',
+                'path': join(folder, remote), 'sha256': hashlib.sha256(bundle).hexdigest()})
+        except (ConnectionError, OSError, TimeoutError):
+            self._discard(node, folder, name)
+            if uploaded != name:
+                self._discard(node, folder, uploaded)
+            return {'ok': False, 'status': 'uncertain', 'error': 'uncertain'}
 
     def _pull(self, node, request):
         from jarvis import brainsync

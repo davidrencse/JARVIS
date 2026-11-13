@@ -11,11 +11,18 @@ Rules this enforces (each has a failing-then-passing test in tests/continuity):
   is a new incarnation: every old lease is void, and nothing is granted until the longest
   validity ever handed out (plus a margin) has passed.
 - Handover/recovery fences before granting: renewals stop, then either every eligible
-  effect-bearing participant acknowledged the fence, or the old validity ran out (+margin).
-  A draining source may release its own lease without closing the transition or dropping
-  that validity margin. Any other open stage still refuses release. A candidate is granted
-  not-ready; ordinary admission waits for a verified canary. A failure after the fence
-  leaves no MAIN (never resurrects the old lease).
+  effect-bearing participant acknowledged the fence (and at least one eligible
+  participant exists), or the old validity ran out (+margin). An ineligible ack is
+  not a quorum and cannot drop a live lease. A draining source may release its own
+  lease without closing the transition or dropping that validity margin. Any other
+  open stage still refuses release. Cutover (`set_mode`) refuses while a transition
+  is open, and fence refuses a mode that is not part of the transfer. A candidate
+  is granted not-ready; a repeat of that grant returns the same lease and does not
+  extend it. Ordinary admission waits for a verified canary. A failure after the
+  fence leaves no MAIN (never resurrects the old lease).
+- A transition is compare-and-set on the incarnation, epoch, and policy it requested.
+  Fence rechecks that tuple before it advances the epoch. Grant and complete recheck
+  the fenced epoch. A moved tuple is `stale` and writes nothing.
 - Admission is consumed once per (target, operation, attempt) under the exact current
   tuple. A retry of the same admission returns the original record, also after a later
   handover; a different digest or admission id for that attempt is a conflict.
@@ -32,9 +39,11 @@ journals, executor guards. Callers pass identities they already authenticated.
 """
 
 from ..locking import transaction
+import errno
 import hashlib
 import json
 import math
+import os
 import re
 import secrets
 import sqlite3
@@ -161,9 +170,32 @@ def _bool(value, name):
 
 
 def _writer_lock(path):
-    """Exclusive, nonblocking lock held for the store's lifetime: one writer per file."""
-    handle = open(path, "a+b")
+    """Exclusive, nonblocking lock held for the store's lifetime: one writer per file.
+
+    The lock file is `<realpath(database)>.writer`. A symlink and its target therefore
+    contend for one lock, instead of each creating a lock beside its own path. The
+    lock path itself must be a regular file; following a symlink there would lock
+    some other inode. An empty file gets one byte so a Windows byte-range lock has
+    something to cover.
+    """
+    lock_path = os.path.realpath(path) + ".writer"
+    if os.path.islink(lock_path):
+        raise AuthorityError("bad_request", "writer lock must be a regular file")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR):
+            raise AuthorityError("bad_request", "writer lock must be a regular file") from None
+        raise AuthorityError("writer_busy", "another authority process owns this store") from None
+    handle = os.fdopen(fd, "a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
         if sys.platform == "win32":
             import msvcrt
             handle.seek(0)
@@ -192,7 +224,7 @@ class AuthorityStore:
         # Before the writer lock and the database, so a bad margin cannot hold the file.
         self.margin = _finite_non_negative(margin, "margin")
         self._lock = threading.RLock()
-        self._writer = _writer_lock(str(self.path) + ".writer")
+        self._writer = _writer_lock(self.path)
         try:
             self._db = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
             self._db.row_factory = sqlite3.Row
@@ -297,6 +329,33 @@ class AuthorityStore:
 
     def _participant(self, db, device_id):
         return db.execute("SELECT * FROM participants WHERE device_id=?", (device_id,)).fetchone()
+
+    def _same_tuple(self, row, incarnation, epoch, policy):
+        """Refuse before a write when this is not the tuple the caller bound."""
+        if (row["incarnation"], row["epoch"], row["policy_version"]) != (incarnation, epoch, policy):
+            raise AuthorityError("stale", "authority moved on; refresh status")
+
+    def _expect_tuple(self, row, transition, epoch):
+        """Bind a step to the transition's incarnation and policy.
+
+        ``epoch`` is ``expected_epoch`` until fence commits, and ``fenced_epoch`` after.
+        """
+        self._same_tuple(row, transition["expected_incarnation"], epoch, transition["expected_policy"])
+
+    def _require_transfer_mode(self, row, allowed):
+        if row["mode"] not in allowed:
+            raise AuthorityError("mode", f"no MAIN transitions in {row['mode']}")
+
+    def _fence_quorum(self, db, row, prior):
+        """Shared by fence and cancel.
+
+        Every eligible participant, plus the previous holder when one is named, must
+        have acked this epoch. No eligible participant means there is no quorum:
+        an ineligible row with a high ``fenced_epoch`` must not retire a live MAIN.
+        """
+        if db.execute("SELECT COUNT(*) FROM participants WHERE eligible=1").fetchone()[0] < 1:
+            return False
+        return self._acked(db, row, (prior,))
 
     # --- read ---------------------------------------------------------------------------
 
@@ -491,33 +550,47 @@ class AuthorityStore:
         """A participant durably installed `mode_version` and refuses every grant whose epoch is
         <= `fenced_epoch` (it acks the epoch being fenced). Acks only move forward; a foreign
         installation or a version/epoch the authority never issued is refused. A disabled
-        installation is refused with ``revoked`` and is not recorded."""
+        installation is refused with ``revoked`` and is not recorded.
+
+        The next mode version may be acked only while the fleet is already in QUIESCED or
+        ROLLBACK_QUIESCED, which is the cutover waiting for that ack. From any other mode,
+        a version ahead of the one this authority has issued is ``ahead`` and is not stored.
+        """
         self._guard()
         _int(mode_version, "mode_version"), _int(fenced_epoch, "fenced_epoch")
         if boot_id is not None:
             _ident(boot_id, "boot_id")
         with self._tx() as db:
-            p = self._participant(db, _ident(device_id, "device_id"))
+            device_id = _ident(device_id, "device_id")
+            p = self._participant(db, device_id)
             if p is None or p["installation_id"] != installation_id:
                 raise AuthorityError("unknown_participant", "device/installation not enrolled")
             if not p["eligible"]:
                 raise AuthorityError("revoked", "disabled installation cannot acknowledge")
             row = self._row(db)
-            if mode_version > row["mode_version"] + 1 or fenced_epoch > row["epoch"]:
+            ceiling = row["mode_version"] + (1 if row["mode"] in ("QUIESCED", "ROLLBACK_QUIESCED") else 0)
+            if mode_version > ceiling or fenced_epoch > row["epoch"]:
                 raise AuthorityError("ahead", "acknowledgement names a version the authority never issued")
             db.execute("UPDATE participants SET mode_version=MAX(mode_version, ?), fenced_epoch=MAX(fenced_epoch, ?),"
-                       " boot_id=COALESCE(?, boot_id), acked_at=? WHERE device_id=?",
-                       (mode_version, fenced_epoch, boot_id, self._wall(), device_id))
+                       " boot_id=COALESCE(?, boot_id), acked_at=? WHERE device_id=? AND installation_id=?",
+                       (mode_version, fenced_epoch, boot_id, self._wall(), device_id, installation_id))
 
     def set_mode(self, mode, expected_mode_version):
         """Cutover step (MAIN-HANDOFF §5). Entering V2_ONLY_NO_MAIN or LEGACY_ACTIVE from a
-        quiesced mode needs every eligible participant to have acked the new version first."""
+        quiesced mode needs every eligible participant to have acked the new version first.
+
+        An open transition owns the mode until it finishes. ``set_mode`` then raises
+        ``busy`` and leaves the row unchanged, so rollback cannot overwrite a handover
+        that is about to grant a MAIN.
+        """
         self._guard()
         _int(expected_mode_version, "expected_mode_version")
         with self._tx() as db:
             row = self._row(db)
             if row["mode_version"] != expected_mode_version:
                 raise AuthorityError("stale", "mode version changed")
+            if row["transition_id"]:
+                raise AuthorityError("busy", "a transition is open")
             if mode not in MODE_EDGES.get(row["mode"], ()):
                 raise AuthorityError("bad_edge", f"{row['mode']} cannot move to {mode}")
             new_version = row["mode_version"] + 1
@@ -530,8 +603,11 @@ class AuthorityStore:
                 wait = self._quiet(db, row, self._mono(), self._acked(db, row, (row["last_holder"],)))
                 if wait > 0:
                     raise AuthorityError("not_quiet", "earlier v2 grants may still be valid", wait)
-            db.execute("UPDATE authority SET mode=?, mode_version=?, updated_at=? WHERE fleet_id=?",
-                       (mode, new_version, self._wall(), self.fleet_id))
+            updated = db.execute("UPDATE authority SET mode=?, mode_version=?, updated_at=? "
+                                 "WHERE fleet_id=? AND mode_version=? AND transition_id IS NULL",
+                                 (mode, new_version, self._wall(), self.fleet_id, expected_mode_version)).rowcount
+            if updated != 1:
+                raise AuthorityError("busy", "a transition is open")
             return new_version
 
     # --- lease --------------------------------------------------------------------------
@@ -571,15 +647,15 @@ class AuthorityStore:
                 current = self._get(db, row["transition_id"])
                 if current is None or current["state"] != "DRAINING" or current["source"] != holder:
                     raise AuthorityError("busy", "a transition is open; let it fence")
-                self._lease = None
                 db.execute("UPDATE authority SET holder=NULL, lease_id=NULL, lease_ready=0, last_holder=?,"
                            " updated_at=? WHERE fleet_id=?",
                            (holder, self._wall(), self.fleet_id))
+                self._lease = None
                 return
-            self._lease = None
             db.execute("UPDATE authority SET holder=NULL, lease_id=NULL, lease_ready=0, last_holder=?,"
                        " mode=?, updated_at=? WHERE fleet_id=?",
                        (holder, "V2_ONLY_NO_MAIN", self._wall(), self.fleet_id))
+            self._lease = None
 
     def _match(self, row, holder, lease_id, incarnation, epoch):
         if (row["holder"] is None or row["holder"] != holder or row["lease_id"] != lease_id
@@ -613,9 +689,7 @@ class AuthorityStore:
             row, now = self._row(db), self._mono()
             if row["transition_id"]:
                 raise AuthorityError("busy", "another transition is open", None)
-            if (row["incarnation"], row["epoch"], row["policy_version"]) != (
-                    expected_incarnation, expected_epoch, expected_policy):
-                raise AuthorityError("stale", "authority moved on; refresh status")
+            self._same_tuple(row, expected_incarnation, expected_epoch, expected_policy)
             if row["mode"] not in ("V2_ACTIVE", "V2_ONLY_NO_MAIN"):
                 raise AuthorityError("mode", f"no MAIN transitions in {row['mode']}")
             cand = self._participant(db, candidate)
@@ -639,7 +713,10 @@ class AuthorityStore:
                        " created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                        (tid, caller, client_key, digest, action, profile, row["holder"] if valid else None,
                         candidate, expected_incarnation, expected_epoch, expected_policy, "REQUESTED", w, w))
-            db.execute("UPDATE authority SET transition_id=?, updated_at=? WHERE fleet_id=?", (tid, w, self.fleet_id))
+            updated = db.execute("UPDATE authority SET transition_id=?, updated_at=? "
+                                 "WHERE fleet_id=? AND transition_id IS NULL", (tid, w, self.fleet_id)).rowcount
+            if updated != 1:
+                raise AuthorityError("busy", "another transition is open")
             return _transition_view(self._get(db, tid))
 
     def _get(self, db, tid):
@@ -660,7 +737,8 @@ class AuthorityStore:
         if checkpoint is not None:
             _ident(checkpoint, "checkpoint")
         with self._tx() as db:
-            self._open(db, transition_id, ("REQUESTED", "VALIDATING"))
+            t = self._open(db, transition_id, ("REQUESTED", "VALIDATING"))
+            self._expect_tuple(self._row(db), t, t["expected_epoch"])
             db.execute("UPDATE transitions SET state='VALIDATING', control_ready=?, ai_ready=?, checkpoint=?,"
                        " updated_at=? WHERE transition_id=?",
                        (1 if control_ready else 0, 1 if ai_ready else 0, checkpoint, self._wall(), transition_id))
@@ -671,74 +749,142 @@ class AuthorityStore:
         self._guard()
         with self._tx() as db:
             t = self._open(db, transition_id, ("REQUESTED", "VALIDATING"))
+            row = self._row(db)
+            self._expect_tuple(row, t, t["expected_epoch"])
+            self._require_transfer_mode(row, ("V2_ACTIVE", "V2_ONLY_NO_MAIN", "HANDOVER"))
             if not t["control_ready"] or (t["profile"] == "ai" and not t["ai_ready"]):
                 raise AuthorityError("not_ready", "candidate readiness does not meet the requested profile")
-            self._drain_since = self._mono()
+            w = self._wall()
             db.execute("UPDATE authority SET mode=CASE WHEN mode='V2_ACTIVE' THEN 'HANDOVER' ELSE mode END,"
-                       " updated_at=? WHERE fleet_id=?", (self._wall(), self.fleet_id))
+                       " updated_at=? WHERE fleet_id=?", (w, self.fleet_id))
             db.execute("UPDATE transitions SET state='DRAINING', updated_at=? WHERE transition_id=?",
-                       (self._wall(), transition_id))
+                       (w, transition_id))
+            self._drain_since = self._mono()
             return _transition_view(self._get(db, transition_id))
 
     def fence(self, transition_id):
-        """Clear the old lease and advance the epoch once nothing older can still act: either
-        every eligible participant and the previous MAIN acknowledged refusing the current
-        epoch, or the old validity ran out plus the safety margin. Never before the
-        new-incarnation barrier."""
+        """Clear the old lease and advance the epoch once nothing older can still act.
+
+        The fast path is the same quorum ``cancel`` uses: every eligible participant
+        and the previous MAIN have acked this epoch, and at least one eligible
+        participant exists. Otherwise the old validity must run out, plus the safety
+        margin. Never before the new-incarnation barrier. A retry once the transition
+        is already FENCING returns that result and does not advance the epoch again.
+        """
         self._guard()
         with self._tx() as db:
-            t = self._open(db, transition_id, ("DRAINING",))
+            t = self._get(db, transition_id)
+            if t is None:
+                raise AuthorityError("not_found", "no such transition")
             row, now = self._row(db), self._mono()
+            if t["state"] == "FENCING":
+                self._expect_tuple(row, t, t["fenced_epoch"])
+                self._require_transfer_mode(row, ("HANDOVER",))
+                if row["holder"] is not None or row["lease_id"] is not None:
+                    raise AuthorityError("bad_state", "fence left a lease behind")
+                return _transition_view(t)
+            if t["state"] != "DRAINING":
+                raise AuthorityError("bad_state", f"transition is {t['state']}")
+            self._expect_tuple(row, t, t["expected_epoch"])
+            self._require_transfer_mode(row, ("V2_ACTIVE", "V2_ONLY_NO_MAIN", "HANDOVER"))
             prior = t["source"] or row["holder"] or row["last_holder"]
-            acked = self._acked(db, row, (prior,))
-            if self._lease_valid(row, now):
-                if not acked:
-                    raise AuthorityError("lease_live", "old lease still valid",
-                                         self._lease["expires"] + self.margin - now)
-                self._lease = None  # the old MAIN and every target confirmed they stopped
-            wait = self._quiet(db, row, now, acked)
+            quorum = self._fence_quorum(db, row, prior)
+            if self._lease_valid(row, now) and not quorum:
+                raise AuthorityError("lease_live", "old lease still valid",
+                                     self._lease["expires"] + self.margin - now)
+            wait = self._quiet(db, row, now, quorum)
             if wait > 0:
                 raise AuthorityError("not_quiet", "earlier grants may still be honoured", wait)
-            self._lease = None
-            db.execute("UPDATE authority SET epoch=epoch+1, last_holder=COALESCE(holder, last_holder), holder=NULL,"
-                       " lease_id=NULL, lease_ready=0, mode='HANDOVER', updated_at=? WHERE fleet_id=?",
-                       (self._wall(), self.fleet_id))
+            w = self._wall()
+            updated = db.execute(
+                "UPDATE authority SET epoch=epoch+1, last_holder=COALESCE(holder, last_holder), holder=NULL,"
+                " lease_id=NULL, lease_ready=0, mode='HANDOVER', updated_at=? "
+                "WHERE fleet_id=? AND incarnation=? AND epoch=? AND policy_version=?",
+                (w, self.fleet_id, row["incarnation"], row["epoch"], row["policy_version"])).rowcount
+            if updated != 1:
+                raise AuthorityError("stale", "authority moved on; refresh status")
             row = self._row(db)
             db.execute("UPDATE transitions SET state='FENCING', fenced_epoch=?, updated_at=? WHERE transition_id=?",
-                       (row["epoch"], self._wall(), transition_id))
+                       (row["epoch"], w, transition_id))
+            self._lease = None
             return _transition_view(self._get(db, transition_id))
 
+    def _lease_view(self, row, now, valid_for):
+        return {"holder": self._lease["holder"], "lease_id": self._lease["lease_id"],
+                "incarnation": row["incarnation"], "epoch": row["epoch"],
+                "valid_for": valid_for, "ready": False}
+
     def grant(self, transition_id):
-        """Give the candidate a not-ready lease under the fenced epoch: canary only, no admission."""
+        """Give the candidate a not-ready lease under the fenced epoch: canary only, no admission.
+
+        A repeat while the transition is still GRANTED_NOT_READY returns that same lease
+        and the time it still has left. It does not mint a second id or extend the expiry.
+        The candidate must still be an eligible PC on the first grant.
+        """
         self._guard()
         with self._tx() as db:
-            t = self._open(db, transition_id, ("FENCING",))
+            t = self._get(db, transition_id)
+            if t is None:
+                raise AuthorityError("not_found", "no such transition")
             row, now = self._row(db), self._mono()
+            if t["state"] == "GRANTED_NOT_READY":
+                self._expect_tuple(row, t, t["fenced_epoch"])
+                self._require_transfer_mode(row, ("HANDOVER",))
+                if row["holder"] != t["candidate"] or not row["lease_id"]:
+                    raise AuthorityError("bad_state", "grant does not match this transition")
+                if not self._lease_valid(row, now):
+                    raise AuthorityError("expired", "lease lapsed; only a recovery transition can grant again")
+                return self._lease_view(row, now, self._lease["expires"] - now)
+            if t["state"] != "FENCING":
+                raise AuthorityError("bad_state", f"transition is {t['state']}")
+            self._expect_tuple(row, t, t["fenced_epoch"])
+            self._require_transfer_mode(row, ("HANDOVER",))
             if now < self._barrier_until:
                 raise AuthorityError("not_quiet", "new incarnation barrier", self._barrier_until - now)
+            cand = self._participant(db, t["candidate"])
+            if cand is None or cand["kind"] != "pc" or not cand["eligible"]:
+                raise AuthorityError("ineligible", "candidate is not an eligible enrolled PC")
             lease_id = "ls-" + secrets.token_hex(8)
-            db.execute("UPDATE authority SET holder=?, lease_id=?, lease_ready=0,"
-                       " max_validity=MAX(max_validity, ?), updated_at=? WHERE fleet_id=?",
-                       (t["candidate"], lease_id, self.lease_seconds, self._wall(), self.fleet_id))
+            w = self._wall()
+            updated = db.execute(
+                "UPDATE authority SET holder=?, lease_id=?, lease_ready=0,"
+                " max_validity=MAX(max_validity, ?), updated_at=? "
+                "WHERE fleet_id=? AND holder IS NULL AND lease_id IS NULL AND incarnation=? AND epoch=?",
+                (t["candidate"], lease_id, self.lease_seconds, w, self.fleet_id,
+                 row["incarnation"], row["epoch"])).rowcount
+            if updated != 1:
+                raise AuthorityError("bad_state", "fence does not match the authority tuple")
+            db.execute("UPDATE transitions SET state='GRANTED_NOT_READY', updated_at=? WHERE transition_id=?",
+                       (w, transition_id))
             self._lease = {"lease_id": lease_id, "holder": t["candidate"], "expires": now + self.lease_seconds}
             self._validity_end = max(self._validity_end or 0.0, self._lease["expires"])
             self._drain_since = None  # the new holder renews normally; admission still waits for ready
-            db.execute("UPDATE transitions SET state='GRANTED_NOT_READY', updated_at=? WHERE transition_id=?",
-                       (self._wall(), transition_id))
-            return {"holder": t["candidate"], "lease_id": lease_id, "incarnation": row["incarnation"],
-                    "epoch": row["epoch"], "valid_for": self.lease_seconds, "ready": False}
+            return self._lease_view(row, now, self.lease_seconds)
 
     def complete(self, transition_id, canary_ok):
-        """Verified canary activates admission; a failed one leaves no MAIN at a fresh epoch."""
+        """Verified canary activates admission; a failed one leaves no MAIN at a fresh epoch.
+
+        A tuple that no longer matches the fenced grant is ``stale`` and is not activated
+        and not failed. Failing it would advance the epoch again on a record this step
+        does not own.
+        """
         self._guard()
         _bool(canary_ok, "canary_ok")
         with self._tx() as db:
             t = self._open(db, transition_id, ("GRANTED_NOT_READY",))
             row, now, w = self._row(db), self._mono(), self._wall()
+            self._expect_tuple(row, t, t["fenced_epoch"])
+            self._require_transfer_mode(row, ("HANDOVER",))
+            if row["holder"] != t["candidate"] or not row["lease_id"]:
+                raise AuthorityError("bad_state", "grant does not match this transition")
             if canary_ok and self._lease_valid(row, now):
                 pref = t["candidate"] if t["action"] == "set_preferred_main" else row["preferred"]
-                db.execute("UPDATE authority SET lease_ready=1, mode='V2_ACTIVE', preferred=?, transition_id=NULL,"
-                           " updated_at=? WHERE fleet_id=?", (pref, w, self.fleet_id))
+                updated = db.execute(
+                    "UPDATE authority SET lease_ready=1, mode='V2_ACTIVE', preferred=?, transition_id=NULL,"
+                    " updated_at=? WHERE fleet_id=? AND incarnation=? AND epoch=? AND holder=?",
+                    (pref, w, self.fleet_id, row["incarnation"], row["epoch"], t["candidate"])).rowcount
+                if updated != 1:
+                    raise AuthorityError("stale", "authority moved on; refresh status")
                 db.execute("UPDATE transitions SET state='SUCCEEDED', outcome='new_main', updated_at=?"
                            " WHERE transition_id=?", (w, transition_id))
             else:
@@ -752,24 +898,15 @@ class AuthorityStore:
             t = self._open(db, transition_id, OPEN_STATES)
             w = self._wall()
             row = self._row(db)
-            # DRAINING is fenced-by-acks only on fence()'s quorum: every eligible
-            # participant and the previous holder (source, else holder, else
-            # last_holder) have acked this epoch, and at least one eligible ack
-            # exists. The extra ack check rejects vacuous _acked (no eligible
-            # participants and no prior). A partial set leaves the old MAIN in
-            # place; targets that already acked refuse its tickets in consume
-            # ("target already fenced this epoch"), so admission stays fail-closed.
-            # Ineligible or disabled acks do not count. FENCING and
-            # GRANTED_NOT_READY still fail unconditionally: fence() already
-            # advanced the epoch and cleared the old lease, so there is nothing
-            # to restore.
+            # DRAINING is fenced-by-acks only on fence()'s quorum. A partial set leaves
+            # the old MAIN in place; targets that already acked refuse its tickets in
+            # consume ("target already fenced this epoch"). Ineligible acks do not count.
+            # FENCING and GRANTED_NOT_READY still fail unconditionally: fence() already
+            # advanced the epoch and cleared the old lease, so there is nothing to restore.
             fenced_by_acks = False
             if t["state"] == "DRAINING":
                 prior = t["source"] or row["holder"] or row["last_holder"]
-                eligible_acks = db.execute(
-                    "SELECT COUNT(*) FROM participants WHERE eligible=1 AND fenced_epoch>=?",
-                    (row["epoch"],)).fetchone()[0]
-                fenced_by_acks = self._acked(db, row, (prior,)) and eligible_acks > 0
+                fenced_by_acks = self._fence_quorum(db, row, prior)
             if t["state"] in FENCED_STATES or fenced_by_acks:
                 # Full quorum, or fence() already ran: keeping the old MAIN would
                 # be a MAIN nobody obeys.
@@ -780,7 +917,6 @@ class AuthorityStore:
                 # V2_ACTIVE would claim a MAIN the store no longer has.
                 self._fail_after_fence(db, transition_id, "cancelled_after_release")
             else:
-                self._drain_since = None
                 db.execute("UPDATE authority SET transition_id=NULL, mode=CASE WHEN mode='HANDOVER' THEN"
                            " 'V2_ACTIVE' ELSE mode END, updated_at=? WHERE fleet_id=?", (w, self.fleet_id))
                 db.execute("UPDATE transitions SET state='CANCELLED', outcome='old_main_kept', updated_at=?"
@@ -789,16 +925,17 @@ class AuthorityStore:
                 row = self._row(db)
                 if row["holder"] and not self._lease_valid(row, self._mono()):
                     db.execute("UPDATE authority SET mode='V2_ONLY_NO_MAIN' WHERE fleet_id=?", (self.fleet_id,))
+                self._drain_since = None
             return _transition_view(self._get(db, transition_id))
 
     def _fail_after_fence(self, db, transition_id, outcome):
-        self._lease = None
-        self._drain_since = None
         w = self._wall()
         db.execute("UPDATE authority SET holder=NULL, lease_id=NULL, lease_ready=0, epoch=epoch+1,"
                    " mode='V2_ONLY_NO_MAIN', transition_id=NULL, updated_at=? WHERE fleet_id=?", (w, self.fleet_id))
         db.execute("UPDATE transitions SET state='FAILED', outcome=?, updated_at=? WHERE transition_id=?",
                    (outcome, w, transition_id))
+        self._lease = None
+        self._drain_since = None
 
     # --- admission ----------------------------------------------------------------------
 

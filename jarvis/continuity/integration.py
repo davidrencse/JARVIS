@@ -1139,6 +1139,8 @@ def production_issuer(private_key, client, *, wall=None):
 
     The callable does not verify tickets and does not treat a boolean as a signature.
     A MAIN that is not current and ready refuses with `stale` before anything is signed.
+    The signing client must itself be that MAIN. After Zenbook yields to Dell, or Dell
+    yields back to Arch, the former holder's key refuses and nothing is signed.
     """
     clock = time.time if wall is None else wall
     if not callable(clock):
@@ -1155,6 +1157,11 @@ def production_issuer(private_key, client, *, wall=None):
                  and status.get("main_ready") is True and _ident_ok(status.get("main")))
         if not ready or effect_class not in _EFFECTS:
             raise IntegrationError("stale" if effect_class in _EFFECTS else "bad_request")
+        signer = getattr(client, "device_id", None)
+        holder = status.get("lease_holder")
+        if (not _ident_ok(signer) or signer != status.get("main")
+                or ("lease_holder" in status and holder != signer)):
+            raise IntegrationError("stale")
         if not _ident_ok(target) or not _ident_ok(operation_id) or not _ident_ok(attempt_id):
             raise IntegrationError("bad_request")
         if not _DIGEST.fullmatch(digest or ""):

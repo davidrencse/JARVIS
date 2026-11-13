@@ -131,7 +131,12 @@ with open(patch, encoding="utf-8") as fh:
 if not isinstance(cfg, dict) or not isinstance(upd, dict):
     raise SystemExit("config and patch must be JSON objects")
 cfg.update(upd)
-fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+if hasattr(os, "O_CLOEXEC"):
+    flags |= os.O_CLOEXEC
+fd = os.open(out, flags, 0o600)
 with os.fdopen(fd, "w", encoding="utf-8") as fh:
     json.dump(cfg, fh, indent=2, sort_keys=True)
     fh.write("\\n")
@@ -151,13 +156,11 @@ restore() {{ # $1 = /opt backup dir, $2 = config backup file
 restart_and_wait() {{
   sudo -n systemctl restart "$UNIT" || return 1
   for _ in $(seq 1 15); do
-    if systemctl is-active --quiet "$UNIT"; then
-      sleep 2
-      systemctl is-active --quiet "$UNIT" && return 0
-    fi
+    systemctl is-active --quiet "$UNIT" || return 1
     sleep 1
   done
-  return 1
+  systemctl is-active --quiet "$UNIT" || return 1
+  return 0
 }}
 """
 
@@ -217,7 +220,13 @@ def build_deploy_script(sha, ts, *, restart, patch=False):
     lines += [
         "",
         'echo "[remote] swap"',
-        'sudo -n rm -rf "$OPT" && sudo -n mv "$STAGE" "$OPT"',
+        'sudo -n mv "$OPT" "$OPT.outgoing-$TS"',
+        'if ! sudo -n mv "$STAGE" "$OPT"; then',
+        '  echo "[remote] swap FAILED; restoring live tree" >&2',
+        '  sudo -n mv "$OPT.outgoing-$TS" "$OPT" || echo "[remote] restore of live tree FAILED" >&2',
+        '  exit 1',
+        'fi',
+        'sudo -n rm -rf "$OPT.outgoing-$TS" || true',
         f'sudo -n chown -R {SERVICE_USER}:{SERVICE_USER} "$OPT"',
         'sudo -n chmod 0750 "$OPT"',
     ]

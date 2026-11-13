@@ -109,6 +109,25 @@ def _effect_word(state):
     return "not_run"
 
 
+def _status_admits(status):
+    """True only for a ready V2 lease that has no open transition.
+
+    ``main_ready`` and ``lease_valid`` must be real bools. An open transition
+    stops new work while the mode is still ``V2_ACTIVE``, which is the window
+    before ``drain`` moves the mode to ``HANDOVER``.
+    """
+    if status.get("mode") != "V2_ACTIVE":
+        return False
+    if status.get("main_ready") is not True or status.get("lease_valid") is not True:
+        return False
+    main = status.get("main")
+    if not isinstance(main, str) or not main:
+        return False
+    if "transition" in status and status["transition"] is not None:
+        return False
+    return True
+
+
 class ExecutorGuard:
     """Durable local fence plus online admission before any v2 effect.
 
@@ -132,8 +151,9 @@ class ExecutorGuard:
         self._managed = bool(managed)
         self._lock = threading.RLock()
         # Journal sections take ``_lock``. Authority calls and sinks release it.
-        # ``_inflight`` counts sinks already running; ``fence`` waits for zero
-        # before acknowledge. ``_active`` serializes one operation at a time.
+        # ``_active`` covers an admission from before its first authority call
+        # through sink completion. ``_inflight`` separately counts sinks already
+        # running; ``fence`` waits for zero before acknowledge.
         self._cv = threading.Condition(self._lock)
         self._inflight = 0
         self._active = set()
@@ -189,7 +209,11 @@ class ExecutorGuard:
             # Waiting on our own sink would deadlock. Same refusal as fence.
             if getattr(self._tls, "depth", 0):
                 raise AuthorityError("busy", "executor guard cannot be re-entered from a sink")
-            while self._inflight:
+            # An admit temporarily releases this lock around authority calls.
+            # Closing while one of those calls is parked would set _db=None
+            # underneath it, leaving a PREPARED receipt that a reopened guard
+            # could execute. Wait for the entire admission, not just its sink.
+            while self._active or self._inflight:
                 self._cv.wait()
             if self._db is not None:
                 self._db.close()
@@ -591,6 +615,7 @@ class ExecutorGuard:
                 self._update_receipt(op, "RELEASED", "released", None)
                 raise AuthorityError("released", "interactive session was released")
             if state == "CONSUMED":
+                self._update_receipt(op, "RELEASED", "released", None)
                 raise AuthorityError("released", "interactive session was released before the effect")
             raise AuthorityError("released", "interactive session was released")
         return row
@@ -640,11 +665,13 @@ class ExecutorGuard:
         ``admission()`` is a historical read and does not authorize the sink. A PREPARED
         row still consumes the exact ticket when that lookup already found a record.
         CONSUMED work rechecks the current tuple and consumes the same ticket again
-        before ACCEPTED. An identical consume may return the old receipt for
-        reconciliation; a stale current status still refuses the effect. Revoked, stale,
-        conflict, and bad_ticket become REJECTED. A transient error leaves CONSUMED, or
-        PREPARED if this attempt never consumed, and does not call the sink. ACCEPTED
-        is uncertain and is never retried.
+        before ACCEPTED. Status is read again after consume returns: an identical
+        replay does not recheck drain, so a drain, open transition, or lapsed lease
+        that landed during the call is ``no_admission`` and does not start the sink.
+        That refusal leaves PREPARED or CONSUMED in place and is safe to repeat.
+        Revoked, stale, conflict, and bad_ticket become REJECTED. A transient error
+        leaves CONSUMED, or PREPARED if this attempt never consumed, and does not
+        call the sink. ACCEPTED is uncertain, survives restart, and is never retried.
 
         The status check, the consume, and the sink are not one distributed atomic
         effect with a revoke. A fence that is durable before ACCEPTED refuses the
@@ -717,7 +744,8 @@ class ExecutorGuard:
         Status is first. A stale tuple is refused here and is not sent to ``consume``.
         When the tuple is still current, ``consume`` rechecks membership. An identical
         ticket can return the stored receipt; ``_same_admission`` keeps that receipt
-        bound to this attempt. ``admission()`` is not called.
+        bound to this attempt. The store returns that replay before it checks drain,
+        so status is read again before this method returns. ``admission()`` is not called.
         """
         self._status_for_ticket(op)
         try:
@@ -733,32 +761,44 @@ class ExecutorGuard:
         except OSError:
             raise AuthorityError("unavailable", "authority unreachable") from None
         _same_admission(consumed, op)
-        # Fence, stop, or a higher tuple may have landed while consume ran.
+        # Drain, fence, or a higher tuple may have landed while consume ran.
+        # The replay above does not prove the lease is still admissible.
+        self._status_for_ticket(op)
         self._revalidate_open(op)
         return consumed
 
     def _status_for_ticket(self, op):
+        """Refuse work the current status cannot admit.
+
+        A regressed tuple does not lower the watermark and does not consume.
+        A newer tuple is stored from this status, never from the ticket. A
+        durable local fence rejects the receipt. Anything that is not a ready
+        ``V2_ACTIVE`` lease with no open transition — including handover,
+        drain, a lapsed lease, and a truthy non-bool ready flag — is
+        ``no_admission`` and leaves the receipt unchanged.
+        """
         with self._unlocked():
             status = self._status()
         if self._quarantined:
             raise AuthorityError("quarantined", "executor journal is unusable")
         self._check_pinned(status)
         issued = (int(status["incarnation"]), int(status["epoch"]))
-        if issued < self._high or int(status["mode_version"]) < self._high_mode:
+        mode_version = int(status["mode_version"])
+        if issued < self._high or mode_version < self._high_mode:
             raise AuthorityError("stale", "authority tuple is older than the durable high-water mark")
-        if issued > self._high or int(status["mode_version"]) > self._high_mode:
-            self._advance_high(issued[0], issued[1], int(status["mode_version"]))
+        if issued > self._high or mode_version > self._high_mode:
+            self._advance_high(issued[0], issued[1], mode_version)
         tup = (op["incarnation"], op["epoch"])
-        if (issued != tup or int(status["mode_version"]) != op["mode_version"]
+        if tup <= self._fenced:
+            self._update_receipt(op, "REJECTED", "stale", None)
+            raise AuthorityError("stale", "this installation has fenced that epoch")
+        if not _status_admits(status):
+            raise AuthorityError("no_admission", "MAIN lease not valid and ready")
+        if (issued != tup or mode_version != op["mode_version"]
                 or int(status["policy_version"]) != op["policy_version"] or status["main"] != op["main"]
                 or status["authority_id"] != op["authority_id"]):
             self._update_receipt(op, "REJECTED", "stale", None)
             raise AuthorityError("stale", "not the current MAIN tuple")
-        if status.get("mode") != "V2_ACTIVE" or not status.get("main_ready") or not status.get("lease_valid"):
-            raise AuthorityError("no_admission", "MAIN lease not valid and ready")
-        if tup <= self._fenced:
-            self._update_receipt(op, "REJECTED", "stale", None)
-            raise AuthorityError("stale", "this installation has fenced that epoch")
         return status
 
     def _on_consume_error(self, op, exc):

@@ -30,7 +30,6 @@ See `GatewayConfig`, `FailoverPolicy`, `backup_gateway`, and `restore_gateway`.
 
 import argparse
 import base64
-import errno
 import hashlib
 import ipaddress
 import json
@@ -570,6 +569,49 @@ class _GatewayHTTPServer(ThreadingHTTPServer):
             return self._active == 0
 
 
+def _participant_disabled(gateway, device_id, installation_id):
+    """True when this installation's participant row is ineligible.
+
+    A missing row is not disabled: clients are directory entries only.
+    A gateway double with no store (transport tests) is not disabled.
+    The store lock is taken after the gateway lock when the caller holds one.
+    """
+    store = getattr(gateway, "store", None)
+    db = getattr(store, "_db", None)
+    lock = getattr(store, "_lock", None)
+    if store is None or db is None or lock is None:
+        return False
+    with lock:
+        try:
+            row = db.execute(
+                "SELECT eligible FROM participants WHERE device_id=? AND installation_id=?",
+                (device_id, installation_id)).fetchone()
+        except sqlite3.Error:
+            raise GatewayError("unavailable") from None
+    if row is None:
+        return False
+    return not row["eligible"]
+
+
+def _relay_authority_changed(gateway, status, origin):
+    """True when the posted answer is no longer the live MAIN's pinned origin.
+
+    A read must not be returned after takeover. An effect that already left
+    the process is left unresolved and is not posted again.
+    """
+    try:
+        current = gateway._relay_status()
+    except GatewayError:
+        return True
+    if not isinstance(current, dict) or not isinstance(status, dict):
+        return True
+    for key in ("authority_id", "incarnation", "epoch", "mode_version", "main"):
+        if current.get(key) != status.get(key):
+            return True
+    record = getattr(gateway, "_devices", {}).get(current.get("main"))
+    return record is None or record.relay_origin != origin
+
+
 class ContinuityGateway:
     """One `AuthorityStore`, one device directory, and an optional in-process HTTP server.
 
@@ -771,8 +813,22 @@ class ContinuityGateway:
         # Replay key is a digest. The nonce text is not stored.
         nonce_digest = _nonce_digest(nonce)
         with self._lock:
+            current = self._devices.get(device_id)
+            if (current is None or current.installation_id != installation_id
+                    or current.public_key != record.public_key):
+                raise GatewayError("unauthorized")
+            record = current
             self._fresh(self._nonces, (device_id, nonce_digest), issued_at)
             if not verify_message(DEVICE_NS, message, signature, record.public_key):
+                raise GatewayError("unauthorized")
+            # Status and relay must not answer for a disabled installation.
+            # Acknowledge and consume still reach the store, which returns revoked.
+            if purpose in {"status", "relay"} and _participant_disabled(
+                    self, device_id, installation_id):
+                raise GatewayError("unauthorized")
+            current = self._devices.get(device_id)
+            if (current is None or current.installation_id != installation_id
+                    or current.public_key != record.public_key):
                 raise GatewayError("unauthorized")
             expires = issued_at + SKEW_SECONDS
             self._persist_device_nonce(device_id, nonce_digest, expires)
@@ -865,6 +921,8 @@ class ContinuityGateway:
     def status(self, principal, payload):
         """AuthorityStatus for an enrolled device. Empty payload."""
         self._accept_device(principal, "status", "status", _exact(payload, ()))
+        if _participant_disabled(self, principal.device_id, principal.installation_id):
+            raise GatewayError("unauthorized")
         return self._store(self.store.status)
 
     def renew(self, principal, payload):
@@ -1090,6 +1148,8 @@ class ContinuityGateway:
         """
         self._accept_device(principal, "client", "relay", _exact(
             payload, ("operation_id", "target", "attempt_id", "digest", "capability")))
+        if _participant_disabled(self, principal.device_id, principal.installation_id):
+            raise GatewayError("unauthorized")
         operation_id = _ident(payload["operation_id"])
         target, attempt_id = _ident(payload["target"]), _ident(payload["attempt_id"])
         digest, capability = _digest(payload["digest"]), _ident(payload["capability"])
@@ -1125,15 +1185,15 @@ class ContinuityGateway:
         })
         try:
             upstream = _post_json(origin + RELAY_PATH, body, MAX_RELAY_RESPONSE)
+            if (set(upstream) != {"operation_id", "accepted"} or upstream["operation_id"] != operation_id
+                    or not isinstance(upstream["accepted"], bool)):
+                raise GatewayError("no_relay", operation_id=operation_id)
+            if _relay_authority_changed(self, status, origin):
+                raise GatewayError("no_relay", operation_id=operation_id)
         except GatewayError:
             with self._lock:
                 self._relays[operation_id] = {"identity": identity, "state": "error"}
             raise GatewayError("no_relay", operation_id=operation_id) from None
-        if (set(upstream) != {"operation_id", "accepted"} or upstream["operation_id"] != operation_id
-                or not isinstance(upstream["accepted"], bool)):
-            with self._lock:
-                self._relays[operation_id] = {"identity": identity, "state": "error"}
-            raise GatewayError("no_relay", operation_id=operation_id)
         result = {"operation_id": operation_id, "relayed": True, "effect_authorized": False,
                   "upstream_accepted": upstream["accepted"]}
         with self._lock:
@@ -1146,12 +1206,16 @@ class ContinuityGateway:
         `envelope` is the request body the phone sent. It is checked against the signed
         `digest`, sent once, and never stored, logged, or put in the audit trail. An
         effect is keyed by `operation_id` and never re-posted: a repeat returns the stored
-        small result, and a lost or odd answer leaves the operation unresolved
-        (`no_relay`). A read is one attempt and is not remembered. `effect_authorized`
-        is always false: MAIN still needs its own admission ticket.
+        small result, and a lost, odd, or stale-authority answer leaves the operation
+        unresolved (`no_relay`). A read is one attempt and is not remembered. A read or
+        an effect that finishes after the MAIN tuple or its pinned origin changes is
+        `no_relay` and is not posted again. `effect_authorized` is always false: MAIN
+        still needs its own admission ticket.
         """
         self._accept_device(principal, "client", "relay", _exact(
             payload, ("operation_id", "target", "attempt_id", "digest", "capability", "kind")))
+        if _participant_disabled(self, principal.device_id, principal.installation_id):
+            raise GatewayError("unauthorized")
         operation_id = _ident(payload["operation_id"])
         target, attempt_id = _ident(payload["target"]), _ident(payload["attempt_id"])
         digest, capability = _digest(payload["digest"]), payload["capability"]
@@ -1203,18 +1267,17 @@ class ContinuityGateway:
         try:
             upstream = _post_json(origin + RELAY_PATH, body, limit, timeout=timeout)
             result = self._transient_result(effect, operation_id, upstream)
-            if not effect:
-                # A held read can finish after a takeover. Never return the old
-                # MAIN's answer as a read from the new authority tuple. Effects
-                # retain their at-most-once outcome and must never be re-posted.
-                current = self._relay_status()
-                if any(current.get(k) != status.get(k) for k in
-                       ("authority_id", "incarnation", "epoch", "mode_version", "main")):
-                    raise GatewayError("no_relay", operation_id=operation_id)
+            # A held call can finish after a takeover. Never return the old
+            # MAIN's answer as the new authority's. An effect stays unresolved
+            # and is not posted a second time.
+            if _relay_authority_changed(self, status, origin):
+                raise GatewayError("no_relay", operation_id=operation_id)
         except GatewayError:
             if effect:
                 with self._lock:
-                    self._effects[operation_id] = {"identity": identity, "state": "error"}
+                    slot = self._effects.get(operation_id)
+                    if slot is None or slot.get("state") != "done":
+                        self._effects[operation_id] = {"identity": identity, "state": "error"}
             raise GatewayError("no_relay", operation_id=operation_id) from None
         if effect:
             with self._lock:
@@ -1282,12 +1345,57 @@ class ContinuityGateway:
                 "capabilities": sorted(capabilities)}
 
     def disable_participant(self, owner_proof, payload):
-        """Durably revoke a participant after fresh owner proof."""
+        """Durably revoke a participant after fresh owner proof.
+
+        A participant row stays, with `eligible` false, so acknowledge still
+        reaches the store and returns `revoked`. Status and relay refuse that
+        installation. A client has no participant row: the matching directory
+        entry is deleted, and a second call is `unknown_participant`.
+        """
         self._accept_owner(owner_proof, "disable", _exact(payload, ("device_id", "installation_id")))
         device_id = _ident(payload["device_id"])
         installation_id = _ident(payload["installation_id"])
-        result = self._store(lambda: self.store.disable_participant(device_id, installation_id))
+        with self._lock:
+            try:
+                result = self._store(lambda: self.store.disable_participant(device_id, installation_id))
+            except GatewayError as exc:
+                if exc.code != "unknown_participant":
+                    raise
+                result = self._remove_client_directory(device_id, installation_id)
+                if result is None:
+                    raise
         return result if isinstance(result, dict) else {"device_id": device_id, "disabled": True}
+
+    def _remove_client_directory(self, device_id, installation_id):
+        """Delete one client directory row. None when this is not that client.
+
+        Caller holds the gateway lock. The store lock is taken after it.
+        A participant row is left for `disable_participant` on the store.
+        """
+        store = self.store
+        with store._lock:
+            try:
+                participant = store._db.execute(
+                    "SELECT 1 FROM participants WHERE device_id=?", (device_id,)).fetchone()
+                if participant is not None:
+                    return None
+                row = store._db.execute(
+                    "SELECT installation_id, kind FROM gateway_directory WHERE device_id=?",
+                    (device_id,)).fetchone()
+                if (row is None or row["kind"] != "client"
+                        or row["installation_id"] != installation_id):
+                    return None
+                store._db.execute(
+                    "DELETE FROM gateway_directory WHERE device_id=? AND installation_id=? AND kind='client'",
+                    (device_id, installation_id))
+            except sqlite3.Error:
+                raise GatewayError("unavailable") from None
+        current = self._devices.get(device_id)
+        if (current is not None and current.installation_id == installation_id
+                and current.kind == "client"):
+            self._devices.pop(device_id, None)
+        return {"device_id": device_id, "installation_id": installation_id, "kind": "client",
+                "eligible": False, "disabled": True, "already": False}
 
     def set_mode(self, owner_proof, payload):
         """One cutover edge. The store still refuses jumps to V2_ACTIVE."""
@@ -2504,30 +2612,6 @@ def _absent_file(path):
     return file
 
 
-def _exclusive_create(path):
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError:
-        raise GatewayError("conflict") from None
-    except OSError as exc:
-        if exc.errno in {errno.EEXIST, errno.ELOOP, errno.ENOTDIR}:
-            raise GatewayError("conflict") from None
-        raise GatewayError("conflict") from None
-    os.close(fd)
-
-
-def _unlink(path):
-    try:
-        os.unlink(path)
-    except OSError:
-        return
-
-
 def _open_ro(path):
     """Read-only SQLite connection. query_only is on, so this cannot write."""
     try:
@@ -2625,52 +2709,131 @@ def _wipe_destination(db, fleet_id, new_authority_id):
     _assert_wiped(db, fleet_id, new_authority_id)
 
 
+def _backup_image(src):
+    """Copy `src` in memory and return a plain SQLite image. Membership stays.
+
+    SQLite is not given the destination path. A build without
+    `serialize`/`deserialize`, or an image that stays WAL, is `unavailable`.
+    This does not wipe grants or directory rows.
+    """
+    if not _sqlite_image_io():
+        raise GatewayError("unavailable")
+    try:
+        mem = sqlite3.connect(":memory:", isolation_level=None)
+    except sqlite3.Error:
+        raise GatewayError("unavailable") from None
+    mem.row_factory = sqlite3.Row
+    try:
+        src.backup(mem)
+        _non_wal(mem)
+        _integrity(mem)
+        return _rollback_header(mem.serialize())
+    except GatewayError:
+        raise
+    except sqlite3.Error:
+        raise GatewayError("bad_state") from None
+    finally:
+        mem.close()
+
+
+def _verify_backup_image(blob, fleet_id, authority_id):
+    """Re-read a backup image in memory. The source authority id must still match."""
+    if not _plain_sqlite_image(blob) or not _sqlite_image_io():
+        raise GatewayError("bad_state")
+    try:
+        check = sqlite3.connect(":memory:", isolation_level=None)
+    except sqlite3.Error:
+        raise GatewayError("unavailable") from None
+    check.row_factory = sqlite3.Row
+    try:
+        check.deserialize(bytes(blob))
+        check.execute("PRAGMA query_only=ON")
+        _integrity(check)
+        seen_fleet, seen_auth = _snapshot_shape(check)
+    except GatewayError:
+        raise
+    except sqlite3.Error:
+        raise GatewayError("bad_state") from None
+    finally:
+        check.close()
+    if seen_fleet != fleet_id or seen_auth != authority_id:
+        raise GatewayError("authority_mismatch")
+    return seen_fleet, seen_auth
+
+
 def backup_gateway(config, output):
     """Copy one stopped authority database to a new file.
 
     Does not construct `AuthorityStore`, so the source incarnation does not
-    move. Acquires the same exclusive lock as the store (`<state_path>.writer`
-    via `_writer_lock`). A held lock is `writer_busy` and creates no output.
+    move. Acquires the same exclusive lock as the store (`_writer_lock` on
+    the database path, which locks `<realpath>.writer`). A held lock is
+    `writer_busy` and creates no output.
 
-    `output` must be absent. A symlink is `conflict` and is not followed.
-    The file is created with `O_CREAT|O_EXCL|O_NOFOLLOW`. The SQLite backup
-    API then copies pages into it. On failure the new file is removed.
+    `output` must be absent, including a symlink. A platform without directory
+    fds or SQLite serialize/deserialize is `unavailable` and creates nothing.
+
+    Pages are copied in a private memory database. SQLite never opens
+    `output`. The image is a plain rollback-journal file and is written
+    through an `O_EXCL|O_NOFOLLOW` fd on the parent directory. A name that is
+    no longer that inode, including a symlink planted in the write window, is
+    `conflict`. Failure unlinks only the inode this call still holds. A
+    replacement symlink is left in place and is not followed.
 
     The source is opened read-only after the lock is held. Its fleet id and
     authority id must match the config. An extra table, view, or trigger is
     `bad_state` and is not copied. No personal body is read or written.
     """
     _require_config(config)
+    if not _posix_anchored_io() or not _sqlite_image_io():
+        raise GatewayError("unavailable")
     source = _present_file(config.state_path)
     dest = _absent_file(output)
     if source.resolve() == Path(output).resolve():
         raise GatewayError("conflict")
+    if dest.name in ("", ".", "..") or "/" in dest.name or "\\" in dest.name:
+        raise GatewayError("bad_config")
     try:
-        lock = _writer_lock(str(Path(config.state_path)) + ".writer")
+        # `_writer_lock` appends `.writer` to the database path. Passing the
+        # lock file here would lock a different inode from `AuthorityStore`.
+        lock = _writer_lock(os.fspath(source))
     except AuthorityError as exc:
         raise GatewayError(exc.code if _safe_code(exc.code) else "writer_busy") from None
+    parent_fd = dest_fd = None
     created = False
-    src = dst = None
     fleet_id = authority_id = None
     try:
         src = _open_ro(source)
-        fleet_id, authority_id = _pin_snapshot(src, config)
-        _exclusive_create(dest)
+        try:
+            fleet_id, authority_id = _pin_snapshot(src, config)
+            image = _backup_image(src)
+        finally:
+            src.close()
+        if os.path.lexists(dest):
+            raise GatewayError("conflict")
+        parent_fd = _open_parent_dir(dest.parent)
+        if not _parent_anchored(parent_fd, dest.parent) or not _entry_absent(parent_fd, dest.name):
+            raise GatewayError("conflict")
+        dest_fd = _create_at(parent_fd, dest.name)
         created = True
-        dst = sqlite3.connect(os.fspath(dest), isolation_level=None)
-        # The backup API reads the source. query_only stays on so this
-        # connection still cannot run a writing statement.
-        src.backup(dst)
-        _integrity(dst)
+        _write_fd(dest_fd, image)
+        readback = _read_fd(dest_fd)
+        if readback != image:
+            raise GatewayError("bad_state")
+        if not _parent_anchored(parent_fd, dest.parent) or not _entry_is_fd(
+                parent_fd, dest.name, dest_fd):
+            raise GatewayError("conflict")
+        _verify_backup_image(readback, fleet_id, authority_id)
+        if not _entry_is_fd(parent_fd, dest.name, dest_fd):
+            raise GatewayError("conflict")
     except Exception:
         if created:
-            _unlink(dest)
+            _unlink_if_ours(parent_fd, dest.name, dest_fd)
         raise
     finally:
-        if dst is not None:
-            dst.close()
-        if src is not None:
-            src.close()
+        if dest_fd is not None:
+            os.close(dest_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
         lock.close()
     return {"ok": True, "output": os.fspath(dest), "state_path": os.fspath(source),
             "fleet_id": fleet_id, "authority_id": authority_id}
