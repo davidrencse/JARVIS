@@ -9,12 +9,14 @@ gateway, Tailscale or Dell has been exercised.
 
 import json
 import re
+import threading
+import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.request import Request, urlopen
 
-from jarvis.continuity.authority import SAFETY_MARGIN, AuthorityError, AuthorityStore
+from jarvis.continuity.authority import LEASE_SECONDS, SAFETY_MARGIN, AuthorityError, AuthorityStore
 from jarvis.continuity.executor import ExecutorGuard
 from jarvis.continuity.gateway import AuthorityClient, GatewayError
 from jarvis.continuity.integration import (
@@ -42,6 +44,8 @@ from jarvis.continuity.integration import (
 )
 from jarvis.continuity.ingress import PHONE_COOKIE, IngressError, PhoneProtocolAdapter
 from jarvis.continuity.runtime import RuntimeRefusal
+from jarvis.continuity.participant import Participant
+from jarvis.continuity.renewal import LeaseRenewer
 from tests.continuity._fleet import Clock
 
 SECRET = "SECRET-PROMPT-do-not-store"
@@ -154,6 +158,9 @@ class Composed(unittest.TestCase):
         self.addCleanup(self.fleet.close)
         self.arch = self.fleet.nodes["zenbook"]
         self.dell = self.fleet.nodes["dell"]
+        self.relay_events = []
+        for node in (self.arch, self.dell):
+            self.record_relay(node)
         self.fleet.cutover()
         _, self.arch_lease = self.fleet.promote("zenbook")
         self.arch.runtime.start()
@@ -164,6 +171,30 @@ class Composed(unittest.TestCase):
         self.ingress.activate(self.fleet.status()["mode_version"], legacy_phone_fenced=True)
         self.http = PhoneProtocolAdapter(self.ingress)
         self.cookie, self.csrf = self._pair()
+
+    def record_relay(self, node):
+        """Keep fixture errors visible instead of losing them in Handler's 503.
+
+        Preserve the real transport, deadline, and at-most-once behavior. In
+        particular, never retry an ask to make an intermittent failure pass.
+        """
+        real = node.handle_relay
+
+        def recorded(body):
+            event = {"node": node.name, "kind": body.get("kind")}
+            started = time.monotonic()
+            self.relay_events.append(event)
+            try:
+                result = real(body)
+                event["status"] = result[0]
+                return result
+            except Exception as exc:
+                event["exception"] = type(exc).__name__ + ": " + str(exc)
+                raise
+            finally:
+                event["elapsed"] = time.monotonic() - started
+
+        node.handle_relay = recorded
 
     def _pair(self):
         self.ingress.identify(hdr())
@@ -213,7 +244,7 @@ class Composed(unittest.TestCase):
 
     def test_arch_sleep_promotes_dell_same_phone_session_sink_once_stale_arch_refused(self):
         first = self.ask("op-ask-0001")
-        self.assertEqual(first.status, 200, first.body)
+        self.assertEqual(first.status, 200, (first.body, self.relay_events))
         self.assertEqual(self.arch.effects, ["op-ask-0001"])
         again = self.ask("op-ask-0001")
         self.assertEqual(again.status, 200, again.body)
@@ -257,6 +288,91 @@ class Composed(unittest.TestCase):
         self.assertIn(renew.exception.code, ("stale", "expired", "not_holder"))
 
     # --- reboot, partition, restart ---------------------------------------------
+
+    def crash_arch(self):
+        """Lose the relay and renewals without drain, release, fence, or handoff.
+
+        shutdown() stops only the loopback stand-in, not a JARVIS service. Keep
+        the socket so the return test can bring the same endpoint back online.
+        """
+        self.arch.server.shutdown()
+        self.arch.thread.join(timeout=5)
+        self.assertFalse(self.arch.thread.is_alive())
+        self.assertTrue(self.dell.client.status()["lease_valid"])
+
+    def background_ticks(self, seconds, *nodes):
+        """Drive the production background worker with deterministic time.
+
+        Hub.start and Agent.run currently start LeaseRenewer, not the optional
+        RecoveryOrchestrator. Do not substitute owner.promote here: that would
+        hide the missing automatic recovery that caused the incident. No owner
+        private key is given to a node, and no canary is fabricated.
+        """
+        workers = [LeaseRenewer(Participant(node.client, node.runtime, guard=node.executor))
+                   for node in nodes]
+        results = []
+        for _ in range(seconds):
+            self.clock.tick(1)
+            results.append([worker.tick() for worker in workers])
+        return results
+
+    def assert_phone_served_by(self, device, key):
+        # Separate checks expose both the authority/routing failure and its
+        # phone consequence, rather than stopping at the first failed assertion.
+        with self.subTest(stage="oracle-main"):
+            self.assertEqual(self.dell.client.status()["main"], device)
+        with self.subTest(stage="paired-session"):
+            me = self.call("GET", "/phone/api/me")
+            self.assertEqual(me.status, 200, me.body)
+            self.assertEqual((me.body.get("main") or {}).get("id"), device, me.body)
+        with self.subTest(stage="phone-answer"):
+            answer = self.call("GET", "/phone/api/overview")
+            self.assertEqual(answer.status, 200, answer.body)
+            self.assertEqual(answer.body["main"], device, answer.body)
+        with self.subTest(stage="phone-effect"):
+            answer = self.ask(key)
+            self.assertEqual(answer.status, 200, answer.body)
+            self.assertEqual(self.fleet.nodes[device].effects, [key])
+
+    def test_abrupt_arch_loss_automatically_promotes_dell_and_routes_phone(self):
+        """Incident regression: no owner command and no cooperative Arch RPC."""
+        self.dell.runtime.start()
+        before = self.arch.client.renew_count()
+        self.crash_arch()
+        self.background_ticks(int(LEASE_SECONDS + SAFETY_MARGIN + 5), self.dell)
+        self.assertEqual(self.arch.client.renew_count(), before)
+        # This must turn green when the production worker can recover MAIN.
+        # Do not mark expectedFailure: the requested availability is missing.
+        self.assert_phone_served_by("dell", "op-crash-dell")
+        self.assertEqual(self.arch.effects, [])
+
+    def test_returning_arch_automatically_reclaims_main_and_routes_same_phone(self):
+        """Isolate failback even while automatic crash recovery is broken.
+
+        The one manual recovery below is an explicit setup precondition, not
+        evidence of automatic failover. The first regression tests that part.
+        Everything after Arch returns must happen without an owner command.
+        """
+        self.crash_arch()
+        self.clock.tick(LEASE_SECONDS + SAFETY_MARGIN + 1)
+        self.dell.runtime.start()
+        _, lease = self.fleet.promote("dell")
+        self.dell.runtime.accept_lease(lease)
+        self.assertEqual(self.call("GET", "/phone/api/overview").body["main"], "dell")
+
+        self.arch.reboot()
+        self.arch.runtime.invalidate_after_resume()
+        self.arch.runtime.start()
+        self.arch.thread = threading.Thread(target=self.arch.server.serve_forever, daemon=False)
+        self.arch.thread.start()
+        # Keep Dell alive while the returning preferred PC is observed for the
+        # full 30-second stability window used by RuntimePolicy. Then the fence
+        # still waits out Dell's last lease plus the safety margin (no full ack
+        # quorum: the Oracle server participant does not tick here), so the
+        # handback cannot finish before 30 + LEASE_SECONDS + SAFETY_MARGIN.
+        self.background_ticks(int(30 + LEASE_SECONDS + SAFETY_MARGIN + 5), self.dell, self.arch)
+        self.assert_phone_served_by("zenbook", "op-return-arch")
+        self.assertEqual(self.dell.effects, [])
 
     def test_reboot_partition_and_restart_do_not_replay(self):
         self.assertEqual(self.ask("op-before-01").status, 200)

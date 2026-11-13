@@ -230,6 +230,7 @@ class ParticipantChannelTests(unittest.TestCase):
             self.assertEqual(db.execute('select payload from jobs where id=?', (job,)).fetchone()[0], '{}')
 
     def test_scoped_brain_transfer_after_drain_and_expiry_refusal(self):
+        import contextlib
         import sqlite3
         import hashlib
         from jarvis import brainsync, transfer
@@ -254,7 +255,7 @@ class ParticipantChannelTests(unittest.TestCase):
                           'vault': {'enabled': True, 'path': str(vault)}}
             p.config, p.state = configs[d], self.states[d]
         (self.root/'zenbook/vault/note.md').write_text('latest note')
-        with sqlite3.connect(self.states['zenbook']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(self.states['zenbook']/'memory.sqlite3')) as db, db:
             db.execute('create table items(body text)')
             db.execute('insert into items values (?)', ('private sqlite bytes',))
         def within(config, path):
@@ -267,7 +268,7 @@ class ParticipantChannelTests(unittest.TestCase):
             result = brainsync.handoff('zenbook', 'dell', configs['zenbook'], self.states['zenbook'].parent, transport=adapter)
             self.assertTrue(result['ok'], result)
             self.assertEqual((self.root/'dell/vault/note.md').read_text(), 'latest note')
-            with sqlite3.connect(self.states['dell']/'memory.sqlite3') as db:
+            with contextlib.closing(sqlite3.connect(self.states['dell']/'memory.sqlite3')) as db, db:
                 self.assertEqual(db.execute('select body from items').fetchone()[0], 'private sqlite bytes')
             operation = {'action': 'brain_stage', 'path': devices['dell']['brain_transfer_dir']}
             self.clock.tick(100)

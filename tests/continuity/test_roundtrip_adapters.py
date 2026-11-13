@@ -1,5 +1,6 @@
 """Two PC handoffs using actual adapters, fake wire/process/service boundaries."""
 import base64
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -39,7 +40,7 @@ class RoundTripAdapters(unittest.TestCase):
             p.runtime._probe = lambda d=d: {'control_ready': self.healthy[d]}
             self.hubs[d] = SimpleNamespace(state=state, main=d, started=False,
                 continuity_endpoint='https://'+d+'.example.ts.net:443')
-        with sqlite3.connect(e.states['zenbook']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['zenbook']/'memory.sqlite3')) as db, db:
             db.execute('create table items(body text)'); db.execute("insert into items values ('first brain')")
         (e.root/'zenbook/vault/note.md').write_text('first note')
         e.seat_zenbook()
@@ -70,7 +71,7 @@ class RoundTripAdapters(unittest.TestCase):
         return part
 
     def quick_check(self, device):
-        with sqlite3.connect(self.e.states[device]/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(self.e.states[device]/'memory.sqlite3')) as db, db:
             return db.execute('pragma quick_check').fetchone()[0] == 'ok'
 
     def handoff(self, old, new):
@@ -133,7 +134,7 @@ class RoundTripAdapters(unittest.TestCase):
         return path, hashes
 
     def prepare_return(self, **changes):
-        with sqlite3.connect(self.e.states['dell']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(self.e.states['dell']/'memory.sqlite3')) as db, db:
             db.execute("insert into items values ('new Dell memory')")
         return self.stage_return('dell', 'zenbook', **changes)
 
@@ -148,7 +149,7 @@ class RoundTripAdapters(unittest.TestCase):
         self.assertEqual(e.store.status()['main'], 'zenbook')
         self.assertFalse(brainsync._frozen(e.states['zenbook'].parent, 'zenbook'))
         self.assertTrue(brainsync._frozen(e.states['dell'].parent, 'dell'))
-        with sqlite3.connect(e.states['zenbook']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['zenbook']/'memory.sqlite3')) as db, db:
             self.assertEqual(db.execute('select count(*) from items').fetchone()[0], 2)
         self.assertEqual(self.switches, [('zenbook', 'dell'), ('dell', 'zenbook')])
         with self.assertRaises(RuntimeRefusal): e.participants['dell'].runtime.require_authority('ordinary')
@@ -156,7 +157,7 @@ class RoundTripAdapters(unittest.TestCase):
 
     def test_return_without_operator_disposition_preserves_memory_conflict_and_freeze(self):
         e = self.e; self.assertTrue(self.handoff('zenbook', 'dell')['ok'])
-        with sqlite3.connect(e.states['dell']/'memory.sqlite3') as db: db.execute("insert into items values ('different')")
+        with contextlib.closing(sqlite3.connect(e.states['dell']/'memory.sqlite3')) as db, db: db.execute("insert into items values ('different')")
         before = brainsync.snapshot_memory(e.states['zenbook']/'memory.sqlite3')
         result = self.handoff('dell', 'zenbook')
         self.assertFalse(result['ok'])
@@ -171,7 +172,7 @@ class RoundTripAdapters(unittest.TestCase):
         self.assertFalse(e.store.status()['lease_valid'])
         self.assertTrue(return_brain.refreeze(e.participants['zenbook'])['memory_preserved'])
         self.assertTrue(brainsync._frozen(e.states['zenbook'].parent, 'zenbook'))
-        with sqlite3.connect(e.states['zenbook']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['zenbook']/'memory.sqlite3')) as db, db:
             self.assertEqual(db.execute('select count(*) from items').fetchone()[0], 2)
 
     def test_candidate_readiness_failure_keeps_existing_main(self):
@@ -241,7 +242,7 @@ class RoundTripAdapters(unittest.TestCase):
         self.assertEqual(alive.exception.code, 'main_alive')
         self.assertTrue(approval.is_file())
         self.assertFalse((e.states['zenbook']/first_archive/return_brain.FILE).exists())
-        with sqlite3.connect(e.states['zenbook']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['zenbook']/'memory.sqlite3')) as db, db:
             db.execute("insert into items values ('second outward')")
         self.stage_return('zenbook', 'dell')
         dell_archive = self.approval('dell')['archive']
@@ -251,7 +252,7 @@ class RoundTripAdapters(unittest.TestCase):
         self.assertFalse(brainsync._frozen(e.states['dell'].parent, 'dell'))
         self.assertTrue(brainsync._frozen(e.states['zenbook'].parent, 'zenbook'))
         self.assertEqual((e.states['dell']/dell_archive/'memory.sqlite3').read_bytes(), dell_memory)
-        with sqlite3.connect(e.states['dell']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['dell']/'memory.sqlite3')) as db, db:
             db.execute("insert into items values ('second return')")
         with self.assertRaises(RuntimeRefusal) as wrong:
             self.stage_return('dell', 'zenbook', incoming_sha256='0'*64)
@@ -267,13 +268,13 @@ class RoundTripAdapters(unittest.TestCase):
         self.assertEqual(e.store.status()['main'], 'zenbook')
         self.assertEqual(self.approval('zenbook')['phase'], 'activated')
         self.assertEqual(self.switches, [('zenbook', 'dell'), ('dell', 'zenbook'), ('zenbook', 'dell'), ('dell', 'zenbook')])
-        with sqlite3.connect(e.states['zenbook']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['zenbook']/'memory.sqlite3')) as db, db:
             self.assertEqual([row[0] for row in db.execute('select body from items order by rowid')],
                              ['first brain', 'new Dell memory', 'second outward', 'second return'])
-        with sqlite3.connect(e.states['zenbook']/first_archive/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['zenbook']/first_archive/'memory.sqlite3')) as db, db:
             self.assertEqual([row[0] for row in db.execute('select body from items')], ['first brain'])
         self.assertTrue((e.states['zenbook']/first_archive/'activated-freeze.json').is_file())
-        with sqlite3.connect(e.states['zenbook']/second['archive']/'memory.sqlite3') as db:
+        with contextlib.closing(sqlite3.connect(e.states['zenbook']/second['archive']/'memory.sqlite3')) as db, db:
             self.assertEqual(db.execute('select count(*) from items').fetchone()[0], 3)
         self.assertEqual((e.states['dell']/dell_archive/'memory.sqlite3').read_bytes(), dell_memory)
 

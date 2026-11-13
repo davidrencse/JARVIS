@@ -362,6 +362,16 @@ class Cutover(Base):
 
 
 class Routing(Base):
+    def test_relay_outage_is_temporary_and_does_not_mean_phone_was_refused(self):
+        refusal = self.ing._from_gateway(GatewayError("no_relay"))
+        self.assertEqual((refusal.code, refusal.status, refusal.wait), ("no_relay", 503, 2))
+        self.assertIn("reconnect", refusal.message)
+        self.assertNotIn("refused", refusal.message)
+        self.gw.view.update(main=None, main_ready=False, lease_valid=False)
+        with self.assertRaises(IngressError) as caught:
+            self.ing._route(self.gw.view)
+        self.assertEqual((caught.exception.code, caught.exception.wait), ("no_main", 2))
+
     def test_no_ready_main_and_no_substitute_target(self):
         self.activate()
         issued, body = self.pair_body()

@@ -90,6 +90,19 @@ class RepointVerifyCacheTests(unittest.TestCase):
         self.assertEqual(checks.call_count, 2)
         self.assertEqual(len(repoint._VERIFY_CACHE), 2)
 
+    def test_mutation_during_signature_check_cannot_poison_cache(self):
+        instruction = _instruction()
+        def check(*_args):
+            instruction['body']['endpoint'] = 'https://evil.example:443'
+            return True
+        with patch('jarvis.continuity.repoint.verify_message', side_effect=check):
+            body = self._verify(instruction)
+        self.assertEqual(body['endpoint'], _body()['endpoint'])
+        with patch('jarvis.continuity.repoint.verify_message', return_value=True) as checks:
+            cached = self._verify()
+        self.assertEqual(cached, _body())
+        checks.assert_not_called()
+
     def test_changed_pins_reverifies(self):
         with patch('jarvis.continuity.repoint.verify_message', return_value=True) as checks:
             self._verify()

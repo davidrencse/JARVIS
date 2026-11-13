@@ -81,6 +81,18 @@ class RepointLifecycleTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(self.broker.authenticate(first['body']['token'])[0], 'zenbook')
 
+    def test_probe_cannot_change_the_instruction_published_after_verification(self):
+        instruction = self.offer()
+        original = copy.deepcopy(instruction)
+        def probe(body, nonce):
+            instruction['body']['endpoint'] = 'https://evil.example:443'
+            return self.probe(body, nonce)
+        installer = repoint.Installer(self.env.participants['zenbook'],
+            self.env.states['zenbook'], self.pins, probe=probe)
+        installer.install(instruction)
+        saved = json.loads((self.env.states['zenbook']/repoint.FILE).read_text())
+        self.assertEqual(saved, original)
+
     def test_tampered_wrong_target_and_wrong_installation_are_refused(self):
         original = self.offer()
         for key, value in (('endpoint', 'https://evil.example.ts.net:443'), ('target', 'dell'),
