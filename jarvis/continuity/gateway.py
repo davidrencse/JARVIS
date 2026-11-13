@@ -132,6 +132,12 @@ _PURPOSE_PATH = {
     "consume": "/v1/authority/admissions/consume",
     "lookup": "/v1/authority/admissions/lookup",
     "relay": "/v1/authority/relay",
+    # Self-recovery (opt-in per gateway config): an enrolled PC asks to take or
+    # return MAIN for itself. The store's lease, epoch and fence rules still
+    # decide; these purposes only let a device open and step its own transition.
+    "self_policy": "/v1/authority/self/policy",
+    "self_transition": "/v1/authority/self/transitions",
+    "self_step": "/v1/authority/self/transitions/step",
 }
 _OWNER_PATH = {
     "transition": "/v1/authority/transitions",
@@ -578,7 +584,8 @@ class ContinuityGateway:
     and phone bodies stay in RAM and are never written.
     """
 
-    def __init__(self, store, owner_public_keys, *, wall=time.time, owns_store=False):
+    def __init__(self, store, owner_public_keys, *, wall=time.time, owns_store=False,
+                 self_recovery=None):
         keys = tuple(owner_public_keys)
         if not keys:
             raise GatewayError("bad_request")
@@ -605,11 +612,12 @@ class ContinuityGateway:
         # Manual promotion only. Constructed with the default so no gateway
         # object can grow an automatic promoter later in this process.
         self.policy = FailoverPolicy(auto_failover=False)
+        self.self_recovery = _self_recovery(self_recovery)
         self._load_durable()
 
     @classmethod
     def open(cls, path, fleet_id, authority_id, owner_public_keys, *, monotonic=time.monotonic,
-             wall=time.time, lease_seconds=None, margin=None):
+             wall=time.time, lease_seconds=None, margin=None, self_recovery=None):
         kwargs = {"monotonic": monotonic, "wall": wall}
         if lease_seconds is not None:
             kwargs["lease_seconds"] = lease_seconds
@@ -620,12 +628,16 @@ class ContinuityGateway:
         except AuthorityError as exc:
             raise GatewayError(exc.code) from None
         try:
-            return cls(store, owner_public_keys, wall=wall, owns_store=True)
+            return cls(store, owner_public_keys, wall=wall, owns_store=True,
+                       self_recovery=self_recovery)
         except Exception:
             store.close()
             raise
 
     def close(self):
+        front = getattr(self, "phone_front", None)
+        if front:
+            front.close()
         self.shutdown()
         if self._owns_store and not self._closed:
             self._closed = True
@@ -911,6 +923,78 @@ class ContinuityGateway:
             raise GatewayError("forbidden")
         return self._store(lambda: self.store.readiness(transition_id, control_ready, ai_ready, checkpoint))
 
+    # --- self-recovery -------------------------------------------------------------
+    #
+    # Off unless the gateway config names `self_recovery`. A PC listed there may
+    # open `recover` for itself once the old lease has lapsed (the store refuses
+    # `main_alive` before that), and the preferred PC may open
+    # `set_preferred_main` for itself to take MAIN back. The device then steps only
+    # the transitions it opened. Fencing is unchanged: `fence` still waits for the
+    # old validity plus margin or a full acknowledgement quorum, and the epoch
+    # moves before any grant, so a returning or partitioned old MAIN is refused.
+
+    def _self_allowed(self, principal):
+        config = self.self_recovery
+        if config is None:
+            raise GatewayError("forbidden")
+        if principal.kind != "pc" or principal.device_id not in config["candidates"]:
+            raise GatewayError("forbidden")
+        return config
+
+    def self_policy(self, principal, payload):
+        self._accept_device(principal, "candidate", "self_policy", _exact(payload, ()))
+        config = self.self_recovery
+        if config is None or principal.kind != "pc" or principal.device_id not in config["candidates"]:
+            return {"enabled": False}
+        return {"enabled": True, "candidates": list(config["candidates"]),
+                "preferred": config["preferred"], "stability_s": config["stability_s"]}
+
+    def self_transition(self, principal, payload):
+        self._accept_device(principal, "candidate", "self_transition", _exact(payload, (
+            "client_key", "action", "expected_incarnation", "expected_epoch",
+            "expected_policy", "profile")))
+        config = self._self_allowed(principal)
+        action = payload["action"]
+        if action == "set_preferred_main":
+            current = self._store(self.store.status)
+            if principal.device_id != (current.get("preferred") or config["preferred"]):
+                raise GatewayError("forbidden")
+        elif action != "recover":
+            raise GatewayError("forbidden")
+        return self._store(lambda: self.store.request(
+            "self:" + principal.device_id, _ident(payload["client_key"]), action,
+            principal.device_id, _nnint(payload["expected_incarnation"]),
+            _nnint(payload["expected_epoch"]), _nnint(payload["expected_policy"]), payload["profile"]))
+
+    def self_step(self, principal, payload):
+        self._accept_device(principal, "candidate", "self_step", _exact(
+            payload, ("transition_id", "step"), ("canary_ok",)))
+        self._self_allowed(principal)
+        transition_id, step = _ident(payload["transition_id"]), payload["step"]
+        if step not in {"drain", "fence", "grant", "complete", "cancel"}:
+            raise GatewayError("bad_request")
+        if (step == "complete") != ("canary_ok" in payload):
+            raise GatewayError("bad_request")
+        current = self._store(lambda: self.store.transition(transition_id))
+        caller = self._store(lambda: self.store.transition_caller(transition_id))
+        own = caller == "self:" + principal.device_id and current["candidate"] == principal.device_id
+        if not own:
+            # A surviving PC may clear a dead candidate's not-ready grant and
+            # nothing else. After a fence that leaves no MAIN, never two.
+            status = self._store(self.store.status)
+            if not (step == "cancel" and current["state"] == "GRANTED_NOT_READY"
+                    and not status.get("lease_valid")):
+                raise GatewayError("forbidden")
+        if step == "drain":
+            return self._store(lambda: self.store.drain(transition_id))
+        if step == "fence":
+            return self._store(lambda: self.store.fence(transition_id))
+        if step == "grant":
+            return self._store(lambda: self.store.grant(transition_id))
+        if step == "cancel":
+            return self._store(lambda: self.store.cancel(transition_id))
+        return self._store(lambda: self.store.complete(transition_id, _flag(payload["canary_ok"])))
+
     def transition_step(self, owner_proof, payload):
         """drain, fence, grant, complete, or cancel. Owner proof only; no policy-token bypass."""
         self._accept_owner(owner_proof, "step", _exact(
@@ -1119,6 +1203,14 @@ class ContinuityGateway:
         try:
             upstream = _post_json(origin + RELAY_PATH, body, limit, timeout=timeout)
             result = self._transient_result(effect, operation_id, upstream)
+            if not effect:
+                # A held read can finish after a takeover. Never return the old
+                # MAIN's answer as a read from the new authority tuple. Effects
+                # retain their at-most-once outcome and must never be re-posted.
+                current = self._relay_status()
+                if any(current.get(k) != status.get(k) for k in
+                       ("authority_id", "incarnation", "epoch", "mode_version", "main")):
+                    raise GatewayError("no_relay", operation_id=operation_id)
         except GatewayError:
             if effect:
                 with self._lock:
@@ -1494,6 +1586,12 @@ class ContinuityGateway:
             return self.consume(principal, payload)
         if purpose == "lookup":
             return self.admission(principal, payload)
+        if purpose == "self_policy":
+            return self.self_policy(principal, payload)
+        if purpose == "self_transition":
+            return self.self_transition(principal, payload)
+        if purpose == "self_step":
+            return self.self_step(principal, payload)
         return self.relay(principal, payload)
 
     def _dispatch_owner(self, purpose, proof, payload):
@@ -1701,6 +1799,23 @@ class AuthorityClient:
 
     def enroll(self, record):
         return self._owner("enroll", record)
+
+    def self_policy(self):
+        return self._device("self_policy", {})
+
+    def self_request(self, client_key, action, expected_incarnation, expected_epoch,
+                     expected_policy, profile="control"):
+        return self._device("self_transition", {
+            "client_key": client_key, "action": action,
+            "expected_incarnation": expected_incarnation, "expected_epoch": expected_epoch,
+            "expected_policy": expected_policy, "profile": profile,
+        })
+
+    def self_step(self, transition_id, step, canary_ok=None):
+        payload = {"transition_id": transition_id, "step": step}
+        if canary_ok is not None:
+            payload["canary_ok"] = canary_ok
+        return self._device("self_step", payload)
 
     def set_mode(self, mode, expected_mode_version):
         return self._owner("mode", {"mode": mode, "expected_mode_version": expected_mode_version})
@@ -1931,7 +2046,7 @@ _ALLOWED_SNAPSHOT_TABLES = frozenset({
 _CONFIG_KEYS = frozenset({
     "state_path", "fleet_id", "authority_id", "owner_public_keys",
     "bind_host", "bind_port", "tls_cert", "tls_key",
-    "lease_seconds", "margin", "auto_failover",
+    "lease_seconds", "margin", "auto_failover", "self_recovery", "phone_front",
 })
 _CONFIG_REQUIRED = frozenset({"state_path", "fleet_id", "authority_id", "owner_public_keys"})
 _MAX_CONFIG_BYTES = 65536
@@ -2081,6 +2196,63 @@ def _nonce_from_stored(row):
     return (device_id, digest), expires
 
 
+SELF_RECOVERY_STABILITY_S = 30.0
+
+
+def _self_recovery(value):
+    """`{"candidates": [pc ids], "preferred": pc id}` or None (off).
+
+    `preferred` must be a candidate; it is the PC that takes MAIN back after
+    `stability_s` (at least 30 s) of steady readiness. No other keys.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict) and value.get("enabled") is False and set(value) <= {"enabled"}:
+        return None
+    if not isinstance(value, dict) or set(value) - {"candidates", "preferred", "stability_s"}:
+        raise GatewayError("bad_request")
+    candidates = value.get("candidates")
+    if not isinstance(candidates, (list, tuple)) or not 0 < len(candidates) <= 8:
+        raise GatewayError("bad_request")
+    names = tuple(_ident(item) for item in candidates)
+    if len(set(names)) != len(names):
+        raise GatewayError("bad_request")
+    preferred = value.get("preferred")
+    if preferred is not None and preferred not in names:
+        raise GatewayError("bad_request")
+    stability = value.get("stability_s", SELF_RECOVERY_STABILITY_S)
+    if (isinstance(stability, bool) or not isinstance(stability, (int, float))
+            or not math.isfinite(stability) or stability < SELF_RECOVERY_STABILITY_S or stability > 3600):
+        raise GatewayError("bad_request")
+    return {"candidates": names, "preferred": preferred, "stability_s": float(stability)}
+
+
+def _phone_front(value):
+    """`{"bind_port": 1024-65535, "upstreams": {device: origin}}` or None (off).
+
+    The front binds 127.0.0.1 only. Each origin is an https `*.ts.net` name or
+    a loopback http origin; `PhoneFront` validates them.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"bind_port", "upstreams"}:
+        raise GatewayError("bad_config")
+    port = value["bind_port"]
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+        raise GatewayError("bad_config")
+    upstreams = value["upstreams"]
+    if not isinstance(upstreams, dict) or not 0 < len(upstreams) <= 8:
+        raise GatewayError("bad_config")
+    from jarvis.continuity import phone_front
+    clean = {}
+    for device, origin in upstreams.items():
+        try:
+            clean[_ident(device)] = phone_front._check_origin(origin)
+        except (GatewayError, ValueError):
+            raise GatewayError("bad_config") from None
+    return {"bind_port": port, "upstreams": clean}
+
+
 class FailoverPolicy:
     """Manual MAIN promotion only.
 
@@ -2135,7 +2307,8 @@ class GatewayConfig:
     """
 
     def __init__(self, *, state_path, fleet_id, authority_id, owner_public_keys, bind_host,
-                 bind_port, tls_cert, tls_key, lease_seconds, margin, auto_failover):
+                 bind_port, tls_cert, tls_key, lease_seconds, margin, auto_failover,
+                 self_recovery=None, phone_front=None):
         self.state_path = state_path
         self.fleet_id = fleet_id
         self.authority_id = authority_id
@@ -2147,6 +2320,8 @@ class GatewayConfig:
         self.lease_seconds = lease_seconds
         self.margin = margin
         self.auto_failover = auto_failover
+        self.self_recovery = self_recovery
+        self.phone_front = phone_front
 
 
 def _live_roots():
@@ -2281,11 +2456,21 @@ def load_gateway_config(path):
     auto_failover = data.get("auto_failover", False)
     if not isinstance(auto_failover, bool):
         raise GatewayError("bad_config")
+    self_recovery = None
+    if "self_recovery" in data:
+        try:
+            self_recovery = _self_recovery(data["self_recovery"])
+        except GatewayError:
+            raise GatewayError("bad_config") from None
+    phone_front = None
+    if "phone_front" in data:
+        phone_front = _phone_front(data["phone_front"])
     return GatewayConfig(
         state_path=state_path, fleet_id=_as_ident(data["fleet_id"]),
         authority_id=_as_ident(data["authority_id"]), owner_public_keys=tuple(public_keys),
         bind_host=bind_host, bind_port=bind_port, tls_cert=tls_cert, tls_key=tls_key,
-        lease_seconds=lease_seconds, margin=margin, auto_failover=auto_failover)
+        lease_seconds=lease_seconds, margin=margin, auto_failover=auto_failover,
+        self_recovery=self_recovery, phone_front=phone_front)
 
 
 def _require_config(config):
@@ -2968,7 +3153,8 @@ def serve_gateway(config):
     if config.margin is not None:
         kwargs["margin"] = config.margin
     gateway = ContinuityGateway.open(
-        config.state_path, config.fleet_id, config.authority_id, config.owner_public_keys, **kwargs)
+        config.state_path, config.fleet_id, config.authority_id, config.owner_public_keys,
+        self_recovery=config.self_recovery, **kwargs)
     gateway.policy = policy
     try:
         origin = gateway.serve(
@@ -2976,6 +3162,16 @@ def serve_gateway(config):
     except Exception:
         gateway.close()
         raise
+    if config.phone_front:
+        from jarvis.continuity.phone_front import PhoneFront
+        try:
+            front = PhoneFront(gateway.store.status, config.phone_front["upstreams"],
+                               bind_port=config.phone_front["bind_port"])
+            front.start()
+        except Exception:
+            gateway.close()
+            raise
+        gateway.phone_front = front
     return gateway, origin
 
 

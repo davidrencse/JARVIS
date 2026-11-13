@@ -425,6 +425,45 @@ class GatewayPort:
             _from_client(exc)
 
 
+
+class SelfRecoveryPort(GatewayPort):
+    """Device-signed port for a node that recovers or reclaims MAIN for itself.
+
+    Same reads and lease calls as ``GatewayPort``. Transition requests and steps
+    go to the gateway's self-recovery purposes, signed with this installation's
+    key, instead of owner calls. The candidate is always this device; the gateway
+    checks that again and refuses when self-recovery is off.
+    """
+
+    def __init__(self, client):
+        super().__init__(client)
+        if not callable(getattr(client, "self_request", None)) or not callable(
+                getattr(client, "self_step", None)):
+            raise RuntimeRefusal("bad_request")
+
+    def transition_request(self, request):
+        if not isinstance(request, dict) or _wire_banned(request):
+            raise RuntimeRefusal("bad_request")
+        if any(key not in request for key in _REQUEST_FIELDS):
+            raise RuntimeRefusal("bad_request")
+        if set(request) - set(_REQUEST_FIELDS) - {"caller"}:
+            raise RuntimeRefusal("bad_request")
+        if request["candidate"] != getattr(self._client, "device_id", None):
+            raise RuntimeRefusal("forbidden")
+        return self._invoke(lambda: self._client.self_request(
+            request["client_key"], request["action"], request["expected_incarnation"],
+            request["expected_epoch"], request["expected_policy"], request["profile"]))
+
+    def transition_step(self, transition_id, step, canary_ok=None):
+        if step not in _STEPS:
+            raise RuntimeRefusal("bad_request")
+        if step == "complete":
+            if not isinstance(canary_ok, bool):
+                raise RuntimeRefusal("bad_request")
+        elif canary_ok is not None:
+            raise RuntimeRefusal("bad_request")
+        return self._invoke(lambda: self._client.self_step(transition_id, step, canary_ok))
+
 class MainRuntime:
     """One PC's lease, readiness, and admission latch. The hub calls these; nothing is scheduled here."""
 
@@ -940,13 +979,19 @@ def _step(ok, phase, code, wait=None, transition=None, lease=None, reason=None,
 class RecoveryOrchestrator:
     """Hub-side driver. One authority step at a time. Never grants admission by itself.
 
-    ``step`` will not complete a canary, will not call ``make_main_now``, and will
-    not shrink a store wait. The hub passes ``submit_canary(ok)`` only after its
-    own check. Candidate facts come from the hub's directory; this object does
+    ``step`` never calls ``make_main_now`` or shrinks a store wait. Without an
+    activation hook the hub passes ``submit_canary(ok)`` after its own check.
+    Candidate facts come from the hub's directory; this object does
     not probe providers or list participants (the store has no such read).
+
+    With candidate_runtime, only that node advances its own transitions and the
+    real grant is delivered before activate(device, lease). The activation hook
+    must be idempotent across retries and prove brain, endpoint and canary
+    readiness. The application must call step on its existing lifecycle tick;
+    constructing this object starts no background work.
     """
 
-    def __init__(self, port, directory, policy, clock):
+    def __init__(self, port, directory, policy, clock, *, candidate_runtime=None, activate=None):
         if not isinstance(policy, RuntimePolicy) or not callable(clock):
             raise RuntimeRefusal("bad_request")
         self._port = port
@@ -957,6 +1002,15 @@ class RecoveryOrchestrator:
         self._stable_since = None
         self._lease = None
         self._keys = {}
+        if candidate_runtime is not None and not _ident_ok(getattr(candidate_runtime, "device_id", None)):
+            raise RuntimeRefusal("bad_request")
+        if activate is not None and (candidate_runtime is None or not callable(activate)):
+            raise RuntimeRefusal("bad_request")
+        # A node-owned driver may only accept/promote its own grant. activate
+        # must bring up the brain/serving path and verify its canary; lease
+        # ownership alone is never proof that the assistant can serve.
+        self._candidate = candidate_runtime
+        self._activate = activate
 
     def note_discontinuity(self):
         """Resume, link loss, or a directory reset. Stability does not accrue across this."""
@@ -974,6 +1028,13 @@ class RecoveryOrchestrator:
         if status["mode"] == "QUARANTINED":
             return _step(False, "quarantined", "quarantined")
         if status.get("transition"):
+            if (status["transition"].get("state") == "GRANTED_NOT_READY" and
+                    not status.get("lease_valid")):
+                # Any surviving driver can clear a dead candidate's grant.
+                return self.cancel(status["transition"]["transition_id"])
+            if (self._candidate is not None and
+                    status["transition"].get("candidate") != self._candidate.device_id):
+                return _step(False, "standby", "not_candidate", transition=status["transition"])
             return self._advance(status, status["transition"])
         barrier = status.get("grant_barrier")
         if barrier:
@@ -1033,6 +1094,8 @@ class RecoveryOrchestrator:
         chosen, reason = self._choose(status, now)
         if chosen is None:
             return _step(False, "no_main", "NO_ELIGIBLE_MAIN", reason=reason)
+        if self._candidate is not None and chosen != self._candidate.device_id:
+            return _step(False, "standby", "not_candidate", candidate=chosen)
         key = self._auto_key("recover", chosen, status)
         return self._request(status, "recover", chosen, self.policy.profile, key)
 
@@ -1040,6 +1103,8 @@ class RecoveryOrchestrator:
         target = status.get("preferred") or self.policy.preferred
         if not self.policy.auto_failback or not target or target == status.get("main"):
             return _step(False, "main", "holding")
+        if self._candidate is not None and target != self._candidate.device_id:
+            return _step(False, "standby", "not_candidate", candidate=target)
         now = self._clock()
         facts = self._facts(target, now)
         stable = self._stability(target, facts, now)
@@ -1115,6 +1180,15 @@ class RecoveryOrchestrator:
         except AuthorityError as err:
             return _step(False, "no_main" if action == "recover" else "main", err.code, wait=err.wait,
                          candidate=candidate)
+        automatic = next((identity for identity, key in self._keys.items() if key == client_key), None)
+        if automatic is not None and view.get("state") in ("CANCELLED", "FAILED", "SUCCEEDED"):
+            # Cancellation before fencing leaves the same epoch. Reusing the
+            # deterministic key forever just reads that terminal transition.
+            # Retain idempotence during each live attempt; rotate only after a
+            # terminal response proves that attempt cannot have an effect.
+            import secrets
+            self._keys[automatic] = client_key[:96] + "-retry-" + secrets.token_hex(8)
+            return _step(False, "waiting", "retry", transition=view)
         return _step(True, "requested", "requested", transition=view)
 
     def _advance(self, status, transition):
@@ -1155,6 +1229,8 @@ class RecoveryOrchestrator:
         if state == "FENCING":
             return self._grant(tid, transition)
         if state == "GRANTED_NOT_READY":
+            if self._candidate is not None:
+                return self._promote_candidate(transition)
             return _step(False, "promoting", "canary_required", transition=transition, lease=self._lease)
         return _step(False, "checking", "bad_state", transition=transition)
 
@@ -1172,7 +1248,38 @@ class RecoveryOrchestrator:
         self._lease = {key: lease[key] for key in _LEASE_FIELDS if key in lease}
         self._lease["valid_for"] = lease.get("valid_for")
         self._lease["ready"] = False
+        if self._candidate is not None:
+            return self._promote_candidate(transition)
         return _step(True, "promoting", "canary_required", transition=transition, lease=dict(self._lease))
+
+    def _promote_candidate(self, transition):
+        tid = transition["transition_id"]
+        try:
+            # Keep the actual grant response across a lost accept response.
+            # Neither status nor a different node can reconstruct this secret.
+            if self._lease is not None:
+                self._candidate.accept_lease(dict(self._lease))
+            snapshot = self._candidate.lease_snapshot()
+            status = self._port.status()
+            if (not snapshot or snapshot.get("holder") != self._candidate.device_id or
+                    snapshot.get("incarnation") != status.get("incarnation") or
+                    snapshot.get("epoch") != status.get("epoch") or
+                    status.get("main") != self._candidate.device_id or
+                    not status.get("lease_valid") or
+                    (status.get("transition") or {}).get("transition_id") != tid):
+                return _step(False, "promoting", "lease_unavailable", transition=transition)
+            if self._activate is None:
+                return _step(False, "promoting", "canary_required", transition=transition)
+            ok = self._activate(self._candidate.device_id, dict(snapshot)) is True
+        except LinkError:
+            self.note_discontinuity()
+            return _step(False, "partition", "partition", transition=transition)
+        except (AuthorityError, RuntimeRefusal) as err:
+            return _step(False, "promoting", err.code, wait=err.wait, transition=transition)
+        result = self.submit_canary(tid, ok)
+        if result["ok"]:
+            self._candidate.renew_once()
+        return result
 
 
 _HANDOFF_ACTIONS = frozenset({"set_preferred_main", "recover"})
@@ -1639,7 +1746,9 @@ class SafeHandoff:
         source = transition.get("source")
         if source is not None and source != old_main:
             return _handoff_result(False, "conflict", "conflict", status=status, transition=transition)
-        if transition.get("action") == "recover" and status.get("lease_valid"):
+        if (transition.get("action") == "recover" and status.get("lease_valid") and
+                not (transition.get("state") == "GRANTED_NOT_READY" and
+                     status.get("main") == new_main and status.get("main_ready") is False)):
             return _handoff_result(False, "refused", "main_alive", status=status, transition=transition)
         state = transition.get("state")
         tid = transition.get("transition_id")
@@ -1658,7 +1767,8 @@ class SafeHandoff:
             transition = view
             state = view.get("state")
         if state == "DRAINING":
-            if self._source is not None and callable(getattr(self._source, "begin_drain", None)):
+            if (transition.get("action") != "recover" and self._source is not None and
+                    callable(getattr(self._source, "begin_drain", None))):
                 try:
                     report = self._source.begin_drain(tid)
                 except (RuntimeRefusal, AuthorityError) as err:

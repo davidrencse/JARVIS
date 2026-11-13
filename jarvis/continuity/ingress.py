@@ -1332,6 +1332,10 @@ class MobileIngress:
             wait = None
         if re.fullmatch(r"[a-z0-9_]{1,40}", code):
             self._note(code)
+        if code == "no_relay":
+            return IngressError(code, status,
+                                "The MAIN connection is unavailable. Waiting to reconnect.",
+                                wait=wait if wait is not None else 2)
         return IngressError(code, status, "The authority refused that.", wait=wait)
 
     def _route(self, status):
@@ -1339,7 +1343,7 @@ class MobileIngress:
         ready = (status.get("mode") == "V2_ACTIVE" and status.get("main_ready") is True
                  and status.get("lease_valid") is True and isinstance(status.get("main"), str))
         if not ready:
-            raise IngressError("no_main", 503, "No ready MAIN. Nothing was sent.")
+            raise IngressError("no_main", 503, "No ready MAIN. Waiting to reconnect.", wait=2)
         main = status["main"]
         holder = status.get("lease_holder")
         if isinstance(holder, str) and holder != main:

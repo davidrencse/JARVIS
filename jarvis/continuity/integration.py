@@ -497,6 +497,11 @@ _RELAY_KEYS = frozenset({
 })
 
 
+# Same shape as the Oracle gateway config's `self_recovery`: both PCs may recover
+# MAIN for themselves once the old lease lapses; zenbook (Arch) takes it back.
+SELF_RECOVERY = {"candidates": ["zenbook", "dell"], "preferred": "zenbook"}
+
+
 class PcNode:
     """One PC: real runtime, real executor journal, and a temporary MAIN relay sink.
 
@@ -645,7 +650,8 @@ class IsolatedFleet:
         self._keys = self._make_keys()
         self.gateway = ContinuityGateway.open(
             root / "authority.sqlite", FLEET_ID, AUTHORITY_ID, [self._keys["owner"][0]],
-            monotonic=clock.mono, wall=clock.wall)
+            monotonic=clock.mono, wall=clock.wall,
+            self_recovery=SELF_RECOVERY)
         self.origin = self.gateway.serve()
         self.owner = self._client(LinkedClient, None, owner=True)
         self._enrolled = []
@@ -706,7 +712,8 @@ class IsolatedFleet:
         self.gateway.close()
         self.gateway = ContinuityGateway.open(
             self.root / "authority.sqlite", FLEET_ID, AUTHORITY_ID, [self._keys["owner"][0]],
-            monotonic=self.clock.mono, wall=self.clock.wall)
+            monotonic=self.clock.mono, wall=self.clock.wall,
+            self_recovery=SELF_RECOVERY)
         self.origin = self.gateway.serve()
         clients = [self.owner, self.oracle, self.phone_client] + [n.client for n in self.nodes.values()]
         for client in clients:

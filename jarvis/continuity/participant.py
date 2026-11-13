@@ -215,7 +215,7 @@ class Participant:
             return self.runtime.lease_snapshot()
 
 
-def load_local(config, state, *, probe, client_factory=None, guard=None):
+def load_local(config, state, *, probe, client_factory=None, guard=None, boot=None):
     """Load only this PC's configured operator file. No network or marker writes.
 
     A real readiness probe is required; absence never manufactures readiness.
@@ -232,7 +232,8 @@ def load_local(config, state, *, probe, client_factory=None, guard=None):
     client, _ = (client_factory or build_client)(path)
     if client.device_id != identity(config)[0]:
         raise RuntimeRefusal('candidacy_mismatch')
-    runtime = MainRuntime(GatewayPort(client), client.device_id, client.installation_id, probe)
+    runtime = MainRuntime(GatewayPort(client), client.device_id, client.installation_id, probe,
+                          boot=boot)
     return Participant(client, runtime, guard=guard, config=config, state=state)
 
 

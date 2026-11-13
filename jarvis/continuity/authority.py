@@ -332,6 +332,16 @@ class AuthorityStore:
                 raise AuthorityError("not_found", "no such transition")
             return _transition_view(t)
 
+    def transition_caller(self, transition_id):
+        """Who opened a transition. The gateway uses it to keep self-recovery
+        steps to transitions a device opened for itself."""
+        with self._lock:
+            t = self._db.execute("SELECT caller FROM transitions WHERE transition_id=?",
+                                 (_ident(transition_id, "transition_id"),)).fetchone()
+            if t is None:
+                raise AuthorityError("not_found", "no such transition")
+            return t["caller"]
+
     def admission(self, admission_id):
         """Reconciliation lookup. Returns the consumed record or None; never consumes.
 

@@ -128,6 +128,9 @@ def verify(instruction, *, authority_id, target, pins):
     pins, failures are not stored, and every caller gets its own deep copy.
     A changed file is a different instruction from _read, so it misses.
     """
+    # Fingerprint and verify the same snapshot, including across ssh-keygen's
+    # blocking call. Callers can retain and mutate their input dictionaries.
+    instruction, pins = copy.deepcopy(instruction), copy.deepcopy(pins)
     key = _verify_cache_key(instruction, authority_id, target, pins)
     if key is not None:
         with _VERIFY_CACHE_LOCK:
@@ -237,6 +240,9 @@ class Installer:
     def install(self, instruction):
         from jarvis.locking import exclusive_lock
         from .integration import production_binding
+        # Publish exactly what was verified even if the caller changes its offer
+        # while the endpoint probe is in flight.
+        instruction = copy.deepcopy(instruction)
         client = self.participant.client
         body = verify(instruction, authority_id=client.authority_id, target=client.device_id, pins=self.pins)
         binding = production_binding(self.state)
