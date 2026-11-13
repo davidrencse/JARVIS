@@ -223,12 +223,14 @@ def node_worker():
                     saved["cluster"]["main_url"] + "/v1/status",
                     headers={"Authorization": "Bearer " + old, "X-JARVIS-Main": "zenbook"})
                 try:
-                    urllib.request.urlopen(request, timeout=5)
+                    with urllib.request.urlopen(request, timeout=5) as response:
+                        response.read()
                     invite_dead = False
                     http_status = 200
                 except urllib.error.HTTPError as exc:
                     invite_dead = exc.code == 403
                     http_status = exc.code
+                    exc.close()
                 cred = json.loads((state / "cluster-node.json").read_text(encoding="utf-8"))
                 _say({"joined": joined["joined"], "keep": saved.get("keep"),
                       "redeemed": redeemed, "status_main": status.get("main_device"),
@@ -482,9 +484,11 @@ class MembershipTests(unittest.TestCase):
             "from jarvis.config_lock import config_mutation;"
             "cm = config_mutation(sys.argv[2]); cm.__enter__(); print('held', flush=True);"
             "line = sys.stdin.readline();\n"
-            "doc = json.loads(open(sys.argv[3], encoding='utf-8').read());"
-            "doc['cluster'].update(enabled=True, main_device='zenbook', local_device='zenbook');"
-            "open(sys.argv[3], 'w', encoding='utf-8').write(json.dumps(doc));"
+            "with open(sys.argv[3], encoding='utf-8') as src:\n"
+            "    doc = json.loads(src.read())\n"
+            "doc['cluster'].update(enabled=True, main_device='zenbook', local_device='zenbook')\n"
+            "with open(sys.argv[3], 'w', encoding='utf-8') as out:\n"
+            "    out.write(json.dumps(doc))\n"
             "print('promoted', flush=True); cm.__exit__(None, None, None); print('released', flush=True)"
         )
         proc = subprocess.Popen(

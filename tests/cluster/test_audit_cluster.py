@@ -311,7 +311,7 @@ class PullUpdateTests(unittest.TestCase):
         self.assertIn("FAILED (failures=1)", report["note"])
         with patch("jarvis.release.cut", return_value={"released": False, "note": "Nodes already get this code."}):
             report = deploy.update(config, self.tmp.name, "dell")
-        self.assertIn("next poll", report["note"])
+        self.assertIn("offline", report["note"])  # no broker row: nothing to wait for
 
     def test_auto_update_skips_non_ssh_node_quietly(self):
         config = configuration()
