@@ -50,25 +50,39 @@
   else document.body.appendChild(panel);
   const $ = (s) => panel.querySelector(s);
   const canvas = $(".flow-canvas"), svg = $(".flow-edges");
-  let pending = [], confirmBusy = false;
+  let pending = [], confirmBusy = false, confirmInflight = false, confirmTimer = 0, confirmSig = "";
   async function refreshConfirmations() {
     // The page has the gate (gate.js): confirmations live there, not in the trace.
     if (document.getElementById("gate")) { $(".flow-confirm").hidden = true; return; }
-    if (confirmBusy) return;
+    if (confirmBusy || confirmInflight) return;
+    confirmInflight = true;
     try {
       const data = await J.api("/api/confirm");
       const hadPending = pending.length > 0;
       pending = data.pending || [];
       const region = $(".flow-confirm");
       region.hidden = !pending.length;
-      region.innerHTML = pending.map((item) => `<div class="flow-confirm-row">
-        <p><strong>${esc(item.id)}</strong> ${esc(item.summary)}</p>
-        <div><button type="button" class="flow-btn" data-confirm="${esc(item.id)}" data-action="approve">Confirm</button>
-        <button type="button" class="flow-btn" data-confirm="${esc(item.id)}" data-action="reject">Reject</button></div>
-        </div>`).join("");
+      const sig = JSON.stringify(pending.map((item) => [item.id, item.summary]));
+      // A failed confirm leaves the buttons disabled; rebuild so they can be pressed again.
+      const locked = [...region.querySelectorAll("button")].some((b) => b.disabled);
+      if (sig !== confirmSig || locked) {
+        confirmSig = sig;
+        region.innerHTML = pending.map((item) => `<div class="flow-confirm-row">
+          <p><strong>${esc(item.id)}</strong> ${esc(item.summary)}</p>
+          <div><button type="button" class="flow-btn" data-confirm="${esc(item.id)}" data-action="approve">Confirm</button>
+          <button type="button" class="flow-btn" data-confirm="${esc(item.id)}" data-action="reject">Reject</button></div>
+          </div>`).join("");
+      }
       if (pending.length && !hadPending) hidden = false;
       sync();
     } catch (err) { /* The live reconnect and periodic refresh try again. */ }
+    finally { confirmInflight = false; }
+  }
+  function pollConfirmations() {
+    clearInterval(confirmTimer);
+    confirmTimer = 0;
+    if (document.getElementById("gate") || document.hidden) return;
+    confirmTimer = setInterval(refreshConfirmations, 5000); // the gate polls otherwise
   }
   $(".flow-confirm").addEventListener("click", async (event) => {
     const button = event.target.closest("button[data-confirm]");
@@ -83,8 +97,13 @@
     } catch (err) { J.toast?.(`Confirmation failed: ${err.message}`); }
     finally { confirmBusy = false; await refreshConfirmations(); }
   });
-  refreshConfirmations();
-  if (!document.getElementById("gate")) setInterval(refreshConfirmations, 5000); // the gate polls otherwise
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { clearInterval(confirmTimer); confirmTimer = 0; return; }
+    refreshConfirmations();
+    pollConfirmations();
+  });
+  if (!document.hidden) refreshConfirmations();
+  pollConfirmations();
 
   $(".flow-pin").addEventListener("click", () => { pinned = !pinned; store.set("jarvis.flow.pin", pinned); sync(); });
   $(".flow-close").addEventListener("click", () => { hidden = true; pinned = false; store.set("jarvis.flow.pin", false); sync(); });
@@ -212,13 +231,15 @@
 
   const GLYPH = { run: "", done: "", fail: "×", wait: "" }, WORD = { run: "running…", done: "done.", fail: "failed", wait: "queued" };
 
+  function text(el, value) { if (el.textContent !== value) el.textContent = value; }
   function draw() {
     const t = turns.get(shown);
     if (!t) return;
     const { pos, rows, cols } = layout(t);
     const width = (cols - 1) * IND + W, height = rows * H + (rows - 1) * GY;
-    // Shrink to fit the panel's width (down to 70%), then scroll.
-    const room = $(".flow-body").clientWidth - 28;
+    // Read the panel once, then write. A later clientHeight would force a reflow.
+    const body = $(".flow-body");
+    const room = body.clientWidth - 28, bodyTop = body.scrollTop, bodyH = body.clientHeight;
     const k = room > 0 ? Math.max(0.7, Math.min(1, room / width)) : 1;
     canvas.style.width = width + "px"; canvas.style.height = height + "px";
     canvas.style.transform = k < 1 ? `scale(${k})` : "";
@@ -236,7 +257,7 @@
       const rx = a.x + 14, y1 = a.y + H, x2 = b.x, y2 = b.y + H / 2;   // dotted rail down, leader across
       edges += `<path class="flow-edge" data-state="${esc(n.state)}" d="M${rx} ${y1} V${y2} H${x2}"/>`;
     }
-    svg.innerHTML = edges;
+    if (svg._edges !== edges) { svg._edges = edges; svg.innerHTML = edges; }
 
     // Nodes are kept and moved, not rebuilt, so the tree grows instead of flickering.
     if (canvas.dataset.turn !== t.id) { canvas.querySelectorAll(".flow-node").forEach((el) => el.remove()); canvas.dataset.turn = t.id; }
@@ -248,25 +269,31 @@
         el = document.createElement("div");
         el.className = "flow-node"; el.dataset.id = n.id;
         el.innerHTML = `<b class="fn-ico"></b><span class="fn-label"></span><span class="fn-detail"></span><sup class="fn-no"></sup><span class="fn-st"><em></em><i class="fn-glyph"></i></span>`;
+        el._label = el.querySelector(".fn-label");
+        el._detail = el.querySelector(".fn-detail");
+        el._no = el.querySelector(".fn-no");
+        el._word = el.querySelector(".fn-st em");
+        el._glyph = el.querySelector(".fn-glyph");
         canvas.appendChild(el);
       }
       els.delete(n.id);
       const p = at(n.id);
       el.dataset.state = n.state;
-      el.style.transform = `translate(${p.x}px, ${p.y}px)`;
+      const transform = `translate(${p.x}px, ${p.y}px)`;
+      if (el.style.transform !== transform) el.style.transform = transform;
       el.title = [n.label, n.detail].filter(Boolean).join("\n");
-      el.querySelector(".fn-label").textContent = n.label || n.id;
-      el.querySelector(".fn-detail").textContent = n.detail || "";
-      el.querySelector(".fn-no").textContent = n.id === "root" ? "" : n.order;
-      el.querySelector(".fn-st em").textContent = WORD[n.state] || "";
-      el.querySelector(".fn-glyph").textContent = GLYPH[n.state] || "";
+      text(el._label, n.label || n.id);
+      text(el._detail, n.detail || "");
+      text(el._no, n.id === "root" ? "" : String(n.order));
+      text(el._word, WORD[n.state] || "");
+      text(el._glyph, GLYPH[n.state] || "");
     }
     for (const el of els.values()) el.remove();
     // Keep the newest working node in view.
     const busy = [...t.nodes.values()].filter((n) => n.state === "run" && n.id !== "root" && pos.has(n.id)).pop();
     if (busy) {
-      const body = $(".flow-body"), y = at(busy.id).y * k;
-      if (y < body.scrollTop || y + H * k > body.scrollTop + body.clientHeight) body.scrollTop = y - body.clientHeight / 2;
+      const y = at(busy.id).y * k;
+      if (y < bodyTop || y + H * k > bodyTop + bodyH) body.scrollTop = y - bodyH / 2;
     }
 
     const keys = [...turns.keys()], i = keys.indexOf(shown);

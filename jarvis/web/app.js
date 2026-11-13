@@ -65,7 +65,7 @@
     if (unit === "USD") return "$" + Number(v).toFixed(2);
     if (unit === "CNY") return "¥" + Number(v).toFixed(2);
     if (unit === "%") return Math.round(v) + "%";
-    return compact(v) + (unit ? " " + unit : "");
+    return compact(v) + (unit ? " " + esc(unit) : "");
   }
   const stamp = (iso) => typeof iso === "number" ? iso * 1000 : Date.parse(iso);
   function ago(iso) {
@@ -156,15 +156,23 @@
     const day = t.getUTCDay() || 7; t.setUTCDate(t.getUTCDate() + 4 - day);
     return Math.ceil(((t - Date.UTC(t.getUTCFullYear(), 0, 1)) / 86400000 + 1) / 7);
   }
+  let clockSig = "";
   function tick() {
     const d = new Date();
     $("#top-clock").textContent = d.toLocaleTimeString([], { hour12: false });
-    $("#clock-time").textContent = hhmm(d);
+    const hm = hhmm(d);
+    if ($("#clock-time").textContent !== hm) $("#clock-time").textContent = hm;
     $("#clock-sec").textContent = String(d.getSeconds()).padStart(2, "0");
-    $("#clock-date").textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", year: "numeric" });
-    $("#clock-tz").textContent = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const date = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+    if ($("#clock-date").textContent !== date) $("#clock-date").textContent = date;
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if ($("#clock-tz").textContent !== tz) $("#clock-tz").textContent = tz;
     const start = new Date(d.getFullYear(), 0, 0), doy = Math.floor((d - start) / 86400000);
     const days = Math.round((new Date(d.getFullYear(), 11, 31) - start) / 86400000);
+    // Facts change once a minute; rewriting them every second rebuilds the same nodes.
+    const sig = d.toISOString().slice(11, 16) + "|" + isoWeek(d) + "|" + doy + "|" + days;
+    if (sig === clockSig) return;
+    clockSig = sig;
     $("#clock-facts").innerHTML = [
       ["UTC", d.toISOString().slice(11, 16)], ["Week", "W" + String(isoWeek(d)).padStart(2, "0")],
       ["Day", `${doy} / ${days}`], ["Year", Math.round((doy / days) * 100) + "% done"],
@@ -194,7 +202,13 @@
     if (!r.headline) return `<span class="cr-val" style="color:var(--ink-3)">—<small>${r.status === "error" ? "check failed" : "not set up"}</small></span>`;
     return `<span class="cr-val">${money(r.headline.value, r.headline.unit)}<small>${esc(r.headline.label)}</small></span>`;
   }
+  let creditRowsSig = "", creditTableSig = "";
   function renderCreditRows(list) {
+    const sig = JSON.stringify(list) + "|" + Math.floor(Date.now() / 60000);
+    const checked = "checked " + ago(list[0]?.checked_at);
+    if ($("#credits-checked").textContent !== checked) $("#credits-checked").textContent = checked;
+    if (sig === creditRowsSig) return;
+    creditRowsSig = sig;
     const ready = list.filter((r) => r.status !== "unconfigured"), idle = list.filter((r) => r.status === "unconfigured");
     $("#credit-rows").innerHTML = ready.map((r) => `<div class="cr" data-id="${esc(r.id)}">${srcMark(r)}
         <span class="cr-name">${esc(r.name)}<small>${esc(r.blurb)}</small></span>
@@ -203,7 +217,6 @@
         ${r.meters.length && r.status === "error" ? `<span class="cr-note cr-note-full">${esc(r.note)}</span>` : ""}</div>`).join("") +
       (idle.length ? `<div class="cr-more"><span class="src src-none" aria-hidden="true"></span>${idle.length} not set up: ${esc(idle.map((r) => r.name).join(", "))}<a href="#credits">Set up${icon("chevron-right")}</a></div>` : "");
     $("#credits-mini-legend").innerHTML = legend(["live", "local", "manual", "error"]);
-    $("#credits-checked").textContent = "checked " + ago(list[0]?.checked_at);
   }
   function setupBox(r) {
     const s = r.setup || {}, dash = s.dashboard ? `<a href="${esc(s.dashboard)}" target="_blank" rel="noopener noreferrer">${esc(new URL(s.dashboard).host)}${icon("external-link")}</a>` : null;
@@ -218,6 +231,9 @@
   function renderCreditTable(list) {
     if (!list) return;
     if ($("#credit-table .ct-edit") || $("#credit-table").contains(document.activeElement)) return; // never wipe a half-typed entry
+    const sig = JSON.stringify(list) + "|" + Math.floor(Date.now() / 60000);
+    if (sig === creditTableSig) return;
+    creditTableSig = sig;
     $("#credits-legend").innerHTML = `<span class="legend">${legend(["live", "local", "manual", "none", "error"])}</span>`;
     const groups = {};
     list.filter((r) => r.group !== "Model APIs").forEach((r) => (groups[r.group] = groups[r.group] || []).push(r));  // pay-per-token APIs are off-limits
@@ -258,13 +274,28 @@
     f.querySelector("[data-cancel]").addEventListener("click", () => f.remove());
     f.querySelector("[data-clear]").addEventListener("click", () => { if (confirm("Remove the balance you entered?")) send({ remaining: "" }); });
   }
+  let creditsFlight = null, creditsNeedForce = false;
   async function refreshCredits(force) {
-    try {
-      state.credits = await api("/api/credits" + (force ? "?refresh=1" : ""));
-      emit("credits", state.credits);
-      renderCreditRows(state.credits);
-      if (!$("#view-credits").hidden) renderCreditTable(state.credits);
-    } catch (e) { $("#credit-rows").innerHTML = `<div class="empty"><b>Couldn't read credits.</b>${esc(plainError(e.message))} Check that JARVIS is running, then press Check now.</div>`; }
+    if (force) creditsNeedForce = true;
+    if (creditsFlight) return creditsFlight;
+    creditsFlight = (async () => {
+      try {
+        do {
+          const useForce = creditsNeedForce;
+          creditsNeedForce = false;
+          try {
+            state.credits = await api("/api/credits" + (useForce ? "?refresh=1" : ""));
+            emit("credits", state.credits);
+            renderCreditRows(state.credits);
+            if (!$("#view-credits").hidden) renderCreditTable(state.credits);
+          } catch (e) {
+            creditRowsSig = "";
+            $("#credit-rows").innerHTML = `<div class="empty"><b>Couldn't read credits.</b>${esc(plainError(e.message))} Check that JARVIS is running, then press Check now.</div>`;
+          }
+        } while (creditsNeedForce);
+      } finally { creditsFlight = null; }
+    })();
+    return creditsFlight;
   }
   $("#credits-refresh").addEventListener("click", async () => { const b = $("#credits-refresh"); b.disabled = true; await refreshCredits(true); b.disabled = false; announce("Credits checked."); });
 
@@ -302,16 +333,16 @@
   });
 
   // ---------- overview ----------
+  let overviewFlight = null, overviewSig = "";
   async function refreshOverview() {
-    try { state.overview = await api("/api/overview"); emit("overview", state.overview); }
-    catch (e) { $("#top-status").innerHTML = `<span class="chip">Console server unreachable</span>`; return; }
-    const o = state.overview;
-    renderInputSettings();
-    $("#top-status").innerHTML = [
-      `<a class="chip" href="#memory">${icon("database")} ${o.memory.items} in memory</a>`,
-      `<span class="chip">${icon("audio-lines")} ${o.voice.voiceprint ? "voiceprint enrolled" : "no voiceprint"}</span>`,
-    ].join("");
-    lastOverview = Date.now();
+    if (overviewFlight) return overviewFlight;
+    overviewFlight = (async () => {
+      try { return await paintOverview(); }
+      finally { overviewFlight = null; }
+    })();
+    return overviewFlight;
+  }
+  function renderListenerLog(o) {
     const heardLines = (o.voice.recent || []).filter((l) => !/ignored another voice/.test(l)).slice(-5).map((l) => {
       const m = l.match(/^(\S+ \S+)\s+(.*)$/); const text = m ? m[2] : l;
       return `<div title="${esc(l)}"><b>${esc(m ? m[1].slice(11, 16) : "")}</b> ${esc(text)}</div>`;
@@ -319,6 +350,25 @@
     const ign = o.voice.ignored || {};
     const ignLine = ign.count ? `<div class="muted" title="Voices that didn't match your voiceprint are dropped unread">${ign.count} other voice${ign.count === 1 ? "" : "s"} ignored${ign.last ? ` · last ${esc(ign.last.slice(11, 16))}` : ""}</div>` : "";
     $("#listener-log").innerHTML = heardLines + ignLine || (o.voice.listening ? "Listening. Nothing heard yet; start with “Jarvis…”." : "Listener is off.");
+  }
+  async function paintOverview() {
+    let next;
+    try { next = await api("/api/overview"); }
+    catch (e) { $("#top-status").innerHTML = `<span class="chip">Console server unreachable</span>`; return; }
+    state.overview = next;
+    lastOverview = Date.now();
+    // Same payload in the same minute: skip the DOM rewrite. "ago" strings move once a minute.
+    const sig = JSON.stringify(next) + "|" + Math.floor(Date.now() / 60000);
+    if (sig === overviewSig) return;
+    overviewSig = sig;
+    emit("overview", state.overview);
+    const o = state.overview;
+    renderInputSettings();
+    $("#top-status").innerHTML = [
+      `<a class="chip" href="#memory">${icon("database")} ${o.memory.items} in memory</a>`,
+      `<span class="chip">${icon("audio-lines")} ${o.voice.voiceprint ? "voiceprint enrolled" : "no voiceprint"}</span>`,
+    ].join("");
+    renderListenerLog(o);
     const auto = $(".dock [data-tier='']");
     auto.title = o.routing.auto_escalate ? "Let the router pick from your words" : `Conversation: the ${o.brain?.name || "ChatGPT"} brain answers. Pick Tools or Plan for more.`;
     renderRouter(o); renderMachines(o); renderHeapFacts(o);
@@ -489,7 +539,13 @@
   // ---------- graphs ----------
   const graphs = [];
   const mini = new ForceGraph($("#mini-graph"), { mini: true }); graphs.push(mini);
-  async function loadMini() { try { mini.setData(await api("/api/graph/heap")); } catch (e) {} }
+  let miniFlight = null;
+  async function loadMini() {
+    if (miniFlight) return miniFlight;
+    miniFlight = (async () => { try { mini.setData(await api("/api/graph/heap")); } catch (e) {} })();
+    try { return await miniFlight; }
+    finally { miniFlight = null; }
+  }
   let big, graphData = {}, layer = "heap";
   async function loadGraph(again) {
     if (!big) {
@@ -506,16 +562,30 @@
       dot: '<circle cx="6" cy="6" r="2.5" fill="currentColor"/>', circle: '<circle cx="6" cy="6" r="4" fill="currentColor"/>', ring: '<circle cx="6" cy="6" r="4.5" fill="none" stroke="currentColor"/><circle cx="6" cy="6" r="1.6" fill="currentColor"/>' }[shape];
     return `<svg viewBox="0 0 12 12" aria-hidden="true">${s}</svg>`;
   }
+  let layerFlight = null, layerGen = 0;
   async function applyLayer() {
-    try {
-      const need = { heap: ["heap"], case: ["case"], system: ["system"], all: ["system", "heap"] }[layer];
-      const got = await Promise.all(need.map((k) => api(k === "system" ? "/api/graph/system" : "/api/graph/heap" + (k === "case" ? "?case=" + encodeURIComponent(state.case) : ""))));
-      const data = got.length === 1 ? got[0] : { nodes: [...got[0].nodes, ...got[1].nodes], edges: [...got[0].edges, ...got[1].edges,
-        ...got[1].nodes.filter((n) => n.kind === "kind").map((n) => ({ src: n.id, dst: "ext:memdb", rel: "stored in" }))] };
-      big.setData(data); graphData.loadedLayer = layer;
-      if (!data.nodes.length) toast(layer === "case" ? "Nothing filed in this investigation yet." : "Nothing to draw yet.");
-      updateMatches();
-    } catch (e) { toast("Graph: " + plainError(e.message)); return false; }
+    const gen = ++layerGen;
+    if (layerFlight) return layerFlight;
+    layerFlight = (async () => {
+      try {
+        const use = layer;
+        const need = { heap: ["heap"], case: ["case"], system: ["system"], all: ["system", "heap"] }[use];
+        const got = await Promise.all(need.map((k) => api(k === "system" ? "/api/graph/system" : "/api/graph/heap" + (k === "case" ? "?case=" + encodeURIComponent(state.case) : ""))));
+        if (gen !== layerGen) return;
+        const data = got.length === 1 ? got[0] : { nodes: [...got[0].nodes, ...got[1].nodes], edges: [...got[0].edges, ...got[1].edges,
+          ...got[1].nodes.filter((n) => n.kind === "kind").map((n) => ({ src: n.id, dst: "ext:memdb", rel: "stored in" }))] };
+        big.setData(data); graphData.loadedLayer = use;
+        if (!data.nodes.length) toast(use === "case" ? "Nothing filed in this investigation yet." : "Nothing to draw yet.");
+        updateMatches();
+      } catch (e) {
+        if (gen !== layerGen) return;
+        toast("Graph: " + plainError(e.message)); return false;
+      } finally {
+        layerFlight = null;
+        if (gen !== layerGen) applyLayer();
+      }
+    })();
+    return layerFlight;
   }
   function setLayer(name) {
     layer = name; $$(".graph-toolbar [data-layer]").forEach((x) => x.setAttribute("aria-pressed", x.dataset.layer === name));
@@ -570,20 +640,37 @@
     await searchMemory();
     if (pendingOpen) { openMemory(pendingOpen); pendingOpen = null; }
   }
+  let memFlight = null, memGen = 0, memSig = "";
   async function searchMemory() {
-    const days = $("#mem-since").value;
-    const params = { q: $("#mem-q").value, kind: $("#mem-kind").value, tag: $("#mem-tag").value.trim().replace(/^#/, ""), limit: 60,
-                     min_importance: $("#mem-imp").value, since: days ? new Date(Date.now() - (days === "1" ? (Date.now() - new Date().setHours(0, 0, 0, 0)) : days * 86400e3)).toISOString() : "" };
-    if (state.case && $("#mem-in-case").checked) params.case = state.case;
-    try {
-      const items = await api(`/api/memory?${new URLSearchParams(params)}`);
-      const tags = new Set(); items.forEach((it) => it.tags.forEach((t) => tags.add(t)));
-      $("#tag-list").innerHTML = [...tags].sort().map((t) => `<option value="${esc(t)}">`).join("");
-      const filtered = params.q || params.kind || params.tag || params.since || +params.min_importance || params.case;
-      $("#mem-list").innerHTML = items.length ? items.map((it) => `<li><button type="button" data-id="${esc(it.id)}"><b>${esc(it.title)}</b><span class="mono">${esc(it.kind)} · ${ago(it.created_at)}</span><p>${esc(it.preview)}</p></button></li>`).join("")
-        : `<li class="empty"><b>${filtered ? "Nothing matches these filters." : "Memory is empty."}</b>${filtered ? "Loosen a filter or use fewer words; search matches word stems and prefixes." : "Every request, reply and plan lands here automatically, and anything you capture below."}</li>`;
-      $$("#mem-list button").forEach((b) => b.addEventListener("click", () => openMemory(b.dataset.id)));
-    } catch (e) { $("#mem-list").innerHTML = `<li class="empty"><b>Search failed.</b>${esc(plainError(e.message))}</li>`; }
+    const gen = ++memGen;
+    if (memFlight) return memFlight;
+    memFlight = (async () => {
+      try {
+        const days = $("#mem-since").value;
+        const params = { q: $("#mem-q").value, kind: $("#mem-kind").value, tag: $("#mem-tag").value.trim().replace(/^#/, ""), limit: 60,
+                         min_importance: $("#mem-imp").value, since: days ? new Date(Date.now() - (days === "1" ? (Date.now() - new Date().setHours(0, 0, 0, 0)) : days * 86400e3)).toISOString() : "" };
+        if (state.case && $("#mem-in-case").checked) params.case = state.case;
+        const items = await api(`/api/memory?${new URLSearchParams(params)}`);
+        if (gen !== memGen) return;
+        const sig = Math.floor(Date.now() / 60000) + "\n" + items.map((it) => [it.id, it.kind, it.created_at, it.title, it.preview].join("\n")).join("\n");
+        if (sig === memSig) return;
+        memSig = sig;
+        const tags = new Set(); items.forEach((it) => it.tags.forEach((t) => tags.add(t)));
+        $("#tag-list").innerHTML = [...tags].sort().map((t) => `<option value="${esc(t)}">`).join("");
+        const filtered = params.q || params.kind || params.tag || params.since || +params.min_importance || params.case;
+        $("#mem-list").innerHTML = items.length ? items.map((it) => `<li><button type="button" data-id="${esc(it.id)}"><b>${esc(it.title)}</b><span class="mono">${esc(it.kind)} · ${ago(it.created_at)}</span><p>${esc(it.preview)}</p></button></li>`).join("")
+          : `<li class="empty"><b>${filtered ? "Nothing matches these filters." : "Memory is empty."}</b>${filtered ? "Loosen a filter or use fewer words; search matches word stems and prefixes." : "Every request, reply and plan lands here automatically, and anything you capture below."}</li>`;
+        $$("#mem-list button").forEach((b) => b.addEventListener("click", () => openMemory(b.dataset.id)));
+      } catch (e) {
+        if (gen !== memGen) return;
+        memSig = "";
+        $("#mem-list").innerHTML = `<li class="empty"><b>Search failed.</b>${esc(plainError(e.message))}</li>`;
+      } finally {
+        memFlight = null;
+        if (gen !== memGen) searchMemory();
+      }
+    })();
+    return memFlight;
   }
   async function openMemory(id) {
     $$("#mem-list button").forEach((b) => b.setAttribute("aria-current", b.dataset.id === id));
@@ -651,18 +738,25 @@
     for (const d of drops) { const li = document.createElement("li"); li.className = d.cls; li.textContent = d.text; log.appendChild(li); }
   }
   const conn = { data: null, error: "", busy: new Set(), timer: 0 };
+  let connFlight = null;
   async function loadConnections() {
-    try { conn.data = await api("/api/connections"); conn.error = ""; }
-    catch (e) { conn.error = e.message; }
-    // A re-render would drop the full-screen view and any upload in progress.
-    if (!$("#view-devices").hidden && !document.fullscreenElement && !drops.some((d) => d.cls === "pending")) renderDevices();
+    if (connFlight) return connFlight;
+    connFlight = (async () => {
+      try { conn.data = await api("/api/connections"); conn.error = ""; }
+      catch (e) { conn.error = e.message; }
+      // A re-render would drop the full-screen view and any upload in progress.
+      if (!$("#view-devices").hidden && !document.fullscreenElement && !drops.some((d) => d.cls === "pending")) renderDevices();
+    })();
+    try { return await connFlight; }
+    finally { connFlight = null; }
   }
   function pollConnections() {
     clearTimeout(conn.timer);
     conn.timer = setTimeout(async () => {
-      if ($("#view-devices").hidden) return;
-      if (document.visibilityState === "visible") await loadConnections();
-      pollConnections();
+      conn.timer = 0;
+      if ($("#view-devices").hidden || document.hidden) return;
+      await loadConnections();
+      if (!$("#view-devices").hidden && !document.hidden) pollConnections();
     }, 8000);
   }
   const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
@@ -832,42 +926,198 @@
     return parts.map(([t, ok]) => `<span>${ok == null ? "" : dot(!!ok)}${esc(t)}</span>`).join("");
   }
 
-  function renderDevices() {
-    const o = state.overview; if (!o) return false;
-    const inv = Object.fromEntries((o.devices || []).map((d) => [d.id, d]));
-    const open = new Set($$("#view-devices details.cx-more[open]").map((el) => el.closest("[aria-label]")?.getAttribute("aria-label")));
-    $("#devices-top").innerHTML = `
-      <header class="cx-top"><p class="cx-summary" aria-live="polite">${summary()}</p>
-        <div class="cx-top-actions"><span class="cx-meta">${conn.data ? "checked " + ago(conn.data.checked_at) : conn.error ? "not reachable" : "checking…"}</span>
-        <button type="button" class="cx-btn" id="cx-refresh">${icon("refresh-cw")}<span>Check now</span></button></div></header>
-      ${linksPanel(o, inv)}`;
-    $("#devices-grid").innerHTML = `${herePanel()}
-      <div class="cx-pair">${screenPanel(o)}${sendPanel(o)}</div>
-      ${agentsPanel(o)}`;
-    $$("#view-devices details.cx-more").forEach((el) => { if (open.has(el.closest("[aria-label]")?.getAttribute("aria-label"))) el.open = true; });
-    paintMeters($("#view-devices"));
-    wireDropzone(); wireScreen(); wireConnections();
+  // Skip the card rebuild when this string is unchanged. checked_at is not part of it:
+  // the header shows it as "checked … ago" and paintChecked updates that node alone.
+  // silent_for ticks every poll, so the signature stores the bucket silent() would show.
+  let devicesSeen = "";
+  function devicesSignature(o) {
+    const data = conn.data;
+    let cluster = null;
+    if (data && data.cluster) {
+      cluster = {};
+      for (const k in data.cluster) if (k !== "nodes") cluster[k] = data.cluster[k];
+      cluster.nodes = (data.cluster.nodes || []).map((n) => {
+        const node = {};
+        for (const key in n) if (key !== "silent_for") node[key] = n[key];
+        node.heard = silent(n.silent_for);
+        return node;
+      });
+    }
+    const devices = (o.devices || []).map((d) => ({
+      id: d.id, hostname: d.hostname, label: d.label, here: d.here, send: !!d.send,
+      address: d.address, model: d.model, cpu: d.cpu, ram: d.ram, gpu: d.gpu,
+      tools: d.tools, collected_at: d.collected_at,
+    }));
+    return JSON.stringify({
+      devices, agents: o.agents || {},
+      conn: data ? { cluster, here: data.here } : null,
+      error: conn.error || "",
+      busy: [...conn.busy].sort(),
+      gw: gw.data,
+      screen: screenView.device,
+      live: !!screenView.live,
+    });
+  }
+  function checkedLabel() {
+    return conn.data ? "checked " + ago(conn.data.checked_at) : conn.error ? "not reachable" : "checking…";
+  }
+  function paintChecked() {
+    const el = $("#cx-checked");
+    if (el) el.textContent = checkedLabel();
+  }
+  function armDevices() {
     if (!conn.data && !conn.error && !conn.loading) { conn.loading = true; loadConnections().finally(() => (conn.loading = false)); }
     pollConnections(); loadGateway();
   }
+  function childPath(root, el) {
+    const path = [];
+    let node = el;
+    while (node && node !== root) {
+      const parent = node.parentElement;
+      if (!parent) return null;
+      const idx = Array.prototype.indexOf.call(parent.children, node);
+      if (idx < 0) return null;
+      path.push(idx);
+      node = parent;
+    }
+    return node === root ? path.reverse() : null;
+  }
+  function nodeAt(root, path) {
+    let node = root;
+    for (let i = 0; i < path.length; i++) {
+      const kids = node && node.children;
+      node = kids && kids[path[i]];
+      if (!node) return null;
+    }
+    return node;
+  }
+  function captureScroll(root) {
+    const out = [];
+    if (!root) return out;
+    const stack = [[root, []]];
+    while (stack.length) {
+      const item = stack.pop();
+      const el = item[0], path = item[1];
+      const top = el.scrollTop || 0, left = el.scrollLeft || 0;
+      if ((top || left) && path.length) out.push({ path, top, left });
+      const kids = el.children;
+      if (!kids) continue;
+      for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], path.concat(i)]);
+    }
+    return out;
+  }
+  function restoreScroll(root, saved) {
+    for (let i = 0; i < saved.length; i++) {
+      const el = nodeAt(root, saved[i].path);
+      if (!el) continue;
+      if (saved[i].top) el.scrollTop = saved[i].top;
+      if (saved[i].left) el.scrollLeft = saved[i].left;
+    }
+  }
+  function captureAncestors(el) {
+    const out = [];
+    let node = el;
+    while (node) {
+      const top = node.scrollTop || 0, left = node.scrollLeft || 0;
+      if (top || left) out.push({ el: node, top, left });
+      node = node.parentElement;
+    }
+    return out;
+  }
+  function restoreAncestors(saved) {
+    for (let i = 0; i < saved.length; i++) {
+      if (saved[i].top) saved[i].el.scrollTop = saved[i].top;
+      if (saved[i].left) saved[i].el.scrollLeft = saved[i].left;
+    }
+  }
+  function attrSel(name, value) {
+    if (value == null || /["\\\]]/.test(value)) return "";
+    return "[" + name + '="' + value + '"]';
+  }
+  function focusToken(el) {
+    const top = $("#devices-top"), grid = $("#devices-grid");
+    if (!el || typeof el.getAttribute !== "function") return null;
+    if (!((top && top.contains(el)) || (grid && grid.contains(el)))) return null;
+    let caret = null, caretEnd = null;
+    try { if (typeof el.selectionStart === "number") { caret = el.selectionStart; caretEnd = el.selectionEnd; } }
+    catch (e) { /* a select throws when asked for a caret */ }
+    if (el.id && /^[A-Za-z][\w:-]*$/.test(el.id)) return { sel: "#" + el.id, caret, caretEnd };
+    const attrs = ["data-cx", "data-cx-screen", "data-cx-send", "data-dev"];
+    for (let i = 0; i < attrs.length; i++) {
+      const sel = attrSel(attrs[i], el.getAttribute(attrs[i]));
+      if (sel) return { sel, caret, caretEnd };
+    }
+    if (el.hasAttribute && el.hasAttribute("data-scr-snap")) return { sel: "[data-scr-snap]", caret, caretEnd };
+    const root = top && top.contains(el) ? top : grid;
+    const path = root && childPath(root, el);
+    return path ? { rootId: root.id, path, tag: el.tagName, caret, caretEnd } : null;
+  }
+  function focusFind(token) {
+    if (!token) return null;
+    if (token.sel) { try { return $(token.sel); } catch (e) { return null; } }
+    const root = document.getElementById(token.rootId);
+    const node = root && nodeAt(root, token.path);
+    return node && node.tagName === token.tag ? node : null;
+  }
+  function focusBack(el, token) {
+    if (!el || typeof el.focus !== "function") return;
+    try { el.focus({ preventScroll: true }); }
+    catch (e) { try { el.focus(); } catch (e2) { /* detached, or a stub with no focus */ } }
+    if (token && token.caret != null) { try { el.setSelectionRange(token.caret, token.caretEnd); } catch (e) { /* not a text field */ } }
+  }
+
+  function renderDevices(force) {
+    const o = state.overview; if (!o) return false;
+    const sig = devicesSignature(o);
+    if (!force && sig === devicesSeen && $("#cx-checked")) {
+      paintChecked();
+      paintMeters($("#view-devices"));
+      armDevices();
+      return true;
+    }
+    const top = $("#devices-top"), grid = $("#devices-grid");
+    const open = new Set($$("#view-devices details.cx-more[open]").map((el) => el.closest("[aria-label]")?.getAttribute("aria-label")));
+    const held = focusToken(document.activeElement);
+    const ancestors = captureAncestors(document.getElementById("view-devices"));
+    const topScroll = captureScroll(top), gridScroll = captureScroll(grid);
+    const inv = Object.fromEntries((o.devices || []).map((d) => [d.id, d]));
+    top.innerHTML = `
+      <header class="cx-top"><p class="cx-summary" aria-live="polite">${summary()}</p>
+        <div class="cx-top-actions"><span class="cx-meta" id="cx-checked">${checkedLabel()}</span>
+        <button type="button" class="cx-btn" id="cx-refresh">${icon("refresh-cw")}<span>Check now</span></button></div></header>
+      ${linksPanel(o, inv)}`;
+    grid.innerHTML = `${herePanel()}
+      <div class="cx-pair">${screenPanel(o)}${sendPanel(o)}</div>
+      ${agentsPanel(o)}`;
+    $$("#view-devices details.cx-more").forEach((el) => { if (open.has(el.closest("[aria-label]")?.getAttribute("aria-label"))) el.open = true; });
+    restoreScroll(top, topScroll); restoreScroll(grid, gridScroll);
+    paintMeters($("#view-devices"));
+    wireDropzone(); wireScreen(); wireConnections();
+    focusBack(focusFind(held), held);
+    restoreAncestors(ancestors);
+    devicesSeen = devicesSignature(o);
+    armDevices();
+    return true;
+  }
 
   function wireConnections() {
-    $("#cx-refresh")?.addEventListener("click", () => { conn.data = null; renderDevices(); loadConnections(); });
+    $("#cx-refresh")?.addEventListener("click", () => { conn.data = null; renderDevices(true); loadConnections(); });
     $$("#devices-grid [data-cx]").forEach((b) => b.addEventListener("click", async () => {
-      const key = b.dataset.cx, [target, part, action] = key.split(":");
-      conn.busy.add(key); renderDevices();
+      const key = b.getAttribute("data-cx"), [target, part, action] = key.split(":");
+      conn.busy.add(key); renderDevices(true);
       try {
         const r = await api("/api/connections", { target, part, action });
         const note = r.result?.note; if (note) toast(note); else announce(`${words(part)}: ${action} done`);
       } catch (e) { toast(plainError(e.message)); } finally { conn.busy.delete(key); await loadConnections(); }
     }));
     $$("#view-devices [data-cx-screen]").forEach((b) => b.addEventListener("click", () => {
-      screenView.device = b.dataset.cxScreen; store.set("jarvis.scrdevice", screenView.device);
-      renderDevices(); $(".screen-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }); snapScreen();
+      screenView.device = b.getAttribute("data-cx-screen"); store.set("jarvis.scrdevice", screenView.device);
+      renderDevices(true); $(".screen-panel")?.scrollIntoView({ behavior: "smooth", block: "start" }); snapScreen();
     }));
     $$("#view-devices [data-cx-send]").forEach((b) => b.addEventListener("click", () => {
-      store.set("jarvis.dropdevice", b.dataset.cxSend);
-      const sel = $("#drop-device"); if (sel) sel.value = b.dataset.cxSend;
+      const sendTo = b.getAttribute("data-cx-send");
+      store.set("jarvis.dropdevice", sendTo);
+      const sel = $("#drop-device"); if (sel) sel.value = sendTo;
       $("#dropzone")?.scrollIntoView({ behavior: "smooth", block: "center" }); $("#dropzone")?.focus({ preventScroll: true });
     }));
   }
@@ -938,23 +1188,35 @@
     screenView.live = on; clearTimeout(screenView.timer);
     const gen = screenView.gen = (screenView.gen || 0) + 1;  // only the newest chain may run
     $("#scr-live")?.setAttribute("aria-pressed", String(on));
+    // Live only changes the button and the frame; both are updated in place.
+    if (state.overview && $("#cx-checked")) devicesSeen = devicesSignature(state.overview);
     if (!on) return paintScreen();
     const tick = async () => {
-      if (!screenView.live || gen !== screenView.gen) return;
-      if (!$("#view-devices").hidden && document.visibilityState === "visible") await snapScreen();
-      if (screenView.live && gen === screenView.gen) screenView.timer = setTimeout(tick, 3000);
+      if (!screenView.live || gen !== screenView.gen || document.hidden) return;
+      if (!$("#view-devices").hidden) await snapScreen();
+      if (screenView.live && gen === screenView.gen && !document.hidden) screenView.timer = setTimeout(tick, 3000);
     };
     tick();
   }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    if (!$("#view-devices").hidden) {
+      clearTimeout(conn.timer); conn.timer = 0;
+      loadConnections().finally(() => {
+        if (!$("#view-devices").hidden && !document.hidden && !conn.timer) pollConnections();
+      });
+    }
+    if (screenView.live) setLive(true);
+  });
   function wireScreen() {
     if (!$("#scr-frame")) return;
     paintScreen();
     $$(".scr-tabs button").forEach((b) => b.addEventListener("click", () => {
-      if (b.dataset.dev === screenView.device) return;
-      screenView.device = b.dataset.dev; screenView.error = ""; store.set("jarvis.scrdevice", b.dataset.dev);
-      $$(".scr-tabs button").forEach((x) => x.setAttribute("aria-selected", String(x === b)));
-      paintScreen();
-      if ((clusterNode(b.dataset.dev) || {}).presence !== "busy") snapScreen();
+      const id = b.getAttribute("data-dev");
+      if (id === screenView.device) return;
+      screenView.device = id; screenView.error = ""; store.set("jarvis.scrdevice", id);
+      renderDevices(true);
+      if ((clusterNode(id) || {}).presence !== "busy") snapScreen();
     }));
     $("#scr-refresh").addEventListener("click", snapScreen);
     $("#scr-live").addEventListener("click", () => setLive(!screenView.live));
@@ -991,17 +1253,33 @@
 
   // ---------- session thread: every channel, from memory ----------
   let history = [];
+  let historyFlight = null, historySig = "";
   const mine = new Set(store.get("jarvis.mine", []));       // message IDs sent from this console
   let local = [];                                            // pending or failed asks not in memory
   let lastHistory = 0;
   async function loadHistory() {
-    try { history = await api("/api/history?limit=40"); } catch (e) { return; }
-    lastHistory = Date.now();
-    // A live turn is retired once its reply is in memory.
-    for (const h of history) if (h.reply && live.turns.get(h.id)?.done) live.turns.delete(h.id);
-    // An interrupted CLI or listener can leave a turn with no end; give up after 20 min.
-    for (const [id, t] of live.turns) if (!t.done && Date.now() - t.at > 20 * 60e3) live.turns.delete(id);
-    renderThread(); if (state.overview) renderRouter(state.overview);
+    if (historyFlight) return historyFlight;
+    historyFlight = (async () => {
+      let all;
+      try { all = await api("/api/history?limit=60"); }
+      catch (e) { return; }
+      // Newest first. The thread and router stay on the newest 40; signals.js counts today from the wider page.
+      history = all.slice(0, 40);
+      lastHistory = Date.now();
+      // A live turn is retired once its reply is in memory.
+      for (const h of history) if (h.reply && live.turns.get(h.id)?.done) live.turns.delete(h.id);
+      // An interrupted CLI or listener can leave a turn with no end; give up after 20 min.
+      for (const [id, t] of live.turns) if (!t.done && Date.now() - t.at > 20 * 60e3) live.turns.delete(id);
+      const sig = JSON.stringify(history);
+      if (sig !== historySig) {
+        historySig = sig;
+        if (state.overview) renderRouter(state.overview);
+      }
+      renderThread();
+      emit("history", all);
+    })();
+    try { return await historyFlight; }
+    finally { historyFlight = null; }
   }
   const CHANNEL = { console: "console", voice: "voice", cli: "CLI" };
   const channelOf = (h) => CHANNEL[h.channel] || (mine.has(h.id) ? "console" : "voice or CLI");
@@ -1020,6 +1298,7 @@
   }
   const liveReply = (t, tier) => ({ who: "jarvis", text: t.done ? t.reply : t.sentences.join(" "), at: t.at + 1, tier: t.tier || tier, usage: t.usage,
     streaming: !t.done, error: t.error, meta: t.done ? [t.seconds != null ? t.seconds + "s" : null, t.plan || null].filter(Boolean) : [t.sentences.length ? "answering" : "thinking"] });
+  let threadSig = null;
   function renderThread() {
     const el = $("#thread");
     const rows = [], known = new Set();
@@ -1037,6 +1316,9 @@
     }
     rows.push(...local);
     rows.sort((a, b) => a.at - b.at);
+    const sig = new Date().toDateString() + "\u0002" + rows.map((m) => [m.who, m.at, m.tier || "", m.channel || "", m.voice ? 1 : 0, m.error ? 1 : 0, m.streaming ? 1 : 0, m.text, (m.meta || []).join(","), m.usage ? JSON.stringify(m.usage) : ""].join("\u0001")).join("\u0002");
+    if (sig === threadSig) return;
+    threadSig = sig;
     if (!rows.length) {
       el.innerHTML = `<li class="thread-empty"><h3>What should I work on?</h3>
         <p>Type below, or say “Jarvis, …”: the mic is always on, but only requests that start with “Jarvis” are sent (the mic button turns it off). Quick asks run one cheap model call; big jobs get a specialist plan you review first.</p>
@@ -1145,7 +1427,7 @@
     local.push(pending); renderThread();
     const pre = heard ? [[`heard you · voice match ${heard.score ?? "not checked"}`, "done"]] : [];
     trace([...pre, ["routing", "active"]]); announce("Sent. Routing.");
-    let ticker;
+    let ticker, onAskVis = null;
     try {
       const job = await api("/api/ask", { text, tier: state.tier || null, speak: state.speak, case: state.case || null });
       current = { id: job.id, pending, route: job.route, t0: Date.now(), message: null };
@@ -1158,7 +1440,11 @@
         if (t?.sentences.length) current.answering = true;
         trace([...pre, [routeLabel(current.route), "done"], [current.answering ? `answering · ${s}s` : `working · ${s}s · Esc to stop waiting`, "active"]]);
       };
-      draw(); ticker = setInterval(draw, 500);
+      draw();
+      const armTicker = () => { clearInterval(ticker); if (!document.hidden) ticker = setInterval(draw, 500); };
+      armTicker();
+      onAskVis = () => { if (document.hidden) clearInterval(ticker); else { draw(); armTicker(); } };
+      document.addEventListener("visibilitychange", onAskVis);
       const done = await waitForJob(job.id, 15 * 60e3);
       const routed = routeLabel(current.route);
       if (done.state === "stopped") { trace([...pre, [routed, "done"], ["stopped waiting · JARVIS may still finish; the reply will appear here", "fail"]]); announce("Stopped waiting."); return; }
@@ -1183,6 +1469,7 @@
       local.push({ who: "jarvis", text: plainError(e.message), error: true, at: Date.now() });
       trace([...pre, ["couldn't start", "fail"]]); announce("Couldn't start: " + plainError(e.message));
     } finally {
+      if (onAskVis) document.removeEventListener("visibilitychange", onAskVis);
       clearInterval(ticker); current = null;
       setBusy(false); renderThread();
       refreshOverview(); loadMini();
@@ -1515,7 +1802,17 @@
     },
     "voice.ready"() { soonOverview(); },
     "voice.heard"() { soonOverview(); },
-    "voice.ignored"() { soonOverview(); },
+    // Other-person audio is counted on the listener log. A full overview refetch per clip
+    // only rewrites this same line, so bump the count locally and redraw that block.
+    "voice.ignored"() {
+      const voice = state.overview && state.overview.voice;
+      if (!voice) return;
+      if (!voice.ignored) voice.ignored = { count: 0, last: null };
+      voice.ignored.count = (voice.ignored.count || 0) + 1;
+      const d = new Date(), p = (n) => String(n).padStart(2, "0");
+      voice.ignored.last = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+      renderListenerLog(state.overview);
+    },
     // Grok Bot finished a handoff after the brain's turn had already ended.
     "grok.reply"(d) { toast(`Grok finished: ${String(d.answer || "").slice(0, 220)}`); soonHistory(); },
   };
@@ -1578,9 +1875,16 @@
   let creditsAt = Date.now();
   const creditsNow = () => { creditsAt = Date.now(); refreshCredits(false); };
   setInterval(() => { if (!document.hidden) creditsNow(); }, 120000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && Date.now() - creditsAt > 120000) creditsNow(); });
   refreshProbe(false);
   setInterval(() => { if (!document.hidden) refreshProbe(false); }, 60000); // the server caches for 55 s
-  setInterval(() => { if (state.probe) $("#probe-checked").textContent = "checked " + ago(state.probe.checked_at); }, 15000);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden && state.probe && Date.now() / 1000 - state.probe.checked_at > 60) refreshProbe(false); });
+  setInterval(() => { if (!document.hidden && state.probe) $("#probe-checked").textContent = "checked " + ago(state.probe.checked_at); }, 15000);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    if (!live.connected || Date.now() - lastOverview > 60000) refreshOverview();
+    if (!live.connected || Date.now() - lastHistory > 120000) loadHistory();
+    if (Date.now() - creditsAt > 120000) creditsNow();
+    if (!state.probe) return;
+    $("#probe-checked").textContent = "checked " + ago(state.probe.checked_at);
+    if (Date.now() / 1000 - state.probe.checked_at > 60) refreshProbe(false);
+  });
 })();

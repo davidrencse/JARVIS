@@ -25,10 +25,15 @@
     pill.style.transform = vertical ? `translateY(${box.top - host.top}px)` : `translateX(${box.left - host.left}px)`;
   }
   const navPill = () => slide($(".rail-pill"), $('.rail a[aria-current="page"]'));
-  addEventListener("resize", navPill);
+  let pillQueued = 0;
+  const queuePill = () => {
+    if (pillQueued) return;
+    pillQueued = requestAnimationFrame(() => { pillQueued = 0; navPill(); });
+  };
+  addEventListener("resize", queuePill);
   // Fonts and wrapping change the pill's target after first paint; re-measure then too.
-  if (window.ResizeObserver) new ResizeObserver(navPill).observe($(".rail"));
-  document.fonts?.ready.then(navPill);
+  if (window.ResizeObserver) new ResizeObserver(queuePill).observe($(".rail"));
+  document.fonts?.ready.then(queuePill);
 
   // ---------- header title follows the view; the prompt lives in the assistant ----------
   const dock = $("#dock"), shell = $(".shell"), home = $("#dock-home");
@@ -43,7 +48,7 @@
     view = name;
     $("#page-title").textContent = $("#view-" + name)?.dataset.title || "Console";
     document.documentElement.dataset.view = name;
-    placeDock(); requestAnimationFrame(navPill);
+    placeDock(); queuePill();
   }
   on("view", onView);
   addEventListener("resize", placeDock);
@@ -89,25 +94,31 @@
     const zen = probe?.devices?.zenbook, dell = probe?.devices?.dell;
     const stat = (ic, label, value, sub, tone) => `<div class="stat ${tone || ""}"><span class="stat-ic" aria-hidden="true">${icon(ic)}</span>
       <div><span class="stat-label">${esc(label)}</span><b>${value == null ? "—" : value}</b><span class="stat-sub">${esc(sub || "")}</span></div></div>`;
-    $("#limit-stats").innerHTML =
-      stat("gauge", "Codex, 5 h", left(five) == null ? null : left(five) + "%", five ? (five.resets_at ? "resets in " + until(five.resets_at) : "left") : "no data") +
-      stat("calendar", "Codex, week", left(week) == null ? null : left(week) + "%", week?.resets_at ? "resets in " + until(week.resets_at) : "left") +
-      stat("laptop-minimal", "Zenbook memory", zen?.mem_avail_pct == null ? null : zen.mem_avail_pct + "%", "free", zen?.mem_avail_pct != null && zen.mem_avail_pct < 10 ? "alert" : "");
     const tile = (title, sub, bits, prog, progLabel, tone) => `<div class="silk-tile">
       <h3>${esc(title)}</h3><p>${esc(sub)}</p>
       <div class="tile-bits">${bits.map((b) => `<span>${esc(b)}</span>`).join("")}</div>
       <div class="tile-prog ${tone || ""}"><span>${esc(progLabel)}</span><span>${prog == null ? "—" : Math.round(prog) + "%"}</span>
         <i aria-hidden="true"><b style="width:${prog == null ? 0 : Math.max(2, Math.min(100, prog))}%"></b></i></div></div>`;
     const lm = probe?.input_link;
-    $("#silk-tiles").innerHTML =
+    const done = credits && probe;
+    const count = done ? String([five, week, zen].filter(Boolean).length) : "…";
+    const statsHtml =
+      stat("gauge", "Codex, 5 h", left(five) == null ? null : left(five) + "%", five ? (five.resets_at ? "resets in " + until(five.resets_at) : "left") : "no data") +
+      stat("calendar", "Codex, week", left(week) == null ? null : left(week) + "%", week?.resets_at ? "resets in " + until(week.resets_at) : "left") +
+      stat("laptop-minimal", "Zenbook memory", zen?.mem_avail_pct == null ? null : zen.mem_avail_pct + "%", "free", zen?.mem_avail_pct != null && zen.mem_avail_pct < 10 ? "alert" : "");
+    const tilesHtml =
       tile("WinLaptop", "Dell G15 · this laptop",
         [dell?.lan_mouse?.running ? "Lan Mouse up" : "Lan Mouse off", lm ? (lm.level === "down" ? "link down" : "link up") : "checking"],
         five ? 100 - (five.pct ?? 0) : null, "Codex window left") +
       tile("archmain", zen?.ssh ? `Zenbook · ${zen.ip || "online"}` : zen ? "Zenbook · unreachable" : "Zenbook · checking",
         [zen?.ping_ms != null ? zen.ping_ms + " ms" : "—", zen?.wifi_power_save === "on" ? "power save on" : "power save off"],
         zen?.mem_avail_pct ?? null, "Memory free", zen?.mem_avail_pct != null && zen.mem_avail_pct < 10 ? "alert" : "");
-    const done = credits && probe;
-    $("#limits-count").textContent = done ? String([five, week, zen].filter(Boolean).length) : "…";
+    const sig = statsHtml + "\0" + tilesHtml + "\0" + count;
+    if (limits._sig === sig) return;
+    limits._sig = sig;
+    $("#limit-stats").innerHTML = statsHtml;
+    $("#silk-tiles").innerHTML = tilesHtml;
+    $("#limits-count").textContent = count;
   }
   on("credits", (d) => { credits = d; limits(); });
   on("probe", (d) => { probe = d; limits(); });
@@ -117,7 +128,11 @@
   const KIND_ICON = { message: "message-square", reply: "audio-lines", note: "file-text", finding: "flag", plan: "list-checks", result: "activity", case: "folder-search", url: "link", output: "terminal" };
   function recent(o) {
     const items = (o?.memory?.recent || []).slice(0, 5);
-    $("#recent-list").innerHTML = items.length ? items.map((it) => `<li><a href="#memory" data-id="${esc(it.id)}">
+    const list = $("#recent-list");
+    const sig = items.map((it) => [it.id, it.kind, it.title].join("\t")).join("\n");
+    if (list._sig === sig) return;
+    list._sig = sig;
+    list.innerHTML = items.length ? items.map((it) => `<li><a href="#memory" data-id="${esc(it.id)}">
         <span class="pl-ic" aria-hidden="true">${icon(KIND_ICON[it.kind] || "file-text")}</span><span class="pl-t">${esc(it.title)}</span><span class="pl-k">${esc(it.kind)}</span></a></li>`).join("")
       : `<li class="empty"><b>Nothing remembered yet.</b>Requests, replies and notes land here.</li>`;
     $$("#recent-list a").forEach((a) => a.addEventListener("click", () => {

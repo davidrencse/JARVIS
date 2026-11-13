@@ -683,11 +683,147 @@
   }
 
   // ---------- memory archive vs Git ----------
+  // Polls reuse the panel when this string matches. checked_at is painted on its own.
+  let vaultSeen = "", vaultBump = 0;
+  const vaultWhen = (t) => !t ? "" : ago(typeof t === "number" ? t : Date.parse(t) / 1000);
+  function vaultCheckedText(v) { return "Checked " + vaultWhen(v && v.checked_at) + "."; }
+  function vaultSignature() {
+    if (!S.vault) return S.loadingVault ? "loading" : S.vaultErr ? "err:" + errText(S.vaultErr) : "empty";
+    let raw;
+    try { raw = JSON.parse(JSON.stringify(S.vault)); }
+    catch (e) { return "bust-" + (++vaultBump); }
+    delete raw.checked_at;
+    const arch = raw.archive;
+    if (arch && typeof arch.oldest_pending_age_s === "number") arch.oldest_pending_age_s = Math.round(arch.oldest_pending_age_s / 60);
+    const git = raw.git;
+    if (git && typeof git.last_fetch_at === "number") git.fetch_stale = (Date.now() / 1000 - git.last_fetch_at) > 3600;
+    return JSON.stringify(raw) + "\n" + (S.vaultErr ? errText(S.vaultErr) : "");
+  }
+  function walkEls(root, fn) {
+    const stack = [root];
+    while (stack.length) {
+      const n = stack.pop();
+      if (!n || !n.tagName) continue;
+      fn(n);
+      const kids = n.children || [];
+      for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+  }
+  function findAttr(root, name, value) {
+    let found = null;
+    walkEls(root, (n) => { if (!found && n.getAttribute && n.getAttribute(name) === value) found = n; });
+    return found;
+  }
+  function vaultFocus(root) {
+    const el = document.activeElement;
+    if (!el || el === root || !el.tagName || !root.contains || !root.contains(el)) return null;
+    const saved = { tag: el.tagName, id: el.id || "", summary: el.tagName === "SUMMARY" ? (el.textContent || "") : "", button: el.tagName === "BUTTON" ? (el.textContent || "") : "" };
+    const path = [];
+    let node = el;
+    while (node && node !== root) {
+      const parent = node.parentElement;
+      if (!parent || !parent.children) return saved;
+      const idx = Array.prototype.indexOf.call(parent.children, node);
+      if (idx < 0) return saved;
+      path.push(idx);
+      node = parent;
+    }
+    if (node === root) saved.path = path.reverse();
+    return saved;
+  }
+  function putVaultFocus(root, saved) {
+    if (!saved) return;
+    let el = null;
+    if (saved.id) walkEls(root, (n) => { if (!el && n.id === saved.id) el = n; });
+    if (!el && saved.summary) walkEls(root, (n) => { if (!el && n.tagName === "SUMMARY" && n.textContent === saved.summary) el = n; });
+    if (!el && saved.button) walkEls(root, (n) => { if (!el && n.tagName === "BUTTON" && n.textContent === saved.button) el = n; });
+    if (!el && saved.path) {
+      let node = root;
+      for (let i = 0; i < saved.path.length && node; i++) node = node.children && node.children[saved.path[i]];
+      if (node && node.tagName === saved.tag) el = node;
+    }
+    if (!el || typeof el.focus !== "function") return;
+    try { el.focus({ preventScroll: true }); }
+    catch (err) { try { el.focus(); } catch (err2) { /* nothing to focus */ } }
+  }
+  function pageScroll(el) {
+    const saved = [];
+    let n = el;
+    while (n) {
+      const top = n.scrollTop || 0, left = n.scrollLeft || 0;
+      if (top || left) saved.push({ el: n, top: top, left: left });
+      n = n.parentElement || null;
+    }
+    return saved;
+  }
+  function putScroll(saved) {
+    for (let i = 0; i < saved.length; i++) {
+      if (saved[i].top) saved[i].el.scrollTop = saved[i].top;
+      if (saved[i].left) saved[i].el.scrollLeft = saved[i].left;
+    }
+  }
+  function innerScroll(root) {
+    const out = [];
+    const walk = (el, path) => {
+      if (!el || !el.tagName) return;
+      const top = el.scrollTop || 0, left = el.scrollLeft || 0;
+      if ((top || left) && path.length) out.push({ path: path.slice(), top: top, left: left, tag: el.tagName });
+      const kids = el.children || [];
+      for (let i = 0; i < kids.length; i++) walk(kids[i], path.concat(i));
+    };
+    walk(root, []);
+    return out;
+  }
+  function putInnerScroll(root, saved) {
+    for (let i = 0; i < saved.length; i++) {
+      let node = root;
+      const path = saved[i].path;
+      for (let j = 0; j < path.length && node; j++) node = node.children && node.children[path[j]];
+      if (!node || node.tagName !== saved[i].tag) continue;
+      if (saved[i].top) node.scrollTop = saved[i].top;
+      if (saved[i].left) node.scrollLeft = saved[i].left;
+    }
+  }
+  function openDetailLabels(root) {
+    const labels = [];
+    walkEls(root, (n) => {
+      if (n.tagName !== "DETAILS" || !(n.open || (n.hasAttribute && n.hasAttribute("open")))) return;
+      const kids = n.children || [];
+      for (let i = 0; i < kids.length; i++) if (kids[i].tagName === "SUMMARY" && kids[i].textContent) labels.push(kids[i].textContent);
+    });
+    return labels;
+  }
+  function reopenDetails(root, labels) {
+    if (!labels.length) return;
+    walkEls(root, (n) => {
+      if (n.tagName !== "DETAILS") return;
+      const kids = n.children || [];
+      let label = "";
+      for (let i = 0; i < kids.length; i++) if (kids[i].tagName === "SUMMARY") label = kids[i].textContent || "";
+      if (labels.indexOf(label) < 0) return;
+      n.open = true;
+      if (n.setAttribute) n.setAttribute("open", "");
+    });
+  }
   function renderVault() {
+    const sig = vaultSignature();
+    if (sig === vaultSeen && vaultBody.children.length) {
+      const label = findAttr(vaultBody, "data-fl-checked", "1");
+      if (label && S.vault) {
+        const next = vaultCheckedText(S.vault);
+        if (label.textContent !== next) label.textContent = next;
+      }
+      return;
+    }
+    const focus = vaultFocus(vaultBody);
+    const pages = pageScroll(vaultBody);
+    const scrolled = innerScroll(vaultBody);
+    const open = openDetailLabels(vaultBody);
     clear(vaultBody);
-    if (S.loadingVault && !S.vault) { vaultBody.append(note("", "Loading archive status…")); return; }
-    if (S.vaultErr && !S.vault) { vaultBody.append(note("bad", "Couldn't read archive status. " + errText(S.vaultErr), btn("Retry", () => loadVault(), "fl-inline"))); return; }
-    const v = S.vault; if (!v) return;
+    const finish = () => { reopenDetails(vaultBody, open); putInnerScroll(vaultBody, scrolled); putVaultFocus(vaultBody, focus); putScroll(pages); vaultSeen = sig; };
+    if (S.loadingVault && !S.vault) { vaultBody.append(note("", "Loading archive status…")); finish(); return; }
+    if (S.vaultErr && !S.vault) { vaultBody.append(note("bad", "Couldn't read archive status. " + errText(S.vaultErr), btn("Retry", () => loadVault(), "fl-inline"))); finish(); return; }
+    const v = S.vault; if (!v) { finish(); return; }
     if (S.vaultErr) vaultBody.append(note("bad", "Couldn't refresh. Showing the last reading. " + errText(S.vaultErr)));
     const a = v.archive || {}, g = v.git, vv = v.vault || {};
     const n = (x) => (typeof x === "number" ? x : null);
@@ -697,14 +833,13 @@
     const archBlock = h("div", { class: "fl-block" }, h("h4", { text: "Memory archive" }),
       h("p", { class: "fl-line" }, h("span", { class: "cx-pill" + (archiveState === "current" ? " ok" : archiveState === "error" || archiveState === "blocked" || archiveState === "partial" ? " warn" : ""), text: ARCH[archiveState] || str(archiveState, 30) || "Unknown" }), " ",
         a.capture_enabled ? (a.capture_complete ? "Database capture is on for every store." : "Capture is not enabled for every database store.") + (filesUnverified ? " Plans, runs and knowledge files are not verified." : "") : "Capture is off."));
-    const when = (t) => !t ? "" : ago(typeof t === "number" ? t : Date.parse(t) / 1000);
     const facts = h("dl", { class: "fl-facts" });
     const add = (k, val) => { if (val !== null && val !== undefined && val !== "") facts.append(h("dt", { text: k }), h("dd", { text: String(val) })); };
     add("Waiting to archive", n(a.archive_pending)); add("Held back", n(a.archive_held)); add("Errors", n(a.archive_errors));
     add("Oldest waiting", n(a.oldest_pending_age_s) != null ? Math.round(a.oldest_pending_age_s / 60) + " min" : null);
     add("Baseline still to read", n(a.archive_baseline_pending));
     if (a.files_stale === true) add("Files", "Not verified since the last sync");
-    add("Last archived", a.last_success ? when(a.last_success) : "never");
+    add("Last archived", a.last_success ? vaultWhen(a.last_success) : "never");
     add("Gate", a.gate ? str(a.gate, 40) : null); add("Stage", a.stage ? str(a.stage, 40) : null);
     if (a.has_error) add("Needs attention", "The archive reported an error.");
     archBlock.append(h("p", { class: "fl-fine", text: "The archive is JARVIS's own capture of memory, history and tasks into the vault folder. It is separate from Git." }));
@@ -724,7 +859,7 @@
       gitBlock.append(h("p", { class: "fl-line", text: "Unpublished changes: " + unpublished }));
       let fetchLine = "Ahead / behind is unknown: no upstream branch is set.";
       if (g.upstream_set) {
-        const fetched = g.last_fetch_at ? when(g.last_fetch_at) : "";
+        const fetched = g.last_fetch_at ? vaultWhen(g.last_fetch_at) : "";
         const stale = !g.last_fetch_at || (typeof g.last_fetch_at === "number" && (Date.now() / 1000 - g.last_fetch_at) > 3600);
         fetchLine = (n(g.ahead) == null || n(g.behind) == null ? "Ahead / behind is unknown" : n(g.ahead) + " ahead, " + n(g.behind) + " behind") + ", as of the last fetch" + (fetched ? " (" + fetched + ")" : ", which never ran, so these numbers can't be trusted") + (stale ? ". Treat that fetch as stale." : ".");
       }
@@ -740,7 +875,8 @@
     gitBlock.append(h("details", { class: "fl-diag" }, h("summary", { text: "Git diagnostic details" }), gFacts));
     vaultBody.append(h("div", { class: "fl-two" }, archBlock, gitBlock));
     arr(v.problems).forEach((p) => vaultBody.append(note("", str(p, 200))));
-    vaultBody.append(h("p", { class: "fl-fine", text: "Checked " + when(v.checked_at) + "." }));
+    vaultBody.append(h("p", { class: "fl-fine", "data-fl-checked": "1", text: vaultCheckedText(v) }));
+    finish();
   }
 
   // ---------- MAIN transfer (preview only) ----------
@@ -798,8 +934,25 @@
     mo.observe(viewEl, { attributes: true, attributeFilter: ["hidden"] });
   }
   if (typeof window.addEventListener === "function") window.addEventListener("pagehide", stop);
-  setInterval(() => { if (started && visible() && !busy && !S.loadingInv) { loadInv(); } }, POLL_MS);
-  setInterval(() => { if (started && visible() && !S.loadingVault) loadVault(); }, POLL_MS * 3);
+  // Polls pause while the tab is hidden and catch up once when it is shown again.
+  let invTimer = 0, vaultTimer = 0;
+  function armPolls() {
+    if (invTimer) clearInterval(invTimer);
+    if (vaultTimer) clearInterval(vaultTimer);
+    invTimer = vaultTimer = 0;
+    if (typeof document.hidden === "boolean" && document.hidden) return;
+    invTimer = setInterval(() => { if (started && visible() && !busy && !S.loadingInv) loadInv(); }, POLL_MS);
+    vaultTimer = setInterval(() => { if (started && visible() && !S.loadingVault) loadVault(); }, POLL_MS * 3);
+  }
+  if (typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      armPolls();
+      if (document.hidden || !started || !visible()) return;
+      if (!busy && !S.loadingInv) loadInv();
+      if (!S.loadingVault) loadVault();
+    });
+  }
+  armPolls();
   if (visible()) start();
   window.JarvisFleet = { refresh: () => refreshAll(false), clearSecret: () => clearSecret("Code cleared.") };
 })();

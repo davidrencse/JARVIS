@@ -12,7 +12,8 @@
    the data feeds, numbered callout tags, hover, and placement in the wheel's world.
    The engine running = JARVIS working: off and still when idle, revs with activity, winds down
    when the request is done. Monochrome metal, colour means state (amber = activity, green = ok,
-   red = error). Renders only while visible, idles at 30 fps, holds still with reduced motion.
+   red = error). Renders only while visible, and stops once the picture is still.
+   Turning, strands, the explode tween and the short data ease all schedule frames; reduced motion holds still.
    The circuit-board version lives on in board3d.js (the System design page uses it). */
 import * as THREE from "./vendor/three-0.170.0.module.min.js";
 import { makeKit } from "./engine/kit.js";
@@ -28,7 +29,7 @@ if (host) start(host);
 function start(host) {
   const canvas = host.querySelector("canvas");
   const tip = host.querySelector(".board-tip");
-  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
   const esc = window.JarvisEsc;
   let renderer;
   try {
@@ -37,7 +38,6 @@ function start(host) {
     host.querySelector(".board-fallback")?.removeAttribute("hidden");
     return;
   }
-  renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.25;
@@ -113,6 +113,7 @@ function start(host) {
   const strip = document.createElement("div"); strip.className = "engine-gauges"; host.appendChild(strip);
   const overlay = document.createElement("canvas"); overlay.className = "engine-strands"; host.appendChild(overlay);
   const octx = overlay.getContext("2d");
+  let overlayDirty = true;
   const tagLayer = document.createElement("div"); tagLayer.className = "engine-tags"; host.appendChild(tagLayer);
   for (const m of mods) {
     m.tagEl = document.createElement("span"); m.tagEl.className = "et";
@@ -137,7 +138,7 @@ function start(host) {
     state.explodeTo = state.explodeTo ? 0 : 1;
     ctl.setAttribute("aria-pressed", String(!!state.explodeTo)); ctl.textContent = state.explodeTo ? "Assemble" : "Explode";
     if (reduced) { state.explode = state.explodeTo; applyExplode(state.explode); frameCamera(); renderNow(); }
-    wake(1600);
+    wake();
   };
   const fitEngine = () => {  // the engine's on-screen box (plus its gauges), handed to the wheel to zoom onto
     const wheel = window.JarvisWheel;
@@ -158,13 +159,15 @@ function start(host) {
     if (e.key === "e" || e.key === "E") toggleExplode();
     if (e.key === "f" || e.key === "F") fitEngine();
   });
+  let gaugeHTML = "";
   function gauges() {
     const fuel = (ctx.rows("brain").find(([k]) => /L3 left/.test(k)) || [, "-"])[1];
     const temp = { ok: "normal", warn: "check", fail: "hot" }[state.health];
     const gear = state.toolSpin > 0.15 ? "drive" : state.rpm > 3 ? "neutral" : "park";
-    strip.innerHTML = [["tach", `${Math.round(state.rpm)} rpm`, ""], ["boost", state.thinking ? "spooled" : "off", ""], ["gear", gear, ""],
+    const html = [["tach", `${Math.round(state.rpm)} rpm`, ""], ["boost", state.thinking ? "spooled" : "off", ""], ["gear", gear, ""],
       ["fuel", `L3 ${fuel}`, ""], ["oil", `${state.items} mem`, ""], ["temp", temp, state.health]]
       .map(([k, v, cls]) => `<span class="${cls}"><i>${k}</i><b>${esc(v)}</b></span>`).join("");
+    if (html !== gaugeHTML) { gaugeHTML = html; strip.innerHTML = html; }
     lights();
   }
   function health() {
@@ -185,9 +188,25 @@ function start(host) {
     health();
   }
   const api = (path) => window.Jarvis.api(path);  // app.js loads first on the console
-  const loadCards = async () => { try { for (const c of await api("/api/system/components")) cards[c.id] = c; health(); } catch (e) {} };
-  (async () => { try { setOverview(await api("/api/overview")); } catch (e) {} })();
-  loadCards(); setInterval(() => { if (!document.hidden) loadCards(); }, 30000);
+  let cardsFlight = null, cardsTimer = 0, overviewFlight = null;
+  function loadCards() {
+    if (cardsFlight) return cardsFlight;
+    cardsFlight = (async () => {
+      try { for (const c of await api("/api/system/components")) cards[c.id] = c; health(); }
+      catch (e) {}
+      finally { cardsFlight = null; }
+    })();
+    return cardsFlight;
+  }
+  function loadOverview() {
+    if (overviewFlight) return overviewFlight;
+    overviewFlight = (async () => {
+      try { setOverview(await api("/api/overview")); } catch (e) {}
+      finally { overviewFlight = null; }
+    })();
+    return overviewFlight;
+  }
+  loadOverview(); loadCards();
   addEventListener("jarvis:overview", (ev) => setOverview(ev.detail));
 
   const STAGE_OF = [[/^(hear|intake|voice)/, 0], [/^(route|instant|parse|judge)/, 1], [/^(recall|memory)/, 2], [/^(gate|hist|confirm)/, 3],
@@ -215,7 +234,7 @@ function start(host) {
       state.replies++; state.reply = 1; state.thinking = 0; state.until = performance.now() + 2200; fire(7);
       if (d.error) state.error = 1;
     }
-    wake(3000);
+    wake();
   });
 
   // ---------- hover: 3D parts and the callout tags ----------
@@ -228,13 +247,16 @@ function start(host) {
     if (hover) { hover.focus(false); hover.tagEl.classList.remove("on"); }
     hover = m;
     if (m) { m.focus(true); m.tagEl.classList.add("on"); }
-    if (!running()) renderNow();
+    overlayDirty = true;
+    // The outline is a still change. Paint it now; don't keep the loop alive for a hover.
+    if (raf) return;
+    if (sceneMoving(performance.now())) invalidate(); else renderNow();
   }
+  let tipHTML = "", tipW = 200, tipH = 100;
   function hoverAt(x, y) {
-    const r = canvas.getBoundingClientRect();
     let m = mods.find((q) => q.tagAt && x >= q.tagAt[0] && x <= q.tagAt[2] && y >= q.tagAt[1] && y <= q.tagAt[3]) || null;
     if (!m) {
-      ptr.set((x / r.width) * 2 - 1, -(y / r.height) * 2 + 1);
+      ptr.set((x / Math.max(1, W)) * 2 - 1, -(y / Math.max(1, H)) * 2 + 1);
       ray.setFromCamera(ptr, camera);
       const hit = ray.intersectObjects(hitObjs, false)[0];
       m = hit ? owner.get(hit.object) : null;
@@ -243,17 +265,19 @@ function start(host) {
     canvas.style.cursor = m && m.def.href ? "pointer" : "";
     if (m) {
       const head = `<div class="tt"><b>${String(m.def.no).padStart(2, "0")} ${esc(m.def.name)}</b><span>${esc(m.def.role)}</span></div>`;
-      tip.innerHTML = head + m.info(state).map(([k, v]) => `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
-      tip.hidden = false;
+      const html = head + m.info(state).map(([k, v]) => `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("");
+      if (html !== tipHTML) {
+        tipHTML = html; tip.innerHTML = html; tip.hidden = false;
+        tipW = tip.offsetWidth || 200; tipH = tip.offsetHeight || 100;
+      } else tip.hidden = false;
       // keep the tip on the engine's side of the ring: flip it left of the pointer when it would cross
-      const tw = tip.offsetWidth || 200, th = tip.offsetHeight || 100, limit = ring ? ringEdge(y) : r.width - 4;
-      const tx = x + 14 + tw > limit ? x - 14 - tw : x + 14;
-      tip.style.left = Math.max(4, Math.min(r.width - tw - 4, tx)) + "px"; tip.style.top = Math.max(4, Math.min(r.height - th - 4, y - 10)) + "px";
+      const limit = ring ? ringEdge(y) : W - 4;
+      const tx = x + 14 + tipW > limit ? x - 14 - tipW : x + 14;
+      tip.style.left = Math.max(4, Math.min(W - tipW - 4, tx)) + "px"; tip.style.top = Math.max(4, Math.min(H - tipH - 4, y - 10)) + "px";
     } else tip.hidden = true;
-    wake(600);
   }
-  function leave() { focus(null); tip.hidden = true; wake(600); }
-  canvas.addEventListener("pointermove", (e) => { const r = canvas.getBoundingClientRect(); hoverAt(e.clientX - r.left, e.clientY - r.top); });
+  function leave() { focus(null); tip.hidden = true; }
+  canvas.addEventListener("pointermove", (e) => { hoverAt(e.offsetX, e.offsetY); });
   canvas.addEventListener("pointerleave", leave);
   host.parentElement.addEventListener("click", () => { if (hover && hover.def.href) location.href = hover.def.href; });
 
@@ -284,9 +308,12 @@ function start(host) {
   }
   // Called from inside the wheel's own frame: render right here, in the same frame, so the engine
   // and the ring move as one (a separate rAF lagged a frame behind and shivered while panning).
+  let viewPending = false;
   function setView(v) {
     if (!v || (v.k === view.k && v.x === view.x && v.y === view.y)) return;
     view = { k: v.k, x: v.x, y: v.y };
+    if (!shown()) { viewPending = true; return; }
+    viewPending = false;
     frameCamera();
     renderNow();
   }
@@ -306,19 +333,23 @@ function start(host) {
     strip.style.display = sx < -300 || sx > W + 300 || sy < -300 || sy > H + 300 ? "none" : "";
     placeTags(ew);
   }
+  const tagBoxes = [];
   function placeTags(ew) {
     // full tags once the engine is big enough to read them, numbers only when small, none when tiny
     const mode = ew > 640 || (state.explode > 0.5 && ew > 300) ? "full" : ew > 150 ? "num" : "off";
     tagLayer.setAttribute("data-mode", mode);
-    if (mode === "off") { for (const m of mods) m.tagAt = null; return; }
+    if (mode === "off") { for (const m of mods) m.tagAt = null; overlayDirty = true; return; }
     if (mode !== tagMode || !mods[0].tagSize) for (const m of mods) m.tagSize = [m.tagEl.offsetWidth || 60, m.tagEl.offsetHeight || 16];
     tagMode = mode;
     const reach = Math.max(0.55, Math.min(1.6, ew / 520)), floor = H - 30;
-    const boxes = mods.map((m) => {
+    for (let i = 0; i < mods.length; i++) {
+      const m = mods[i];
       const [ax, ay] = screenOf(m.root.localToWorld(aw.copy(m.anchor))), [dx, dy] = m.def.tag, [tw, th] = m.tagSize;
       const tx = ax + dx * reach, ty = ay + dy * reach;
-      return { m, ax, ay, tw, th, l: dx < 0 ? tx - tw : tx, t: ty - th / 2 };
-    });
+      const b = tagBoxes[i] || (tagBoxes[i] = { m, ax: 0, ay: 0, tw: 0, th: 0, l: 0, t: 0 });
+      b.m = m; b.ax = ax; b.ay = ay; b.tw = tw; b.th = th; b.l = dx < 0 ? tx - tw : tx; b.t = ty - th / 2;
+    }
+    const boxes = tagBoxes;
     const edge = ringEdge;
     const [ctlR, ctlB] = ctlRect;
     const clamp = (b) => {
@@ -344,42 +375,95 @@ function start(host) {
       const ex = Math.max(b.l, Math.min(b.l + b.tw, b.ax)), ey = Math.max(b.t, Math.min(b.t + b.th, b.ay));
       b.m.tagAt = [b.l, b.t, b.l + b.tw, b.t + b.th, b.ax, b.ay, ex, ey];
     }
+    overlayDirty = true;
   }
   let tagMode = "";
   const aw = new THREE.Vector3();
 
   // a stage fired on the ring: a strand runs from the firing cylinder to that stage
   const strands = [];
-  function burst(wx, wy) { strands.push({ wx, wy, born: performance.now(), ci: ctx.shared.lastFired ?? 4 }); if (strands.length > 12) strands.shift(); wake(1400); }
+  function burst(wx, wy) { strands.push({ wx, wy, born: performance.now(), ci: ctx.shared.lastFired ?? 4 }); if (strands.length > 12) strands.shift(); wake(); }
   window.JarvisBoard = { place, hoverAt, leave, setView, burst };
   setTimeout(() => { const hook = window.JarvisBoardHook; if (hook) { hook.board = window.JarvisBoard; if (hook.G) place(hook.G, hook.size.W, hook.size.H); if (hook.view) setView(hook.view); } }, 0);
-  let ctlRect = [0, 0];
-  function size() {
-    W = Math.max(1, host.clientWidth); H = Math.max(1, host.clientHeight);
-    ctlRect = [ctlBox.offsetLeft + ctlBox.offsetWidth + 6, ctlBox.offsetTop + ctlBox.offsetHeight + 6];
-    renderer.setSize(W, H, false);
-    overlay.width = Math.round(W * Math.min(2, devicePixelRatio || 1)); overlay.height = Math.round(H * Math.min(2, devicePixelRatio || 1));
-    frameCamera(); wake(300);
+  let ctlRect = [0, 0], laidOut = false, usedDpr = 0;
+  // dpr 2 through a 1440p buffer; larger stages drop toward 1 so a 4K canvas is not a 33MP render.
+  function cappedDpr(w, h) {
+    const cap = 2560 * 1440 * 4;
+    let dpr = Math.min(devicePixelRatio || 1, 2);
+    if (w * h * dpr * dpr > cap) dpr = Math.min(dpr, Math.sqrt(cap / (w * h)));
+    return Math.max(1, Math.min(2, dpr));
   }
-  new ResizeObserver(size).observe(host);
+  function size() {
+    const cw = host.clientWidth, ch = host.clientHeight;
+    laidOut = cw > 0 && ch > 0;
+    if (!laidOut) { if (raf) { cancelAnimationFrame(raf); raf = 0; } return; }
+    W = cw; H = ch;
+    ctlRect = [ctlBox.offsetLeft + ctlBox.offsetWidth + 6, ctlBox.offsetTop + ctlBox.offsetHeight + 6];
+    const dpr = cappedDpr(W, H);
+    if (dpr !== usedDpr) { usedDpr = dpr; renderer.setPixelRatio(dpr); }
+    renderer.setSize(W, H, false);
+    const ow = Math.round(W * dpr), oh = Math.round(H * dpr);
+    if (overlay.width !== ow || overlay.height !== oh) { overlay.width = ow; overlay.height = oh; overlayDirty = true; }
+    if (shown()) { viewPending = false; frameCamera(); } else viewPending = true;
+    wake();
+  }
 
   // ---------- loop ----------
-  let visible = true, awakeUntil = 0, last = 0, raf = 0, lastGauge = 0;
+  let visible = true, easeUntil = 0, last = 0, raf = 0, lastGauge = 0;
+  let resizeObs = null, ioObs = null;
   const running = () => state.rpm > 3 || state.rpmTo > 3;
-  const shown = () => visible && !document.hidden && host.offsetParent !== null;
+  const shown = () => visible && !document.hidden && laidOut;
   function renderNow() { if (shown()) { renderer.render(scene, camera); drawOverlay(performance.now()); } }
-  new IntersectionObserver((es) => { visible = es.some((x) => x.isIntersecting); if (visible) wake(800); }).observe(host);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(800); });
-  function wake(ms) { awakeUntil = Math.max(awakeUntil, performance.now() + ms); if (!raf) raf = requestAnimationFrame(loop); }
+  function onIntersect(es) {
+    visible = es.some((x) => x.isIntersecting);
+    if (visible) wake(); else if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  }
+  function onVis() {
+    if (document.hidden) { if (raf) { cancelAnimationFrame(raf); raf = 0; } return; }
+    loadOverview(); loadCards(); wake();
+  }
+  document.addEventListener("visibilitychange", onVis);
+  const reduceMq = matchMedia("(prefers-reduced-motion: reduce)");
+  reduceMq.addEventListener?.("change", () => { reduced = reduceMq.matches; state.reduced = reduced; invalidate(); });
+  new MutationObserver(() => invalidate()).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => invalidate());
+  // wake(ms) / invalidate() are the one entry that resumes drawing. ms keeps a short
+  // window for lerps the modules hide (oil level, fuel); pointer moves do not pass one.
+  function invalidate() { if (!raf && shown()) raf = requestAnimationFrame(loop); }
+  function wake(ms) { if (ms > 0 && !reduced) easeUntil = Math.max(easeUntil, performance.now() + ms); invalidate(); }
+  function sceneMoving(now) {
+    if (running()) return true;             // crank, belts, turbo: the engine is actually turning
+    if (reduced) return false;              // holds still, same as before
+    if (Math.abs(state.explode - state.explodeTo) > 0.001) return true;
+    if (state.error > 0.01 || state.boost > 0.01 || state.reply > 0.02 || state.intake > 0.02 || state.toolSpin > 0.02) return true;
+    if (strands.length) return true;
+    const cyl = ctx.shared.cylinders;
+    if (cyl) for (let i = 0; i < cyl.length; i++) if (cyl[i].heat > 0.02) return true;
+    return now < easeUntil;                 // oil and fuel easing after a data change
+  }
+  function arm() {
+    if (!resizeObs) { resizeObs = new ResizeObserver(size); resizeObs.observe(host); }
+    if (!ioObs) { ioObs = new IntersectionObserver(onIntersect); ioObs.observe(host); }
+    if (!cardsTimer) cardsTimer = setInterval(() => { if (!document.hidden) loadCards(); }, 30000);
+  }
+  function disarm() {
+    if (raf) cancelAnimationFrame(raf);
+    raf = 0;
+    if (resizeObs) { resizeObs.disconnect(); resizeObs = null; }
+    if (ioObs) { ioObs.disconnect(); ioObs = null; }
+    if (cardsTimer) { clearInterval(cardsTimer); cardsTimer = 0; }
+  }
+  addEventListener("pagehide", disarm);
+  addEventListener("pageshow", (ev) => { if (!ev.persisted) return; arm(); if (!document.hidden) onVis(); });
   function loop(now) {
     raf = 0;
     if (!shown()) return;
-    const run = running();
-    if (now - last >= (run ? 1000 / 60 : 1000 / 30) - 1) {
-      const dt = Math.min(0.05, (now - last) / 1000 || 0.016); last = now;
-      step(dt, now); renderer.render(scene, camera); drawOverlay(now);
-    }
-    if ((run || now < awakeUntil) && (!reduced || run)) raf = requestAnimationFrame(loop);
+    if (viewPending) { viewPending = false; frameCamera(); }
+    const dt = Math.min(0.05, (now - last) / 1000 || 0.016); last = now;
+    step(dt, now); renderer.render(scene, camera); drawOverlay(now);
+    // Stop once the picture is still. The radiator's idle creep is not motion: the
+    // engine is off and still when nothing is happening, including while the pointer rests on it.
+    if (shown() && sceneMoving(now) && !raf) raf = requestAnimationFrame(loop);
   }
   function step(dt, now) {
     if (now > state.until) state.rpmTo = 0;  // nothing happening: the engine shuts off
@@ -389,7 +473,7 @@ function start(host) {
     if (state.explode !== state.explodeTo) {
       state.explode += (state.explodeTo - state.explode) * Math.min(1, dt * 5);
       if (Math.abs(state.explode - state.explodeTo) < 0.002) state.explode = state.explodeTo;
-      applyExplode(state.explode); frameCamera(); wake(200);
+      applyExplode(state.explode); frameCamera();
     }
     for (const m of mods) m.update(dt, state, now);
     state.error *= Math.pow(0.5, dt);
@@ -397,6 +481,8 @@ function start(host) {
   }
   const pw = new THREE.Vector3();
   function drawOverlay(now) {
+    if (!strands.length && !overlayDirty) return;
+    overlayDirty = false;
     const dpr = overlay.width / Math.max(1, W);
     octx.setTransform(dpr, 0, 0, dpr, 0, 0); octx.clearRect(0, 0, W, H);
     // callout leaders: anchor dot, elbow to the tag
@@ -427,5 +513,5 @@ function start(host) {
     }
   }
   for (const m of mods) m.update(0, state, 0);
-  size(); gauges(); wake(1500);
+  arm(); size(); gauges(); wake(1500);
 }

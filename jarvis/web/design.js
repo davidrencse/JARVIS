@@ -21,6 +21,7 @@ const REASONS = {  // the router's reasons, said plainly
   "owner override": "you picked the tier yourself",
 };
 let data = null, open = null, lastPath = null;
+let designSig = "", partsSig = "", partsBusy = false, partsGen = 0, loading = false, loadTimer = 0;
 // which part of the 3D board (board3d.js) does each station's job
 const HW = { hear: "I/O shield", decide: "chipset", remember: "RAM + M.2 drive", think: "CPU + cooler", act: "graphics card",
   speak: "audio chip", log: "log chip", machines: "network chip" };
@@ -122,7 +123,12 @@ function toggle(id, scroll = true) {
 }
 
 /* the route tester lights up the stations a request would pass through */
-let packetTimer = 0;
+let packetTimer = 0, packetStep = null, flowVisible = true;
+function packetShown() { return flowVisible && !document.hidden; }
+// Resumes the route packet after a hidden tab or an off-screen flow. A finished trace has no step.
+function invalidate() {
+  if (packetStep && !packetTimer && packetShown()) packetTimer = setInterval(packetStep, 600);
+}
 async function trace(text) {
   try {
     const r = await api("/api/route?text=" + encodeURIComponent(text));
@@ -143,21 +149,24 @@ function light(path) {
 }
 function runPacket(path) {
   clearInterval(packetTimer);
+  packetTimer = 0;
   const packet = $("packet"), cards = [...document.querySelectorAll("#flow .station")];
-  if (!packet || !cards.length || getComputedStyle(packet).display === "none") return;
+  if (!packet || !cards.length || getComputedStyle(packet).display === "none") { packetStep = null; return; }
   const stops = cards.filter((c) => path.includes(c.dataset.id));
-  const flowBox = $("flow").getBoundingClientRect();
   let i = 0;
   packet.style.opacity = "1";
   const step = () => {
-    if (i >= stops.length) { clearInterval(packetTimer); packet.style.opacity = "0"; return; }
+    if (!packetShown()) { clearInterval(packetTimer); packetTimer = 0; return; }
+    if (i >= stops.length) { clearInterval(packetTimer); packetTimer = 0; packetStep = null; packet.style.opacity = "0"; return; }
     const box = stops[i].getBoundingClientRect();
+    const flowBox = $("flow").getBoundingClientRect();
     packet.style.transition = i ? "left .55s ease" : "none";
     packet.style.left = `${box.left - flowBox.left + box.width / 2 - 4}px`;
     i++;
   };
+  packetStep = step;
   step();
-  packetTimer = setInterval(step, 600);
+  invalidate();
 }
 
 /* ---------- 02: health ---------- */
@@ -199,14 +208,27 @@ function renderSetup() {
 }
 /* ---------- 04a: the live components, one card each ---------- */
 const STATE_WORD = { ok: "running", warn: "check", off: "off", fail: "broken" };
-async function renderParts() {
-  let cards;
-  try {
-    cards = await api("/api/system/components");
-  } catch (err) {
-    $("parts").innerHTML = `<p class="parts-err">Couldn't read the components: ${esc(err.message)}</p>`;
-    return;
-  }
+async function renderParts(preset) {
+  let cards = preset || null;
+  let gen = partsGen;
+  if (!cards) {
+    if (partsBusy) return;
+    gen = ++partsGen;
+    partsBusy = true;
+    try {
+      cards = await api("/api/system/components");
+    } catch (err) {
+      if (gen !== partsGen) return;
+      partsSig = "";
+      $("parts").innerHTML = `<p class="parts-err">Couldn't read the components: ${esc(err.message)}</p>`;
+      return;
+    } finally { partsBusy = false; }
+    if (gen !== partsGen) return;
+  } else gen = ++partsGen;
+  let sig = "";
+  try { sig = JSON.stringify(cards); } catch (e) { sig = ""; }
+  if (sig && sig === partsSig) return;
+  partsSig = sig;
   $("parts").innerHTML = cards.map((c) => `<article class="part ${esc(c.state)}" aria-label="${esc(c.title)}: ${esc(STATE_WORD[c.state] || c.state)}">
       <header><h3>${esc(c.title)}</h3><span class="state"><span class="dot ${esc(c.state)}"></span>${esc(STATE_WORD[c.state] || c.state)}</span></header>
       <dl>${c.rows.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join("")}</dl>
@@ -287,7 +309,9 @@ async function diagnose() {
   btn.disabled = true; btn.textContent = "Running…"; btn.removeAttribute("data-state");
   try {
     const [d, comps] = await Promise.all([api("/api/system/design"), api("/api/system/components")]);
-    data = d; render();
+    data = d;
+    try { designSig = JSON.stringify(data); } catch (e) { designSig = ""; }
+    render(comps);
     const parts = new Map();
     const add = (name, state, problem) => {
       const p = parts.get(name) || { name, state: "ok", problems: [], checks: 0 };
@@ -315,20 +339,26 @@ async function diagnose() {
 }
 $("diag-run").addEventListener("click", diagnose);
 
-function render() {
-  renderFlow(); Object.entries(marks).forEach(([cls, id]) => mark(cls, id)); renderChecks(); renderStores(); renderSetup(); renderCodemap(); renderParts();
+function render(parts) {
+  renderFlow(); Object.entries(marks).forEach(([cls, id]) => mark(cls, id)); renderChecks(); renderStores(); renderSetup(); renderCodemap(); renderParts(parts);
   if (lastPath) light(lastPath);
   if (open) { const was = open; open = null; toggle(was, false); }
 }
 
 async function load() {
+  if (loading || diagnosing) return;
+  loading = true;
   try {
-    data = await api("/api/system/design");
+    const next = await api("/api/system/design");
+    let sig = "";
+    try { sig = JSON.stringify(next); } catch (e) { sig = ""; }
+    if (data && sig && sig === designSig) { await renderParts(); return; }
+    data = next;
+    designSig = sig;
+    render();
   } catch (err) {
     $("score").textContent = "Couldn't read the system: " + err.message;
-    return;
-  }
-  render();
+  } finally { loading = false; }
 }
 
 $("tester").addEventListener("submit", (e) => {
@@ -336,5 +366,32 @@ $("tester").addEventListener("submit", (e) => {
   const text = $("try").value.trim();
   if (text) trace(text);
 });
+function armLoad() {
+  clearInterval(loadTimer);
+  loadTimer = 0;
+  if (document.hidden) return;
+  loadTimer = setInterval(load, 30000); // health is live: start the listener and watch it go green
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    clearInterval(loadTimer); loadTimer = 0;
+    clearInterval(packetTimer); packetTimer = 0;
+    return;
+  }
+  load();
+  armLoad();
+  invalidate();
+});
+{
+  const flowEl = $("flow");
+  if (flowEl && typeof IntersectionObserver === "function") {
+    new IntersectionObserver((es) => {
+      flowVisible = es.some((x) => x.isIntersecting);
+      if (flowVisible) invalidate();
+      else { clearInterval(packetTimer); packetTimer = 0; }
+    }).observe(flowEl);
+  }
+}
+addEventListener("resize", () => invalidate());
 load();
-setInterval(load, 30000);  // health is live: start the listener and watch it go green
+armLoad();

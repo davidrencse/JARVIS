@@ -6,7 +6,8 @@
      graphics card      = the action tools   I/O shield       = voice + network
    Light pulses run along the copper traces as a request moves through JARVIS (turn.step events).
    Monochrome metal like a studio render; colour means state: amber = activity, red = error.
-   It renders only while visible, idles at 30 fps, and stills completely with reduced motion. */
+   It renders only while visible. A settled frame (camera home, fans stopped, nothing in flight)
+   does not schedule another one. Reduced motion still snaps the camera and keeps the fans still. */
 import * as THREE from "./vendor/three-0.170.0.module.min.js";
 
 // Mounted on the System design page (#design-board): it fills its box, feeds itself live events,
@@ -18,7 +19,7 @@ if (host) start(host);
 function start(host) {
   const canvas = host.querySelector("canvas");
   const tip = host.querySelector(".board-tip");
-  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
   let renderer;
   try {
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: "high-performance" });
@@ -27,7 +28,6 @@ function start(host) {
     host.querySelector(".board-fallback")?.removeAttribute("hidden");
     return;
   }
-  renderer.setPixelRatio(Math.min(2, devicePixelRatio || 1));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.3;
@@ -259,10 +259,16 @@ function start(host) {
     }
     wake(300);
   }
-  const loadCards = async () => {
-    try { setCards(await get("/api/system/components")); } catch (e) {}
-  };
-  loadCards(); setInterval(() => { if (!document.hidden) loadCards(); }, 30000);
+  let cardsFlight = null, cardsTimer = 0;
+  function loadCards() {
+    if (cardsFlight) return cardsFlight;
+    cardsFlight = (async () => {
+      try { setCards(await get("/api/system/components")); } catch (e) {}
+      finally { cardsFlight = null; }
+    })();
+    return cardsFlight;
+  }
+  loadCards();
   const rows = (id) => (cards[id] ? cards[id].rows : [["status", "loading"]]);
 
   // ---------- traces that light up: pulses between the parts ----------
@@ -287,7 +293,7 @@ function start(host) {
     r.addColorStop(0, "rgba(255,255,255,1)"); r.addColorStop(0.25, "rgba(255,220,150,.9)"); r.addColorStop(1, "rgba(255,180,60,0)");
     g.fillStyle = r; g.fillRect(0, 0, 64, 64); return new THREE.CanvasTexture(c);
   })();
-  const pulses = [];
+  const pulses = [], pulsePos = new THREE.Vector3();
   const pulseMat = (color) => new THREE.SpriteMaterial({ map: sprite, color, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending });
   function pulse(path, color = 0xf0b429) {
     if (!curves[path] || pulses.length > 40) return;
@@ -320,35 +326,42 @@ function start(host) {
     setCards();
     wake(400);
   }
+  let overviewFlight = null, overviewTimer = 0;
+  function loadOverview() {
+    if (overviewFlight) return overviewFlight;
+    overviewFlight = (async () => {
+      try { setOverview(await get("/api/overview")); } catch (e) {}
+      finally { overviewFlight = null; }
+    })();
+    return overviewFlight;
+  }
   function onLive(e) {
     const kind = e && e.kind, d = (e && e.data) || {};
     if (kind && kind !== "hello") {  // every event lands in the log: blink its chip
       state.events++;
       const logLed = CHIPS.find((c) => c.id === "log").led.material;
-      logLed.emissive.setHex(0xf0b429); setTimeout(() => logLed.emissive.setHex(LED.ok), 220); wake(400);
+      logLed.emissive.setHex(0xf0b429); setTimeout(() => { logLed.emissive.setHex(LED.ok); wake(); }, 220); wake();
     }
     if (kind === "turn.start") { state.thinking = 1; state.busyUntil = performance.now() + 60000; pulse("voice", 0xdfe9f5); }
     if (kind === "turn.done") {
       state.thinking = 0; state.busyUntil = performance.now() + 1500; pulse("memory");
       sticks[0] && (sticks[0].hot = 1);
-      if (d.error) { state.error = 1; wake(3000); }
+      if (d.error) { state.error = 1; wake(); }
     }
     if (kind === "turn.step") {
       const id = String(d.id || ""), label = String(d.label || "");
       state.lastStep = label || id;
       if (/^(recall|memory)/.test(id)) { pulse("memory"); sticks.forEach((s) => (s.hot = Math.max(s.hot, 0.6))); }
       else if (/browser|chrome|navigate|snapshot/i.test(id + label)) pulse("browser");
-      if (/^(tool|adapter|grok|step)/.test(id)) { pulse("act"); state.lastTool = label || id; state.toolUntil = performance.now() + 4000; gpuLed.material.emissive.setHex(0xf0b429); setTimeout(() => gpuLed.material.emissive.setHex(0x000000), 1600); }
+      if (/^(tool|adapter|grok|step)/.test(id)) { pulse("act"); state.lastTool = label || id; state.toolUntil = performance.now() + 4000; gpuLed.material.emissive.setHex(0xf0b429); setTimeout(() => { gpuLed.material.emissive.setHex(0x000000); wake(); }, 1600); }
       else if (/^(route|judge|gate|confirm|parse)/.test(id)) pulse("gates");
-      else if (/vault/i.test(id + label)) { pulse("vault"); vaultLed.material.emissive.setHex(0xf0b429); setTimeout(() => vaultLed.material.emissive.setHex(0x000000), 1600); }
+      else if (/vault/i.test(id + label)) { pulse("vault"); vaultLed.material.emissive.setHex(0xf0b429); setTimeout(() => { vaultLed.material.emissive.setHex(0x000000); wake(); }, 1600); }
       if (d.state === "fail") { pulse("act", 0xff4d5e); state.error = 1; }
     }
   }
   addEventListener("jarvis:overview", (ev) => setOverview(ev.detail));
   addEventListener("jarvis:live", (ev) => onLive(ev.detail));
-  (async () => {  // first paint without waiting for the next refresh
-    try { setOverview(await get("/api/overview")); } catch (e) {}
-  })();
+  loadOverview();  // first paint without waiting for the next refresh
 
   // ---------- what each part is, and what it does in JARVIS ----------
   const ROLE = {
@@ -439,7 +452,7 @@ function start(host) {
   const lines = document.createElementNS(SVGNS, "svg");
   lines.setAttribute("class", "board-lines"); lines.setAttribute("aria-hidden", "true");
   host.insertBefore(lines, tip);
-  let focus = null, hover = null, zoomed = null;
+  let focus = null, hover = null, zoomed = null, tipW = 0, tipH = 0, calloutSig = "";
   const partFocus = (p) => ({ parts: [p], title: p.title, role: p.role, rows: p.info() });
   function setFocus(f) {
     focus = f;
@@ -448,15 +461,24 @@ function start(host) {
       f.rows.map(([k, v]) => `<div><span>${E(k)}</span><b>${E(v)}</b></div>`).join("");
     tip.hidden = !f;
     tip.classList.toggle("is-route", !!(f && f.route));
+    if (f) { tipW = tip.offsetWidth; tipH = tip.offsetHeight; calloutSig = ""; }
+    else if (calloutSig) { calloutSig = ""; lines.innerHTML = ""; }
     wake(400);
   }
   const v3 = new THREE.Vector3();
   function drawCallout() {
-    if (!focus || !hiBox.visible) { lines.innerHTML = ""; return; }
-    const w = host.clientWidth, h = host.clientHeight;
+    if (!focus || !hiBox.visible) {
+      if (calloutSig) { calloutSig = ""; lines.innerHTML = ""; }
+      return;
+    }
+    const w = viewW, h = viewH;
     hiBox.box.getCenter(v3); v3.y = hiBox.box.max.y; v3.project(camera);
     const ax = (v3.x + 1) / 2 * w, ay = (1 - v3.y) / 2 * h;
-    const cw = tip.offsetWidth, ch = tip.offsetHeight, pad = 12;
+    // Half-pixel signature: a settled camera does not rebuild the SVG every frame.
+    const sig = (ax * 2 | 0) + "," + (ay * 2 | 0) + "," + w + "," + h + "," + tipW + "," + tipH;
+    if (sig === calloutSig) return;
+    calloutSig = sig;
+    const cw = tipW || 260, ch = tipH || 80, pad = 12;
     let cx, cy, ex, ey, pts;
     if (w < cw * 2 + 140) {  // narrow: card above or below, line drops to it
       cx = Math.max(pad, Math.min(w - cw - pad, ax - cw / 2));
@@ -480,9 +502,8 @@ function start(host) {
 
   // ---------- hover (the camera stays put: pointing only picks parts) ----------
   const ray = new THREE.Raycaster(), ptr = new THREE.Vector2(-9, -9);
-  function hoverAt(x, y) {  // host-local CSS px
-    const r = canvas.getBoundingClientRect();
-    ptr.set((x / r.width) * 2 - 1, -(y / r.height) * 2 + 1);
+  function hoverAt(x, y) {  // host-local CSS px; size cached by ResizeObserver
+    ptr.set((x / viewW) * 2 - 1, -(y / viewH) * 2 + 1);
     ray.setFromCamera(ptr, camera);
     const hit = ray.intersectObjects(hitObjs, false)[0];
     const p = hit ? owner.get(hit.object) : null;
@@ -506,7 +527,7 @@ function start(host) {
       role: d.plain || list[0].role, rows: d.rows || [] } : null;
     if (!hover) setFocus(held());
   });
-  canvas.addEventListener("pointermove", (e) => { const r = canvas.getBoundingClientRect(); hoverAt(e.clientX - r.left, e.clientY - r.top); });
+  canvas.addEventListener("pointermove", (e) => { hoverAt(e.offsetX, e.offsetY); });
   canvas.addEventListener("pointerleave", leave);
 
   // ---------- keyboard: Tab to the board, arrows walk the parts in reading order, Enter zooms ----------
@@ -585,6 +606,7 @@ function start(host) {
     new THREE.MeshBasicMaterial({ color: 0xdfe9f5, transparent: true, opacity: 0, depthTest: false }));
   scanBar.renderOrder = 12; scanBar.visible = false; board.add(scanBar);
   function clearDiag() {
+    clearHold();
     if (!diag) return;
     for (const r of diag.results) if (r.helper) { scene.remove(r.helper); r.helper.geometry.dispose(); r.helper.material.dispose(); }
     diag = null; scanBar.visible = false;
@@ -599,8 +621,10 @@ function start(host) {
     diag = { results, total: (ev.detail && ev.detail.total) || results.length, t: 0, hold: 0, done: false };
     scanBar.visible = true; wake(1000);
   });
+  // true while the scan or the fade is on screen. The 7s hold is a still frame: a timer
+  // resumes the loop when the outlines should fade, instead of redrawing the whole time.
   function stepDiag(dt) {
-    if (!diag) return;
+    if (!diag) return false;
     const SWEEP = reduced ? 0.01 : 2.2;
     if (diag.t < 1) {
       diag.t = Math.min(1, diag.t + dt / SWEEP);
@@ -610,7 +634,9 @@ function start(host) {
         r.helper = new THREE.Box3Helper(r.box, DIAG[r.state] || DIAG.ok);
         r.helper.material.depthTest = false; r.helper.material.transparent = true; r.helper.renderOrder = 10; scene.add(r.helper);
       }
-    } else if (!diag.done) {
+      return true;
+    }
+    if (!diag.done) {
       diag.done = true; scanBar.visible = false;
       // end on the worst part, with what's wrong and the fix; or a clean bill of health
       const bad = diag.results.filter((r) => r.state !== "ok").sort((a, b) => (b.state === "fail") - (a.state === "fail"));
@@ -627,15 +653,15 @@ function start(host) {
           role: `Every part that has a check passed: ${diag.results.length} parts, ${diag.total} checks read live.`, rows: [["result", "ok"]] };
       diag.focus = f;
       if (!hover && !zoomed) setFocus(f);
-    } else {
-      diag.hold += dt;
-      if (diag.hold > 7) {
-        const fade = Math.max(0, 1 - (diag.hold - 7) / 1.5);
-        for (const r of diag.results) if (r.helper) r.helper.material.opacity = fade;
-        if (fade <= 0) { const mine = focus === diag.focus; clearDiag(); if (mine && !hover) setFocus(held()); return; }
-      }
+      armHold(7000);
+      return false;
     }
-    wake(200);
+    if (diag.hold < 7) { armHold((7 - diag.hold) * 1000); return false; }
+    diag.hold += dt;
+    const fade = Math.max(0, 1 - (diag.hold - 7) / 1.5);
+    for (const r of diag.results) if (r.helper) r.helper.material.opacity = fade;
+    if (fade <= 0) { const mine = focus === diag.focus; clearDiag(); if (mine && !hover) setFocus(held()); return false; }
+    return true;
   }
 
   // ---------- logic: a request's real route, station by station, along Manhattan traces ----------
@@ -670,25 +696,26 @@ function start(host) {
     line.renderOrder = 9; line.geometry.setDrawRange(0, 0);
     const dot = new THREE.Sprite(pulseMat(AMBER)); dot.scale.set(0.9, 0.9, 0.9); dot.renderOrder = 11; dot.material.depthTest = false;
     board.add(line, dot);
-    route = { curve, line, dot, stops, tier, at: -1, t: 0, hold: 0,
+    route = { curve, line, dot, stops, tier, at: -1, t: 0, hold: 0, anchor: at[0],
       stopT: stops.map((_, k) => (k === 0 || !total ? 0 : lens[2 * k - 1] / total)),
       dur: Math.max(1.2, 0.75 * (stops.length - 1)), focus: null };
     wake(1000);
   }
+  const routePos = new THREE.Vector3();
   function routeFocus(k) {
     const st = route.stops[k], list = STATION_PARTS[st].map(byName);
     return { route: true, parts: list, title: `${String(k + 1).padStart(2, "0")} / ${String(route.stops.length).padStart(2, "0")} · ${st.toUpperCase()}`,
       role: list[0].role, rows: [["part", list[0].title], ["tier", route.tier || "—"], ["next", route.stops[k + 1] || "done"]] };
   }
   function stepRoute(dt) {
-    if (!route) return;
+    if (!route) return false;
     if (route.t < 1) {
       route.t = Math.min(1, route.t + dt / route.dur);
       // equal time per station, however long the trace between them
       const legs = route.stops.length - 1, u = route.t * legs, k = Math.min(Math.floor(u), Math.max(0, legs - 1)) + (route.t >= 1 ? 1 : 0);
       const a = route.stopT[Math.min(Math.floor(u), legs)] || 0, b = route.stopT[Math.min(Math.floor(u) + 1, legs)] ?? 1;
       const along = legs ? Math.min(1, a + (b - a) * (u - Math.floor(u))) : 0;
-      const pos = legs ? route.curve.getPointAt(route.t >= 1 ? 1 : along) : anchorOf(route.stops[0]);
+      const pos = legs ? route.curve.getPointAt(route.t >= 1 ? 1 : along, routePos) : route.anchor;
       route.dot.position.set(pos.x, 0.2, pos.z);
       route.line.geometry.setDrawRange(0, Math.ceil((route.t >= 1 ? 1 : along) * 241));
       if (k !== route.at) {
@@ -702,59 +729,118 @@ function start(host) {
       if (route.hold > 4.6) {
         const mine = focus && focus.route; clearRoute(); if (mine && !hover) setFocus(held());
         dispatchEvent(new CustomEvent("jarvis:board-stop", { detail: { station: null } }));
+        return false;
       }
     }
-    wake(200);
+    return true;
   }
   addEventListener("jarvis:route", (ev) => runRoute(ev.detail && ev.detail.path, ev.detail && ev.detail.tier));
   canvas.addEventListener("click", () => { if (hover) zoomTo(hover); else if (zoomed) zoomTo(null); });
-  {  // no console here: read the live stream and the overview ourselves
-    if (window.EventSource) {
-      const es = new EventSource("/api/events");
-      es.addEventListener("message", (ev) => { let e; try { e = JSON.parse(ev.data); } catch (x) { return; } onLive(e); });
-    }
-    const refresh = async () => { try { setOverview(await get("/api/overview")); } catch (e) {} };
-    setInterval(() => { if (!document.hidden) refresh(); }, 20000);
+  // ---------- size, camera, loop (rAF only while the picture is changing) ----------
+  // dpr 2 through a 1440p buffer; larger stages drop toward 1 so a 4K canvas is not a 33MP render.
+  function cappedDpr(w, h) {
+    const cap = 2560 * 1440 * 4;
+    let dpr = Math.min(devicePixelRatio || 1, 2);
+    if (w * h * dpr * dpr > cap) dpr = Math.min(dpr, Math.sqrt(cap / (w * h)));
+    return Math.max(1, Math.min(2, dpr));
   }
-  // ---------- size, camera, loop (renders only while visible; idles at 30 fps) ----------
+  let viewW = 1, viewH = 1, laidOut = false, usedDpr = 0;
+  let visible = true, last = 0, raf = 0, holdTimer = 0;
+  let resizeObs = null, ioObs = null, events = null;
+  // One entry for every mutation (wake and invalidate are the same function).
+  // Schedules a frame when the board is on screen; that frame schedules the next
+  // only while step() reports the picture is still moving.
+  function invalidate() { if (!raf && shown()) raf = requestAnimationFrame(loop); }
+  function wake() { invalidate(); }
+  function clearHold() { if (holdTimer) { clearTimeout(holdTimer); holdTimer = 0; } }
+  function armHold(ms) {
+    if (holdTimer) return;
+    holdTimer = setTimeout(() => {
+      holdTimer = 0;
+      if (!diag || !diag.done) return;
+      diag.hold = Math.max(diag.hold, 7);
+      wake();
+    }, Math.max(0, ms));
+  }
   function size() {
-    const w = Math.max(1, host.clientWidth), h = Math.max(1, host.clientHeight);
-    renderer.setSize(w, h, false); camera.aspect = w / h;
+    const cw = host.clientWidth, ch = host.clientHeight;
+    laidOut = cw > 0 && ch > 0;
+    if (!laidOut) { if (raf) { cancelAnimationFrame(raf); raf = 0; } return; }
+    viewW = cw; viewH = ch;
+    const dpr = cappedDpr(cw, ch);
+    if (dpr !== usedDpr) { usedDpr = dpr; renderer.setPixelRatio(dpr); }
+    renderer.setSize(cw, ch, false); camera.aspect = cw / ch;
     // fit the whole board in its slot, both ways
     const t = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
     camera.userData.dist = Math.max((BD * 0.56) / t, (BW * 0.6) / (t * camera.aspect));
     camera.clearViewOffset();
-    camera.updateProjectionMatrix(); wake(300);
+    camera.updateProjectionMatrix();
+    if (focus && !tip.hidden) { tipW = tip.offsetWidth; tipH = tip.offsetHeight; }
+    calloutSig = "";
+    wake(300);
   }
-  new ResizeObserver(size).observe(host);
-  let visible = true, awakeUntil = 0, last = 0, raf = 0;
-  new IntersectionObserver((es) => { visible = es.some((x) => x.isIntersecting); if (visible) wake(800); }).observe(host);
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(800); });
-  function wake(ms) { awakeUntil = Math.max(awakeUntil, performance.now() + ms); if (!raf) raf = requestAnimationFrame(loop); }
+  const shown = () => visible && !document.hidden && laidOut;
+  function onIntersect(es) {
+    visible = es.some((x) => x.isIntersecting);
+    if (visible) wake(800); else if (raf) { cancelAnimationFrame(raf); raf = 0; }
+  }
+  function onVis() {
+    if (document.hidden) { if (raf) { cancelAnimationFrame(raf); raf = 0; } return; }
+    loadOverview(); loadCards(); wake(800);
+  }
+  document.addEventListener("visibilitychange", onVis);
+  const reduceMq = matchMedia("(prefers-reduced-motion: reduce)");
+  reduceMq.addEventListener?.("change", () => { reduced = reduceMq.matches; wake(); });
+  new MutationObserver(() => invalidate()).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => invalidate());
+  function arm() {
+    if (!resizeObs) { resizeObs = new ResizeObserver(size); resizeObs.observe(host); }
+    if (!ioObs) { ioObs = new IntersectionObserver(onIntersect); ioObs.observe(host); }
+    if (!cardsTimer) cardsTimer = setInterval(() => { if (!document.hidden) loadCards(); }, 30000);
+    if (!overviewTimer) overviewTimer = setInterval(() => { if (!document.hidden) loadOverview(); }, 20000);
+    if (window.EventSource && !events) {
+      events = new EventSource("/api/events");
+      events.addEventListener("message", (ev) => { let e; try { e = JSON.parse(ev.data); } catch (x) { return; } onLive(e); });
+    }
+  }
+  function disarm() {
+    if (raf) cancelAnimationFrame(raf);
+    raf = 0;
+    clearHold();
+    if (resizeObs) { resizeObs.disconnect(); resizeObs = null; }
+    if (ioObs) { ioObs.disconnect(); ioObs = null; }
+    if (cardsTimer) { clearInterval(cardsTimer); cardsTimer = 0; }
+    if (overviewTimer) { clearInterval(overviewTimer); overviewTimer = 0; }
+    if (events) { events.close(); events = null; }
+  }
+  addEventListener("pagehide", disarm);
+  addEventListener("pageshow", (ev) => { if (!ev.persisted) return; arm(); if (!document.hidden) onVis(); });
   let shadowsBaked = false, routeDt = 0.016;
   const cam = { x: null, y: null, z: null, d: null, el: null };
+  const CAM_KEYS = ["x", "y", "z", "d", "el"];
+  const homeGoal = { x: 0, y: 0, z: 0.45, d: 30, el: 1.12 };
   let camGoal = null;
   function loop(now) {
     raf = 0;
-    if (!visible || document.hidden || host.offsetParent === null) return;  // hidden panel: stop entirely
-    const busy = state.thinking || pulses.length || route || diag || now < awakeUntil;
-    const interval = busy ? 1000 / 60 : 1000 / 30;
-    if (now - last >= interval - 1) {
-      const raw = (now - last) / 1000 || 0.016, dt = Math.min(0.05, raw); last = now;
-      routeDt = Math.min(0.25, raw);  // the route keeps real time even when frames are slow
-      step(dt, now); renderer.render(scene, camera); drawCallout();
-      if (!shadowsBaked) { renderer.shadowMap.needsUpdate = true; shadowsBaked = true; renderer.render(scene, camera); }
-    }
-    if (!reduced || busy) raf = requestAnimationFrame(loop);
+    if (!shown()) return;  // hidden tab, off-screen, or a 0×0 host: stop entirely
+    const raw = (now - last) / 1000 || 0.016, dt = Math.min(0.05, raw); last = now;
+    routeDt = Math.min(0.25, raw);  // the route keeps real time even when frames are slow
+    const again = step(dt, now);
+    renderer.render(scene, camera); drawCallout();
+    if (!shadowsBaked) { renderer.shadowMap.needsUpdate = true; shadowsBaked = true; renderer.render(scene, camera); }
+    if (again && shown() && !raf) raf = requestAnimationFrame(loop);
   }
   function step(dt, now) {
-    const t = now / 1000;
     // A fixed, high, slightly tilted studio angle: the board never follows the mouse. Clicking a
     // part glides the camera in to it (camGoal); the whole board is the default goal.
-    const goal = camGoal || { x: 0, y: 0, z: 0.45, d: camera.userData.dist || 30, el: 1.12 };
+    if (!camGoal) homeGoal.d = camera.userData.dist || 30;
+    const goal = camGoal || homeGoal;
     const k = reduced ? 1 : 1 - Math.exp(-dt * 4.5);
-    for (const key of ["x", "y", "z", "d", "el"]) cam[key] = cam[key] == null ? goal[key] : cam[key] + (goal[key] - cam[key]) * k;
-    if (Object.keys(goal).some((key) => Math.abs(goal[key] - cam[key]) > 1e-3)) awakeUntil = Math.max(awakeUntil, now + 100);
+    let drifting = false;
+    for (const key of CAM_KEYS) {
+      cam[key] = cam[key] == null ? goal[key] : cam[key] + (goal[key] - cam[key]) * k;
+      if (Math.abs(goal[key] - cam[key]) > 1e-3) drifting = true;
+    }
     const az = -0.08, d = cam.d, el = cam.el;
     camera.position.set(cam.x + Math.sin(az) * Math.cos(el) * d, cam.y + Math.sin(el) * d, cam.z + Math.cos(az) * Math.cos(el) * d);
     camera.lookAt(cam.x, cam.y, cam.z);
@@ -762,26 +848,37 @@ function start(host) {
     const working = state.thinking || now < state.busyUntil;
     const toolsOn = now < (state.toolUntil || 0);
     const ease = (f, target, up, down) => { f.speed += (target - f.speed) * Math.min(1, (target > f.speed ? up : down) * dt); };
-    ease(fan, reduced ? 0 : working ? 16 : 0, 1.6, 0.55);
+    const fanTarget = reduced ? 0 : working ? 16 : 0;
+    ease(fan, fanTarget, 1.6, 0.55);
+    if (fanTarget === 0 && fan.speed < 0.05) fan.speed = 0;
     fan.rotor.rotation.y -= fan.speed * dt;
     fan.ringMat.emissiveIntensity = Math.min(1.6, fan.speed / 10);
+    let fans = fanTarget > 0 || fan.speed > 0;
     gpuFans.forEach((f, i) => {
-      ease(f, reduced ? 0 : toolsOn ? 13 : working ? 3 : 0, 1.4, 0.5);
+      const target = reduced ? 0 : toolsOn ? 13 : working ? 3 : 0;
+      ease(f, target, 1.4, 0.5);
+      if (target === 0 && f.speed < 0.05) f.speed = 0;
       f.rotor.rotation.y += f.speed * dt * (i ? 1 : -1);
       f.ringMat.emissiveIntensity = Math.min(1.4, f.speed / 9);
+      if (target > 0 || f.speed > 0) fans = true;
     });
-    if (fan.speed > 0.05 || gpuFans.some((f) => f.speed > 0.05)) awakeUntil = Math.max(awakeUntil, now + 100);
+    let hot = false;
     for (const st of sticks) {
-      if (st.hot > 0.01 && st.kind) { st.hot *= 0.96; st.bar.material.emissive.setHex(st.hot > 0.4 ? 0xf0b429 : 0xdfe9f5); }
+      if (st.hot > 0.01 && st.kind) {
+        st.hot *= 0.96; st.bar.material.emissive.setHex(st.hot > 0.4 ? 0xf0b429 : 0xdfe9f5);
+        if (st.hot > 0.01) hot = true;
+      }
     }
     for (let i = pulses.length - 1; i >= 0; i--) {
       const p = pulses[i]; p.t += dt * p.speed;
       if (p.t >= 1) { board.remove(p.s); p.s.material.dispose(); pulses.splice(i, 1); continue; }
-      const pos = curves[p.path].getPointAt(p.t); p.s.position.set(pos.x, 0.18, pos.z);
+      curves[p.path].getPointAt(p.t, pulsePos); p.s.position.set(pulsePos.x, 0.18, pulsePos.z);
       p.s.material.opacity = Math.sin(p.t * Math.PI);
     }
-    stepRoute(routeDt); stepDiag(routeDt);
+    const routeLive = stepRoute(routeDt), diagLive = stepDiag(routeDt);
     if (state.error) { state.error *= 0.97; brainBadge.material.color.setRGB(1, 1 - state.error * 0.7, 1 - state.error * 0.7); if (state.error < 0.02) { state.error = 0; brainBadge.material.color.setRGB(1, 1, 1); } }
+    return drifting || fans || hot || pulses.length > 0 || routeLive || diagLive || state.error > 0;
   }
-  size(); wake(1500);
+  arm(); size(); wake();
+  document.fonts?.ready.then(() => { calloutSig = ""; wake(); });
 }

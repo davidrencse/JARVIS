@@ -8,6 +8,7 @@
   const BARS = 24, FAST = 110, SLOW = 3000, IDLE = 1000;
   const bars = new Array(BARS).fill(0);
   let floor = 0.004, state = "off", timer = null, busy = false, drawn = "";
+  let earInk = "", earQuiet = "", earTheme = null;
 
   // Same curve as the voice setup orb (voicesetup.js levelOf): quiet speech still shows.
   const height = (rms) => Math.min(1, Math.pow(Math.max(0, rms) * 14, 0.6));
@@ -22,21 +23,28 @@
     box.setAttribute("title", label);
   }
 
+  function earColors() {
+    const theme = document.documentElement.getAttribute("data-theme") || "";
+    if (earTheme === theme && earInk) return;
+    earTheme = theme;
+    const css = getComputedStyle(box);
+    earInk = css.getPropertyValue("--ear-ink").trim() || "#888";
+    earQuiet = css.getPropertyValue("--ear-quiet").trim() || "#555";
+  }
   function draw(force) {
-    const key = state + bars.join();
+    const key = (document.documentElement.getAttribute("data-theme") || "") + state + bars.join();
     if (force !== true && key === drawn) return;
-    drawn = key;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
     const w = canvas.clientWidth, h = canvas.clientHeight;
     if (!w || !h) return;
+    drawn = key;
     if (canvas.width !== Math.round(w * dpr)) canvas.width = Math.round(w * dpr);
     if (canvas.height !== Math.round(h * dpr)) canvas.height = Math.round(h * dpr);
     const g = canvas.getContext("2d");
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, w, h);
-    const css = getComputedStyle(box);
-    const ink = css.getPropertyValue("--ear-ink").trim() || "#888";
-    const quiet = css.getPropertyValue("--ear-quiet").trim() || "#555";
+    earColors();
+    const ink = earInk, quiet = earQuiet;
     const step = w / BARS, bw = Math.max(1.5, step * 0.55), mid = h / 2;
     const loud = Math.max(0.012, floor * 3.2);
     for (let i = 0; i < BARS; i++) {
@@ -49,12 +57,14 @@
 
   async function poll() {
     timer = null;
+    if (document.hidden) return;
     if (busy) return schedule(FAST);
-    if (document.hidden || !box.getClientRects().length) return schedule(IDLE);
+    if (!box.getClientRects().length) return schedule(IDLE);
     busy = true;
     let r = null;
     try { r = await window.Jarvis.api("/api/voice/level"); } catch { r = null; }
     busy = false;
+    if (document.hidden) return;
     if (!r || !r.live) {
       bars.fill(0); setState("off"); draw();
       return schedule(SLOW);
@@ -74,8 +84,10 @@
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && timer != null) { clearTimeout(timer); timer = null; poll(); }
+    if (document.hidden) { clearTimeout(timer); timer = null; return; }
+    poll();
   });
+  document.getElementById("theme-toggle")?.addEventListener("click", () => draw(true));
   window.addEventListener("resize", () => draw(true));
   draw(true);
   poll();

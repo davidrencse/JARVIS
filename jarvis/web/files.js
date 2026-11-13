@@ -26,25 +26,51 @@
     el.textContent = text; el.className = "files-status " + (cls || "");
   }
 
+  function failText(e) {
+    const msg = e && typeof e.message === "string" ? e.message.trim() : "";
+    return msg || "Something went wrong.";
+  }
+
+  const loadGen = {};
   async function load(device, path) {
-    const pane = panes[device]; pane.busy = true; pane.error = null; draw(device);
+    const pane = panes[device];
+    const gen = (loadGen[device] || 0) + 1;
+    loadGen[device] = gen;
+    pane.busy = true; pane.error = null; draw(device);
     try {
       const listing = await api(`/api/fs?device=${encodeURIComponent(device)}&path=${encodeURIComponent(path || "")}`);
+      if (loadGen[device] !== gen) return;
       if (listing.path !== pane.listing?.path) pane.query = "";
       pane.listing = listing;
-    } catch (e) { pane.error = e.message; }
+    } catch (e) {
+      if (loadGen[device] !== gen) return;
+      pane.error = failText(e);
+    }
+    if (loadGen[device] !== gen) return;
     pane.busy = false; draw(device);
   }
 
+  let copying = false;
   async function copy(src, dst) {
+    if (copying) return setStatus("A copy is already running. Wait for it to finish.", "bad");
     const dstPane = panes[dst.device];
-    if (!dstPane?.listing) return;
+    if (!dstPane?.listing) return setStatus("Open a folder on the other laptop first.", "bad");
+    copying = true;
     setStatus(`Copying ${src.name} …`, "pending");
     try {
       const r = await api("/api/fs/copy", { src_device: src.device, src_path: src.path, dst_device: dst.device, dst_dir: dst.dir });
       setStatus(`Copied ${r.copied}${r.as !== r.copied ? " as " + r.as : ""} to ${dst.device}.`, "ok");
-      load(dst.device, dstPane.listing.path);
-    } catch (e) { setStatus(`${src.name}: ${e.message}`, "bad"); toast(e.message); }
+      if (dstPane.listing) load(dst.device, dstPane.listing.path);
+    } catch (e) {
+      const message = failText(e);
+      setStatus(`${src.name}: ${message}`, "bad");
+      toast(message);
+      // A folder copy can stop after some of it has landed. Refresh the folder
+      // still on screen so that partial result is not a stale listing.
+      if (panes[dst.device]?.listing) load(dst.device, panes[dst.device].listing.path);
+    } finally {
+      copying = false;
+    }
   }
 
   function row(listing, e) {
@@ -114,13 +140,16 @@
     root.addEventListener("click", (e) => {
       const paneEl = e.target.closest("[data-pane]"); if (!paneEl) return;
       const device = paneEl.dataset.pane, l = panes[device].listing;
-      if (panes[device].busy) return;
+      if (panes[device].busy) return setStatus("This folder is still loading.", "bad");
       const act = e.target.closest("[data-act]")?.dataset.act;
       if (act === "refresh") return load(device, l?.path);
       if (act === "up" && l?.parent) return load(device, l.parent);
       const rowEl = e.target.closest(".frow"); if (!rowEl) return;
       if (e.target.closest(".fsend")) {
-        const other = devices.find((x) => x.id !== device); if (!other) return;
+        const here = devices.find((x) => x.id === device);
+        const other = devices.find((x) => x.id !== device && x.remote !== here?.remote && panes[x.id]?.listing)
+          || devices.find((x) => x.id !== device && panes[x.id]?.listing);
+        if (!other) return setStatus("The other laptop's folder hasn't loaded, so there is nowhere to copy to. Refresh it first.", "bad");
         return copy({ device, path: rowEl.dataset.path, name: rowEl.dataset.name }, { device: other.id, dir: panes[other.id].listing?.path });
       }
       if (rowEl.dataset.dir === "1") load(device, rowEl.dataset.path);
@@ -144,8 +173,11 @@
       const raw = e.dataTransfer.getData(MIME); if (!raw) return;
       e.preventDefault();
       const paneEl = e.target.closest("[data-pane]"); if (!paneEl) return;
-      const src = JSON.parse(raw), device = paneEl.dataset.pane;
-      if (src.device === device) return setStatus("Drop it on the other laptop's pane: copies go between the two machines.", "bad");
+      let src;
+      try { src = JSON.parse(raw); }
+      catch (err) { return setStatus("That drop couldn't be read. Try the copy arrow.", "bad"); }
+      const device = paneEl.dataset.pane;
+      if (!src || src.device === device) return setStatus("Drop it on the other laptop's pane: copies go between the two machines.", "bad");
       const folder = e.target.closest('.frow[data-dir="1"]');
       copy(src, { device, dir: folder ? folder.dataset.path : panes[device].listing?.path });
     });

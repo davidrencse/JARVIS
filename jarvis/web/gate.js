@@ -43,7 +43,11 @@
   const ro = new ResizeObserver(place);
   ro.observe(gate);
   if (document.getElementById("dock")) ro.observe(document.getElementById("dock"));
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) { clearTimeout(timer); refresh(); } });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    lastSig = ""; // grant chips show minutes left; a hidden tab does not tick them
+    clearTimeout(timer); refresh();
+  });
   addEventListener("resize", place);
   addEventListener("jarvis:view", () => requestAnimationFrame(place));
 
@@ -122,31 +126,46 @@
     }
   }
   setInterval(() => { if (!document.hidden && pending.length) tick(); }, 1000);
-  setInterval(() => { lastSig = ""; }, 60000); // grant chips show minutes left
+  setInterval(() => { if (!document.hidden) lastSig = ""; }, 60000); // grant chips show minutes left
 
   // ---------- data ----------
-  async function refresh() {
-    clearTimeout(timer);
-    if (!busy) {
-      try {
-        const data = await J.api("/api/confirm");
-        const next = data.pending || [];
-        const fresh = next.filter((x) => !seen.has(x.id));
-        next.forEach((x) => seen.add(x.id));
-        const sig = JSON.stringify([next.map((x) => [x.id, x.hash, x.can_grant, x.target, x.expires_at]),
-          data.grants || [], (data.recent || history).map((h) => [h.id, h.outcome])]);
-        pending = next; grants = data.grants || []; history = data.recent || history;
-        // Redraw only on change: a redraw would drop keyboard focus and re-announce the list.
-        if (sig !== lastSig) { lastSig = sig; render(); } else place();
-        if (fresh.length) {
-          // Announce only what is new: rewriting the list must not re-read every question.
-          const tmp = document.createElement("p");
-          tmp.innerHTML = fresh.map(what).join(" ");
-          say.textContent = `JARVIS needs your OK: ${tmp.textContent}`;
-        }
-        if (fresh.length) dispatchEvent(new CustomEvent("jarvis-gate:asked", { detail: fresh.length }));
-      } catch (e) { /* offline: try again on the next tick */ }
+  let refreshing = false, refreshAgain = false;
+  function rememberSeen(ids) {
+    for (const id of ids) seen.add(id);
+    if (seen.size <= 400) return;
+    const keep = new Set(ids);
+    for (const id of seen) {
+      if (seen.size <= 200) break;
+      if (!keep.has(id)) seen.delete(id);
     }
+  }
+  async function refresh() {
+    if (refreshing) { refreshAgain = true; return; }
+    refreshing = true;
+    clearTimeout(timer);
+    try {
+      if (!busy) {
+        try {
+          const data = await J.api("/api/confirm");
+          const next = data.pending || [];
+          const fresh = next.filter((x) => !seen.has(x.id));
+          rememberSeen(next.map((x) => x.id));
+          const sig = JSON.stringify([next.map((x) => [x.id, x.hash, x.can_grant, x.target, x.expires_at]),
+            data.grants || [], (data.recent || history).map((h) => [h.id, h.outcome])]);
+          pending = next; grants = data.grants || []; history = data.recent || history;
+          // Redraw only on change: a redraw would drop keyboard focus and re-announce the list.
+          if (sig !== lastSig) { lastSig = sig; render(); } else place();
+          if (fresh.length) {
+            // Announce only what is new: rewriting the list must not re-read every question.
+            const tmp = document.createElement("p");
+            tmp.innerHTML = fresh.map(what).join(" ");
+            say.textContent = `JARVIS needs your OK: ${tmp.textContent}`;
+          }
+          if (fresh.length) dispatchEvent(new CustomEvent("jarvis-gate:asked", { detail: fresh.length }));
+        } catch (e) { /* offline: try again on the next tick */ }
+      }
+    } finally { refreshing = false; }
+    if (refreshAgain) { refreshAgain = false; return refresh(); }
     // A hidden tab keeps the title badge current, slowly.
     timer = setTimeout(refresh, document.hidden ? 15000 : pending.length ? 1500 : 4000);
   }
