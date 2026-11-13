@@ -23,7 +23,7 @@ from jarvis.cluster import Hub, NodeWorker, execute_local, save_json
 from jarvis.continuity.executor import ExecutorGuard
 from jarvis.continuity.integration import (
     ENVELOPE_KEY, IsolatedFleet, SignedAuthority, clear_production, configure_production,
-    effect_digest, open_unfenced, production_issuer,
+    effect_digest, open_unfenced, production_issuer, set_node_seen_mode,
 )
 from jarvis.deploy import code_key, sign_job
 from jarvis.remote import Remote
@@ -84,8 +84,10 @@ CHILD = textwrap.dedent("""
         try:
             worker.once()
         finally:
-            guard.close()
-            clear_production(spec["node"])
+            try:
+                guard.close()
+            finally:
+                clear_production(spec["node"])
     except SystemExit:
         raise
     except Exception:
@@ -108,9 +110,11 @@ def fleet_config(port):
 class Runtime:
     def __init__(self):
         self.calls = []
+        self.order = []
 
     def require_authority(self, effect_class, target=None):
         self.calls.append((effect_class, target))
+        self.order.append(("authority", effect_class, target))
         return {"ready": True}
 
     def release_before_suspend(self):
@@ -120,8 +124,27 @@ class Runtime:
 
 @unittest.skipUnless(shutil.which("ssh-keygen"), "needs ssh-keygen")
 class ManagedDispatch(unittest.TestCase):
-    def test_producer_poll_runs_once_and_a_fenced_epoch_refuses(self):
+    def setUp(self):
+        self._poll_wait = cluster.POLL_WAIT
+        self._dispatches = []
+        self.addCleanup(self._restore_shared_state)
+        self._restore_shared_state()
         cluster.POLL_WAIT = 0.3
+
+    def _join_dispatches(self):
+        for thread in getattr(self, "_dispatches", ()):
+            if thread.is_alive():
+                thread.join(timeout=5)
+
+    def _restore_shared_state(self):
+        # Stop dispatch threads before dropping the binding they authorize against.
+        self._join_dispatches()
+        cluster.POLL_WAIT = getattr(self, "_poll_wait", cluster.POLL_WAIT)
+        open_unfenced()
+        clear_production()
+        set_node_seen_mode("before")
+
+    def test_producer_poll_runs_once_and_a_fenced_epoch_refuses(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         root = Path(tmp.name)
@@ -153,13 +176,28 @@ class ManagedDispatch(unittest.TestCase):
             configure_production(
                 main, runtime, executor=fleet.nodes["zenbook"].executor, issuer=issuer)
             remote = Remote(config, main)
-            with patch("jarvis.inventory.collect", return_value={"local": True}) as collect, \
-                    patch("jarvis.remote.run_here", return_value=(True, "apps")):
+
+            def collect_once():
+                runtime.order.append(("effect", "inventory"))
+                return {"local": True}
+
+            def apps_once(*_args, **_kwargs):
+                runtime.order.append(("effect", "list_apps"))
+                return (True, "apps")
+
+            with patch("jarvis.inventory.collect", side_effect=collect_once) as collect, \
+                    patch("jarvis.remote.run_here", side_effect=apps_once):
                 local = execute_local("inventory", {}, config, main)
                 ok, text = remote.call("zenbook", "list_apps", "")
             self.assertEqual(local, {"local": True})
             self.assertEqual((ok, text), (True, "apps"))
             self.assertEqual(collect.call_count, 1)
+            self.assertEqual(runtime.order, [
+                ("authority", "ordinary", "zenbook"),
+                ("effect", "inventory"),
+                ("authority", "ordinary", "zenbook"),
+                ("effect", "list_apps"),
+            ])
             self.assertEqual([item[1]["target"] for item in issued], ["zenbook", "zenbook"])
             for signed, ticket in issued:
                 receipt = fleet.nodes["zenbook"].executor.reconcile(
@@ -214,6 +252,8 @@ class ManagedDispatch(unittest.TestCase):
             self.assertEqual(envelope["signed_operation"]["digest"], digest)
             self.assertEqual(envelope["admission_ticket"]["target"], "dell")
             self.assertIn("BEGIN SSH SIGNATURE", envelope["signed_operation"]["signature"])
+            self.assertEqual(runtime.order[-1], ("authority", "ordinary", "dell"))
+            self.assertFalse(effects.exists())
             self.child(spec_path)
             self.finish(box)
             self.assertEqual(box["value"], {"ok": True, "text": "once"})
@@ -234,6 +274,11 @@ class ManagedDispatch(unittest.TestCase):
             with patch("jarvis.hostmeter.cached_sample", return_value=None):
                 self.assertTrue(worker.once())
             self.assertEqual(replayed, [])
+            self.assertEqual(worker.client.results, [{
+                "id": "job-replay", "failed": True,
+                "result": {"error": "Not run: not_run"},
+            }])
+            self.assertFalse((node / "cluster-jobs-seen.json").exists())
             guard.close()
             guard = None
             clear_production(node)
@@ -246,18 +291,39 @@ class ManagedDispatch(unittest.TestCase):
             hub.broker.heartbeat("dell", {"hostname": "dell"})
             refused = self.dispatch(hub, "inventory", {})
             self.pending(hub, refused)
+            self.assertEqual(runtime.order[-1], ("authority", "ordinary", "dell"))
+            before_refuse = len(json.loads(effects.read_text(encoding="utf-8")))
             self.child(spec_path)
             self.finish(refused)
             self.assertIn("stale", str(refused["error"]))
-            self.assertEqual(len(json.loads(effects.read_text(encoding="utf-8"))), 1)
+            self.assertEqual(len(json.loads(effects.read_text(encoding="utf-8"))), before_refuse)
         finally:
+            cleanup_error = None
             if guard is not None:
-                guard.close()
+                try:
+                    guard.close()
+                except Exception as exc:
+                    cleanup_error = exc
             if hub is not None:
-                hub.close()
-            clear_production()
-            open_unfenced()
-            fleet.close()
+                try:
+                    hub.close()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            self._join_dispatches()
+            try:
+                clear_production()
+                open_unfenced()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            try:
+                fleet.close()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if cleanup_error is not None and sys.exc_info()[0] is None:
+                raise cleanup_error
 
     def open_guard(self, journal, authority, wall):
         return ExecutorGuard(
@@ -270,16 +336,17 @@ class ManagedDispatch(unittest.TestCase):
 
         def run():
             try:
-                box["value"] = hub.dispatch("dell", kind, payload, timeout=20)
+                box["value"] = hub.dispatch("dell", kind, payload, timeout=60)
             except Exception as exc:
                 box["error"] = exc
 
         box["thread"] = threading.Thread(target=run)
+        self._dispatches.append(box["thread"])
         box["thread"].start()
         return box
 
     def pending(self, hub, box):
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if "error" in box:
                 self.fail(box["error"])
@@ -293,7 +360,7 @@ class ManagedDispatch(unittest.TestCase):
         self.fail(box.get("error") or "job was not queued")
 
     def finish(self, box):
-        box["thread"].join(timeout=25)
+        box["thread"].join(timeout=70)
         self.assertFalse(box["thread"].is_alive(), "dispatch did not finish")
 
     def child(self, spec_path):
@@ -301,16 +368,21 @@ class ManagedDispatch(unittest.TestCase):
         env["JARVIS_NO_MODELS"] = "1"
         proc = subprocess.run(
             [sys.executable, "-c", CHILD, str(spec_path)], cwd=ROOT, env=env,
-            capture_output=True, text=True, timeout=45, check=False)
+            capture_output=True, text=True, timeout=90, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:] + proc.stdout[-500:])
 
     def worker(self, state, job, executor):
         class Client:
             main = "zenbook"
 
+            def __init__(self):
+                self.results = []
+
             def request(self, path, body=None, timeout=45):
                 if path == "/v1/poll":
                     return {"job": job}
+                if path == "/v1/result":
+                    self.results.append(body)
                 return {}
 
         worker = NodeWorker.__new__(NodeWorker)

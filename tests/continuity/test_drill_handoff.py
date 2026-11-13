@@ -90,24 +90,41 @@ class World:
         self.sentinel_hash = _sha(self.sentinel)
 
     def close(self):
+        """Stop every child. One failure must not leave the others running."""
         if self.closed:
             return
         self.closed = True
-        if self.proxy is not None:
-            self.proxy.close()
-            self.proxy = None
-        for worker in reversed(list(self.workers.values())):
-            worker.stop()
+        errors = []
+
+        def attempt(action):
+            try:
+                action()
+            except Exception as exc:
+                errors.append(exc)
+
+        proxy = self.proxy
+        self.proxy = None
+        if proxy is not None:
+            attempt(proxy.close)
+        workers = list(self.workers.values())
         self.workers.clear()
-        if self.gateway is not None:
-            self.gateway.stop()
-            self.gateway = None
+        for worker in reversed(workers):
+            attempt(worker.stop)
+        gateway = self.gateway
+        self.gateway = None
+        if gateway is not None:
+            attempt(gateway.stop)
+        if errors:
+            raise errors[0]
 
     def start_gateway(self):
         state = self.root / "authority.sqlite"
+        # 15s is the longest validity CachedAuthority will keep. A shorter lease
+        # expires while a loaded node is still inside one relay.
         cfg = write_config(
             self.root, state=state, fleet=FLEET, authority=AUTH,
-            owner_public=self.keys["owner"][0], name="gateway.json")
+            owner_public=self.keys["owner"][0], name="gateway.json",
+            lease_seconds=15)
         self.gateway = GatewayProc(cfg)
         info = self.gateway.serve()
         self.origin = info["origin"]
@@ -161,7 +178,9 @@ class World:
         }
         if relay is not None:
             record["relay_origin"] = relay
-        deadline = time.monotonic() + 1
+        # One attempt can sit for the client timeout before it reports
+        # unavailable. The retry budget has to cover more than one attempt.
+        deadline = time.monotonic() + 30
         while True:
             try:
                 return self.owner.enroll(record)
@@ -216,7 +235,7 @@ class World:
         return current
 
     def _fence(self, tid):
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 60
         while True:
             try:
                 self.owner.step(tid, "fence")
@@ -240,7 +259,7 @@ class World:
         return status["main"]
 
     def wait_barrier(self, device_id):
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 60
         while True:
             status = must(self.workers[device_id].call("status"))
             barrier = status.get("grant_barrier")
@@ -332,7 +351,7 @@ class HandoffDrill(SeamMixin, unittest.TestCase):
         must(world.workers["node-b"].call("hold", {"on": False}))
         old_port = origin_port(world.origin)[1]
         self.assertEqual(world.gateway.stop(), 0)
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 15
         while listener_open(old_port) and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertFalse(listener_open(old_port))

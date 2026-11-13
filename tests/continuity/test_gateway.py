@@ -20,7 +20,8 @@ from pathlib import Path
 from jarvis.continuity.authority import AuthorityError, AuthorityStore
 from jarvis.continuity.gateway import (
     DEVICE_NS, HTTP_STATUS, AuthenticatedPort, AuthorityClient, ContinuityGateway, DevicePrincipal,
-    GatewayError, _agreed_wait, _message, _post_json, canonical, pin_origin, pin_relay, sign_message,
+    GatewayError, TICKET_NS, _Record, _agreed_wait, _message, _post_json, canonical, pin_origin,
+    pin_relay, sign_message, verify_message,
 )
 from jarvis.continuity.ingress import ContinuityGatewaySession, IngressError
 from jarvis.continuity.integration import (
@@ -980,6 +981,151 @@ class Quarantine(unittest.TestCase):
                 self.assertEqual(raised.exception.code, "quarantined")
             finally:
                 foreign.close()
+
+
+class DirectoryNamespace(GatewayCase):
+    """A client enrollment cannot replace a live PC directory key, and consume binds it."""
+
+    def _directory(self, device_id):
+        row = self.gw.store._db.execute(
+            "SELECT device_id, installation_id, kind, public_key FROM gateway_directory WHERE device_id=?",
+            (device_id,)).fetchone()
+        return None if row is None else tuple(row)
+
+    def _participant(self, device_id):
+        row = self.gw.store._db.execute(
+            "SELECT installation_id, kind, eligible, mode_version, fenced_epoch"
+            " FROM participants WHERE device_id=?", (device_id,)).fetchone()
+        return None if row is None else tuple(row)
+
+    def _ticket(self, lease, admission_id, operation_id):
+        status = self._client("zenbook").status()
+        return {
+            "admission_id": admission_id, "target": "dell", "operation_id": operation_id,
+            "attempt_id": "a-1", "digest": digest("open firefox"), "main": "zenbook",
+            "incarnation": lease["incarnation"], "epoch": lease["epoch"],
+            "issued_at": self.clock.w - 1, "admit_until": self.clock.w + 3600,
+            "issuer_incarnation": status["incarnation"],
+        }
+
+    def test_client_enroll_cannot_replace_a_live_pc_and_consume_binds_installation(self):
+        self.cutover()
+        _tid, lease, done = self.promote("zenbook", "k-boot")
+        self.assertEqual(done["state"], "SUCCEEDED")
+        self.assertTrue(self._client("zenbook").status()["main_ready"])
+        directory = self._directory("zenbook")
+        participant = self._participant("zenbook")
+        self.enroll("zenbook", "pc", PC)
+        self.assertEqual(self._participant("zenbook"), participant)
+        self.assertEqual(self._directory("zenbook"), directory)
+        with self.assertRaises(GatewayError) as raised:
+            self.owner.enroll({
+                "device_id": "zenbook", "installation_id": "phone-inst", "kind": "client",
+                "public_key": _keys()["phone"][0], "capabilities": list(CLIENT),
+            })
+        self.assertEqual((raised.exception.code, raised.exception.status), ("conflict", 409))
+        self.assertEqual(self._directory("zenbook"), directory)
+        self.assertEqual(self._participant("zenbook"), participant)
+        self.assertEqual(self._client("zenbook").status()["main"], "zenbook")
+        forged = AuthorityClient(
+            self.origin, authority_id="oracle-auth", wall=self.clock.wall,
+            device_id="zenbook", installation_id="phone-inst",
+            private_key_path=_keys()["phone"][1])
+        with self.assertRaises(GatewayError) as raised:
+            forged.status()
+        self.assertEqual(raised.exception.code, "unauthorized")
+        forged_ticket = self._ticket(lease, "adm-forged", "op-forged")
+        with self.assertRaises(GatewayError) as raised:
+            self._client("dell").consume(forged_ticket, forged.sign_ticket(forged_ticket))
+        self.assertEqual(raised.exception.code, "unauthorized")
+        self.assertIsNone(self.gw.store.admission("adm-forged"))
+        real = self._ticket(lease, "adm-real", "op-real")
+        first = self._client("dell").consume(real, self._client("zenbook").sign_ticket(real))
+        self.assertFalse(first["already"])
+        with self.assertRaises(GatewayError) as raised:
+            self.owner.enroll({
+                "device_id": "zenbook", "installation_id": "zenbook-new", "kind": "pc",
+                "public_key": _keys()["stranger"][0], "capabilities": list(PC),
+            })
+        self.assertEqual(raised.exception.code, "active_holder")
+        with self.assertRaises(GatewayError) as raised:
+            self.owner.enroll({
+                "device_id": "zenbook", "installation_id": "zenbook-inst", "kind": "server",
+                "public_key": _keys()["zenbook"][0], "capabilities": list(SERVER),
+            })
+        self.assertEqual(raised.exception.code, "active_holder")
+        self.assertEqual(self._directory("zenbook"), directory)
+        self.assertEqual(self._participant("zenbook"), participant)
+        with self.assertRaises(GatewayError) as raised:
+            self.owner.enroll({
+                "device_id": "oracle", "installation_id": "phone-inst", "kind": "client",
+                "public_key": _keys()["phone"][0], "capabilities": list(CLIENT),
+            })
+        self.assertEqual(raised.exception.code, "conflict")
+        self.assertEqual(self._directory("oracle")[2], "server")
+        self.enroll("phone", "client", CLIENT)
+        self.assertIsNone(self._participant("phone"))
+        self.assertEqual(self._client("phone").status()["main"], "zenbook")
+        self.owner.enroll({
+            "device_id": "phone", "installation_id": "phone-inst", "kind": "client",
+            "public_key": _keys()["stranger"][0], "capabilities": list(CLIENT),
+        })
+        self.assertEqual(self._directory("phone")[1:], ("phone-inst", "client", _keys()["stranger"][0]))
+        self.assertIsNone(self._participant("phone"))
+        rotated = AuthorityClient(
+            self.origin, authority_id="oracle-auth", wall=self.clock.wall,
+            device_id="phone", installation_id="phone-inst",
+            private_key_path=_keys()["stranger"][1])
+        self.assertEqual(rotated.status()["mode"], "V2_ACTIVE")
+        with self.assertRaises(GatewayError) as raised:
+            self._client("phone").status()
+        self.assertEqual(raised.exception.code, "unauthorized")
+        with self.assertRaises(GatewayError) as raised:
+            self.owner.enroll({
+                "device_id": "phone", "installation_id": "phone-inst-2", "kind": "client",
+                "public_key": _keys()["phone"][0], "capabilities": list(CLIENT),
+            })
+        self.assertEqual(raised.exception.code, "conflict")
+        self.assertEqual(self._directory("phone")[1], "phone-inst")
+        with self.assertRaises(GatewayError) as raised:
+            self.owner.enroll({
+                "device_id": "phone", "installation_id": "phone-inst", "kind": "pc",
+                "public_key": _keys()["phone"][0], "capabilities": list(PC),
+            })
+        self.assertEqual(raised.exception.code, "conflict")
+        self.assertIsNone(self._participant("phone"))
+        self.assertEqual(self._directory("phone")[2], "client")
+        oracle = self._participant("oracle")
+        self.owner.enroll({
+            "device_id": "oracle", "installation_id": "oracle-inst-2", "kind": "server",
+            "public_key": _keys()["oracle"][0], "capabilities": list(SERVER),
+        })
+        reset = self._participant("oracle")
+        self.assertEqual(reset[0], "oracle-inst-2")
+        self.assertEqual((reset[3], reset[4]), (0, -1))
+        self.assertNotEqual(reset[3:], oracle[3:])
+        self.assertEqual(self._directory("oracle")[1], "oracle-inst-2")
+        dell = self._participant("dell")
+        self.enroll("dell", "pc", PC)
+        self.assertEqual(self._participant("dell"), dell)
+        phone = self.gw._devices["phone"]
+        planted = _Record("zenbook", "phone-inst", "pc", phone.public_key, phone.capabilities, None)
+        split = self._ticket(lease, "adm-split", "op-split")
+        with self.gw._lock, self.gw.store._lock:
+            self.gw.store._db.execute(
+                "UPDATE gateway_directory SET installation_id=?, kind=?, public_key=? WHERE device_id=?",
+                ("phone-inst", "pc", phone.public_key, "zenbook"))
+            self.gw._devices["zenbook"] = planted
+        self.assertEqual(self._directory("zenbook")[1:3], ("phone-inst", "pc"))
+        self.assertEqual(self._participant("zenbook")[0], "zenbook-inst")
+        signature = rotated.sign_ticket(split)
+        self.assertTrue(verify_message(TICKET_NS, _message(TICKET_NS, split), signature, phone.public_key))
+        with self.assertRaises(GatewayError) as raised:
+            self._client("dell").consume(split, signature)
+        self.assertEqual(raised.exception.code, "unauthorized")
+        self.assertIsNone(self.gw.store.admission("adm-split"))
+        self.assertIsNotNone(self.gw.store.admission("adm-real"))
+        self.assertEqual(self._participant("zenbook"), participant)
 
 
 if __name__ == "__main__":

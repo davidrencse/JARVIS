@@ -601,7 +601,9 @@ class BindTlsAndShutdown(_GatewayTemp):
         }), encoding="utf-8")
         proc = subprocess.Popen(
             [sys.executable, "-m", "jarvis.continuity.gateway", "serve", "--config", os.fspath(cfg_path)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=os.fspath(Path(__file__).resolve().parents[2]),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=os.fspath(Path(__file__).resolve().parents[2]),
+            start_new_session=True, bufsize=0,
         )
         self.addCleanup(lambda: _reap(proc))
         line = _read_line(proc, 8)
@@ -619,8 +621,11 @@ class BindTlsAndShutdown(_GatewayTemp):
             try:
                 code = proc.wait(timeout=12)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=3)
+                _kill_group(proc.pid, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
                 err = proc.stderr.read().decode(errors="replace")
                 self.fail("serve did not exit after SIGTERM\n" + err)
         finally:
@@ -653,20 +658,42 @@ def _read_line(proc, timeout):
         if b"\n" in buf:
             line, _rest = buf.split(b"\n", 1)
             return line
-    proc.kill()
+    _kill_group(proc.pid, signal.SIGKILL)
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
     raise AssertionError("no readiness line: %r" % buf)
 
 
+def _kill_group(pid, sig):
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+
+
 def _reap(proc):
+    if proc is None:
+        return
     if proc.poll() is None:
-        proc.kill()
+        _kill_group(proc.pid, signal.SIGKILL)
         try:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             pass
-    for stream in (proc.stdout, proc.stderr):
+    else:
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
         if stream is not None:
             try:
-                stream.close()
+                if not stream.closed:
+                    stream.close()
             except OSError:
                 pass

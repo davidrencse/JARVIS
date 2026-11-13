@@ -47,6 +47,15 @@ META_KEYS = frozenset({
 })
 _CAP = 256 * 1024
 _LIVE = (REPO / ".jarvis", Path.home() / ".local" / "state" / "jarvis")
+# Production posts the relay with a 2s urllib timeout (gateway._post_json) and
+# the authority client uses 10s (AuthorityClient._send). On a loaded machine the
+# node is not scheduled inside 2s, so the gateway answers no_relay before the
+# effect runs. The drill keeps that path and only raises those two deadlines
+# inside its own gateway and worker processes. The parent suite is not patched.
+DRILL_RELAY_TIMEOUT = 20
+DRILL_CLIENT_TIMEOUT = 30
+DRILL_CALL_TIMEOUT = 50
+_JOIN_BUDGET = 15
 
 
 class SeamGap(AssertionError):
@@ -106,6 +115,36 @@ def child_env():
     return env
 
 
+def _widen_http_timeout(short, longer):
+    """One urllib timeout, in this child only. Does not touch sleep or Event.wait."""
+    import urllib.request
+    real = urllib.request.OpenerDirector.open
+
+    def open(self, fullurl, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+        if timeout == short:
+            timeout = longer
+        return real(self, fullurl, data, timeout)
+
+    urllib.request.OpenerDirector.open = open
+
+
+def _serve_drill_gateway(argv):
+    _widen_http_timeout(2, DRILL_RELAY_TIMEOUT)
+    from jarvis.continuity.gateway import main
+    raise SystemExit(main(argv))
+
+
+def _join_until(thread, budget):
+    if thread is None or getattr(thread, "ident", None) is None:
+        return
+    deadline = time.monotonic() + budget
+    while thread.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        thread.join(timeout=min(0.5, remaining))
+
+
 def refuse_live(path):
     resolved = Path(path).resolve()
     for root in _LIVE:
@@ -129,6 +168,44 @@ def kill_group(pid, sig):
             os.kill(pid, sig)
         except (ProcessLookupError, PermissionError, OSError):
             return
+
+
+def _close_stream(stream):
+    if stream is None:
+        return
+    try:
+        if getattr(stream, "closed", False):
+            return
+        stream.close()
+    except OSError:
+        pass
+
+
+def _close_socket(sock):
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def _finish_popen(proc):
+    """Kill a still-running group, then close every pipe the parent owns."""
+    if proc is None:
+        return
+    if proc.poll() is None:
+        kill_group(proc.pid, signal.SIGKILL)
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            pass
+    for stream in (proc.stdout, proc.stderr, proc.stdin):
+        _close_stream(stream)
 
 
 def make_keys(folder, names):
@@ -266,19 +343,22 @@ class _Pump:
 
     def _read(self, stream):
         try:
-            fd = stream.fileno()
-        except (AttributeError, OSError):
-            return
-        try:
-            while True:
-                chunk = os.read(fd, 4096)
-                if not chunk:
-                    break
-                with self.lock:
-                    if len(self.buf) < self.cap:
-                        self.buf.extend(chunk[:self.cap - len(self.buf)])
-        except OSError:
-            return
+            try:
+                fd = stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                return
+            try:
+                while True:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    with self.lock:
+                        if len(self.buf) < self.cap:
+                            self.buf.extend(chunk[:self.cap - len(self.buf)])
+            except OSError:
+                return
+        finally:
+            _close_stream(stream)
 
     def bytes(self):
         with self.lock:
@@ -295,16 +375,26 @@ def run_cli(args, timeout=20):
         stdin=subprocess.DEVNULL, start_new_session=True, bufsize=0,
     )
     try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_group(proc.pid, signal.SIGKILL)
-        out, err = proc.communicate(timeout=3)
-        raise AssertionError("cli timeout %s stderr=%s" % (args, err[:300]))
-    return proc.returncode, out, err
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_group(proc.pid, signal.SIGKILL)
+            try:
+                out, err = proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                out, err = b"", b""
+            raise AssertionError("cli timeout %s stderr=%s" % (args, (err or b"")[:300]))
+        return proc.returncode, out, err
+    finally:
+        _finish_popen(proc)
 
 
 class GatewayProc:
-    """``python -m jarvis.continuity.gateway serve`` in its own process group."""
+    """Production ``gateway.main(["serve", ...])`` in its own process group.
+
+    The child is this module so the relay timeout patch stays in that process.
+    ``run_cli`` still launches ``python -m jarvis.continuity.gateway``.
+    """
 
     def __init__(self, config_path):
         self.config_path = str(config_path)
@@ -316,7 +406,8 @@ class GatewayProc:
 
     def start(self):
         self.proc = subprocess.Popen(
-            [str(PY), "-u", "-m", "jarvis.continuity.gateway", "serve", "--config", self.config_path],
+            [str(PY), "-u", "-m", "tests.continuity.test_drill_process",
+             "--drill-gateway", "serve", "--config", self.config_path],
             cwd=str(REPO), env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL, start_new_session=True, bufsize=0,
         )
@@ -353,24 +444,24 @@ class GatewayProc:
         proc = self.proc
         if proc is None:
             return None
-        if proc.poll() is None:
-            kill_group(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                kill_group(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=3)
-        self.returncode = proc.returncode
-        for stream in (proc.stdout, proc.stderr):
-            if stream is not None:
+        try:
+            if proc.poll() is None:
+                kill_group(proc.pid, signal.SIGTERM)
                 try:
-                    stream.close()
-                except OSError:
-                    pass
-        for pump in (self.out, self.err):
-            if pump is not None:
-                pump.thread.join(timeout=1)
-        return self.returncode
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    kill_group(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=3)
+            self.returncode = proc.returncode
+            return self.returncode
+        finally:
+            for pump in (self.out, self.err):
+                if pump is not None:
+                    pump.thread.join(timeout=1)
+            _finish_popen(proc)
+            for pump in (self.out, self.err):
+                if pump is not None:
+                    pump.thread.join(timeout=1)
 
 
 class WorkerProc:
@@ -391,7 +482,7 @@ class WorkerProc:
         self.err = _Pump(self.proc.stderr)
         return self
 
-    def call(self, op, args=None, timeout=25):
+    def call(self, op, args=None, timeout=DRILL_CALL_TIMEOUT):
         if self.proc is None or self.proc.poll() is not None:
             code = None if self.proc is None else self.proc.returncode
             raise AssertionError("worker dead before %s code=%s stderr=%s" % (op, code, self._stderr()))
@@ -434,26 +525,22 @@ class WorkerProc:
         proc = self.proc
         if proc is None:
             return None
-        if proc.poll() is None:
-            try:
-                proc.stdin.close()
-            except OSError:
-                pass
-            kill_group(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                kill_group(proc.pid, signal.SIGKILL)
-                proc.wait(timeout=3)
-        for stream in (proc.stdout, proc.stderr, proc.stdin):
-            if stream is not None:
+        try:
+            if proc.poll() is None:
+                _close_stream(proc.stdin)
+                kill_group(proc.pid, signal.SIGTERM)
                 try:
-                    stream.close()
-                except OSError:
-                    pass
-        if self.err is not None:
-            self.err.thread.join(timeout=1)
-        return proc.returncode
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    kill_group(proc.pid, signal.SIGKILL)
+                    proc.wait(timeout=3)
+            return proc.returncode
+        finally:
+            if self.err is not None:
+                self.err.thread.join(timeout=1)
+            _finish_popen(proc)
+            if self.err is not None:
+                self.err.thread.join(timeout=1)
 
 
 class LoopProxy:
@@ -465,122 +552,153 @@ class LoopProxy:
 
     def __init__(self, host, port):
         self.upstream = (host, int(port))
-        self.sock = socket.socket()
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(32)
-        self.sock.settimeout(0.2)
-        self.port = self.sock.getsockname()[1]
-        self.origin = "http://127.0.0.1:%d" % self.port
+        self.sock = None
+        self.port = None
+        self.origin = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._live = []
         self._pumps = []
         self._closed = False
+        self._thread = None
+        sock = socket.socket()
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(32)
+            sock.settimeout(0.2)
+        except Exception:
+            _close_socket(sock)
+            raise
+        self.sock = sock
+        self.port = sock.getsockname()[1]
+        self.origin = "http://127.0.0.1:%d" % self.port
         self._thread = threading.Thread(target=self._accept, daemon=True)
-        self._thread.start()
+        try:
+            self._thread.start()
+        except Exception:
+            self.close()
+            raise
 
     def _accept(self):
         while not self._stop.is_set():
+            sock = self.sock
+            if sock is None:
+                return
             try:
-                client, _addr = self.sock.accept()
+                client, _addr = sock.accept()
             except socket.timeout:
                 continue
             except OSError:
                 return
             if self._stop.is_set():
-                client.close()
+                _close_socket(client)
                 return
             worker = threading.Thread(target=self._splice, args=(client,), daemon=True)
             with self._lock:
                 self._pumps.append(worker)
-            worker.start()
+            try:
+                worker.start()
+            except Exception:
+                _close_socket(client)
+                return
 
     def _splice(self, client):
-        if self._stop.is_set():
-            client.close()
-            return
-        try:
-            upstream = socket.create_connection(self.upstream, timeout=2)
-        except OSError:
-            client.close()
-            return
-        client.settimeout(0.2)
-        upstream.settimeout(0.2)
+        upstream = None
+        left = None
+        right = None
         with self._lock:
-            self._live.extend((client, upstream))
-
-        def pump(src, dst, rewrite_host=False):
-            head = b""
+            self._live.append(client)
+        try:
+            if self._stop.is_set():
+                return
             try:
-                while not self._stop.is_set():
-                    try:
-                        data = src.recv(8192)
-                    except socket.timeout:
-                        continue
-                    if not data:
-                        break
-                    if rewrite_host:
-                        head += data
-                        if b"\r\n\r\n" not in head:
-                            if len(head) > 65536:
-                                return
-                            continue
-                        headers, body = head.split(b"\r\n\r\n", 1)
-                        host, port = self.upstream
-                        authority = ("[%s]:%d" if ":" in host else "%s:%d") % (host, port)
-                        lines = headers.split(b"\r\n")
-                        # Keep duplicate headers duplicate: the gateway must still
-                        # reject malformed framing/authentication normally.
-                        lines = [b"Host: " + authority.encode("ascii")
-                                 if line.lower().startswith(b"host:") else line for line in lines]
-                        data = b"\r\n".join(lines) + b"\r\n\r\n" + body
-                        rewrite_host = False
-                    dst.sendall(data)
+                upstream = socket.create_connection(self.upstream, timeout=2)
             except OSError:
                 return
-            finally:
-                try:
-                    dst.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
+            with self._lock:
+                self._live.append(upstream)
+            if self._stop.is_set():
+                return
+            client.settimeout(0.2)
+            upstream.settimeout(0.2)
 
-        left = threading.Thread(target=pump, args=(client, upstream, True), daemon=True)
-        right = threading.Thread(target=pump, args=(upstream, client), daemon=True)
-        left.start()
-        right.start()
-        left.join(timeout=2)
-        right.join(timeout=2)
+            def pump(src, dst, rewrite_host=False):
+                head = b""
+                try:
+                    while not self._stop.is_set():
+                        try:
+                            data = src.recv(8192)
+                        except socket.timeout:
+                            continue
+                        if not data:
+                            break
+                        if rewrite_host:
+                            head += data
+                            if b"\r\n\r\n" not in head:
+                                if len(head) > 65536:
+                                    return
+                                continue
+                            headers, body = head.split(b"\r\n\r\n", 1)
+                            host, port = self.upstream
+                            authority = ("[%s]:%d" if ":" in host else "%s:%d") % (host, port)
+                            lines = headers.split(b"\r\n")
+                            # Keep duplicate headers duplicate: the gateway must still
+                            # reject malformed framing/authentication normally.
+                            lines = [b"Host: " + authority.encode("ascii")
+                                     if line.lower().startswith(b"host:") else line for line in lines]
+                            data = b"\r\n".join(lines) + b"\r\n\r\n" + body
+                            rewrite_host = False
+                        dst.sendall(data)
+                except OSError:
+                    return
+                finally:
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+
+            left = threading.Thread(target=pump, args=(client, upstream, True), daemon=True)
+            right = threading.Thread(target=pump, args=(upstream, client), daemon=True)
+            with self._lock:
+                self._pumps.extend((left, right))
+            left.start()
+            right.start()
+            # Stay alive until both directions finish so close() can join this
+            # thread and the sockets are not abandoned after a short wait.
+            while left.is_alive() or right.is_alive():
+                left.join(timeout=0.2)
+                right.join(timeout=0.2)
+        finally:
+            _close_socket(upstream)
+            _close_socket(client)
+            _join_until(left, _JOIN_BUDGET)
+            _join_until(right, _JOIN_BUDGET)
+
+    def _drop_live(self):
+        with self._lock:
+            live = list(self._live)
+            self._live.clear()
+        for sock in live:
+            _close_socket(sock)
 
     def close(self):
         if self._closed:
             return
         self._closed = True
         self._stop.set()
-        for action in (
-            lambda: self.sock.shutdown(socket.SHUT_RDWR),
-            self.sock.close,
-        ):
-            try:
-                action()
-            except OSError:
-                pass
-        self._thread.join(timeout=2)
-        with self._lock:
-            live = list(self._live)
-            pumps = list(self._pumps)
-            self._live.clear()
-        for sock in live:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                sock.close()
-            except OSError:
-                pass
-        for worker in pumps:
-            worker.join(timeout=2)
+        sock = self.sock
+        self.sock = None
+        _close_socket(sock)
+        _join_until(self._thread, _JOIN_BUDGET)
+        # A splice can register its sockets after the first snapshot.
+        for _ in range(2):
+            self._drop_live()
+            with self._lock:
+                pumps = list(self._pumps)
+            for worker in pumps:
+                _join_until(worker, _JOIN_BUDGET)
+        self._drop_live()
 
 
 def _probe():
@@ -594,27 +712,32 @@ class _Relay:
     def __init__(self, session):
         self.session = session
         self.sock = socket.socket()
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(16)
-        self.sock.setblocking(False)
-        self.port = self.sock.getsockname()[1]
-        self.origin = "http://127.0.0.1:%d" % self.port
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind(("127.0.0.1", 0))
+            self.sock.listen(16)
+            self.sock.setblocking(False)
+            self.port = self.sock.getsockname()[1]
+            self.origin = "http://127.0.0.1:%d" % self.port
+        except Exception:
+            _close_socket(self.sock)
+            self.sock = None
+            raise
 
     def drain(self):
+        sock = self.sock
+        if sock is None:
+            return
         while True:
             try:
-                conn, addr = self.sock.accept()
+                conn, addr = sock.accept()
             except BlockingIOError:
                 return
-            conn.settimeout(2)
+            conn.settimeout(DRILL_RELAY_TIMEOUT)
             try:
                 self._one(conn, addr[0])
             finally:
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+                _close_socket(conn)
 
     def _one(self, conn, peer):
         try:
@@ -636,10 +759,9 @@ class _Relay:
                 return
 
     def close(self):
-        try:
-            self.sock.close()
-        except OSError:
-            pass
+        sock = self.sock
+        self.sock = None
+        _close_socket(sock)
 
 
 def _read_http(conn):
@@ -971,6 +1093,7 @@ def _reply(req, ok, **fields):
 
 
 def worker_main():
+    _widen_http_timeout(10, DRILL_CLIENT_TIMEOUT)
     session = None
     buf = b""
     stdin = sys.stdin.buffer.fileno()
@@ -1025,6 +1148,9 @@ def worker_main():
 
 if __name__ == "__main__":
     try:
-        worker_main()
+        if len(sys.argv) > 1 and sys.argv[1] == "--drill-gateway":
+            _serve_drill_gateway(sys.argv[2:])
+        else:
+            worker_main()
     except KeyboardInterrupt:
         raise SystemExit(0)

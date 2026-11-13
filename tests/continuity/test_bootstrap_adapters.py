@@ -178,7 +178,7 @@ class HubRouteAuthTests(unittest.TestCase):
         cases.append(('/v1/control', {'kind': 'transfer', 'node': 'arch',
             'payload': {'action': 'brain_freeze', 'request': '{}'}}, {'files', 'console'}, 403))
         for path, payload, caps, expected in cases:
-            hub.authenticate = lambda headers, capability=None: ('arch', caps)
+            hub.authenticate = lambda headers, capability=None, source=None: ('arch', caps)
             handler = object.__new__(server.RequestHandlerClass)
             handler.path = path
             body = json.dumps(payload).encode()
