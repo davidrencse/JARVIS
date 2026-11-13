@@ -323,9 +323,9 @@ class EndToEndTests(unittest.TestCase):
 
     def setUp(self):
         for p in (patch.object(NodeWorker, "_untrusted", return_value=None),
-                  patch("jarvis.cluster.POLL_WAIT", 0.5),
-                  patch("jarvis.remote_view.INPUT_HOLD", 0.5),
-                  patch("jarvis.remote_view.KEEPALIVE", 0.2)):
+                  patch("jarvis.cluster.POLL_WAIT", 0.05),
+                  patch("jarvis.remote_view.INPUT_HOLD", 0.05),
+                  patch("jarvis.remote_view.KEEPALIVE", 0.05)):
             p.start()
             self.addCleanup(p.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -355,7 +355,13 @@ class EndToEndTests(unittest.TestCase):
                   patch("jarvis.remote_view.Injector", lambda: Injector(self.pointer, self.keys))):
             p.start()
             self.addCleanup(p.stop)
-        self.addCleanup(lambda: [s.end("test over") for s in list(remote_view._ACTIVE.values())])
+        def _end_node_sessions():
+            sessions = list(remote_view._ACTIVE.values())
+            for session in sessions:
+                session.end("test over")
+            for session in sessions:
+                session.join(2)
+        self.addCleanup(_end_node_sessions)
         self.worker = NodeWorker(self.node, self.state)
         self.worker.once()  # heartbeat: the node is online with this code
 

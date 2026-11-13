@@ -99,7 +99,6 @@ class NodeBase(unittest.TestCase):
         self.state = Path(self.tmp.name)
         remote_view._ACTIVE.clear()
         remote_view._LAN.update(owed=False, starting=0)
-        self.addCleanup(lambda: [s.end("test over") for s in list(remote_view._ACTIVE.values())])
         self.addCleanup(remote_view._ACTIVE.clear)
         self.addCleanup(lambda: remote_view._LAN.update(owed=False, starting=0))
         self.lan = {"running": True}
@@ -125,6 +124,21 @@ class NodeBase(unittest.TestCase):
                   patch("jarvis.platforms.detect", return_value={"os": "linux", "desktop": "hyprland"})):
             p.start()
             self.addCleanup(p.stop)
+
+        def _stop_sessions():
+            sessions = []
+            seen = set()
+            for session in list(remote_view._ACTIVE.values()) + list(remote_view._LATE.values()):
+                if id(session) in seen:
+                    continue
+                seen.add(id(session))
+                sessions.append(session)
+            for session in sessions:
+                session.end("test over")
+            for session in sessions:
+                session.join(2)
+        # Registered last so it runs before the mocks above are removed.
+        self.addCleanup(_stop_sessions)
 
     def session(self, sid, client=None, pointer=None):
         return NodeSession({}, self.state, sid, "low", client=client or NodeClient(),
@@ -234,7 +248,44 @@ class LanMouseHandoffTests(NodeBase):
         self.assertIsNone(marker(self.state))
 
 
+class _NodeClock:
+    """Clock for jarvis.remote_view only. sleep(s) costs s/scale wall seconds and
+    monotonic moves by s, so the late-release loop (0.1 s ticks, 0.5 s then
+    doubling) keeps its shape. The test's time.sleep and thread joins stay real.
+    This does not patch the time module."""
+
+    def __init__(self, scale):
+        self._scale = scale
+        self._real_mono = time.monotonic
+        self._t0 = self._real_mono()
+
+    def monotonic(self):
+        return self._t0 + (self._real_mono() - self._t0) * self._scale
+
+    def sleep(self, seconds):
+        time.sleep(0 if not seconds else seconds / self._scale)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 class MarkerTests(NodeBase):
+    """Late release backs off 0.5 s, then 1 s, on remote_view's clock. Scale that
+    clock so those waits are a fraction of a second of wall time."""
+
+    _RETRY_SCALE = 10
+
+    def setUp(self):
+        super().setUp()
+        clock = patch.object(remote_view, "time", _NodeClock(self._RETRY_SCALE))
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def _session_sleep(self, seconds):
+        # Floor: the retry thread has to be scheduled. The session clock still
+        # advances `seconds` (and the floor, times the scale) in that wait.
+        time.sleep(max(0.2, seconds / self._RETRY_SCALE))
+
     def test_finish_removes_only_its_own_marker(self):
         a = self.session("a" * 32)
         a._mark()
@@ -367,7 +418,7 @@ class MarkerTests(NodeBase):
         b.injector.apply({"t": "down", "b": "left", "x": .5, "y": .5})
         a.release_thread.join(3)
         self.assertFalse(a.release_thread.is_alive())
-        time.sleep(1.2)  # past A's first retry: still nothing from A
+        self._session_sleep(1.2)  # past A's first retry: still nothing from A
         self.assertEqual(a_keys.calls[a_sent:], [])
         self.assertEqual(a_pointer.calls[a_moves:], [])
         self.assertNotIn(("release",), b_pointer.calls)
@@ -387,7 +438,7 @@ class MarkerTests(NodeBase):
     def test_the_late_retry_never_sends_the_backend_release(self):
         a, keys, pointer = self._ended_with_key_a_refused()
         before = pointer.calls.count(("release",))
-        time.sleep(2.0)  # 0.5 s, then 1 s: two retries
+        self._session_sleep(2.0)  # 0.5 s, then 1 s: two retries
         self.assertEqual(pointer.calls.count(("release",)), before)
         keys.refuse = False
         a.release_thread.join(5)
@@ -396,21 +447,16 @@ class MarkerTests(NodeBase):
         self.assertEqual(keys.calls[-1], ("KeyA", False))
         self.assertIsNone(marker(self.state))
 
-    def test_the_late_retry_stops_on_the_stop_file_or_its_bound_and_keeps_the_marker(self):
-        for how in ("stop_file", "bound"):
+    def test_the_late_retry_stops_at_its_bound_and_keeps_the_marker(self):
+        # The control stop file is not a bound: tests/remote/test_release_audit.py keeps retrying through it.
+        for how in ("bound",):
             with self.subTest(how):
                 remote_view._ACTIVE.clear()
                 self.events.clear()
                 with patch.object(NodeSession, "LATE_RELEASE_FOR", 0.3 if how == "bound" else 600.0):
                     a, keys, pointer = self._ended_with_key_a_refused()
                     before = pointer.calls.count(("release",))  # the ending's own, from end()
-                    if how == "stop_file":
-                        stop = patch("jarvis.control._stopped", return_value=True)
-                        stop.start()
-                        self.addCleanup(stop.stop)
                     a.release_thread.join(3)
-                    if how == "stop_file":
-                        stop.stop()
                 self.assertFalse(a.release_thread.is_alive())
                 data = json.loads((self.state / remote_view.MARKER).read_text(encoding="utf-8"))
                 self.assertEqual((data["session"], data["held"]), ("a" * 8, ["KeyA"]))
@@ -854,6 +900,93 @@ class KeyMappingTests(unittest.TestCase):
         inj.apply({"t": "key", "code": "KeyA", "down": False})
         self.assertFalse(inj.busy())
         self.assertEqual(keys.calls, [("KeyA", True)] * 3 + [("KeyA", False)])
+
+
+class LocalStopNotifyTests(NodeBase):
+    """A control stop on the node releases what it holds, then tells the hub.
+
+    Sessions.take_input's hold is INPUT_HOLD (2 s), read at call time. The node's
+    input thread sits in that hold. The hub must hear the stop well inside it,
+    and the key and button must already be up.
+    """
+
+    def test_local_stop_reaches_the_hub_before_the_input_hold(self):
+        hold = 1.5
+        stopped = {"on": False}
+        sessions = Sessions()
+        sid = sessions.open("node", "low")["id"]
+        keys, pointer = Keys(), Pointer()
+        released = {}
+        inflight = {"n": 0, "at": 0.0}
+        gate = threading.Lock()
+        real_take = sessions.take_input
+
+        def take_input(*args, **kwargs):
+            with gate:
+                inflight["n"] += 1
+                inflight["at"] = time.monotonic()
+            try:
+                return real_take(*args, **kwargs)
+            finally:
+                with gate:
+                    inflight["n"] -= 1
+
+        sessions.take_input = take_input
+
+        class Client:
+            def request(self, path, body, timeout=None):
+                if body.get("end") is not None:
+                    released["hub"] = time.monotonic()
+                    return sessions.node_end("node", body["session"], body["end"])
+                if path.endswith("/input"):
+                    # The hub's handler omits hold, so INPUT_HOLD (patched below) applies.
+                    return sessions.take_input("node", body["session"], body.get("after", 0))
+                return sessions.frame("node", body["session"], None, None, None)
+
+        def key(code, down):
+            Keys.key(keys, code, down)
+            if not down:
+                released.setdefault("up", time.monotonic())
+
+        def button(which, how):
+            Pointer.button(pointer, which, how)
+            if how == "up":
+                released.setdefault("button", time.monotonic())
+
+        keys.key = key
+        pointer.button = button
+        session = self.session(sid, client=Client(), pointer=pointer)
+        session.injector.keys = keys
+        remote_view._ACTIVE[sid] = session
+        with patch("jarvis.remote_view.INPUT_HOLD", hold), \
+             patch("jarvis.control._stopped", side_effect=lambda state: stopped["on"]):
+            session.start()
+            try:
+                self.assertTrue(self.until(lambda: inflight["n"] > 0))
+                sessions.push(sid, [{"t": "key", "code": "KeyA", "down": True},
+                                    {"t": "down", "b": "left", "x": 0.5, "y": 0.5}])
+                self.assertTrue(self.until(lambda: "KeyA" in session.injector.held and
+                                           "left" in session.injector.buttons))
+                held_at = time.monotonic()
+                self.assertTrue(self.until(
+                    lambda: inflight["n"] > 0 and inflight["at"] >= held_at - 0.05))
+                time.sleep(0.05)  # inside the hold, not still walking the queue
+                t0 = time.monotonic()
+                stopped["on"] = True
+                self.assertTrue(
+                    self.until(lambda: sessions.get(sid)["state"] == "ended", 0.8),
+                    f"hub still {sessions.get(sid)['state']} after 0.8 s; hold is {hold} s")
+                elapsed = released["hub"] - t0
+                self.assertLess(elapsed, 0.8, f"hub heard at {elapsed:.3f}s; hold is {hold}s")
+                self.assertLess(released["up"], released["hub"])
+                self.assertLess(released["button"], released["hub"])
+                self.assertFalse(session.injector.busy())
+                self.assertIn("stopped on this computer", sessions.get(sid)["error"])
+                self.assertIn(("KeyA", False), keys.calls)
+                self.assertIn(("button", "left", "up"), pointer.calls)
+            finally:
+                session.end("test over")
+                session.join(2)
 
 
 if __name__ == "__main__":

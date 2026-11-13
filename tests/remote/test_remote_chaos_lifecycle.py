@@ -226,6 +226,26 @@ class LanMouse:
 
 
 # -- the base: one main, one node --------------------------------------------------------
+def _short_session_waits(session):
+    """The node's loops wait 0.5 s or 1 s between checks. Only this session's
+    event is wrapped. threading.Event.wait is left alone."""
+    real = session.stop_event.wait
+
+    def wait(timeout=None):
+        if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0.02:
+            timeout = 0.02
+        return real(timeout)
+
+    session.stop_event.wait = wait
+
+
+def _init_with_short_waits(real_init):
+    def init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        _short_session_waits(self)
+    return init
+
+
 class Rig(unittest.TestCase):
     def setUp(self):
         self.tmp = _tmpdir()
@@ -257,10 +277,11 @@ class Rig(unittest.TestCase):
             patch("jarvis.control._stopped", side_effect=lambda state: self.stopped),
             patch("jarvis.platforms.detect", return_value={"os": "linux", "desktop": "hyprland"}),
             patch.object(remote_view, "desktop_problem", return_value=None),
-            patch.object(remote_view, "DEADMAN", 0.4),
-            patch.object(remote_view, "KEEPALIVE", 0.1),
+            patch.object(remote_view, "DEADMAN", 0.05),
+            patch.object(remote_view, "KEEPALIVE", 0.02),
             patch.object(remote_view.end_all, "__defaults__", ("JARVIS on this computer is restarting.", 0.6)),
-            patch.object(NodeSession, "LINK_LOSS", 0.8),
+            patch.object(NodeSession, "LINK_LOSS", 0.5),
+            patch.object(NodeSession, "__init__", _init_with_short_waits(NodeSession.__init__)),
             patch.object(NodeSession, "start", recording_start),
         ]
         for p in patches:
@@ -582,7 +603,9 @@ class ScenarioTests(Rig):
         # The main dies and comes back: a fresh Sessions that never heard of the session.
         self.sessions = Sessions(self.clock)
         self.link.sessions = self.sessions
-        self.assertTrue(until(lambda: self.node_session(sid)._done))
+        # _done flips at the start of _finish, before Lan Mouse is started again.
+        session = self.node_session(sid)
+        self.assertTrue(until(lambda: session._done and not any(t.is_alive() for t in session.threads)))
         self.assertEqual(self.desk.keys, set())
         self.assertEqual(self.desk.buttons, set())
         self.assertTrue(self.node_lm.running)
@@ -947,17 +970,20 @@ class RandomEndToEndTests(Rig):
                     remote_view.run({"op": "stop", "session": live[0]}, {}, self.node_state)
                 elif op == "link_blip":
                     self.link.down = True
-                    time.sleep(rng.choice([0.05, 0.5, 1.2]))
+                    # Same shape as 0.05 / 0.5 / 1.2 against LINK_LOSS 0.8:
+                    # under, under, over the 0.5 s loss patched above.
+                    time.sleep(rng.choice([0.03, 0.30, 0.75]))
                     self.link.down = False
                 elif op == "hang_blip":
                     self.link.hang_input.clear()
-                    time.sleep(rng.choice([0.05, 0.5]))
+                    # Under and over DEADMAN (0.05), as 0.05 and 0.5 were against 0.4.
+                    time.sleep(rng.choice([0.01, 0.08]))
                     self.link.hang_input.set()
                 elif op == "quiet":
                     self.clock.jump(CONSOLE_QUIET + 1)
                 elif op == "control_stop":
                     self.stopped = True
-                    time.sleep(0.2)
+                    time.sleep(0.05)
                     self.stopped = False
                 elif op == "replace_stuck":
                     self.link.hang_input.clear()
@@ -968,7 +994,7 @@ class RandomEndToEndTests(Rig):
                         self.link.hang_input.set()
             except (ValueError, RuntimeError, OSError, Ended, LookupError):
                 pass
-            time.sleep(rng.choice([0.0, 0.02, 0.1]))
+            time.sleep(rng.choice([0.0, 0.005, 0.02]))
         self.link.down = False
         self.link.hang_input.set()
         self.sessions.close_all("JARVIS on the main stopped.")

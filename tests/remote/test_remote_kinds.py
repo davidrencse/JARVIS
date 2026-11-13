@@ -382,9 +382,9 @@ class HubBase(unittest.TestCase):
 
     def setUp(self):
         for p in (patch.object(NodeWorker, "_untrusted", return_value=None),
-                  patch("jarvis.cluster.POLL_WAIT", 0.5),
-                  patch("jarvis.remote_view.INPUT_HOLD", 0.5),
-                  patch("jarvis.remote_view.KEEPALIVE", 0.2)):
+                  patch("jarvis.cluster.POLL_WAIT", 0.05),
+                  patch("jarvis.remote_view.INPUT_HOLD", 0.05),
+                  patch("jarvis.remote_view.KEEPALIVE", 0.05)):
             p.start()
             self.addCleanup(p.stop)
         self.tmp = tempfile.TemporaryDirectory()
@@ -399,7 +399,13 @@ class HubBase(unittest.TestCase):
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         remote_view._ACTIVE.clear()
         self.addCleanup(remote_view._ACTIVE.clear)
-        self.addCleanup(lambda: [s.end("test over") for s in list(remote_view._ACTIVE.values())])
+        def _end_node_sessions():
+            sessions = list(remote_view._ACTIVE.values())
+            for session in sessions:
+                session.end("test over")
+            for session in sessions:
+                session.join(2)
+        self.addCleanup(_end_node_sessions)
         self.addCleanup(camera.end_all, "test over", 2)
 
     def prepare(self):
