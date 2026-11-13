@@ -1,8 +1,10 @@
 """Local web console: `python -m jarvis ui` serves it on http://127.0.0.1:7777.
 
 Standard library only. It binds to loopback, rejects foreign Host headers (DNS
-rebinding) and requires an `X-JARVIS` header on every POST, which a cross-site
-page can't send without a preflight this server never approves.
+rebinding), rejects a browser Origin that is not this server, and requires an
+`X-JARVIS` header on every POST. A cross-site page can't send that header
+without a preflight this server never approves. Browser POSTs must also use
+JSON or raw bytes, not a form content type.
 
 Endpoints read the same state the CLI uses (.jarvis/), so the console and
 `python -m jarvis ...` always agree. /api/events streams what every channel is doing
@@ -24,9 +26,9 @@ import uuid
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
 from .credits import Credits
@@ -40,6 +42,21 @@ WEB = Path(__file__).resolve().parent / "web"
 TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
          ".js": "text/javascript; charset=utf-8", ".svg": "image/svg+xml",
          ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8"}
+# index.html has three style= skeleton placeholders and no inline scripts or
+# event-handler attributes, so styles need 'unsafe-inline' and scripts do not.
+HTML_CSP = (
+    "default-src 'self'; connect-src 'self' https://api.open-meteo.com "
+    "wss://api.elevenlabs.io https://geocoding-api.open-meteo.com; "
+    "img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; "
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'")
+API_CSP = ("default-src 'none'; frame-ancestors 'none'; base-uri 'none'; "
+           "form-action 'none'; object-src 'none'")
+_SECURITY = (("X-Content-Type-Options", "nosniff"), ("Referrer-Policy", "no-referrer"),
+             ("X-Frame-Options", "DENY"), ("Cross-Origin-Resource-Policy", "same-origin"))
+# What a browser may POST. The three CORS-simple types are refused when the request
+# looks like a browser (it sent Origin or Fetch metadata). Non-browser clients omit
+# those and may still use urllib's default form type.
+_POST_TYPES = frozenset({"application/json", "application/octet-stream"})
 
 
 def _host_name(header):
@@ -48,6 +65,85 @@ def _host_name(header):
     if header.startswith("["):
         return header[1:].partition("]")[0].lower()
     return header.split(":")[0].lower()
+
+
+def _header_all(headers, name):
+    """Every value of `name`. A bare dict (unit tests) has no get_all."""
+    getter = getattr(headers, "get_all", None)
+    if getter is not None:
+        found = getter(name)
+        return list(found) if found else []
+    if not hasattr(headers, "get"):
+        return []
+    value = headers.get(name)
+    return [] if value is None else [value]
+
+
+def _csp_for(ctype):
+    return HTML_CSP if str(ctype or "").startswith("text/html") else API_CSP
+
+
+def _origin_allowed(headers, hosts, server):
+    """No Origin (CLI, urllib, tests) is fine. A present Origin must be this
+    server: http://<allow-listed host>:<bound port>, nothing else."""
+    found = _header_all(headers, "Origin")
+    if not found:
+        return True
+    if len(found) != 1:
+        return False
+    raw = found[0].strip()
+    if not raw or raw.lower() == "null":
+        return False
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        return False
+    if (parsed.scheme != "http" or parsed.username or parsed.password or parsed.query
+            or parsed.fragment or parsed.path not in ("", "/")):
+        return False
+    if (parsed.hostname or "").lower() not in hosts:
+        return False
+    if port is None:
+        port = 80
+    address = getattr(server, "server_address", None)
+    if not address or len(address) < 2:
+        return False
+    try:
+        return port == int(address[1])
+    except (TypeError, ValueError):
+        return False
+
+
+def _static_target(path):
+    """A file under jarvis/web, or None. Rejects traversal, encodings of it,
+    backslash, null bytes, absolute targets and symlinks that leave the tree."""
+    if not isinstance(path, str) or "\x00" in path or "\\" in path:
+        return None
+    raw = path.split("?", 1)[0].split("#", 1)[0]
+    if raw.startswith(("//", "http://", "https://")):
+        return None
+    name = "index.html" if raw in ("/", "") else raw.lstrip("/")
+    try:
+        name = unquote(name, errors="strict")
+    except UnicodeError:
+        return None
+    if "\x00" in name or "\\" in name or name.startswith(("/", "\\")):
+        return None
+    parts = PurePosixPath(name).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        return None
+    try:
+        target = (WEB / name).resolve()
+    except (OSError, ValueError):
+        return None
+    try:
+        target.relative_to(WEB)
+    except ValueError:
+        return None
+    if target == WEB or not target.is_file() or target.suffix not in TYPES:
+        return None
+    return target
 
 
 class _Counted:
@@ -1395,30 +1491,81 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         if close:
             self.send_header("Connection", "close")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        if "Cache-Control" not in (headers or {}):
+        extra = headers or {}
+        if "Cache-Control" not in extra:
             self.send_header("Cache-Control", "max-age=3600" if cache else "no-store")
-        for name, value in (headers or {}).items():
-            self.send_header(name, str(value))
+        blocked = {name.lower() for name, _ in _SECURITY} | {"content-security-policy",
+                                                             "access-control-allow-origin"}
+        for name, value in extra.items():
+            if name.lower() not in blocked:
+                self.send_header(name, str(value))
         if disposition:
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", disposition)
             self.send_header("Content-Disposition", f'attachment; filename="jarvis-{safe}"')
-        if ctype.startswith("text/html"):
-            self.send_header("Content-Security-Policy",
-                             "default-src 'self'; connect-src 'self' https://api.open-meteo.com "
-                             "wss://api.elevenlabs.io "
-                             "https://geocoding-api.open-meteo.com; img-src 'self' data: blob:; "
-                             "style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; "
-                             "base-uri 'none'; form-action 'none'; object-src 'none'")
+        self._stamp_security(ctype)
         self.end_headers()
         self.wfile.write(data)
 
+    def _stamp_security(self, ctype):
+        """Isolation headers on every response. No CORS, no framing, no sniffing."""
+        for name, value in _SECURITY:
+            self.send_header(name, value)
+        self.send_header("Content-Security-Policy", _csp_for(ctype))
+
+    def _header_all(self, name):
+        return _header_all(self.headers, name)
+
+    def _host_ok(self):
+        found = self._header_all("Host")
+        return len(found) == 1 and _host_name(found[0]) in self.hosts
+
+    def _origin_ok(self):
+        return _origin_allowed(self.headers, self.hosts, getattr(self, "server", None))
+
+    def _browser_request(self):
+        """A browser attaches Origin or Fetch metadata. urllib and curl do not."""
+        if self._header_all("Origin"):
+            return True
+        return any(self._header_all(name) for name in
+                   ("Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest"))
+
+    def _post_ok(self):
+        """X-JARVIS exactly once, and a non-simple content type when a browser sent it."""
+        if self._header_all("X-JARVIS") != ["1"]:
+            return False
+        types = self._header_all("Content-Type")
+        if len(types) > 1:
+            return False
+        if not self._browser_request():
+            return True
+        media = types[0].split(";", 1)[0].strip().lower() if types else ""
+        return media in _POST_TYPES
+
+    def _target_ok(self):
+        """Origin-form only. An absolute URL in the request line is not a console call."""
+        path = self.path or ""
+        return not path.startswith(("http://", "https://", "//"))
+
     def _allowed(self):
-        host = _host_name(self.headers.get("Host") or "")
+        # Works on a real handler and on the bare object the host-list test passes in.
         # Browsers label requests made by other sites; nothing here is for them.
-        site = self.headers.get("Sec-Fetch-Site")
-        return host in self.hosts and site in (None, "same-origin", "none")
+        headers, hosts = self.headers, self.hosts
+        sites = _header_all(headers, "Sec-Fetch-Site")
+        if len(sites) > 1 or (sites and sites[0] not in ("same-origin", "none")):
+            return False
+        found = _header_all(headers, "Host")
+        if len(found) != 1 or _host_name(found[0]) not in hosts:
+            return False
+        if not _origin_allowed(headers, hosts, getattr(self, "server", None)):
+            return False
+        path = getattr(self, "path", "") or ""
+        return not path.startswith(("http://", "https://", "//"))
+
+    def _deny_reason(self):
+        site = self.headers.get("Sec-Fetch-Site") if hasattr(self.headers, "get") else None
+        if not self._host_ok() and site in (None, "same-origin", "none"):
+            return "Unexpected Host header."
+        return "Requests from other sites are refused."
 
     # Rejected-body protocol. A request we refuse still has its body in flight; closing the socket
     # over unread bytes makes the kernel send a reset, and the client's send fails (BrokenPipe /
@@ -1525,7 +1672,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self._stamp_security("text/event-stream")
             self.end_headers()
             self.wfile.write(b"retry: 2000\n\n")
             write({"seq": self.console.bus.seq, "kind": "hello", "at": time.time(),
@@ -1569,11 +1716,47 @@ class Handler(BaseHTTPRequestHandler):
             message = str(exc) or type(exc).__name__
         self._send(status, {"error": message}, close=close)
 
+    def send_error(self, code, message=None, explain=None):
+        """TRACE and anything else unimplemented: the same headers, no CORS, no request echo."""
+        self.close_connection = True
+        try:
+            phrase = HTTPStatus(int(code)).phrase
+        except ValueError:
+            phrase = "Error"
+        try:
+            self._send(int(code), {"error": phrase}, close=True)
+        except OSError:
+            pass
+
+    def _unsupported(self):
+        """PUT/DELETE/PATCH/OPTIONS. No CORS preflight answer, including Private Network Access."""
+        if not self._allowed():
+            return self._refuse()
+        length = self._content_length()
+        self.close_connection = True
+        try:
+            self._send(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "Method not allowed."}, close=True,
+                       headers={"Allow": "GET, HEAD, POST"})
+        except OSError:
+            return
+        if length:
+            self._drain(length, self.REFUSE_DRAIN_BYTES)
+
+    def do_OPTIONS(self):
+        return self._unsupported()
+
+    def do_PUT(self):
+        return self._unsupported()
+
+    def do_DELETE(self):
+        return self._unsupported()
+
+    def do_PATCH(self):
+        return self._unsupported()
+
     def do_GET(self):
         if not self._allowed():
-            return self._send(HTTPStatus.FORBIDDEN, {"error": "Unexpected Host header." if
-                              self.headers.get("Sec-Fetch-Site") in (None, "same-origin", "none")
-                              else "Requests from other sites are refused."})
+            return self._send(HTTPStatus.FORBIDDEN, {"error": self._deny_reason()})
         url = urlparse(self.path)
         query = {k: v[-1] for k, v in parse_qs(url.query).items()}
         c = self.console
@@ -1665,9 +1848,8 @@ class Handler(BaseHTTPRequestHandler):
             self._fail(exc)
 
     def _static(self, path):
-        name = "index.html" if path in ("/", "") else path.lstrip("/")
-        target = (WEB / name).resolve()
-        if WEB not in target.parents or not target.is_file() or target.suffix not in TYPES:
+        target = _static_target(path)
+        if target is None:
             return self._send(HTTPStatus.NOT_FOUND, {"error": "Not found."})
         if target.suffix == ".woff2":
             return self._send(HTTPStatus.OK, target.read_bytes(), TYPES[target.suffix], cache=True)
@@ -1683,7 +1865,7 @@ class Handler(BaseHTTPRequestHandler):
                    headers={**validators, "Cache-Control": "no-cache"})
 
     def do_POST(self):
-        if not self._allowed() or self.headers.get("X-JARVIS") != "1":
+        if not self._allowed() or not self._post_ok():
             return self._refuse()
         url = urlparse(self.path)
         length = self._content_length()
