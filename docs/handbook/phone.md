@@ -49,7 +49,10 @@ Every request must pass, failing closed at each step:
 5. A POST carries `X-JARVIS-Phone: 1` and a JSON object of at most 256 KiB.
 6. `/phone/api/*` carries the phone's cookie (`__Host-jarvis_phone`, HttpOnly, Secure,
    SameSite=Strict, 90 days). Only its SHA-256 is stored, and it works only from the same
-   Tailscale device and login it was paired from.
+   Tailscale device and login it was paired from. The cookie rotates: a non-frame request
+   after 7 days mints a new one (`Set-Cookie`), and the previous one still works for 10 minutes.
+   A frame request sends its session id in the `X-JARVIS-Session` header, not the URL
+   (`?session=` is still accepted until 2026-12-31 for phones running an old cached page).
 
 The whole server answers 503 to everything while the link is off, while Tailscale Funnel
 reaches the port (the public internet), or while Serve's settings can't be read.
@@ -143,7 +146,7 @@ Camera:
 |---|---|
 | Pairing code | 8 characters, 5 minutes; 60 s to collect the key after `y` |
 | Wrong codes | 5 per device (and per address) per 10 minutes |
-| Cookie | 90 days, bound to the Tailscale device and login |
+| Cookie | 90 days, rotated after 7 days (10 min grace for the old value), bound to the Tailscale device and login |
 | Connections | 24 at once (503 above), one frame request per phone (429), 30 s socket timeout |
 | Session quality | low by default from the phone |
 | Camera presets | low 640x480 @ 5 fps, medium 960x540 @ 8, high 1280x720 @ 10 |
