@@ -7,23 +7,23 @@ Run from the repository root:
 ```
 
 Discovery recurses through the subsystem packages; the release runner uses this same command.
+Directories below are the ones under `tests/` (plus `__init__.py` and this file). `eval/` is JSONL only and has no `__init__.py`.
 
-| Folder | Coverage |
+| Folder | What it holds |
 | --- | --- |
-| `mobile/` | Phone API, PWA, camera and location |
-| `remote/` | Remote sessions, input sharing, clipboard, transfer and Lan Mouse |
-| `cluster/` | Main/node transport, setup, roles and signed jobs |
-| `continuity/` | Authority, gateway, ingress, handoff drills and runtime fences |
-| `desktop/` | Application actions, Spotify, keyboard/mouse, OS backends and terminals |
-| `intelligence/` | Parsing, interpretation, routing, inference and conversation |
-| `security/` | Permissions, gates, approvals, browser restrictions and sandboxing |
-| `voice/` | Microphone, wake word, speech and voice lifecycle |
-| `web/` | Console UI and JavaScript harnesses |
-| `data/` | Storage, vault, memory, indexing and filesystem helpers |
-| `runtime/` | Launchers, releases, settings, usage and workflow |
-| `audits/` | Regression suites spanning several subsystems |
-| `eval/` | Existing evaluation datasets |
-| `archive/` | Preserved pre-change backup files; excluded from discovery |
+| `audits/` | Audit suites for the brain, data, pipeline, listen/autostart/selftest, and system |
+| `cluster/` | Main/node transport, setup, roles, proxy, signed jobs, fleet, membership, pairing, readiness, and doctor |
+| `continuity/` | Authority, gateway, ingress, handoff drills, executor, runtime fences, and the phone receiver |
+| `data/` | Vault, storage, knowledge, semantic memory, brainsync, second brain, consolidation, and filesystem I/O |
+| `desktop/` | Actions, app UI, desktop control, screen, Spotify, terminals, platform backends, and system intents |
+| `eval/` | Scorecard datasets: `cases.jsonl`, `grounding.jsonl`, and `judge.jsonl` |
+| `intelligence/` | Parse, interpret, inference, brain, decide, Grok routing, pipelines, prompts, and situation |
+| `mobile/` | Phone API, phone web harness (`web_phone_test.cjs`), camera, location, fleet, and end-to-end |
+| `remote/` | Remote sessions, chaos suites, Lan Mouse, clipboard, dropzone, shared input, overlay, peripherals, and transfer |
+| `runtime/` | Archive CLI, history, events, harness, release, rest, settings, usage, workflow, scorecard, and selftest |
+| `security/` | Always-ask, confirm, gates, hard deny, permissions, browser gate, sandbox, and hardening |
+| `voice/` | Microphone, wake word, speech-to-text, voice print, idle, level, and main-only voice |
+| `web/` | Console UI, agent, fleet, meters, sysview, theme, and the Node harnesses beside those tests |
 
 Run a subsystem or an individual module:
 
