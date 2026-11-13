@@ -38,8 +38,11 @@ class ListenerLockTests(unittest.TestCase):
             with patch("jarvis.daemon._is_listener", return_value=True):
                 self.assertEqual(daemon._pid(self.state), proc.pid)
         finally:
-            proc.kill()
+            if proc.poll() is None:
+                proc.kill()
             proc.wait()
+            if proc.stdout is not None and not proc.stdout.closed:
+                proc.stdout.close()
         self.assertFalse(daemon.lock_held(self.state))
         with patch("jarvis.daemon._is_listener", return_value=True):
             self.assertIsNone(daemon._pid(self.state))
@@ -47,10 +50,23 @@ class ListenerLockTests(unittest.TestCase):
     def test_a_restart_waits_for_the_old_listener_to_let_go(self):
         first = daemon.InstanceLock(self.state).__enter__()
         import threading
-        threading.Timer(0.6, first.__exit__).start()
+        hold = 0.12
+
+        def let_go():
+            time.sleep(hold)
+            first.__exit__(None, None, None)
+
+        holder = threading.Thread(target=let_go)
+        holder.start()
+        self.addCleanup(holder.join)
         started = time.monotonic()
-        with daemon.InstanceLock(self.state, wait=5):
-            self.assertGreater(time.monotonic() - started, 0.4)
+        # The lock polls every 0.5 s. Cap that poll for this test; the wait itself stays real.
+        real_sleep = time.sleep
+        with patch.object(daemon.time, "sleep", lambda seconds: real_sleep(min(seconds, 0.02))), \
+                daemon.InstanceLock(self.state, wait=2):
+            waited = time.monotonic() - started
+        holder.join(2)
+        self.assertGreater(waited, hold / 2)  # it blocked until the holder let go
 
     def test_a_busy_lock_still_refuses_without_wait(self):
         with daemon.InstanceLock(self.state):
