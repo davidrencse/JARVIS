@@ -150,16 +150,19 @@ class PhoneEndToEnd(unittest.TestCase):
         self.server.start()
         # The real runtime's order: the phone server closes first, then the hub.
         self.runtime = cluster_proxy.Runtime(hub=self.hub, phone=self.server)
+        self._csrf = {}
         self.addCleanup(self.runtime.close)
 
     # ---- helpers
-    def call(self, method, path, body=None, ip=IPHONE, cookie=None):
+    def call(self, method, path, body=None, ip=IPHONE, cookie=None, csrf=True):
         conn = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=30)
         headers = {"Host": DNS, "Tailscale-User-Login": LOGIN, "Sec-Fetch-Site": "same-origin"}
         if ip:
             headers["X-Forwarded-For"] = ip
         if cookie:
             headers["Cookie"] = f"{phone.COOKIE}={cookie}"
+            if method == "POST" and csrf and cookie in self._csrf:
+                headers["X-CSRF-Token"] = self._csrf[cookie]
         data = None
         if method == "POST":
             data = json.dumps(body or {}).encode()
@@ -205,9 +208,15 @@ class PhoneEndToEnd(unittest.TestCase):
         cookie = res.getheader("Set-Cookie")
         self.assertIn("; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=7776000", cookie)
         token = cookie.split(";")[0].split("=", 1)[1]
-        # The code went to the CLI's own output and nowhere else.
+        csrf = body.get("csrf_token") or ""
+        self.assertRegex(csrf, r"^[A-Za-z0-9_-]{16,128}$")
+        # The code went to the CLI's own output and nowhere else. The CSRF plaintext
+        # is returned once and is not written into the store or the events.
         self.assertNotIn(code, json.dumps([self.events, self.logged], default=str))
         self.assertNotIn(code, (self.state / phone.STORE).read_text())
+        self.assertNotIn(csrf, (self.state / phone.STORE).read_text())
+        self.assertNotIn(csrf, json.dumps(self.events))
+        self._csrf[token] = csrf
         return token, body["phone"]["id"], asked[0]
 
     def secret_free(self, *secrets):

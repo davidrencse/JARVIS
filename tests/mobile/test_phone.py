@@ -222,6 +222,7 @@ class PhoneBase(unittest.TestCase):
         self.server.start()
         self.port = self.server.port
         self.events = []
+        self._csrf = {}
         self.console.bus.publish = lambda kind, data=None: self.events.append((kind, data))
 
     def tearDown(self):
@@ -229,7 +230,7 @@ class PhoneBase(unittest.TestCase):
         self.tmp.cleanup()
 
     def request(self, method, path, headers=None, body=None, ip=PHONE_A, login=LOGIN, host=DNS,
-                cookie=None, post_headers=True, raw=None):
+                cookie=None, post_headers=True, raw=None, csrf=True):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         try:
             conn.putrequest(method, path, skip_host=True, skip_accept_encoding=True)
@@ -246,6 +247,10 @@ class PhoneBase(unittest.TestCase):
             if method == "POST" and post_headers:
                 sent.update({"X-JARVIS-Phone": "1", "Content-Type": "application/json"})
             sent.update(headers or {})
+            if method == "POST" and csrf and cookie and "X-CSRF-Token" not in (headers or {}):
+                check = self._csrf.get(cookie)
+                if check:
+                    sent["X-CSRF-Token"] = check
             for k, v in sent.items():
                 if v is not None:
                     conn.putheader(k, v)
@@ -271,6 +276,10 @@ class PhoneBase(unittest.TestCase):
         status, body, res = self.request("POST", "/phone/pair/status", body={"code": code}, ip=ip)
         self.assertEqual(status, 200, body)
         token = res.getheader("Set-Cookie").split(";")[0].split("=", 1)[1]
+        csrf = body.get("csrf_token") or ""
+        self.assertRegex(csrf, r"^[A-Za-z0-9_-]{16,128}$")
+        self.assertNotIn(csrf, (self.state / phone.STORE).read_text())
+        self._csrf[token] = csrf
         return token, body["phone"]["id"]
 
 
