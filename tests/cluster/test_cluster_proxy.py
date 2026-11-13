@@ -135,11 +135,29 @@ class ProxyForwarding(ProxyBase):
         self.assertEqual((seen["method"], seen["body"]), ("POST", payload))
         self.assertEqual(seen["headers"]["content-type"], "application/json")
 
+    def test_browser_form_post_is_refused(self):
+        # A browser Origin plus a CORS-simple content type must not be forwarded.
+        # urllib (no Origin, form type) still is: see the console hardening tests.
+        before = len(self.client.calls)
+        status, _, _ = self.raw("POST", "/api/ask", {
+            "X-JARVIS": "1", "Origin": f"http://127.0.0.1:{self.port}",
+            "Content-Type": "application/x-www-form-urlencoded"}, b"text=hi")
+        self.assertEqual(status, 403)
+        self.assertEqual(len(self.client.calls), before)
+        status, _, _ = self.raw("POST", "/api/ask", {
+            "X-JARVIS": "1", "Origin": f"http://127.0.0.1:{self.port}",
+            "Content-Type": "application/json"}, b"{}")
+        self.assertEqual(status, 200)
+
     def test_untrusted_request_headers_are_stripped(self):
+        before = len(self.client.calls)
+        status, _, _ = self.raw("GET", "/api/overview", {"Origin": "http://evil.example"})
+        self.assertEqual(status, 403)
+        self.assertEqual(len(self.client.calls), before)  # a foreign Origin never reaches the main
         self.raw("GET", "/api/overview", {
             "Authorization": "Bearer ATTACKER", "Cookie": "a=b", "X-JARVIS-Main": "evil",
-            "X-Forwarded-For": "6.6.6.6", "Origin": "http://evil.example", "Accept": "text/html",
-            "Last-Event-ID": "42"})
+            "X-Forwarded-For": "6.6.6.6", "Origin": f"http://127.0.0.1:{self.port}",
+            "Accept": "text/html", "Last-Event-ID": "42"})
         sent = self.client.calls[-1]["headers"]
         self.assertEqual(sent, {"X-JARVIS": "1", "Last-Event-ID": "42"})
         up = FakeMain.seen[-1]["headers"]
@@ -160,6 +178,11 @@ class ProxyForwarding(ProxyBase):
         self.assertNotIn("server-secret", names)
         self.assertIn("cache-control", names)
         self.assertEqual(res.getheader("Referrer-Policy"), "no-referrer")
+        self.assertEqual(res.getheader("X-Frame-Options"), "DENY")
+        self.assertEqual(res.getheader("Cross-Origin-Resource-Policy"), "same-origin")
+        self.assertEqual(res.getheader("X-Content-Type-Options"), "nosniff")
+        self.assertIn("frame-ancestors 'none'", res.getheader("Content-Security-Policy"))
+        self.assertIsNone(res.getheader("Access-Control-Allow-Origin"))
 
     def test_large_response_streams_intact(self):
         status, body, _ = self.raw("GET", "/api/big")
