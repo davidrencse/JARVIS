@@ -1,6 +1,7 @@
 """Nodes get only tested code (release.cut), and a node rolls back code that won't start
 (release.guard). The test suite itself is never run here: `tests` is a stand-in."""
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,14 @@ class CutTests(unittest.TestCase):
                          "tests/test_x.py": "", "pyproject.toml": "[project]\n",
                          ".git/HEAD": "ref", ".jarvis/memory.sqlite3": "db"})
         self.ran = []
+        for patcher in (
+            patch.object(release, 'source_commit', side_effect=lambda repo=None: deploy.code_fingerprint(self.repo / 'jarvis')),
+            patch.object(release, '_archive', side_effect=lambda repo, stage, commit: release._stage(repo, stage)),
+            patch('jarvis.confirm.notify'),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
 
     def suite(self, ok):
         def run(stage):
@@ -60,10 +69,10 @@ class CutTests(unittest.TestCase):
                 patch("jarvis.release.settled", return_value=True):
             self.assertFalse(release.due(self.state))  # same broken code: not tested again
 
-    def test_unsettled_tree_waits(self):
-        report = self.cut(quiet=60)  # files were written just now
-        self.assertFalse(report["released"])
-        self.assertEqual(self.ran, [])
+    def test_dirty_file_quiet_period_does_not_delay_a_commit(self):
+        report = self.cut(quiet=60)
+        self.assertTrue(report['released'])
+        self.assertEqual(len(self.ran), 1)
 
     def test_bundle_serves_the_release_not_the_live_tree(self):
         self.cut()
@@ -163,10 +172,6 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(release.is_bad(self.state, "new1"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FingerprintTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -202,3 +207,140 @@ class FingerprintTests(unittest.TestCase):
         gone = self.root / "gone.py"
         with patch.object(release, "_files", return_value=[gone, self.root / "a.py"]):
             self.assertTrue(release.settled(self.root, quiet=0))
+
+
+RELEASED = "0123456789abcdef"
+LIVE = "fedcba9876543210"
+
+
+class CodeParityTests(unittest.TestCase):
+    """Transfer parity is a report. It must not cut a release, deploy, or update a node."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+        for name in ("cut", "backup", "guard", "install_dependencies"):
+            patcher = patch.object(release, name, side_effect=AssertionError(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(release.subprocess, "run", side_effect=AssertionError("subprocess"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def names(self):
+        return sorted(path.relative_to(self.state).as_posix()
+                      for path in self.state.rglob("*") if path.is_file())
+
+    def codes(self, report):
+        return [block["code"] for block in report["blocks"]]
+
+    def release_at(self, code=RELEASED):
+        root = self.state / "code-release"
+        (root / "jarvis").mkdir(parents=True)
+        (root / "release.json").write_text(
+            json.dumps({"code": code, "at": 1, "tests": "OK"}) + "\n", encoding="utf-8")
+
+    def parity(self, reported=RELEASED, live=RELEASED, settled=None):
+        with patch.object(release, "code_fingerprint", return_value=live):
+            if settled is None:
+                return release.code_parity(self.state, reported)
+            with patch.object(release, "settled", return_value=settled):
+                return release.code_parity(self.state, reported)
+
+    def test_live_tree_match_is_not_a_tested_release(self):
+        before = self.names()
+        with patch.object(release, "code_fingerprint", return_value=LIVE), \
+                patch.object(release, "settled", side_effect=AssertionError("settled")):
+            # served_code still falls back to the live tree. Parity does not treat that as a release.
+            self.assertEqual(release.served_code(self.state), LIVE)
+            report = release.code_parity(self.state, LIVE)
+        self.assertFalse(report["matched"])
+        self.assertFalse(report["authorizes"])
+        self.assertIsNone(report["code"])
+        self.assertEqual(report["live"], LIVE)
+        self.assertEqual(self.codes(report), ["no_tested_release"])
+        self.assertIn("jarvis cluster release", report["instruction"])
+        self.assertIn("does not cut one", report["instruction"])
+        self.assertIn("authorize a transfer", report["limits"])
+        self.assertEqual(self.names(), before)
+
+    def test_note_without_a_package_directory_is_not_a_release(self):
+        (self.state / "code-release").mkdir()
+        (self.state / "code-release" / "release.json").write_text(
+            json.dumps({"code": RELEASED}) + "\n", encoding="utf-8")
+        report = self.parity(reported=RELEASED, live=RELEASED)
+        self.assertEqual(self.codes(report), ["no_tested_release"])
+
+    def test_matching_fingerprints_do_not_authorize_a_transfer(self):
+        self.release_at()
+        with patch.object(release, "settled", side_effect=AssertionError("settled")):
+            report = self.parity()
+        self.assertTrue(report["matched"])
+        self.assertFalse(report["authorizes"])
+        self.assertEqual(report["instruction"], "")
+        self.assertEqual(report["blocks"], [])
+        self.assertEqual(report["code"], RELEASED)
+        self.assertEqual(report["live"], RELEASED)
+        self.assertEqual(report["reported"], RELEASED)
+
+    def test_a_different_pc_names_update_and_does_not_run_it(self):
+        self.release_at()
+        report = self.parity(reported=LIVE, live=RELEASED)
+        self.assertFalse(report["matched"])
+        self.assertEqual(self.codes(report), ["code_mismatch"])
+        self.assertIn(LIVE, report["instruction"])
+        self.assertIn("jarvis cluster update <node>", report["instruction"])
+        self.assertIn("does not update a node", report["instruction"])
+
+    def test_unreleased_edits_say_whether_the_tree_has_settled(self):
+        self.release_at()
+        quiet = self.parity(reported=RELEASED, live=LIVE, settled=True)
+        self.assertEqual(self.codes(quiet), ["unreleased_edits"])
+        self.assertIn("quiet long enough", quiet["instruction"])
+        self.assertIn("does not cut one", quiet["instruction"])
+        recent = self.parity(reported=RELEASED, live=LIVE, settled=False)
+        self.assertIn(str(release.QUIET), recent["instruction"])
+        self.assertIn("Wait for it to settle", recent["instruction"])
+        self.assertNotIn("code_mismatch", self.codes(recent))
+
+    def test_failed_tests_are_named_and_not_retried(self):
+        self.release_at()
+        (self.state / release.FAILED).write_text(
+            json.dumps({"code": LIVE, "tests": "FAIL: tests.runtime.test_release\n"}) + "\n",
+            encoding="utf-8")
+        with patch.object(release, "settled", side_effect=AssertionError("settled")):
+            report = self.parity(reported=RELEASED, live=LIVE)
+        self.assertEqual(self.codes(report)[0], "release_tests_failed")
+        self.assertIn("FAIL: tests.runtime.test_release", report["instruction"])
+        self.assertIn("does not cut one", report["instruction"])
+        self.assertNotIn("unreleased_edits", self.codes(report))
+
+    def test_a_missing_fingerprint_fails_closed(self):
+        self.release_at()
+        missing = self.parity(reported=None, live=RELEASED)
+        self.assertEqual(self.codes(missing), ["reported_missing"])
+        self.assertIn("does not contact", missing["instruction"])
+        self.assertIsNone(missing["reported"])
+        blank = self.parity(reported="", live=RELEASED)
+        self.assertEqual(self.codes(blank), ["reported_missing"])
+        self.assertIsNone(self.parity(reported=12, live=RELEASED)["reported"])
+        with patch.object(release, "code_fingerprint", side_effect=OSError("unread")):
+            unread = release.code_parity(self.state, RELEASED)
+        self.assertIn("live_unreadable", self.codes(unread))
+        self.assertFalse(unread["matched"])
+        self.assertEqual(release.code_parity(None, RELEASED)["blocks"][0]["code"], "unreadable")
+
+    def test_a_rolled_back_fingerprint_is_not_installed_again(self):
+        self.release_at()
+        (self.state / release.BAD).write_text(
+            json.dumps({"code": RELEASED}) + "\n", encoding="utf-8")
+        report = self.parity()
+        self.assertFalse(report["matched"])
+        self.assertEqual(self.codes(report), ["rolled_back"])
+        self.assertIn("must not be installed again", report["instruction"])
+        self.assertIn("does not deploy", report["instruction"])
+
+
+if __name__ == "__main__":
+    unittest.main()
