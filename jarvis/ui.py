@@ -1238,8 +1238,11 @@ class Console:
     # default-denies /api/fleet* to node tokens and the phone server has no write route.
     def fleet(self):
         from . import fleet_management
-        return fleet_management.inventory(
+        from .release import status as release_status
+        result = fleet_management.inventory(
             self.config, self.state, config_path=self.base / "jarvis.config.json")
+        result["release"] = release_status(self.state)
+        return result
 
     def continuity_gateway(self):
         from .continuity.console import gateway_status

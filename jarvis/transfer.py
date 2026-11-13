@@ -748,6 +748,17 @@ def call(config, state, device, payload, timeout=120):
 
 
 def push(config, state, device, source, size, name=None, dest="drop", kind=None, folder=None, *, call_fn=None):
+    # Keep a marker across all chunks, including time between requests.
+    marker = Path(state) / ("release-transfer-" + uuid.uuid4().hex + ".json")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(os.getpid()), encoding="ascii")
+    try:
+        return _push(config, state, device, source, size, name, dest, kind, folder, call_fn=call_fn)
+    finally:
+        marker.unlink(missing_ok=True)
+
+
+def _push(config, state, device, source, size, name=None, dest="drop", kind=None, folder=None, *, call_fn=None):
     """Stream `source` (a binary file object of `size` bytes) to `device` in chunks.
 
     dest "path" lands the file in `folder`, a folder on that device inside its storage roots.
