@@ -39,10 +39,16 @@
           const wake = () => session.ctx?.resume().catch(() => {});
           for (const ev of ["pointerdown", "keydown"]) addEventListener(ev, wake, { once: true, capture: true });
         }
+        session.onVis = () => this._onVisibility(session);
+        document.addEventListener?.("visibilitychange", session.onVis);
+        // Already hidden before the graph exists: park now if this start is not a take yet.
+        if (typeof document.hidden === "boolean" && document.hidden) this._onVisibility(session);
         await session.ctx.audioWorklet.addModule("recorder-worklet.js");
         if (this._session !== session) return await this._release(session);
         session.source = session.ctx.createMediaStreamSource(session.stream);
         session.node = new AudioWorkletNode(session.ctx, "jarvis-recorder");
+        // Hold copies until this.active. The processor defaults on for other callers.
+        session.node.port.postMessage?.({ on: false });
         session.analyser = session.ctx.createAnalyser(); session.analyser.fftSize = 1024;
         session.sink = session.ctx.createGain(); session.sink.gain.value = 0;
         session.source.connect(session.node); session.source.connect(session.analyser);
@@ -55,6 +61,14 @@
         this.calibration = []; this.calibrationTime = 0; this.calibrated = false;
         this.node.port.onmessage = (ev) => this.frame(ev.data);
         this.active = true; this.t0 = performance.now();
+        // Calibration, wait/pre-roll, silence, and the level meter all read these frames.
+        session.node.port.postMessage?.({ on: true });
+        // A hide during setup may have suspended the context. The take needs it back
+        // even if suspend() has not flipped ctx.state yet.
+        if (session.parked && typeof session.ctx.resume === "function") {
+          session.parked = false;
+          session.ctx.resume().catch(() => {});
+        }
         this.paint();
       } catch (error) {
         if (this._session === session) { this._session = null; this.active = false; }
@@ -62,10 +76,37 @@
         throw error;
       }
     }
+    _onVisibility(session) {
+      if (this._session !== session) return;
+      const ctx = session.ctx;
+      if (!ctx || ctx.state === "closed") return;
+      const hidden = typeof document.hidden === "boolean" && document.hidden;
+      if (!hidden) {
+        const parked = session.parked;
+        session.parked = false;
+        if (this.active) session.node?.port?.postMessage?.({ on: true });
+        // Resume a context we parked, or one the browser suspended, when the tab is shown.
+        if ((parked || ctx.state === "suspended") && typeof ctx.resume === "function") ctx.resume().catch(() => {});
+        return;
+      }
+      // Hidden tab. this.active covers calibration, always-on wait/pre-roll, and a
+      // voiced take. Suspending any of those drops samples, so keep a live take running.
+      if (this.active) return;
+      session.node?.port?.postMessage?.({ on: false });
+      if (ctx.state === "running" && typeof ctx.suspend === "function") {
+        session.parked = true;
+        ctx.suspend().catch(() => {});
+      }
+    }
     async _release(session) {
-      const { stream, ctx, source, node, analyser, sink } = session;
+      const { stream, ctx, source, node, analyser, sink, onVis } = session;
       session.stream = session.ctx = session.source = session.node = session.analyser = session.sink = null;
-      if (node) node.port.onmessage = null;
+      session.onVis = null;
+      if (onVis) document.removeEventListener?.("visibilitychange", onVis);
+      if (node) {
+        node.port.onmessage = null;
+        node.port.postMessage?.({ on: false });
+      }
       for (const connected of [source, node, analyser, sink]) {
         try { connected?.disconnect(); } catch (_) { /* already disconnected */ }
       }
@@ -127,12 +168,22 @@
     }
     paint(session = this._session) {
       if (!this.active || !this.wave || this._session !== session) return;
+      // A hidden tab suspends this frame; queue the next one so the loop resumes when shown.
+      if (document.hidden) { requestAnimationFrame(() => this.paint(session)); return; }
       const c = this.wave, g = c.getContext("2d"), dpr = Math.min(devicePixelRatio || 1, 2);
       const w = c.clientWidth, h = c.clientHeight;
       if (c.width !== Math.round(w * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
       g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
-      const buf = new Uint8Array(this.analyser.frequencyBinCount); this.analyser.getByteTimeDomainData(buf);
-      g.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--inv-ink").trim();
+      const n = this.analyser.frequencyBinCount;
+      if (!this._waveBuf || this._waveBuf.length !== n) this._waveBuf = new Uint8Array(n);
+      const buf = this._waveBuf; this.analyser.getByteTimeDomainData(buf);
+      const root = document.documentElement;
+      const theme = root && root.getAttribute ? (root.getAttribute("data-theme") || "") : "";
+      if (this._ink == null || this._inkTheme !== theme) {
+        this._inkTheme = theme;
+        this._ink = getComputedStyle(root).getPropertyValue("--inv-ink").trim();
+      }
+      g.strokeStyle = this._ink;
       g.lineWidth = 1.4; g.beginPath();
       const left = 40, span = w - left - 10;
       for (let i = 0; i < buf.length; i += 8) {
@@ -150,6 +201,7 @@
       const active = this.active, rate = this.ctx?.sampleRate, voiced = this.voiced;
       const chunks = this.chunks, samples = this.samples;
       this.active = false;
+      this.node?.port?.postMessage?.({ on: false });
       this.chunks = [];
       try { this.onLevel(0); } finally { await this._release(session); }
       this.stream = this.ctx = this.node = this.analyser = this.sink = null;

@@ -56,6 +56,8 @@
 
   // ---------- geometry and the static memory tangle (redrawn only on resize/theme) ----------
   let W = 0, H = 0, dpr = 1, G = null, tangle = null, ink = "#ededed", bg = "#000";
+  let fsCached = 8, fontBody = "", fontHead = "", fillIdle = "", fillHot = "", tagBox = null;
+  const clipCache = new Map(), _xy = [0, 0];
   function rng(seed) { return () => ((seed = (seed * 16807) % 2147483647) / 2147483647); }
   function layout() {
     const box = canvas.getBoundingClientRect();
@@ -73,6 +75,11 @@
     G = { R, r: R - band, cx, cy, band, span, step: (2 * span) / STAGES.length };
     if (!view.touched) home();
     inkRGB = rgb(ink); bgRGB = rgb(bg); dark = bgRGB[0] + bgRGB[1] + bgRGB[2] < 1.5;
+    fsCached = Math.max(6.5, Math.min(9, G.band / 18));
+    fontBody = `400 ${fsCached}px "Geist Mono", ui-monospace, monospace`;
+    fontHead = `500 ${fsCached + 0.5}px "Geist Mono", ui-monospace, monospace`;
+    fillIdle = mix(0.05); fillHot = mix(0.16);
+    clipCache.clear(); tagBox = null;
     field?.layout(W, H, dpr, G);
     zoomLabel?.();
     drawTangle();
@@ -102,7 +109,7 @@
   }
 
   const angleOf = (s) => -G.span + G.step * (s.i + 0.5);
-  const polar = (a, d) => [G.cx + Math.cos(a) * d, G.cy + Math.sin(a) * d];
+  const polar = (a, d) => { _xy[0] = G.cx + Math.cos(a) * d; _xy[1] = G.cy + Math.sin(a) * d; return _xy; };
 
   // ---------- live state ----------
   const bundles = []; // memory → stage, fading
@@ -138,7 +145,7 @@
 
   // ---------- drawing ----------
   function frame(now) {
-    pending = false;
+    pending = false; raf = 0;
     // A hidden or collapsed canvas lays out with no room for the ring: arc() would throw.
     if (!G || G.r < 4) return;
     const c = ctx, time = (now - t0) / 1000;
@@ -169,7 +176,7 @@
     for (const s of STAGES) {
       const a = angleOf(s), half = G.step / 2 - 0.004;
       c.globalAlpha = 1;
-      c.fillStyle = s === active || s === hover ? mix(0.16) : mix(0.05);
+      c.fillStyle = s === active || s === hover ? fillHot : fillIdle;
       c.beginPath(); c.arc(G.cx, G.cy, G.R, a - half, a + half); c.arc(G.cx, G.cy, G.r, a + half, a - half, true); c.closePath(); c.fill();
       if (s.heat > 0.02 || s === hover) {
         c.globalAlpha = Math.max(s.heat, s === hover ? 0.6 : 0); c.strokeStyle = ink; c.lineWidth = 1; c.stroke();
@@ -177,18 +184,17 @@
       // text: lines run radially, stacked across the segment
       c.save();
       c.translate(...polar(a, G.r + 8)); c.rotate(a);
-      const fs = Math.max(6.5, Math.min(9, G.band / 18));
-      c.font = `400 ${fs}px "Geist Mono", ui-monospace, monospace`;
+      const fs = fsCached, rowH = fs + 2.5;
       c.textBaseline = "middle"; c.fillStyle = ink;
-      const arcLen = G.step * (G.r + G.band / 2), rows = Math.max(2, Math.floor(arcLen / (fs + 2.5)) - 1);
-      c.globalAlpha = 0.95; c.font = `500 ${fs + 0.5}px "Geist Mono", ui-monospace, monospace`;
-      c.fillText(String(s.i + 1).padStart(2, "0") + " " + s.label.toUpperCase() + (s.total ? "  ·" + s.total : ""), 0, -((rows - 1) / 2) * (fs + 2.5));
-      c.font = `400 ${fs}px "Geist Mono", ui-monospace, monospace`;
+      const arcLen = G.step * (G.r + G.band / 2), rows = Math.max(2, Math.floor(arcLen / rowH) - 1);
+      c.globalAlpha = 0.95; c.font = fontHead;
+      c.fillText(String(s.i + 1).padStart(2, "0") + " " + s.label.toUpperCase() + (s.total ? "  ·" + s.total : ""), 0, -((rows - 1) / 2) * rowH);
+      c.font = fontBody;
       for (let r = 1; r < rows; r++) {
         const line = s.lines[(r - 1 + (reduce.matches || s.heat < 0.05 ? 0 : Math.floor(time * 2))) % s.lines.length];
         if (!line) continue;
         c.globalAlpha = (r === 1 && s.heat > 0.1 ? 0.95 : 0.42);
-        c.fillText(clip(c, line, G.band - 18), 0, (r - (rows - 1) / 2) * (fs + 2.5));
+        c.fillText(clip(c, line, G.band - 18), 0, (r - (rows - 1) / 2) * rowH);
       }
       c.restore();
     }
@@ -201,6 +207,9 @@
     c.beginPath(); c.arc(G.cx, G.cy, G.r - 3, -G.span, G.span); c.stroke();
 
     // bundles from memory into the active stage's inner edge
+    let alive = 0;
+    for (let i = 0; i < bundles.length; i++) if (now - bundles[i].born <= 1600) bundles[alive++] = bundles[i];
+    bundles.length = alive;
     for (const b of bundles) {
       const age = (now - b.born) / 1600; if (age > 1) continue;
       const a = angleOf(b.stage), [tx, ty] = polar(a, G.r - 4);
@@ -240,21 +249,35 @@
   }
   function mix(alpha) { return `color-mix(in srgb, ${ink} ${Math.round(alpha * 100)}%, ${bg})`; }
   function clip(c, text, max) {
-    if (c.measureText(text).width <= max) return text;
-    while (text.length > 3 && c.measureText(text + "…").width > max) text = text.slice(0, -1);
-    return text + "…";
+    const key = max + "\0" + text;
+    const hit = clipCache.get(key);
+    if (hit !== undefined) return hit;
+    let out = text;
+    if (c.measureText(text).width > max) {
+      while (out.length > 3 && c.measureText(out + "…").width > max) out = out.slice(0, -1);
+      out += "…";
+    }
+    if (clipCache.size > 600) clipCache.clear();
+    clipCache.set(key, out);
+    return out;
   }
 
   // Idle: a slow breath (one frame every 120 ms) instead of full-rate animation.
   // Busy: every frame. Idle: a slow breath (one frame per 120 ms). Reduced motion: only on change.
-  let pending = false, timer = 0;
+  let pending = false, timer = 0, raf = 0;
   function schedule(delay) {
-    if (pending) return;
+    if (pending || document.hidden) return;
     if (reduce.matches && delay) return;
     pending = true;
-    if (delay) timer = setTimeout(() => { timer = 0; requestAnimationFrame(frame); }, delay); else requestAnimationFrame(frame);
+    if (delay) timer = setTimeout(() => { timer = 0; raf = requestAnimationFrame(frame); }, delay);
+    else raf = requestAnimationFrame(frame);
   }
   function wake() { if (pending && timer) { clearTimeout(timer); timer = 0; pending = false; } schedule(0); }
+  function stopLoop() {
+    if (timer) { clearTimeout(timer); timer = 0; }
+    if (raf) { cancelAnimationFrame(raf); raf = 0; }
+    pending = false;
+  }
 
   // ---------- tag (hover or active stage) ----------
   const tagEl = $("#lab-tag");
@@ -263,12 +286,20 @@
     tagEl.hidden = false; tagEl._s = s;
     tagEl.querySelector("b").textContent = `${String(s.i + 1).padStart(2, "0")} ${s.label}${s.state ? " · " + s.state : ""}`;
     tagEl.querySelector("span").textContent = s.last || s.lines.slice(0, 3).join(" · ");
+    tagBox = null;
     placeTag();
   }
   function placeTag() {
     const s = tagEl && !tagEl.hidden && tagEl._s; if (!s || !G) return;
+    if (!tagBox) {
+      const w = tagEl.offsetWidth, h = tagEl.offsetHeight;
+      if (w || h) tagBox = [w, h];
+    }
+    const tw = tagBox ? tagBox[0] : 0, th = tagBox ? tagBox[1] : 0;
     let [x, y] = toScreen(...polar(angleOf(s), G.R + Math.min(W * 0.18, 150) / view.k));
-    x = Math.min(W - tagEl.offsetWidth - 8, Math.max(8, x)); y = Math.min(H - tagEl.offsetHeight - 30, Math.max(8, y - 20));
+    x = Math.min(W - tw - 8, Math.max(8, x)); y = Math.min(H - th - 30, Math.max(8, y - 20));
+    if (tagEl._px === x && tagEl._py === y) return;
+    tagEl._px = x; tagEl._py = y;
     tagEl.style.left = x + "px"; tagEl.style.top = y + "px";
   }
   function hideTag() { if (tagEl && !hover) tagEl.hidden = true; }
@@ -436,7 +467,7 @@
   const ro = new ResizeObserver(() => { layout(); wake(); });
   ro.observe(canvas.parentElement);
   new MutationObserver(() => { layout(); wake(); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(); });
+  document.addEventListener("visibilitychange", () => { if (document.hidden) stopLoop(); else wake(); });
   document.fonts?.ready.then(() => { layout(); wake(); });
   layout(); header(); wake();
   window.JarvisWheel = { fire: (id, text, state) => byId[id] && fire(byId[id], text, state), stages: STAGES, fitRect, reset };

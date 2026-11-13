@@ -34,7 +34,7 @@
   document.body.appendChild(dlg);
   const body = dlg.querySelector(".vs-body"), foot = dlg.querySelector(".vs-foot");
 
-  let view = null, devices = null, device = "", timer = 0, screen = "", lastKey = "";
+  let view = null, devices = null, device = "", timer = 0, screen = "", lastKey = "", polling = false;
   // A finished or failed run from before this opening is old news: show the start screen.
   let stale = true;
 
@@ -135,12 +135,23 @@
   // RMS of speech sits around 0.01–0.1: a compressed scale makes both ends visible.
   const levelOf = (rms) => Math.min(1, Math.pow(Math.max(0, rms || 0) * 14, 0.6)).toFixed(3);
 
+  function armPoll(ms) {
+    clearTimeout(timer);
+    timer = 0;
+    if (!dlg.open || document.hidden) return;
+    timer = setTimeout(poll, ms);
+  }
   async function poll() {
     clearTimeout(timer);
-    if (!dlg.open) return;
-    try { view = await api("/api/voice/setup"); render(); }
-    catch (e) { view = { ...(view || {}), running: false, step: "error", error: e.message }; render(); }
-    timer = setTimeout(poll, view?.running ? 120 : 1500);
+    timer = 0;
+    if (!dlg.open || document.hidden) return;
+    if (polling) return;
+    polling = true;
+    try {
+      try { view = await api("/api/voice/setup"); render(); }
+      catch (e) { view = { ...(view || {}), running: false, step: "error", error: e.message }; render(); }
+    } finally { polling = false; }
+    armPoll(view?.running ? 120 : 1500);
   }
 
   async function loadDevices() {
@@ -152,15 +163,17 @@
     }
   }
 
-  async function open() {
+  async function open(preset) {
     if (!dlg.open) dlg.showModal();
     screen = "";
-    try { view = await api("/api/voice/setup"); } catch (e) { view = { step: "error", error: e.message }; }
+    if (preset) view = preset;
+    else try { view = await api("/api/voice/setup"); } catch (e) { view = { step: "error", error: e.message }; }
     if (view.mic?.device) device = view.mic.device;
     stale = !view.running;
     render();
     if (!devices) loadDevices();
-    poll();
+    // The view just loaded; the loop's next read is the live level, not a second copy of this one.
+    armPoll(view?.running ? 120 : 1500);
   }
 
   function close() {
@@ -181,7 +194,7 @@
     if (act === "restart") { stale = true; screen = ""; render(); if (!devices) loadDevices(); return; }
     b.disabled = true;
     try {
-      if (act === "start") { stale = false; view = await api("/api/voice/setup", { action: "start", device }); screen = ""; render(); poll(); }
+      if (act === "start") { stale = false; view = await api("/api/voice/setup", { action: "start", device }); screen = ""; render(); armPoll(120); }
       else if (act === "cancel") { b.textContent = "Cancelling"; await api("/api/voice/setup", { action: "cancel" }); }
       else if (act === "autostart") {
         const on = b.getAttribute("aria-checked") !== "true";
@@ -195,10 +208,15 @@
   });
 
   // Settings > Voice: what is set up on this machine, and the button that opens setup.
+  let entryFlight = null;
   async function paintEntry(s) {
     const box = document.getElementById("vs-entry");
     if (!box) return;
-    try { s = s || await api("/api/voice/setup"); } catch (e) { s = null; }
+    if (s === undefined) {
+      if (entryFlight) return entryFlight;
+      entryFlight = api("/api/voice/setup").then((v) => v, () => null).then((v) => { entryFlight = null; return paintEntry(v); });
+      return entryFlight;
+    }
     const mini = box.querySelector(".vs-mini"), line = box.querySelector("small"), btn = box.querySelector("[data-voicesetup]");
     const enrolled = !!s?.enrolled, m = s?.mic || {};
     mini.classList.toggle("off", !enrolled);
@@ -210,20 +228,24 @@
   }
   document.addEventListener("click", (e) => { if (e.target.closest("[data-voicesetup]")) open(); });
   document.addEventListener("voicesetup:closed", () => paintEntry());
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { clearTimeout(timer); timer = 0; return; }
+    if (dlg.open) poll();
+  });
   const settingsView = document.getElementById("view-settings");
   if (settingsView) new MutationObserver(() => { if (!settingsView.hidden) paintEntry(); }).observe(settingsView, { attributes: true, attributeFilter: ["hidden"] });
-  paintEntry();
 
   // First run: no voiceprint on this machine, and not put off in the last three days.
-  // ?voicesetup=1 opens it regardless (links from elsewhere).
+  // ?voicesetup=1 opens it regardless (links from elsewhere). One read feeds the settings line and the dialog.
   (async () => {
     const forced = new URLSearchParams(location.search).get("voicesetup") === "1";
     let later = 0;
     try { later = Number(localStorage.getItem(LATER)) || 0; } catch (_) {}
-    if (!forced && Date.now() - later < 3 * 864e5) return;
-    try {
-      const s = await api("/api/voice/setup");
-      if (forced || s.running || !s.enrolled) open();
-    } catch (_) { /* no voice deps here: nothing to set up */ }
+    const recent = !forced && Date.now() - later < 3 * 864e5;
+    let s = null;
+    try { s = await api("/api/voice/setup"); } catch (_) { s = null; }
+    paintEntry(s);
+    if (recent || !s) return;
+    if (forced || s.running || !s.enrolled) open(s);
   })();
 })();
