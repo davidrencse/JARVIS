@@ -34,9 +34,39 @@ def reset():
     browser_gate._TYPED.clear()
 
 
+def public_only(url):
+    """Stands in for actions._local_address: no DNS in tests."""
+    from urllib.parse import urlsplit
+    host = urlsplit(url).hostname or ""
+    return f"{host} is on this PC or the home network" if \
+        host in ("localhost", "127.0.0.1", "[::1]") or host.startswith(("192.168.", "10.")) else None
+
+
+def no_dns():
+    patcher = mock.patch("jarvis.actions._local_address", side_effect=public_only)
+    patcher.start()
+    return patcher
+
+
+_PATCH = []
+
+
+def setUpModule():
+    _PATCH.append(no_dns())
+
+
+def tearDownModule():
+    _PATCH.pop().stop()
+
+
+# A neutral site: a snapshot's search box excuses Enter there (on x.com it does not).
+NEUTRAL = SNAP.replace("https://x.com/home", "https://search.example.org/")
+
+
 class ObserveTest(unittest.TestCase):
     def setUp(self):
         reset()
+        self.addCleanup(no_dns().stop)
         observe("pw", SNAP)
 
     def test_read_tool_results_cannot_rewrite_refs_or_url(self):
@@ -75,7 +105,8 @@ class ObserveTest(unittest.TestCase):
 class EnterTest(unittest.TestCase):
     def setUp(self):
         reset()
-        observe("pw", SNAP)
+        self.addCleanup(no_dns().stop)
+        observe("pw", NEUTRAL)
 
     def test_every_enter_spelling_asks(self):
         for key in ("Enter", "\n", "\r", "ControlOrMeta+Enter", "Shift+Enter", "Alt+Enter",
@@ -107,6 +138,9 @@ class EnterTest(unittest.TestCase):
 
 
 class SearchEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(no_dns().stop)
+
     def test_model_description_alone_is_not_a_search_box(self):
         reset()  # Codex lane: nothing observed
         judge(call("browser_type", element="Search box", ref="e9", text="x"))
@@ -115,7 +149,7 @@ class SearchEvidenceTest(unittest.TestCase):
 
     def test_ref_resolving_to_a_non_search_field_is_not_exempt(self):
         reset()
-        observe("pw", SNAP)
+        observe("pw", NEUTRAL)
         self.assertIsNotNone(judge(call("browser_type", element="Search", ref="e3", text="x", submit=True)))
         self.assertIsNone(judge(call("browser_type", ref="e2", text="x", submit=True)))
 
@@ -145,10 +179,10 @@ class ValueTest(unittest.TestCase):
 
     def test_select_option_values_are_checked(self):
         for args in ({"values": ["Delete my account"]}, {"value": "Confirm purchase"}):
-            info = judge(call("browser_select_option", element="Action menu", ref="e3", **args))
+            info = judge(call("browser_select_option", element="Action menu", ref="e13", **args))
             self.assertIsNotNone(info, args)
             self.assertEqual(info["stakes"], "high")
-        self.assertIsNone(judge(call("browser_select_option", element="Size", ref="e3", values=["Large"])))
+        self.assertIsNone(judge(call("browser_select_option", element="Size", ref="e13", values=["Large"])))
 
     def test_fill_form_choice_values_are_checked(self):
         fields = [{"name": "Plan", "type": "combobox", "ref": "e3", "value": "Confirm and pay"}]
@@ -305,6 +339,207 @@ class AlwaysAskByStakesTest(unittest.TestCase):
         for params in (call("browser_press_key", key="Enter"),
                        call("browser_click", ref="e12", element="blue button")):
             self.must_not_ask(params, off)
+
+
+
+ASK = {"rules": {"confirm": "ask"}}
+
+
+class _GateCase(AlwaysAskByStakesTest):
+    """AlwaysAskByStakesTest's run_gate/must_ask helpers, without re-running its tests."""
+    def run(self, result=None):
+        if type(self) is _GateCase:
+            return None
+        return super().run(result)
+
+
+def page(url, *lines):
+    return "### Page state\n- Page URL: " + url + "\n- Page Snapshot:\n```yaml\n" + \
+        "\n".join(lines) + "\n```"
+
+
+class NamedMoneyMessageClickTest(_GateCase):
+    """Audit 2026-11-13 (1): a snapshot-named click on a money/messages word passed because
+    COMMIT lacks those words, and judge() returning None skipped always_asks()."""
+    NAMES = ("Place your order", "Tip", "Payment", "Book now", "Bid", "Rent", "Reserve",
+             "Message", "Email", "DM")
+
+    def setUp(self):
+        reset()
+        observe("pw", page("https://shop.example.org/", *(
+            f'- button "{name}" [ref=e{i}]' for i, name in enumerate(self.NAMES, 20)),
+            '- link "Next page" [ref=e50]'))
+
+    def test_each_named_click_asks_in_both_modes(self):
+        for i, name in enumerate(self.NAMES, 20):
+            params = call("browser_click", ref=f"e{i}")
+            info = judge(params)
+            self.assertIsNotNone(info, name)
+            self.assertEqual(info["stakes"], "high", name)
+            self.must_ask(params)  # rules.confirm: never
+            self.must_ask(params, ASK)
+
+    def test_harmless_named_click_still_runs(self):
+        self.must_not_ask(call("browser_click", ref="e50"))
+        self.must_not_ask(call("browser_click", ref="e50"), ASK)
+
+    def test_other_always_ask_kind_off_does_not_ask_in_never(self):
+        # only "messages" on: Tip (money) is judged high but does not outrank rules.confirm: never
+        cfg = {"rules": {"confirm": "never", "always_ask": ["messages"]}}
+        self.must_not_ask(call("browser_click", ref="e21"), cfg)
+        self.must_ask(call("browser_click", ref="e28"), cfg)  # Message
+
+
+class SearchLabelIsDataTest(_GateCase):
+    """Audit 2026-11-13 (2): a page naming its composer "Search" exempted submit/newline/Enter."""
+
+    def setUp(self):
+        reset()
+
+    def test_composer_labelled_search_on_an_account_site_still_asks(self):
+        observe("pw", page("https://x.com/home", '- searchbox "Search" [ref=e2]'))
+        for params in (call("browser_type", ref="e2", text="hi", submit=True),
+                       call("browser_type", ref="e2", text="hi\n")):
+            self.assertIsNotNone(judge(params), params)
+            self.must_ask(params)
+            self.must_ask(params, ASK)
+        judge(call("browser_type", ref="e2", text="hi"))
+        self.assertIsNotNone(judge(call("browser_press_key", key="Enter")))
+        judge(call("browser_type", ref="e2", text="hi"))
+        self.must_ask(call("browser_press_key", key="Enter"))
+
+    def test_unknown_site_is_not_vouched_for_by_the_label(self):
+        observe("pw", '- searchbox "Search" [ref=e2]')  # a snapshot without a URL
+        self.assertIsNotNone(judge(call("browser_type", ref="e2", text="hi", submit=True)))
+
+    def test_search_on_an_ordinary_site_stays_automatic(self):
+        observe("pw", page("https://www.example.org/", '- searchbox "Search" [ref=e2]'))
+        self.assertIsNone(judge(call("browser_type", ref="e2", text="weather", submit=True)))
+        self.must_not_ask(call("browser_type", ref="e2", text="weather", submit=True))
+
+    def test_sensitive_site_helper(self):
+        for site in ("x.com", "mail.google.com", "www.paypal.com", "mybank.example"):
+            self.assertTrue(browser_gate.sensitive_site(site), site)
+        self.assertFalse(browser_gate.sensitive_site("example.org"))
+        self.assertFalse(browser_gate.sensitive_site(None))
+
+
+class LandedPageTest(unittest.TestCase):
+    """Audit 2026-11-13 (3): a public URL that redirects to the console or a LAN host."""
+
+    def setUp(self):
+        reset()
+
+    def test_redirect_to_the_console_is_refused_and_forgotten(self):
+        observe("pw", page("https://public.example.org/", '- button "Hi" [ref=e1]'))
+        refusal = observe("pw", page("http://127.0.0.1:7777/", '- heading "JARVIS console" [ref=e2]'),
+                          "browser_navigate")
+        self.assertIn("withheld", refusal)
+        self.assertNotIn("console", refusal)  # nothing from the page
+        state = browser_gate.PAGES["pw"]
+        self.assertEqual(state["refs"], {})
+        self.assertTrue(state["blocked"])
+
+    def test_lan_host_and_non_web_schemes_are_refused(self):
+        for url in ("http://192.168.1.5/admin", "http://localhost:7780/", "file:///etc/passwd"):
+            reset()
+            self.assertTrue(observe("pw", page(url, '- text "x" [ref=e1]'), "browser_snapshot"), url)
+
+    def test_public_and_blank_pages_are_read_as_before(self):
+        for url in ("https://www.example.org/a", "about:blank"):
+            reset()
+            self.assertIsNone(observe("pw", page(url, '- button "Hi" [ref=e1]'), "browser_snapshot"), url)
+            self.assertEqual(browser_gate.PAGES["pw"]["refs"]["e1"], ("button", "Hi"))
+
+    def test_every_later_read_is_refused_until_a_public_navigation(self):
+        observe("pw", page("http://127.0.0.1:7777/", '- text "secret" [ref=e1]'), "browser_navigate")
+        approve = browser_gate.gate(lambda p: (True, "ok"), NEVER, ".")
+        for tool in ("browser_snapshot", "browser_evaluate", "browser_get_text", "browser_click"):
+            ok, why = approve(call(tool, ref="e1"))
+            self.assertFalse(ok, tool)
+            self.assertIn("off limits", why)
+        self.assertTrue(approve(call("browser_navigate", url="https://www.example.org/"))[0])
+        browser_gate.observe_call("pw", "browser_navigate", {"url": "https://www.example.org/"})
+        self.assertTrue(approve(call("browser_snapshot"))[0])
+
+    def test_a_repeat_snapshot_of_the_same_local_page_stays_refused(self):
+        text = page("http://127.0.0.1:7777/", '- text "secret" [ref=e1]')
+        observe("pw", text, "browser_snapshot")
+        self.assertTrue(observe("pw", text, "browser_snapshot"))
+
+    def test_relay_replaces_the_reply_and_drops_the_page(self):
+        out = io.StringIO()
+        relay = Relay("pw", {}, lambda p: (True, ""), io.StringIO(), out)
+        relay.calls[3] = "browser_navigate"
+        secret = page("http://192.168.1.9/router", '- text "admin password hunter2" [ref=e1]')
+        reply = {"jsonrpc": "2.0", "id": 3, "result": {"content": [{"type": "text", "text": secret}]}}
+        relay._filter(reply)
+        text = reply["result"]["content"][0]["text"]
+        self.assertTrue(reply["result"]["isError"])
+        self.assertNotIn("hunter2", text)
+        self.assertTrue(text.startswith("Refused:"))
+        self.assertEqual(browser_gate.PAGES["pw"]["refs"], {})
+
+
+class SiteNameTest(unittest.TestCase):
+    """Audit 2026-11-13 (4): site_of() kept two labels and never IDNA-encoded."""
+
+    def test_multi_tenant_hosts_show_the_whole_tenant(self):
+        for url, site in (("https://attacker.blob.core.windows.net/x", "attacker.blob.core.windows.net"),
+                          ("https://bucket.s3.amazonaws.com/k", "bucket.s3.amazonaws.com"),
+                          ("https://bucket.s3.us-west-2.amazonaws.com/k", "bucket.s3.us-west-2.amazonaws.com"),
+                          ("https://evil.azurewebsites.net", "evil.azurewebsites.net"),
+                          ("https://evil.herokuapp.com", "evil.herokuapp.com"),
+                          ("https://evil.web.app", "evil.web.app"),
+                          ("https://x.netlify.app", "x.netlify.app"),
+                          ("https://www.x.com/home", "x.com")):
+            self.assertEqual(browser_gate.site_of(url), site)
+
+    def test_homograph_hosts_are_shown_as_punycode_and_flagged(self):
+        url = "https://раypal.com/signin"  # Cyrillic p, a + Latin "ypal"
+        site = browser_gate.site_of(url)
+        self.assertTrue(site.startswith("xn--"), site)
+        self.assertTrue(site.isascii())
+        self.assertIn("MIXED SCRIPTS", browser_gate._host_note(url))
+        whole = "https://аррӏе.com/"  # all Cyrillic: punycode, no mixed flag
+        self.assertTrue(browser_gate.site_of(whole).startswith("xn--"))
+        self.assertIn("non-ASCII", browser_gate._host_note(whole))
+        self.assertNotIn("MIXED", browser_gate._host_note(whole))
+        self.assertEqual(browser_gate._host_note("https://paypal.com"), "")
+
+    def test_question_names_the_real_host(self):
+        reset()
+        observe("pw", page("https://раypal.com/", '- button "Send" [ref=e1]'))
+        info = judge(call("browser_click", ref="e1"))
+        self.assertIn("xn--", info["site"])
+        self.assertIn("MIXED SCRIPTS", info["question"])
+
+
+class PermissionGrantTest(_GateCase):
+    """Audit 2026-11-13 (5): Authorize / Allow access / Agree / Accept ran unasked in full auto.
+    Choice: permission verbs ask while money or messages is in always_ask; a cookie-banner
+    wording ("Accept cookies", privacy, tracking) stays automatic unless the site is one David's
+    account acts on."""
+
+    def setUp(self):
+        reset()
+        observe("pw", page("https://app.example.org/", '- button "Authorize" [ref=e1]',
+                           '- button "Allow access" [ref=e2]', '- button "Agree" [ref=e3]',
+                           '- button "Accept" [ref=e4]', '- button "Approve" [ref=e5]',
+                           '- button "Accept cookies" [ref=e6]', '- button "Next page" [ref=e7]'))
+
+    def test_grants_ask_in_full_auto_and_ask_mode(self):
+        for ref in ("e1", "e2", "e3", "e4", "e5"):
+            self.must_ask(call("browser_click", ref=ref))
+            self.must_ask(call("browser_click", ref=ref), ASK)
+
+    def test_cookie_banner_is_ordinary_off_account_sites(self):
+        self.must_not_ask(call("browser_click", ref="e6"))
+        observe("pw", page("https://www.paypal.com/", '- button "Accept cookies" [ref=e6]'))
+        self.must_ask(call("browser_click", ref="e6"))
+
+    def test_off_when_always_ask_is_empty(self):
+        self.must_not_ask(call("browser_click", ref="e1"), {"rules": {"confirm": "never", "always_ask": []}})
 
 
 if __name__ == "__main__":

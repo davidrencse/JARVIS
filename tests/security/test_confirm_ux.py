@@ -134,6 +134,15 @@ class Case(unittest.TestCase):
     def park_via_gate(self, params, wait=5):
         import threading
         out = {}
+        # ask() looks up time.sleep on the time module. Capture the real sleep
+        # first, and only while this question is parked: a 0.2 s grant expiry
+        # later in the file still has to wait out the real clock.
+        real_sleep = time.sleep
+        nap = mock.patch.object(
+            browser_gate.time, "sleep",
+            lambda seconds, _real=real_sleep: _real(min(seconds, 0.01)))
+        nap.start()
+        self.addCleanup(nap.stop)
         worker = threading.Thread(target=lambda: out.update(r=self.approve(params, wait)))
         worker.start()
         for _ in range(100):
@@ -259,7 +268,11 @@ class TimeoutTest(Case):
         self.assertEqual(seen, [60, 180])
 
     def test_no_answer_is_expired_not_rejected_and_says_so(self):
-        ok, why = self.approve(call("browser_click", ref="e99"), wait=0.6)
+        from tests.security.test_browser_gate import _Clock, _use_clock
+        clock = _Clock()
+        mono, pause = _use_clock(clock)
+        with mono, pause:
+            ok, why = self.approve(call("browser_click", ref="e99"), wait=0.6)
         self.assertFalse(ok)
         self.assertIn("David didn't answer in 0.6 s (timed out)", why)
         self.assertNotIn("declined", why)
@@ -308,7 +321,11 @@ class NotifyTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d, \
                 mock.patch("jarvis.assistant.confirmation_origin", return_value="dell"), \
                 mock.patch("jarvis.confirm.notify") as note:
-            browser_gate.ask("click “Post”", {}, d, wait=0.1)
+            real_sleep = time.sleep
+            with mock.patch.object(
+                    browser_gate.time, "sleep",
+                    lambda seconds, _real=real_sleep: _real(min(seconds, 0.01))):
+                browser_gate.ask("click “Post”", {}, d, wait=0.1)
         note.assert_called_once()
         self.assertIn("Post", note.call_args.args[0])
 

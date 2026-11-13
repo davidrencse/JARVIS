@@ -116,7 +116,11 @@ class ConfirmationTests(unittest.TestCase):
         self.assertEqual(len(History(self.state).recent()), 2)
 
     def test_confirmation_does_not_skip_target_or_loop_checks(self):
-        for kwargs in ({"app_exists": lambda d, n: False}, {"origin_class": "agent"}):
+        # The agent case still runs the loop check. A stand-in for app_exists
+        # keeps that iteration off the real desktop-entry scan (the missing-app
+        # case above is the target check).
+        for kwargs in ({"app_exists": lambda d, n: False},
+                       {"origin_class": "agent", "app_exists": lambda d, n: True}):
             remote = FakeRemote()
             result = pipeline.run_confirmed(COMMAND, CONFIG, self.state, remote=remote, **kwargs)
             self.assertFalse(remote.calls)

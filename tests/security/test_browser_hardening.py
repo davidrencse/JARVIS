@@ -91,7 +91,9 @@ class GateTests(unittest.TestCase):
         for text in ("hi\n", "hi\r"):
             self.assertTrue(browser_gate.commits(
                 params("s", "browser_type", element="Message box", text=text, slowly=True)))
-        browser_gate.observe("ss", '- searchbox "Search" [ref=e1]')  # only a snapshot proves a search box
+        with mock.patch("jarvis.actions._local_address", return_value=None):
+            browser_gate.observe("ss", '- Page URL: https://search.example.org/\n'
+                                       '- searchbox "Search" [ref=e1]')  # a snapshot proves a search box
         self.assertIsNone(browser_gate.commits(
             params("ss", "browser_type", element="Search box", ref="e1", text="hi\n")))
 

@@ -2,11 +2,13 @@
 
 Temp directories only. No clipboard tools, no SSH, no network.
 """
+import os
 import stat
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
+from unittest import mock
 
 from jarvis import clipsync, pathsafe
 
@@ -141,6 +143,36 @@ class OpenPublishTests(unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual(part.read_bytes(), b"new")
 
+    def test_publish_keeps_bytes_when_windows_denies_the_followup_open(self):
+        # os.replace has already moved the only copy. A WinError 5 from opening
+        # that file (Defender, indexer, OneDrive) must not delete it.
+        part = self.folder / "incoming"
+        part.write_bytes(b"new")
+        dest = self.folder / "landed.txt"
+
+        def deny(path):
+            raise PermissionError(13, "Access is denied")
+
+        with mock.patch.object(pathsafe, "_fchmod_regular", side_effect=deny):
+            with self.assertRaises(PermissionError):
+                pathsafe.publish_new(part, dest)
+        self.assertEqual(dest.read_bytes(), b"new")
+        self.assertFalse(part.exists())
+
+    def test_publish_still_removes_a_non_regular_result(self):
+        part = self.folder / "incoming"
+        part.write_bytes(b"new")
+        dest = self.folder / "landed.txt"
+
+        def not_regular(path):
+            raise ValueError("Refusing to publish a link.")
+
+        with mock.patch.object(pathsafe, "_fchmod_regular", side_effect=not_regular):
+            with self.assertRaises(ValueError):
+                pathsafe.publish_new(part, dest)
+        self.assertFalse(dest.exists())
+        self.assertFalse(part.exists())
+
     def test_link_refuses_a_symlink_source(self):
         planted = self.folder / "part"
         planted.symlink_to(self.secret)
@@ -198,6 +230,148 @@ class InflateTests(unittest.TestCase):
         width, height, rows = clipsync.png_decode(png)
         self.assertEqual((width, height), (1, 1))
         self.assertEqual(rows, [b"\x01\x02\x03\xff"])
+
+
+class _StatView:
+    """Real lstat plus Windows reparse fields. Other attributes stay the file's."""
+
+    def __init__(self, st, **extra):
+        self._st = st
+        self._extra = extra
+
+    def __getattr__(self, name):
+        if name in self._extra:
+            return self._extra[name]
+        return getattr(self._st, name)
+
+
+class WindowsReparseTests(unittest.TestCase):
+    """FILE_ATTRIBUTE_REPARSE_POINT is not enough to call a file a link.
+
+    OneDrive placeholders are regular files tagged 0x9000001A. Junctions and
+    mount points set the name-surrogate bit (0xA0000003). os.name and
+    supports_dir_fd are patched only inside each test so open_leaf takes the
+    Windows path branch.
+    """
+
+    _CLOUD = 0x9000001A
+    _JUNCTION = 0xA0000003
+    _REPARSE = 0x400
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.folder = self.root / "Desktop"
+        self.folder.mkdir()
+        self.leaf = "notes.pdf"
+        self.file = self.folder / self.leaf
+        self.file.write_bytes(b"hello")
+
+    def _windows(self, stamps):
+        from contextlib import contextmanager
+        from unittest import mock
+
+        real = pathsafe.os.lstat
+
+        def lstat(path, *args, **kwargs):
+            st = real(path, *args, **kwargs)
+            extra = stamps.get(os.path.abspath(os.fspath(path)))
+            if extra is None:
+                return st
+            return _StatView(st, **extra)
+
+        @contextmanager
+        def patched():
+            with mock.patch.object(pathsafe.os, "name", "nt"), \
+                    mock.patch.object(pathsafe.os, "supports_dir_fd", frozenset()), \
+                    mock.patch.object(pathsafe.os, "lstat", side_effect=lstat):
+                yield
+
+        return patched()
+
+    def test_cloud_placeholder_opens_and_reports_its_size(self):
+        self.assertTrue(stat.S_ISREG(self.file.lstat().st_mode))
+        self.assertFalse(self._CLOUD & pathsafe._NAME_SURROGATE)
+        stamps = {os.path.abspath(self.file): {
+            "st_mode": stat.S_IFREG | 0o644,
+            "st_file_attributes": self._REPARSE,
+            "st_reparse_tag": self._CLOUD,
+        }}
+        with self._windows(stamps):
+            with pathsafe.open_leaf(self.folder, self.leaf, "rb") as stream:
+                self.assertEqual(stream.read(), b"hello")
+            self.assertEqual(pathsafe.regular_size(self.file), 5)
+
+    def test_cloud_directory_still_opens_and_creates_a_child(self):
+        stamps = {os.path.abspath(self.folder): {
+            "st_file_attributes": self._REPARSE,
+            "st_reparse_tag": self._CLOUD,
+        }}
+        with self._windows(stamps):
+            self.assertEqual(pathsafe.ensure_private_dir(self.folder), os.fspath(self.folder))
+            with pathsafe.open_leaf(self.folder, self.leaf, "rb") as stream:
+                self.assertEqual(stream.read(), b"hello")
+            with pathsafe.open_leaf(self.folder, "part.bin", "xb") as stream:
+                stream.write(b"part")
+        self.assertEqual((self.folder / "part.bin").read_bytes(), b"part")
+
+    def test_junction_tag_is_still_refused(self):
+        self.assertTrue(self._JUNCTION & pathsafe._NAME_SURROGATE)
+        file_stamp = {
+            "st_mode": stat.S_IFREG | 0o644,
+            "st_file_attributes": self._REPARSE,
+            "st_reparse_tag": self._JUNCTION,
+        }
+        dir_stamp = {
+            "st_file_attributes": self._REPARSE,
+            "st_reparse_tag": self._JUNCTION,
+        }
+        with self._windows({os.path.abspath(self.file): file_stamp}):
+            with self.assertRaises(ValueError):
+                pathsafe.open_leaf(self.folder, self.leaf, "rb")
+            with self.assertRaises(ValueError):
+                pathsafe.regular_size(self.file)
+        with self._windows({os.path.abspath(self.folder): dir_stamp}):
+            with self.assertRaises(ValueError):
+                pathsafe.ensure_private_dir(self.folder)
+            with self.assertRaises(ValueError):
+                pathsafe.open_leaf(self.folder, self.leaf, "rb")
+        self.assertEqual(self.file.read_bytes(), b"hello")
+
+    def test_symlink_is_still_refused(self):
+        secret = self.root / "secret"
+        secret.write_bytes(b"SECRET")
+        link = self.folder / "link.pdf"
+        link.symlink_to(secret)
+        with self._windows({}):
+            with self.assertRaises(ValueError):
+                pathsafe.open_leaf(self.folder, "link.pdf", "rb")
+            with self.assertRaises(ValueError):
+                pathsafe.regular_size(link)
+        self.assertEqual(secret.read_bytes(), b"SECRET")
+        self.assertTrue(link.is_symlink())
+
+    def test_directory_reparse_without_a_tag_is_still_refused(self):
+        stamps = {os.path.abspath(self.folder): {
+            "st_file_attributes": self._REPARSE,
+            "st_reparse_tag": None,
+        }}
+        with self._windows(stamps):
+            with self.assertRaises(ValueError):
+                pathsafe.ensure_private_dir(self.folder)
+            with self.assertRaises(ValueError):
+                pathsafe.open_leaf(self.folder, self.leaf, "rb")
+        self.assertEqual(self.file.read_bytes(), b"hello")
+
+    def test_plain_file_is_unaffected(self):
+        with self._windows({}):
+            with pathsafe.open_leaf(self.folder, self.leaf, "rb") as stream:
+                self.assertEqual(stream.read(), b"hello")
+            self.assertEqual(pathsafe.regular_size(self.file), 5)
+            with pathsafe.open_leaf(self.folder, "fresh.bin", "xb") as stream:
+                stream.write(b"ok")
+        self.assertEqual((self.folder / "fresh.bin").read_bytes(), b"ok")
 
 
 if __name__ == "__main__":

@@ -18,7 +18,12 @@ class CommitDetectionTest(unittest.TestCase):
         browser_gate._TYPED.clear()
         browser_gate.PAGES.clear()
         # Search boxes count only when a snapshot shows them (not the model's own words).
-        browser_gate.observe("playwright", '- searchbox "Search" [ref=e11]\n- textbox "Message to Sam" [ref=e2]\n'
+        # A search box excuses Enter only on a known, non-account site (the label is the page's).
+        patcher = mock.patch("jarvis.actions._local_address", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        browser_gate.observe("playwright", '- Page URL: https://search.example.org/\n'
+                                           '- searchbox "Search" [ref=e11]\n- textbox "Message to Sam" [ref=e2]\n'
                                            '- link "Next page" [ref=e4]')
 
     def test_reading_and_moving_around_never_ask(self):
@@ -56,16 +61,37 @@ class CommitDetectionTest(unittest.TestCase):
                                           selector="button:has-text('Publish')")))
 
 
+class _Clock:
+    """ask() polls with time.sleep(0.5) until time.monotonic() passes the deadline.
+    A clock the test owns keeps that order (pending polls, then a late approval)
+    without waiting out the real half-seconds."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += float(seconds)
+
+
+def _use_clock(clock):
+    return mock.patch.object(browser_gate.time, "monotonic", clock.monotonic), \
+        mock.patch.object(browser_gate.time, "sleep", clock.sleep)
+
+
 class FakeQueue:
-    def __init__(self, answer=None, after=0.0):
+    def __init__(self, answer=None, after=0.0, clock=None):
         self.answer, self.after, self.parked, self.rejected = answer, after, None, []
+        self._clock = clock or time.monotonic
 
     def park(self, command, origin, channel):
-        self.parked, self.t0 = command, time.monotonic()
+        self.parked, self.t0 = command, self._clock()
         return {"id": "C1"}
 
     def status(self, number):
-        if self.answer and time.monotonic() - self.t0 >= self.after:
+        if self.answer and self._clock() - self.t0 >= self.after:
             return self.answer
         return "pending"
 
@@ -93,15 +119,21 @@ class GateTest(unittest.TestCase):
 
     def test_waits_for_david_then_runs_or_declines(self):
         post = call("browser_click", element="Post button", ref="e3")
-        queue = FakeQueue("approved", after=0.6)
-        self.assertTrue(self.approve(post, queue)[0])
+        clock = _Clock()
+        queue = FakeQueue("approved", after=0.6, clock=clock.monotonic)
+        mono, pause = _use_clock(clock)
+        with mono, pause:
+            self.assertTrue(self.approve(post, queue)[0])
         self.assertEqual(queue.parked["intent"], "browser_action")
         self.assertIn("Post", queue.parked["args"]["text"])
         self.assertFalse(self.approve(post, FakeQueue("rejected"))[0])
 
     def test_no_answer_is_a_decline_and_the_prompt_is_withdrawn(self):
-        queue = FakeQueue()
-        ok, why = self.approve(call("browser_click", element="Send"), queue, wait=0.6)
+        clock = _Clock()
+        queue = FakeQueue(clock=clock.monotonic)
+        mono, pause = _use_clock(clock)
+        with mono, pause:
+            ok, why = self.approve(call("browser_click", element="Send"), queue, wait=0.6)
         self.assertFalse(ok)
         self.assertEqual(queue.rejected, ["C1"])
 
@@ -112,8 +144,12 @@ class LateApprovalTest(unittest.TestCase):
     def test_approval_after_the_last_poll_is_honoured(self):
         # Polls at 0 s and 0.5 s see "pending"; David approves at 0.8 s, before the loop's
         # next check at 1.0 s finds the deadline passed. Withdrawing is then a no-op.
-        queue = FakeQueue("approved", after=0.8)
-        with mock.patch("jarvis.assistant.confirmation_origin", return_value="dell"), \
+        # The clock advances only inside ask()'s sleep, so that order stays exact.
+        clock = _Clock()
+        queue = FakeQueue("approved", after=0.8, clock=clock.monotonic)
+        mono, pause = _use_clock(clock)
+        with mono, pause, \
+                mock.patch("jarvis.assistant.confirmation_origin", return_value="dell"), \
                 mock.patch("jarvis.confirm.notify"):
             ok, why = browser_gate.ask("click Post", {}, "state", wait=0.8, queue=queue)
         self.assertTrue(ok, why)
@@ -124,7 +160,9 @@ class QueueRoundTripTest(unittest.TestCase):
         from jarvis.assistant import confirm_pending
         from jarvis.confirm import ConfirmQueue
         with tempfile.TemporaryDirectory() as d, \
-                mock.patch("jarvis.assistant.confirmation_origin", return_value="dell"):
+                mock.patch("jarvis.assistant.confirmation_origin", return_value="dell"), \
+                mock.patch.object(browser_gate.time, "sleep",
+                                  lambda seconds, _real=time.sleep: _real(min(seconds, 0.01))):
             result = {}
             worker = threading.Thread(target=lambda: result.update(
                 out=browser_gate.ask("click “Post”", {}, d, wait=10)))

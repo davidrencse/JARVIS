@@ -212,7 +212,14 @@ class HubHardeningTests(unittest.TestCase):
         import http.client
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        hub = Hub(MAIN, tmp.name, tmp.name).start(port=0)
+        import socketserver
+        orig = socketserver.BaseServer.serve_forever
+
+        def fast(self, poll_interval=0.5):
+            return orig(self, min(poll_interval, 0.01))
+
+        with patch.object(socketserver.BaseServer, "serve_forever", fast):
+            hub = Hub(MAIN, tmp.name, tmp.name).start(port=0)
         self.addCleanup(hub.close)
         port = hub.server.server_address[1]
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
