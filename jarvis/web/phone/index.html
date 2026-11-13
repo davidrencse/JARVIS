@@ -117,14 +117,16 @@
   </div>
 
   <main class="main" id="main">
-    <!-- Devices: one instrument row per computer. -->
+    <!-- Devices: status, capabilities and a direct action for each computer. -->
     <section class="scr" id="s-devices" aria-labelledby="dv-h">
       <div class="ph"><h1 id="dv-h" tabindex="-1">Your computers</h1><span class="meta mono" id="dv-meta"></span></div>
       <dl class="strip">
         <div><dt>Online</dt><dd class="mono" id="st-online">–</dd></div>
         <div><dt>Sessions</dt><dd class="mono" id="st-sess">–</dd></div>
       </dl>
-      <p class="section-intro">Choose a computer to control its screen or open its camera.</p>
+      <div class="computer-toolbar"><p class="section-intro">Your computers, wherever you are.</p><button type="button" class="btn" id="dv-refresh">Refresh</button></div>
+      <p class="fine" id="dv-feedback" role="status"></p>
+      <div class="computer-skeleton" id="dv-loading" aria-label="Loading computers"><div class="skel"></div><div class="skel"></div></div>
       <ul class="rows" id="dv-list" aria-label="Computers"></ul>
       <p class="empty" id="dv-empty" hidden>No computers yet. Add one from the main computer: open Manage computers for the steps.</p>
       <a class="manage" id="dv-manage" href="#/fleet"><span class="manage-t"><b>Manage computers</b><small>See what's connected and how to add one</small></span><svg class="i i-sm" aria-hidden="true"><use href="#i-arrow-right"/></svg></a>
@@ -136,8 +138,9 @@
 
     <!-- Manage computers: read-only fleet summary and the join guide. Changes are made on the main PC. -->
     <section class="scr" id="s-fleet" hidden aria-labelledby="fl-h">
-      <a class="back" href="#/devices"><svg class="i i-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg>Devices</a>
+      <a class="back" id="fl-back" href="#/devices"><svg class="i i-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg>Devices</a>
       <div class="ph"><h1 id="fl-h" tabindex="-1">Manage computers</h1><span class="meta mono" id="fl-meta"></span></div>
+      <div class="computer-toolbar"><button type="button" class="btn" id="fl-add" disabled>Add a computer</button><button type="button" class="btn" id="fl-refresh">Refresh</button></div>
       <p class="notice"><span id="fl-note">This phone can look, not change. Adding, changing or removing a computer is finished on the main PC.</span></p>
       <div id="fl-auth">
         <p class="fine" id="fl-main-status" role="status"></p>
@@ -150,6 +153,7 @@
       </div>
       <p class="fine" id="fl-state" role="status"></p>
       <div class="fl-retry-row" id="fl-retry-row" hidden><button type="button" class="btn" id="fl-retry">Try again</button></div>
+      <div class="computer-skeleton" id="fl-loading" hidden aria-label="Loading computers"><div class="skel"></div><div class="skel"></div></div>
       <ul class="rows" id="fl-list" aria-label="Computers and servers"></ul>
       <p class="empty" id="fl-empty" hidden>No computers are set up yet. Add one on the main PC, in Connections.</p>
       <div class="sub" id="fl-guide-wrap" hidden>
@@ -164,14 +168,14 @@
       <div class="ph"><h1 id="ak-h" tabindex="-1">Ask JARVIS</h1><span class="meta mono" id="ak-meta"></span></div>
       <label class="ask-target" for="a-target"><span>Send to</span><select id="a-target" aria-describedby="a-target-note"><option value="">Main computer</option></select></label>
       <p class="fine" id="a-target-note">Actions run on the selected computer. Explicit computer names in your request take priority.</p>
-      <ol class="thread" id="a-thread" aria-live="polite" aria-label="Conversation"></ol>
+      <ol class="thread" id="a-thread" aria-live="polite" aria-relevant="additions text" aria-label="Conversation"></ol>
       <div class="ask-empty" id="a-empty">
-        <h2>What would you like done?</h2><p>Send a request to JARVIS on your main computer.</p>
+        <h2>What would you like done?</h2><p>Ask a question or send a request to the computer you choose above.</p>
         <p class="fine">Anything that needs your OK waits on the PC. This phone never approves.</p>
       </div>
       <div class="ask-bar">
         <label class="sr" for="a-text">Message to JARVIS</label>
-        <textarea id="a-text" rows="1" maxlength="2000" enterkeyhint="send" autocomplete="off" placeholder="Ask JARVIS…"></textarea>
+        <textarea id="a-text" rows="1" maxlength="2000" enterkeyhint="send" autocomplete="off" placeholder="Ask JARVIS…" aria-describedby="a-count a-note"></textarea>
         <button type="button" class="send" id="a-send" aria-label="Send to JARVIS"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-arrow-up"/></svg></button>
       </div>
       <p class="fine mono ask-foot"><span id="a-count">0 / 2000</span><span id="a-note" role="status"></span></p>
@@ -197,7 +201,7 @@
       <div class="sub">
         <div class="ph sm"><h2>Sessions from this phone</h2></div>
         <ul class="rows" id="pn-sess"></ul>
-        <p class="empty" id="pn-sess-empty">None running.</p>
+        <p class="empty" id="pn-sess-empty">No sessions running. Open a computer to control its screen or view its camera.</p>
       </div>
       <div class="sub">
         <div class="ph sm"><h2>Forget this phone</h2></div>
@@ -209,8 +213,9 @@
 
     <!-- One computer: its readings and what this phone may do with it. -->
     <section class="scr" id="s-device" hidden aria-labelledby="d-h">
-      <a class="back" href="#/devices"><svg class="i i-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg>Devices</a>
+      <a class="back" id="d-back" href="#/devices"><svg class="i i-sm" aria-hidden="true"><use href="#i-chevron-left"/></svg>Devices</a>
       <div class="ph"><i class="ld" id="d-dot" aria-hidden="true"></i><h1 id="d-h" tabindex="-1">–</h1><span class="meta mono" id="d-sub"></span></div>
+      <p class="device-presence" id="d-presence" role="status"></p>
       <div class="notice" id="d-sess" hidden>
         <span id="d-sess-t"></span>
         <button type="button" class="mini" id="d-sess-open">Open</button>
@@ -230,11 +235,11 @@
       <!-- Readings sit under Control and Camera. The phone has no separate stats screen. -->
       <div id="d-meters" class="hm-host"></div>
       <div class="sub">
-        <div class="ph sm"><h2 id="d-q-h">Picture quality</h2><span class="meta mono">low is fastest on mobile data</span></div>
+        <div class="ph sm"><h2 id="d-q-h">Picture quality</h2><span class="meta">Low uses less mobile data</span></div>
         <div class="seg" role="group" aria-labelledby="d-q-h">
-          <button type="button" id="d-q-low" aria-pressed="true">Low</button>
-          <button type="button" id="d-q-medium" aria-pressed="false">Medium</button>
-          <button type="button" id="d-q-high" aria-pressed="false">High</button>
+          <button type="button" id="d-q-low" aria-pressed="true">Low<small>Fastest</small></button>
+          <button type="button" id="d-q-medium" aria-pressed="false">Medium<small>Balanced</small></button>
+          <button type="button" id="d-q-high" aria-pressed="false">High<small>Clearest</small></button>
         </div>
       </div>
 
@@ -254,13 +259,13 @@
     <!-- Control: the remote screen, live, with touch, keys and text. -->
     <section class="scr sess" id="s-control" hidden aria-labelledby="c-h">
       <header class="sess-top">
-        <button type="button" class="end" id="c-end"><svg class="i i-sm" aria-hidden="true"><use href="#i-power"/></svg>Stop</button>
         <div class="sess-id"><h1 id="c-h" tabindex="-1">–</h1>
           <span class="state" id="c-state" data-st="starting"><i class="ld" aria-hidden="true"></i><b id="c-st">Starting…</b></span></div>
         <div class="readouts mono" aria-hidden="true"><span id="c-fps">– fps</span><span id="c-res">–</span><span id="c-rtt">– ms</span></div>
       </header>
       <div class="stage" id="c-stage" role="application" tabindex="-1"
            aria-label="Remote screen. Tap to click, hold for a right click, drag two fingers to scroll, pinch to zoom.">
+        <p class="session-stale" id="c-stale" role="status" hidden>Picture paused. Waiting for the computer…</p>
         <div class="layer" id="c-layer"><img class="pic" id="c-img" alt="" draggable="false" hidden></div>
         <i class="cursor" id="c-cursor" aria-hidden="true" hidden></i>
         <i class="ring" id="c-ring" aria-hidden="true" hidden></i>
@@ -269,15 +274,26 @@
           <div class="ph-acts" id="c-ph-acts" hidden><button type="button" class="btn strong" id="c-again">Start again</button><a class="btn" id="c-back" href="#/devices">Back</a></div></div></div>
       </div>
       <div class="dock">
+        <div class="session-actions">
+          <button type="button" class="session-tool" id="c-more" aria-expanded="false" aria-controls="c-options">Options</button>
+          <button type="button" class="end" id="c-end"><svg class="i i-sm" aria-hidden="true"><use href="#i-power"/></svg>Disconnect</button>
+        </div>
+        <div class="session-options" id="c-options" hidden>
+          <button type="button" class="session-tool" id="c-full">Full screen</button>
+          <label for="c-quality">Picture quality</label>
+          <select id="c-quality"><option value="low">Low · fastest</option><option value="medium">Medium</option><option value="high">High · sharpest</option></select>
+          <button type="button" class="session-tool" id="c-apply">Apply &amp; reconnect</button>
+        </div>
+
         <div class="ctl">
           <div class="seg" role="group" aria-label="Touch mode">
             <button type="button" id="c-direct" aria-pressed="true"><svg class="i i-sm" aria-hidden="true"><use href="#i-pointer"/></svg>Touch</button>
             <button type="button" id="c-track" aria-pressed="false"><svg class="i i-sm" aria-hidden="true"><use href="#i-mouse-pointer"/></svg>Trackpad</button>
           </div>
           <button type="button" class="ico" id="c-type" aria-label="Type on the remote computer"><svg class="i" aria-hidden="true"><use href="/icons.svg#i-keyboard"/></svg></button>
-          <button type="button" class="ico" id="c-keys-btn" aria-expanded="true" aria-controls="c-panel" aria-label="Show keys"><svg class="i" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
+          <button type="button" class="ico" id="c-keys-btn" aria-expanded="false" aria-controls="c-panel" aria-label="Show keys"><svg class="i" aria-hidden="true"><use href="#i-chevron-down"/></svg></button>
         </div>
-        <div class="panel" id="c-panel">
+        <div class="panel" id="c-panel" hidden>
           <div class="type">
             <label class="sr" for="c-text">Text to type on the remote computer</label>
             <input id="c-text" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
@@ -286,7 +302,7 @@
           </div>
           <div class="keys" id="c-keys" role="group" aria-label="Keys"></div>
         </div>
-        <p class="gesture-help">Tap to click · Hold to right-click · Two fingers to scroll</p>
+        <p class="gesture-help">Tap to click · Hold to right-click · Pinch to zoom</p>
         <p class="msg" id="c-note" role="status"></p>
       </div>
     </section>
@@ -294,12 +310,12 @@
     <!-- Camera: a viewfinder on a computer's webcam. View only. -->
     <section class="scr sess cam" id="s-camera" hidden aria-labelledby="v-h">
       <header class="sess-top">
-        <button type="button" class="end" id="v-end"><svg class="i i-sm" aria-hidden="true"><use href="#i-power"/></svg>Stop</button>
         <div class="sess-id"><h1 id="v-h" tabindex="-1">–</h1>
           <span class="state" id="v-state" data-st="starting"><i class="ld" aria-hidden="true"></i><b id="v-st">Starting…</b></span></div>
         <span class="mono quality" id="v-q" aria-label="Quality"></span>
       </header>
       <div class="stage viewfinder" id="v-stage">
+        <p class="session-stale" id="v-stale" role="status" hidden>Picture paused. Waiting for the computer…</p>
         <div class="layer"><img class="pic" id="v-img" alt="" draggable="false" hidden></div>
         <div class="ph-box" id="v-ph"><div><h2 id="v-ph-h">Starting…</h2><p id="v-ph-p"></p>
           <div class="ph-acts" id="v-ph-acts" hidden><button type="button" class="btn strong" id="v-again">Start again</button><a class="btn" id="v-back" href="#/devices">Back</a></div></div></div>
@@ -312,7 +328,18 @@
         </div>
       </div>
       <div class="dock cam-dock">
-        <p class="fine" id="v-note">The camera stays on only while this screen is open, for at most 15 minutes. The computer shows a notice while it runs.</p>
+        <div class="session-actions">
+          <button type="button" class="session-tool" id="v-more" aria-expanded="false" aria-controls="v-options">Options</button>
+          <button type="button" class="end" id="v-end"><svg class="i i-sm" aria-hidden="true"><use href="#i-power"/></svg>Disconnect</button>
+        </div>
+        <div class="session-options" id="v-options" hidden>
+          <button type="button" class="session-tool" id="v-full">Full screen</button>
+          <label for="v-quality">Picture quality</label>
+          <select id="v-quality"><option value="low">Low · fastest</option><option value="medium">Medium</option><option value="high">High · sharpest</option></select>
+          <button type="button" class="session-tool" id="v-apply">Apply &amp; reconnect</button>
+        </div>
+
+        <p class="fine" id="v-note">View only. The computer shows a camera notice. Disconnect to turn it off; it ends automatically after 15 minutes.</p>
       </div>
     </section>
   </main>

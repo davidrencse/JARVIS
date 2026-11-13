@@ -28,7 +28,12 @@ const SHELL = [
 self.addEventListener("install", (event) => {
   // One missing file must not stop the install: each is cached on its own, best effort.
   event.waitUntil(caches.open(CACHE)
-    .then((cache) => Promise.all(SHELL.map((url) => cache.add(new Request(url, { cache: "no-cache" })).catch(() => {}))))
+    .then((cache) => Promise.all(SHELL.map(async (url) => {
+      try {
+        const res = await fetch(new Request(url, { cache: "no-cache", credentials: "omit" }));
+        if (cacheable(res, url)) await cache.put(url, res);
+      } catch (e) { /* offline install: keep any shell files already available */ }
+    })))
     .then(() => self.skipWaiting()));
 });
 
@@ -43,6 +48,8 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  // Secrets can also arrive on a shell URL. Such requests must never touch the cache.
+  if (url.search || req.headers.has("Authorization") || req.headers.has("X-CSRF-Token") || req.headers.has("X-JARVIS-Session")) return;
   // Pairing and /phone/api/* (frame long-poll included) stay on the network. Never cached.
   if (url.pathname === "/phone/api" || url.pathname.startsWith("/phone/api/")) return;
   if (url.pathname === "/phone" || url.pathname.startsWith("/phone/")) return;
@@ -53,15 +60,16 @@ self.addEventListener("fetch", (event) => {
   event.waitUntil(live.catch(() => {}));  // a late answer still refreshes the cache
 });
 
-// The network's answer, kept for next time when it's good. A navigation request can't be
-// refetched with options, so it goes as is; the rest revalidate past the HTTP cache so a stale
-// phone.js never outlives a release.
+// Revalidate public shell files past the HTTP cache so stale scripts cannot outlive a release.
 function fetchShell(req, key) {
-  const live = req.mode === "navigate" ? fetch(req) : fetch(req.url, { cache: "no-cache", credentials: "same-origin" });
-  return live.then((res) => {
+  // Shell files are public. Omit cookies even on navigation: browsers hide Set-Cookie
+  // from script, so checking response headers alone cannot protect this cache.
+  const live = fetch(req.url, { cache: "no-cache", credentials: "omit" });
+  return live.then(async (res) => {
     if (cacheable(res, key)) {
       const copy = res.clone();
-      caches.open(CACHE).then((cache) => cache.put(key, copy)).catch(() => {});
+      try { const cache = await caches.open(CACHE); await cache.put(key, copy); }
+      catch (e) { /* a full cache must not prevent the public shell from loading */ }
     }
     return res;
   });
@@ -72,7 +80,12 @@ function fetchShell(req, key) {
 function cacheable(res, key) {
   if (!res || !res.ok || res.type !== "basic") return false;
   let path = key;
-  try { path = new URL(res.url).pathname; } catch (e) { /* keep the request key */ }
+  try {
+    const final = new URL(res.url);
+    if (final.origin !== self.location.origin || final.search) return false;
+    path = final.pathname;
+  } catch (e) { /* keep the request key */ }
+  if (!SHELL.includes(path)) return false;
   if (path === "/phone/api" || path.startsWith("/phone/api/")) return false;
   if (path === "/phone" || path.startsWith("/phone/")) return false;
   if (res.headers.has("Set-Cookie")) return false;

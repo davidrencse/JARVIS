@@ -56,6 +56,24 @@
     set(k, v) { try { localStorage.setItem(k, v); return true; } catch (e) { return false; } },
     del(k) { try { localStorage.removeItem(k); } catch (e) { try { localStorage.setItem(k, ""); } catch (e2) { /* private mode */ } } },
   };
+  // Storage helpers remain compatible. Screen state emits only when its value changes.
+  const stateValues = new Map(), stateListeners = new Map();
+  store.state = (key) => stateValues.get(key);
+  store.on = (key, fn) => {
+    if (!stateListeners.has(key)) stateListeners.set(key, new Set());
+    stateListeners.get(key).add(fn);
+    return () => stateListeners.get(key).delete(fn);
+  };
+  store.update = (key, value) => {
+    const before = stateValues.get(key);
+    if (before === value || (before !== undefined && JSON.stringify(before) === JSON.stringify(value))) return false;
+    stateValues.set(key, value);
+    for (const fn of stateListeners.get(key) || []) fn(value, before);
+    return true;
+  };
+  let online = navigator.onLine !== false;
+  const canPoll = () => !document.hidden && online && !repairing;
+  const retryDelay = (misses, base = POLL_MS) => Math.min(60000, base * Math.pow(2, Math.min(4, Math.max(0, misses))));
   const media = (q) => { try { return !!(window.matchMedia && window.matchMedia(q).matches); } catch (e) { return false; } };
   const reduced = () => media("(prefers-reduced-motion: reduce)");
   const agent = () => String((window.navigator && navigator.userAgent) || "");
@@ -195,10 +213,11 @@
     if (path === "/phone/api/ask") next.key = id;
     return next;
   }
-  function phoneHeaders(json) {
+  function phoneHeaders(json, session) {
     const headers = { "X-JARVIS-Phone": "1" };
     if (json) headers["Content-Type"] = "application/json";
     if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+    if (session) headers["X-JARVIS-Session"] = String(session);
     return headers;
   }
   // The remote-view session id is X-JARVIS-Session on the request, never a query parameter.
@@ -274,19 +293,39 @@
     if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
     return data;
   }
+  function errorMessage(status, data) {
+    const detail = str(data && data.error);
+    if (status === 429) return "JARVIS is busy. Wait a moment, then try again.";
+    if (status === 502 || status === 503 || status === 504) return detail || "JARVIS is restarting or the main computer is asleep. Try again shortly.";
+    if (status === 403 && !detail) return "This phone isn't allowed to do that. Check its permissions on the main computer.";
+    return detail || `JARVIS couldn't complete that (HTTP ${status}). Try again.`;
+  }
   async function call(path, body, opts = {}) {
+    // Only reads can retry automatically. Mutations retain their existing operation IDs
+    // and explicit recovery controls, so a reconnect never repeats an action by accident.
+    const retries = body === undefined ? clamp(Number(opts.retries) || 0, 0, 2) : 0;
+    for (let attempt = 0; ; attempt++) {
+      try { return await callOnce(path, body, opts); }
+      catch (e) {
+        if (attempt >= retries || !canPoll() || (e.kind !== "net" && e.status !== 429 && e.status < 500)) throw e;
+        await sleep(retryDelay(attempt, 500));
+        if (!canPoll()) throw e;
+      }
+    }
+  }
+  async function callOnce(path, body, opts = {}) {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), opts.timeout || 20000);
     const payload = body === undefined ? undefined : stampBody(path, body, opts.operationId);
     const init = { method: payload === undefined ? "GET" : "POST", credentials: "same-origin", cache: "no-store",
-      signal: ctl.signal, headers: phoneHeaders(payload !== undefined) };
+      signal: ctl.signal, headers: phoneHeaders(payload !== undefined, opts.session) };
     if (payload !== undefined) init.body = JSON.stringify(payload);
     let res, data = {};
     try {
       res = await fetch(path, init);
       data = await readJson(res);
     } catch (e) {
-      throw new Fail(UNREACHABLE, "net");
+      throw new Fail(ctl.signal.aborted ? "JARVIS took too long to answer. Check Tailscale, then try again." : UNREACHABLE, "net");
     } finally { clearTimeout(timer); }
     if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
     if (res.status === 401 && data.pair) {
@@ -294,32 +333,45 @@
       throw new Fail(str(data.error) || "This phone isn't paired.", "auth", 401, data);
     }
     if (res.ok && (path === "/phone/pair" || path === "/phone/pair/status") && CSRF_RE.test(data.csrf_token)) saveCsrf(data.csrf_token);
-    if (!res.ok) throw new Fail(str(data.error) || `JARVIS refused that (HTTP ${res.status}).`, "http", res.status, data);
+    if (!res.ok) throw new Fail(errorMessage(res.status, data), "http", res.status, data);
     return { status: res.status, data };
   }
   // call() for the app: tracks reachability for the banner, and a lost pairing goes back to Pair.
   async function api(path, body, opts) {
     try { const r = await call(path, body, opts); reachable(true); return r.data; }
     catch (e) {
-      reachable(e.kind !== "net");
+      reachable(e.kind !== "net" && !(e.status >= 500));
       if (e.kind === "auth") toPair();
       else if (isCsrf(e)) showCsrfRecovery();
       throw e;
     }
   }
+  window.JarvisPhone = { api, call, store, errorMessage, phoneHeaders };
 
   // ---------- top-level screens ----------
   let me = null, loaded = false, downTimer = 0, pollTimer = 0, reach = true;
+  let booting = false, authEpoch = 0, overviewMisses = 0, downMisses = 0;
   let ov = { devices: [], sessions: [], ask: { enabled: false } };
-  function stageTo(name) { for (const k of ["boot", "down", "pair", "app"]) el[k].hidden = k !== name; }
+  function stageTo(name) {
+    for (const k of ["boot", "down", "pair", "app"]) el[k].hidden = k !== name;
+    store.update("stage", name);
+  }
 
   async function boot() {
+    if (booting || document.hidden) return;
+    if (!online) { showDown(new Fail(UNREACHABLE, "net")); return; }
+    booting = true;
+    const epoch = authEpoch;
     clearTimeout(downTimer);
     if (el.pair.hidden && el.app.hidden) stageTo("boot");
     let d;
     try { d = await api("/phone/api/me", undefined, { timeout: 15000 }); }
-    catch (e) { if (e.kind !== "auth") showDown(e); return; }
+    catch (e) { if (e.kind !== "auth" && epoch === authEpoch) showDown(e); return; }
+    finally { booting = false; }
+    if (epoch !== authEpoch) return;
+    downMisses = 0;
     me = d && typeof d === "object" ? d : {};
+    store.update("me", me);
     enterApp();
   }
   let repairBtn = null;
@@ -367,19 +419,23 @@
     stageTo("down");
     const csrf = isCsrf(e);
     const net = !csrf && e.kind === "net";
+    const reconnect = !csrf && e.status >= 500 &&
+      ["no_relay", "no_main", "unavailable", "authority_unavailable", "writer_busy", "busy"].includes(e.data && e.data.code);
     // Tailscale serve answers 502 with no message while JARVIS restarts or isn't listening.
     const silent = !csrf && !net && e.status >= 502 && e.status <= 504 && !str(e.data && e.data.error);
     if (el.downRetry) el.downRetry.hidden = csrf;
     if (csrf) repairButton().hidden = false;
     else if (repairBtn) repairBtn.hidden = true;
-    text(el.downH, csrf ? "Pair this phone again" : net ? UNREACHABLE : silent ? "JARVIS isn't answering" : "JARVIS didn't let this phone in");
+    text(el.downH, csrf ? "Pair this phone again" : reconnect ? "Reconnecting to JARVIS" : net ? UNREACHABLE : silent ? "JARVIS isn't answering" : "JARVIS didn't let this phone in");
     text(el.downP, csrf ? "This phone is still paired, but the check for this site is missing. Pair again from the main computer. This screen does not open the app on the saved sign-in."
+      : reconnect ? "Waiting for the MAIN computer to be ready. This phone will reconnect automatically."
       : net ? "Your phone reaches JARVIS through Tailscale. Turn it on, then try again."
       : silent ? "Tailscale reached the PC, but JARVIS there didn't answer. It may be restarting." : e.message);
-    text(el.downWhen, csrf ? "" : "Trying again every 15 s.");
+    const delay = retryDelay(downMisses++, DOWN_RETRY_MS);
+    text(el.downWhen, csrf ? "" : "Trying again in " + Math.round(delay / 1000) + " s. You can retry now.");
     clearTimeout(downTimer); downTimer = 0;
     if (csrf) { pauseForRepair(); return; }
-    downTimer = setTimeout(() => { if (!repairing && !document.hidden && !el.down.hidden) boot(); }, DOWN_RETRY_MS);
+    if (canPoll()) downTimer = setTimeout(() => { if (canPoll() && !el.down.hidden) boot(); }, delay);
   }
   function enterApp() {
     repairing = false;
@@ -391,11 +447,21 @@
     route(true);
     refresh();
     resumeAsk();
-    clearInterval(pollTimer);
-    pollTimer = setInterval(() => { if (!repairing && !document.hidden && !sess && !starting) refresh(); }, POLL_MS);
+    scheduleOverview();
+  }
+  function scheduleOverview() {
+    clearTimeout(pollTimer); pollTimer = 0;
+    if (!canPoll() || !me || el.app.hidden) return;
+    pollTimer = setTimeout(async () => {
+      pollTimer = 0;
+      if (canPoll() && !sess && !starting) await refresh();
+      scheduleOverview();
+    }, retryDelay(Math.max(0, overviewMisses - 1)));
   }
   // Everything that talks to the server stops; the shell stays.
   function quiesce() {
+    authEpoch++;
+    activeAsk = null;
     clearInterval(pollTimer); pollTimer = 0;
     retireStart();
     if (sess) { stopBeacon(); finish(null, ""); }
@@ -407,6 +473,7 @@
     clearCsrf();
     quiesce();
     me = null;
+    store.update("me", null);
     stageTo("pair");
     const ios = isIOS() && !standalone();
     el.pairIos.hidden = !ios; el.pairForm.hidden = ios; el.pairWait.hidden = true;
@@ -432,18 +499,32 @@
   }
   async function pairStep(path, body) {
     const p = pairing;
-    if (!p) return;
+    if (!p || p.busy) return;
+    if (now() - p.t0 > PAIR_GIVE_UP_MS) { pairFail("The pairing code timed out. Run jarvis phone pair again for a new code."); return; }
+    p.resume = { path, body };
+    if (document.hidden || !online) return;
+    p.resume = null;
+    p.busy = true;
     let r;
     try { r = await call(path, body, { timeout: 20000 }); }
     catch (e) {
       if (pairing !== p) return;
       // While waiting, a dropped request is retried: the approval on the main still counts.
-      if (e.kind === "net" && p.tick) { p.timer = setTimeout(() => pairStep("/phone/pair/status", { code: p.code, operation_id: p.operationId }), PAIR_POLL_MS); return; }
+      if ((e.kind === "net" || e.status >= 500) && p.waiting) {
+        text(el.pwMsg, "Connection lost. Turn on Tailscale; we'll keep checking while this screen is open.");
+        const delay = retryDelay(p.misses || 0, PAIR_POLL_MS); p.misses = (p.misses || 0) + 1;
+        p.timer = setTimeout(() => pairStep("/phone/pair/status", { code: p.code, operation_id: p.operationId }), delay); return;
+      }
       pairFail(e.message);
       return;
     }
+    finally { p.busy = false; }
     if (pairing !== p) return;
-    if (r.data.ok) { clearInterval(p.tick); pairing = null; el.pCode.value = ""; boot(); return; }
+    p.misses = 0;
+    if (r.data.ok) {
+      clearInterval(p.tick); pairing = null; el.pCode.value = "";
+      repairing = false; stageTo("boot"); boot(); return;
+    }
     if (r.status === 202 || r.data.pending) {
       if (now() - p.t0 > PAIR_GIVE_UP_MS) { pairFail("Nobody allowed it in time. Run jarvis phone pair again for a new code."); return; }
       pairWaiting(p);
@@ -453,11 +534,13 @@
     pairFail("JARVIS didn't pair this phone. Run jarvis phone pair again.");
   }
   function pairWaiting(p) {
+    p.waiting = true;
     if (p.tick) return;
     el.pairForm.hidden = true; el.pairWait.hidden = false;
     text(el.pwMsg, "");
     // The console gate's countdown: an amber bar that runs out when the wait gives up.
     const tick = () => {
+      if (document.hidden) return;
       text(el.pwTime, "waiting " + mmss(now() - p.t0).replace(/^0/, ""));
       el.pwBar.style.width = (100 * clamp(1 - (now() - p.t0) / PAIR_GIVE_UP_MS, 0, 1)).toFixed(1) + "%";
     };
@@ -485,6 +568,7 @@
   const beats = [];
   function reachable(ok) {
     reach = ok;
+    store.update("reachable", ok);
     if (!el.app.hidden) el.net.hidden = ok;
     renderLink();
   }
@@ -505,25 +589,36 @@
   const hist = new Map();  // device id -> recent online readings, for its heartbeat
   const okDevice = (d) => d && typeof d === "object" && typeof d.id === "string" && d.id.length > 0;
   async function refresh() {
-    if (refreshing || !me) return;
+    if (refreshing || !me || !canPoll()) return;
     refreshing = true;
+    const epoch = authEpoch;
     const t0 = now();
     try {
       const d = await api("/phone/api/overview", undefined, { timeout: 15000 });
+      if (epoch !== authEpoch || !me || repairing) return;
+      overviewMisses = 0;
       beat(Math.max(1, now() - t0));
       ov = {
         devices: Array.isArray(d.devices) ? d.devices.filter(okDevice) : [],
         sessions: Array.isArray(d.sessions) ? d.sessions.filter((s) => s && typeof s.id === "string") : [],
         ask: d.ask && typeof d.ask === "object" ? d.ask : { enabled: false },
       };
+      // /me was read at launch. A recovered gateway can now relay to a different
+      // MAIN; use the fresh overview so labels and Ask's default follow it.
+      const main = ov.devices.find((d) => d.role === "main");
+      if (main && (!me.main || me.main.id !== main.id)) {
+        me.main = { id: main.id, label: str(main.label, 60) || main.id };
+        text(el.mainLabel, me.main.label);
+      }
       loaded = true;
       for (const dv of ov.devices) {
         const a = hist.get(dv.id) || [];
         a.push(!!dv.online); if (a.length > 12) a.shift();
         hist.set(dv.id, a);
       }
-      renderAll();
+      if (store.update("overview", ov)) renderAll();
     } catch (e) {
+      overviewMisses++;
       if (e.kind !== "auth") beat(null);
     } finally { refreshing = false; }
   }
@@ -548,39 +643,67 @@
 
   // ---------- devices ----------
   const devRows = new Map();
+  let devicesReadAt = 0;
   function renderDevices() {
     const list = sorted(ov.devices), online = list.filter((d) => d.online).length;
-    const d = new Date(now());
-    text(el.dvMeta, loaded ? `read ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` : "");
+    if (loaded && refreshing) devicesReadAt = now();
+    text(el.dvMeta, loaded ? "Updated " + ago(devicesReadAt) : "");
     text(el.stOnline, loaded ? `${online}/${list.length}` : "–");
     text(el.stSess, loaded ? String(ov.sessions.filter((s) => s.state !== "ended").length) : "–");
+    $("dv-loading").hidden = loaded || !el.net.hidden;
     el.dvEmpty.hidden = !(loaded && !list.length);
     keyed(el.dvList, devRows, list, (d) => d.id, makeDevRow, fillDevRow);
   }
   function makeDevRow(d) {
-    const r = { dot: h("i", { class: "ld", "aria-hidden": "true" }), name: h("b", { class: "dev-name" }), sr: h("span", { class: "sr" }),
-      meta: h("span", { class: "dev-meta mono" }), beat: h("canvas", { class: "beat", width: "56", height: "16", "aria-hidden": "true" }),
-      caps: h("span", { class: "caps" }), cap: {} };
-    for (const [k, ic] of CAPS) { const c = h("span", { class: "cap" }, icon(ic, true), h("span", { class: "sr" })); r.cap[k] = c; r.caps.append(c); }
+    const r = { dot: h("i", { class: "ld", "aria-hidden": "true" }), name: h("b", { class: "dev-name" }),
+      meta: h("span", { class: "dev-meta" }), state: h("span", { class: "computer-state" }), caps: h("span", { class: "computer-caps" }) };
     r.a = h("a", { class: "dev", href: "#/device/" + encodeURIComponent(d.id) }, r.dot,
-      h("span", { class: "dev-t" }, r.name, r.sr, r.meta), h("span", { class: "dev-r" }, r.beat, r.caps), icon("chevron-right", true));
-    r.li = h("li", null, r.a);
+      h("span", { class: "dev-t" }, r.name, r.state, r.meta, r.caps), icon("chevron-right", true));
+    r.action = h("button", { type: "button", class: "btn computer-primary" });
+    r.action.addEventListener("click", () => {
+      const current = dev(d.id);
+      if (!current) { go("#/devices"); return; }
+      const existing = mySession(d.id);
+      if (existing) { reattach(existing); return; }
+      const kind = current.online && current.caps && current.caps.remote ? "screen" : current.online && current.caps && current.caps.camera ? "camera" : "";
+      if (!kind) { go("#/device/" + encodeURIComponent(d.id)); return; }
+      want = { device: d.id, kind };
+      go(`#/${kind === "camera" ? "camera" : "control"}/${encodeURIComponent(d.id)}`);
+    });
+    r.li = h("li", { class: "computer-card" }, r.a, r.action);
     return r;
   }
   function fillDevRow(r, d) {
-    text(r.name, str(d.label, 80) || d.id);
+    const name = str(d.label, 80) || d.id;
+    text(r.name, name);
     r.dot.setAttribute("data-st", d.online ? "live" : "off");
-    const parts = [d.role === "main" ? "main" : "node", str(d.platform, 40), d.presence === "busy" ? "busy, awaiting contact" : d.online ? "seen " + ago(d.seen) : "last seen " + ago(d.seen)];
-    text(r.meta, parts.filter(Boolean).join(" · "));
-    const capsText = [];
-    for (const [k, , word] of CAPS) {
-      const on = !!(d.caps && d.caps[k]);
-      r.cap[k].setAttribute("data-on", on ? "1" : "0");
-      capsText.push((on ? "" : "no ") + word);
-    }
-    text(r.sr, `, ${d.presence === "busy" ? "busy, awaiting contact" : d.online ? "online" : "offline"}, ${capsText.join(", ")}`);
-    drawPulse(r.beat, hist.get(d.id) || []);
+    text(r.state, d.presence === "busy" ? "Busy · awaiting contact" : d.online ? "Online" : "Offline");
+    text(r.meta, [d.role === "main" ? "Main computer" : "Connected computer", str(d.platform, 40), "Last seen " + ago(d.seen)].filter(Boolean).join(" · "));
+    const caps = d.caps || {};
+    text(r.caps, [caps.remote ? "Screen control" : "", caps.camera ? "Camera" : ""].filter(Boolean).join(" · ") || "No remote actions available");
+    const action = mySession(d.id) ? "Resume session" : d.online && caps.remote ? "Control screen" : d.online && caps.camera ? "View camera" : "View details";
+    text(r.action, action);
+    r.action.setAttribute("aria-label", action + " · " + name);
   }
+  $("dv-refresh").addEventListener("click", async () => {
+    const button = $("dv-refresh");
+    button.disabled = true; text(button, "Refreshing…");
+    text($("dv-feedback"), "Checking your computers…");
+    try {
+      await refresh();
+      text($("dv-feedback"), el.net.hidden ? "Computers updated." : "Couldn't refresh. Turn on Tailscale, then tap Refresh. Your last reading is kept.");
+      renderDevices();
+    } finally { button.disabled = false; text(button, "Refresh"); }
+  });
+
+  // Reachability belongs to the network layer; this subscriber only draws the
+  // computer list's recovery state when its initial request cannot finish.
+  if (store.on) store.on("reachable", (ok) => {
+    if (!ok) {
+      $("dv-loading").hidden = true;
+      text($("dv-feedback"), loaded ? "Showing your last reading. Turn on Tailscale, then refresh." : "Couldn't load your computers. Turn on Tailscale, then tap Refresh.");
+    } else if (loaded) text($("dv-feedback"), "");
+  });
 
   // ---------- manage computers (read-only legacy fleet; GET /phone/api/fleet for the list) ----------
   // Invite, revoke and permission changes stay on the main PC. A promote control is shown only when
@@ -817,9 +940,9 @@
   }
   function fillFleetRow(r, d) {
     text(r.name, publicFleet(d.label, 160) || str(d.id, 64));
-    r.dot.setAttribute("data-st", d.status === "main" || d.online ? "live" : "off");
+    r.dot.setAttribute("data-st", d.online ? "live" : "off");
     const kind = d.role === "main" || d.status === "main" ? "Main" : "Node";
-    const state = d.presence === "busy" ? "busy" : d.status;
+    const state = d.presence === "busy" ? "busy" : d.status === "main" ? (d.online ? "online" : "offline") : d.status;
     const known = state != null && Object.prototype.hasOwnProperty.call(FLEET_STATUS, state);
     text(r.meta, [kind, publicFleet(d.profile_label, 40) || publicFleet(d.profile, 20), known ? FLEET_STATUS[state] : "Unknown"].filter(Boolean).join(" · "));
     const main = d.role === "main" || d.status === "main";
@@ -837,6 +960,10 @@
     if (fleet && !list.length) text(el.flEmpty, "No computers are set up yet. Add one on the main PC, in Connections.");
     text(el.flState, fleetBusy && !fleet ? "Loading…" : fleetErr ? (fleet ? "Couldn't refresh, showing the last reading. " : "") + fleetErr : "");
     el.flRetryRow.hidden = !fleetErr;
+    $("fl-loading").hidden = !fleetBusy || !!fleet;
+    $("fl-refresh").disabled = fleetBusy;
+    text($("fl-refresh"), fleetBusy ? "Refreshing…" : "Refresh");
+    $("fl-add").disabled = !fleet || !Array.isArray(fleet.guide) || !fleet.guide.length;
     const age = fleet && fleetAt ? Math.max(0, now() - fleetAt) : 0;
     text(el.flMeta, fleet && fleetAt ? "read " + ago(fleetAt) + (fleetErr || age > 60000 ? " · stale" : "") : "");
     const steps = Array.isArray(fleet && fleet.guide) ? fleet.guide.filter((s) => s && typeof s.title === "string") : [];
@@ -848,6 +975,13 @@
     renderPromote();
   }
   el.flRetry.addEventListener("click", () => loadFleet());
+  $("fl-refresh").addEventListener("click", () => loadFleet());
+  $("fl-add").addEventListener("click", () => {
+    const guide = $("fl-guide-wrap");
+    if (guide.hidden) return;
+    guide.setAttribute("tabindex", "-1");
+    try { guide.scrollIntoView({ behavior: reduced() ? "auto" : "smooth", block: "start" }); guide.focus({ preventScroll: true }); } catch (e) { guide.focus(); }
+  });
   if (el.flPromoteGo) el.flPromoteGo.addEventListener("click", () => { promoteGo(); });
   setInterval(() => { if (!repairing && me && cur.name === "fleet" && !document.hidden && !fleetBusy) loadFleet(); }, 20000);
 
@@ -888,12 +1022,43 @@
 
   // ---------- routing ----------
   let cur = { name: "" }, want = null;
+  const screenScroll = new Map();
+  let navigationReady = false, navigationDepth = 1;
+  const routeKey = (r) => r.name + "/" + (r.id || "");
+  function rememberNavigation(r) {
+    const history = window.history;
+    if (!history || !history.replaceState || !history.pushState) return;
+    const hash = "#/" + r.name + (r.id ? "/" + encodeURIComponent(r.id) : "");
+    try {
+      history.scrollRestoration = "manual";
+      if (!navigationReady) {
+        // A same-document guard catches browser/Android Back at the app's entry.
+        // Keep one guard only; revisiting it replaces the old active entry.
+        history.replaceState({ phoneGuard: true }, "", "#/devices");
+        history.pushState({ phoneRoute: hash, phoneDepth: 1 }, "", hash);
+        navigationReady = true;
+      } else if (history.state && history.state.phoneRoute === hash) {
+        navigationDepth = history.state.phoneDepth || 1;
+      } else {
+        navigationDepth++;
+        history.replaceState({ phoneRoute: hash, phoneDepth: navigationDepth }, "", hash);
+      }
+    } catch (e) { /* hash routing still works when history is restricted */ }
+  }
+  function backToComputers(e) {
+    e.preventDefault();
+    const history = window.history;
+    if (navigationReady && navigationDepth > 1 && history && history.back) history.back();
+    else go("#/devices");
+  }
+  for (const id of ["d-back", "fl-back"]) $(id).addEventListener("click", backToComputers);
   function parse() {
     const m = /^#\/(devices|ask|phone|device|control|camera|fleet)(?:\/(.+))?$/.exec(location.hash || "");
     if (!m) return { name: "devices", id: "" };
     let id = "";
     try { id = m[2] ? decodeURIComponent(m[2]) : ""; } catch (e) { return { name: "devices", id: "" }; }
     if (["device", "control", "camera"].includes(m[1]) && !id) return { name: "devices", id: "" };
+    if (!["device", "control", "camera"].includes(m[1]) && id) return { name: "devices", id: "" };
     return { name: m[1], id };
   }
   function go(hash) { if (location.hash === hash) route(); else location.hash = hash; }
@@ -910,6 +1075,8 @@
       return;
     }
     const changed = r.name !== cur.name || r.id !== cur.id;
+    if (changed && cur.name) screenScroll.set(routeKey(cur), el.main.scrollTop || 0);
+    rememberNavigation(r);
     cur = r;
     for (const k of Object.keys(scr)) scr[k].hidden = k !== r.name;
     el.app.setAttribute("data-screen", r.name);
@@ -917,9 +1084,18 @@
       const a = el["tab" + t[0].toUpperCase() + t.slice(1)];
       if (TAB_OF[r.name] === t) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
     }
+    if (r.name === "devices") renderDevices();
     if (r.name === "device") renderDetail();
     if (r.name === "phone") renderPhone();
     if (r.name === "fleet") loadFleet();
+    if (changed) {
+      // Focus first, then restore the saved position: keyboard opening/closing must
+      // not scroll the newly shown screen back to the previous input.
+      try { if (document.activeElement && document.activeElement.blur) document.activeElement.blur(); } catch (e) { /* fine */ }
+      const head = $(HEADS[r.name]);
+      try { if (head) head.focus({ preventScroll: true }); } catch (e) { /* fine */ }
+      try { el.main.scrollTop = screenScroll.get(routeKey(r)) || 0; } catch (e) { /* not scrollable */ }
+    }
     if (kind) {
       const w = asked ? want : null;
       want = null;
@@ -927,14 +1103,17 @@
       else if (w) startSession(r.id, kind);
       else renderSess();
     }
-    if (changed && !first) {
-      try { el.main.scrollTop = 0; } catch (e) { /* not scrollable */ }
-      const head = $(HEADS[r.name]);
-      try { if (head) head.focus({ preventScroll: true }); } catch (e) { /* fine */ }
-    }
     if (!kind && me && changed && !first) refresh();
   }
   addEventListener("hashchange", () => route());
+  addEventListener("popstate", (e) => {
+    if (!me || !navigationReady) return;
+    if (e.state && e.state.phoneGuard) {
+      navigationDepth = 1;
+      window.history.pushState({ phoneRoute: "#/devices", phoneDepth: 1 }, "", "#/devices");
+    }
+    route();
+  });
 
   // ---------- device detail ----------
   const netOf = (d) => d.network && typeof d.network === "object" ? d.network : {};
@@ -946,6 +1125,11 @@
     if (!d) {
       text(el.dH, cur.id); text(el.dSub, ""); el.dDot.setAttribute("data-st", "off");
       text(el.dStatus, loaded ? "Not in the cluster any more" : "Loading…");
+      text($("d-presence"), loaded ? "This computer is no longer connected. Go back to Computers, then open Manage computers to reconnect it." : "Getting this computer's status…");
+      text(el.dControlWhy, "Go back to Computers and refresh the list.");
+      text(el.dCameraWhy, "Go back to Computers and refresh the list.");
+      text(el.dRole, "–"); text(el.dPlatform, "–");
+      for (const row of [el.dRSsid, el.dRLan, el.dRTs]) row.hidden = true;
       for (const b of [el.dControl, el.dCamera]) b.disabled = true;
       try { if (window.JarvisMeters && el.dMeters) window.JarvisMeters.clear(el.dMeters); } catch (e) { /* leave the screen usable */ }
       return;
@@ -954,6 +1138,7 @@
     el.dDot.setAttribute("data-st", d.online ? "live" : "off");
     text(el.dSub, `${d.role === "main" ? "main" : "node"}${d.platform ? " · " + str(d.platform, 40) : ""}`);
     text(el.dStatus, d.presence === "busy" ? "Busy, awaiting contact · last seen " + ago(d.seen) : d.online ? "Online · seen " + ago(d.seen) : "Offline · last seen " + ago(d.seen));
+    text($("d-presence"), el.dStatus.textContent + (!d.online ? ". Wake this computer and check Tailscale, then refresh Computers." : ""));
     text(el.dRole, d.role === "main" ? "Main computer" : "Node");
     text(el.dPlatform, str(d.platform, 40) || "–");
     const n = netOf(d);
@@ -963,10 +1148,10 @@
     const why = d.why && typeof d.why === "object" ? d.why : {};
     const caps = d.caps && typeof d.caps === "object" ? d.caps : {};
     const live = (k) => mySession(d.id, k);
-    el.dControl.disabled = !caps.remote && !live("screen");
-    text(el.dControlWhy, live("screen") ? "Your session is running: open it" : caps.remote ? "See the screen, drive its mouse and keyboard" : str(why.remote) || "Not available");
-    el.dCamera.disabled = !caps.camera && !live("camera");
-    text(el.dCameraWhy, live("camera") ? "Your camera session is running: open it" : caps.camera ? "See through its webcam; it shows a notice there" : str(why.camera) || "Not available");
+    el.dControl.disabled = (!d.online || !caps.remote) && !live("screen");
+    text(el.dControlWhy, live("screen") ? "Your session is running: open it" : !d.online ? "Wake this computer and check Tailscale to control its screen." : caps.remote ? "See the screen, drive its mouse and keyboard" : str(why.remote) || "Not available");
+    el.dCamera.disabled = (!d.online || !caps.camera) && !live("camera");
+    text(el.dCameraWhy, live("camera") ? "Your camera session is running: open it" : !d.online ? "Wake this computer and check Tailscale to use its camera." : caps.camera ? "See through its webcam; it shows a notice there" : str(why.camera) || "Not available");
     const s = mySession(d.id);
     if (s) { el.dSess.hidden = false; el.dSess.s = s; text(el.dSessT, `Your ${kindWord(s.kind).toLowerCase()} session here is ${str(s.state, 20) || "running"}.`); }
     try { if (window.JarvisMeters && el.dMeters) window.JarvisMeters.render(el.dMeters, d.meters || null); } catch (e) { /* a reading must not blank the device screen */ }
@@ -1047,7 +1232,7 @@
   }
 
   // ---------- ask ----------
-  let asking = false;
+  let asking = false, activeAsk = null;
   const askTarget = $("a-target");
   let askTargetKey = "";
   function askTargetChoice(d) {
@@ -1079,6 +1264,8 @@
     el.aText.disabled = loaded && !on;
     el.aText.setAttribute("placeholder", loaded && !on ? (str(ov.ask && ov.ask.why) || "Ask is off on the main computer") : "Ask JARVIS…");
     el.aSend.disabled = asking || (loaded && !on) || !el.aText.value.trim();
+    el.aSend.setAttribute("aria-label", asking ? "Request in progress" : "Send to JARVIS");
+    el.aSend.setAttribute("aria-busy", String(asking));
   }
   function addMsg(who, body, st) {
     const head = h("span", { class: "msg-h mono" }, h("b", null, who === "you" ? "You" : "JARVIS"), h("time", null, timeNow()));
@@ -1091,7 +1278,10 @@
     keepInView();
     return m;
   }
-  function setMsg(m, body, st) { text(m.b, body); m.li.setAttribute("data-st", st || ""); }
+  function setMsg(m, body, st) {
+    text(m.b, body); m.li.setAttribute("data-st", st || "");
+    m.li.setAttribute("aria-busy", String(st === "busy"));
+  }
   function timeNow() { const d = new Date(now()); return pad(d.getHours()) + ":" + pad(d.getMinutes()); }
   function nearBottom() {
     try { return el.main.scrollHeight - el.main.scrollTop - (el.main.clientHeight || 0) < 160; } catch (e) { return true; }
@@ -1209,6 +1399,9 @@
     m.rev = isFinite(tr.rev) ? Math.max(0, Math.floor(tr.rev)) : m.rev || 0;
   }
   function renderUsage(m, usage, pending = false) {
+    const key = JSON.stringify([usage || null, pending]);
+    if (m.usageKey === key) return;
+    m.usageKey = key;
     if (!m.cost) {
       const title = h("summary", null, "Usage & cost");
       m.costBody = h("div", { class: "request-cost-body" });
@@ -1229,6 +1422,7 @@
       usage.calls === 0 && usage.tokens === 0 ? "Local request; no metered model calls." : "Estimated API-equivalent value, not an extra charge to your subscription. Missing provider usage may make this estimate incomplete."));
   }
   function finishAsk(m, d, t0) {
+    activeAsk = null; heldAsk = null;
     saveAsk("");
     renderUsage(m, d && d.usage);
     const tr = d && d.trace && typeof d.trace === "object" ? d.trace : {};
@@ -1236,6 +1430,10 @@
     const reply = str(d && d.reply, 20000);
     const waiting = !!(d && (d.waiting || d.confirm)) || WAITING.test(reply);
     setMsg(m, reply || (waiting ? "Waiting for your OK on the PC." : "Done."), waiting ? "needs" : "ok");
+    if (waiting) {
+      if (!m.confirm) { m.confirm = h("p", { class: "ask-confirm" }); m.li.append(m.confirm); }
+      text(m.confirm, "Review and approve this on the main computer. This phone can't approve requests.");
+    }
     setAct(m, "");
     if (waiting) announce("Waiting for your OK on the PC.");
   }
@@ -1243,11 +1441,14 @@
   // moves with the work; a dropped connection retries, then offers "Check again" (the job lives on).
   async function pumpAsk(m, d, t0, t) {
     let misses = 0;
+    const epoch = authEpoch;
     setAct(m, "");
     for (;;) {
+      if (epoch !== authEpoch || !me || repairing) return;
       if (!d || !d.pending || !d.job) { finishAsk(m, d, t0); return; }
       const job = String(d.job);
       saveAsk(job, t, t0, m.target);
+      activeAsk = { m, d, t0, t };
       paintAsk(m, d, t0);
       if (now() - t0 > ASK_GIVE_UP_MS) {
         setMsg(m, "Still working. The answer will show on the PC.", "needs");
@@ -1255,6 +1456,7 @@
         return;
       }
       await sleep(ASK_POLL_MS);
+      if (epoch !== authEpoch || !me || repairing || !canPoll()) return;
       try {
         d = await api("/phone/api/ask/" + encodeURIComponent(job) + "?after=" + (m.rev || 0), undefined, { timeout: 20000 });
         misses = 0;
@@ -1266,9 +1468,9 @@
           setAct(m, "Check again", () => { asking = true; renderAskMeta(); pumpAsk(m, { pending: true, job, trace: { rev: 0 } }, t0, t).finally(() => { asking = false; renderAskMeta(); }); });
           return;
         }
-        saveAsk("");
+        activeAsk = null; saveAsk("");
         renderUsage(m, e.data && e.data.usage);
-      const tr = e.data && e.data.trace;
+        const tr = e.data && e.data.trace;
         if (tr) renderFlow(m, cleanSteps(tr.steps), { working: false, secs: isFinite(tr.elapsed) ? Math.round(tr.elapsed) : NaN });
         setMsg(m, e.status === 404 ? "JARVIS no longer has that request. Ask again." : e.message, "bad");
         if (e.status === 502) setAct(m, "Try again", () => send(m, t, newKey(), m.target || ""));  // it failed on the PC: a new request
@@ -1293,6 +1495,7 @@
     } catch (e) {
       if (e.kind === "auth") return;
       if (isCsrf(e)) { rememberAsk(key, t, target); return; }
+      if (e.kind === "net") rememberAsk(key, t, target);
       renderUsage(m, e.data && e.data.usage);
       const tr = e.data && e.data.trace;
       if (tr) renderFlow(m, cleanSteps(tr.steps), { working: false, secs: isFinite(tr.elapsed) ? Math.round(tr.elapsed) : NaN });
@@ -1319,7 +1522,14 @@
   }
   // The app was closed or reloaded while a request ran on the PC: pick it up again.
   async function resumeAsk() {
-    if (asking || !me) return;
+    if (asking || !me || !canPoll()) return;
+    if (activeAsk) {
+      const a = activeAsk;
+      asking = true; renderAskMeta();
+      try { await pumpAsk(a.m, a.d, a.t0, a.t); }
+      finally { asking = false; renderAskMeta(); }
+      return;
+    }
     let saved = null;
     try { saved = JSON.parse(store.get(ASK_KEY, "") || "null"); } catch (e) { saved = null; }
     if (saved && saved.held === true) {
@@ -1347,7 +1557,7 @@
   el.aSend.addEventListener("click", ask);
 
   // ---------- this phone ----------
-  let forgetArm = 0, logoutOp = "";
+  let forgetArm = 0, logoutOp = "", forgetting = false;
   function renderPhone() {
     const p = me && me.phone && typeof me.phone === "object" ? me.phone : {};
     text(el.pnName, str(p.name, 40) || "–");
@@ -1368,20 +1578,28 @@
   }
   for (const k of ["system", "light", "dark"]) el["th" + k[0].toUpperCase() + k.slice(1)].addEventListener("click", () => setTheme(k));
   el.pnForget.addEventListener("click", async () => {
+    if (forgetting) return;
     // Two taps, not a dialog: the second within 4 s forgets.
     if (!forgetArm) {
       forgetArm = setTimeout(() => { forgetArm = 0; text(el.pnForgetT, "Forget this phone"); }, 4000);
       text(el.pnForgetT, "Tap again to forget");
+      text(el.pnMsg, "Tap again within 4 seconds to sign out and end this phone's sessions.");
       return;
     }
     clearTimeout(forgetArm); forgetArm = 0;
     text(el.pnForgetT, "Forget this phone");
+    forgetting = true; el.pnForget.disabled = true;
+    text(el.pnMsg, "Signing out and ending this phone's sessions…");
     if (!OP_RE.test(logoutOp)) logoutOp = operationId();
     try { await api("/phone/api/logout", { operation_id: logoutOp }, { timeout: 15000 }); }
     catch (e) {
       if (e.kind !== "auth") { text(el.pnMsg, e.message); return; }
     }
+    finally { forgetting = false; el.pnForget.disabled = false; }
     logoutOp = "";
+    saveAsk(""); heldAsk = null;
+    el.aThread.replaceChildren(); el.aEmpty.hidden = false;
+    el.aText.value = ""; autosize(); countAsk(); text(el.pnMsg, "");
     toPair("This phone is forgotten. Pair it again to use JARVIS here.");
   });
 
@@ -1389,7 +1607,7 @@
   let sess = null, starting = false, startTok = 0, ended = null, sessDevice = "", sessKind = "screen";
   let gen = 0, frameCtl = null, hiddenAt = 0, hiddenTimer = 0, tickTimer = 0;
   let gotFrame = false, fw = 0, fh = 0, lastFrameAt = 0, aliveAt = 0, attachedAt = 0;
-  let frameTimes = [], frameRtts = [], shownUrl = "", nextUrl = "";
+  let frameTimes = [], frameRtts = [], shownUrl = "", nextUrl = "", reconnecting = false, chromeTimer = 0;
   const view = () => VIEWS[sessKind] || VIEWS.screen;
   // Each start has a token; leaving the screen (or a newer start) retires it, and a late reply
   // for a retired start is stopped at once instead of shown.
@@ -1423,7 +1641,8 @@
     sessDevice = s.device || sessDevice;
     gotFrame = false; lastFrameAt = 0; aliveAt = 0; attachedAt = now(); frameTimes = []; frameRtts = []; ended = null;
     fw = s.width || 0; fh = s.height || 0;
-    resetInput(); setZoom(1, 0, 0);
+    reconnecting = false; resetInput(); setZoom(1, 0, 0);
+    showSessionChrome();
     if (document.hidden) { hiddenAt = hiddenAt || now(); armHiddenStop(); } else startFrames();
     clearInterval(tickTimer); tickTimer = setInterval(renderSess, 500);
     lockScreen();
@@ -1431,8 +1650,13 @@
     announce((sessKind === "camera" ? "Opening the camera on " : "Connecting to ") + label(sessDevice) + ".");
   }
   // The session is over (by us, the computer or an error); reason shows when there's no error.
-  function finish(error, reason) {
+  function finish(error, reason, notified = false) {
+    if (sess && !notified) stopBeacon();
     detachLoop();
+    clearTimeout(chromeTimer);
+    if (document.fullscreenElement && document.exitFullscreen) {
+      try { const leaving = document.exitFullscreen(); if (leaving && leaving.catch) leaving.catch(() => {}); } catch (_) { /* already closing */ }
+    }
     clearInterval(tickTimer); tickTimer = 0; clearTimeout(hiddenTimer); hiddenTimer = 0;
     const was = sess;
     resetInput();
@@ -1448,8 +1672,8 @@
   function disconnect(why) {
     const s = sess;
     if (!s) return;
-    const release = s.kind === "screen" && gotFrame;
-    finish(null, why || "Ended.");
+    const release = s.kind === "screen";
+    finish(null, why || "Ended.", true);
     quietStop(s.id, release);
   }
   async function quietStop(id, release) {
@@ -1470,7 +1694,7 @@
     if (sess.kind === "screen") beacon("/phone/api/session/input", { session: id, events: [{ t: "release" }] });
     beacon("/phone/api/session/stop", { session: id });
   }
-  function backgroundStop() { if (!sess) return; stopBeacon(); finish(null, BG_REASON); }
+  function backgroundStop() { if (!sess) return; stopBeacon(); finish(null, BG_REASON, true); }
   function armHiddenStop() {
     clearTimeout(hiddenTimer);
     const left = HIDDEN_STOP_MS - (hiddenAt ? now() - hiddenAt : 0);
@@ -1493,7 +1717,7 @@
             headers: Object.assign(phoneHeaders(false), { "X-JARVIS-Session": id }) });
         if (g !== gen) return;
         if (res.status === 204) {
-          fails = 0; reachable(true);
+          fails = 0; reconnecting = false; reachable(true);
           const nodeAgo = parseFloat(res.headers.get("X-Node-Ago"));
           if (isFinite(nodeAgo) && nodeAgo < STALE_MS / 1000) aliveAt = now() - nodeAgo * 1000;
           continue;
@@ -1510,7 +1734,7 @@
           if (g !== gen || repairing) return;
           // A csrf refusal is not a bad picture: stop the loop, release locally, and pair again.
           if (isCsrf(new Fail("", "http", res.status, d))) {
-            finish(null, "Ended.");
+            finish(null, "Ended.", true);
             showCsrfRecovery();
             return;
           }
@@ -1523,15 +1747,16 @@
         sess.lastSeq = isFinite(seq) ? seq : (sess.lastSeq || 0) + 1;
         if (w > 0 && hh > 0) { fw = w; fh = hh; }
         paint(blob);
-        fails = 0; reachable(true);
+        fails = 0; reconnecting = false; reachable(true);
         frameRtts.push(now() - t0); if (frameRtts.length > 6) frameRtts.shift();
         frameTimes.push(now()); lastFrameAt = now();
         if (!gotFrame) { gotFrame = true; renderSess(); announce("Live."); }
       } catch (e) {
         if (g !== gen || repairing) return;
         if (!e || !e.http) reachable(false);
+        releaseAll(true); reconnecting = true; renderSess();
         if (++fails >= 6) { finish(e && e.http ? e.message : LOST, ""); return; }
-        await sleep(Math.min(3000, 300 * fails));
+        await sleep(Math.min(5000, 300 * Math.pow(2, fails - 1)));
       } finally { clearTimeout(timer); }
     }
   }
@@ -1548,7 +1773,10 @@
     shownUrl = nextUrl; nextUrl = "";
     placeCursor();
   }
-  function onFrameError() { if (nextUrl) { URL.revokeObjectURL(nextUrl); nextUrl = ""; } }
+  function onFrameError() {
+    if (nextUrl) { URL.revokeObjectURL(nextUrl); nextUrl = ""; }
+    if (sess) { releaseAll(true); reconnecting = true; renderSess(); }
+  }
   function dropFrames() {
     for (const v of Object.values(VIEWS)) { v.img.removeAttribute("src"); v.img.hidden = true; }
     if (shownUrl) URL.revokeObjectURL(shownUrl);
@@ -1561,6 +1789,7 @@
   const STATE_WORD = { starting: "Starting…", live: "Live", stale: "No new frames", ended: "Ended", failed: "Couldn't connect" };
   function sessState() {
     if (starting) return "starting";
+    if (sess && reconnecting) return "stale";
     if (!sess) return ended ? (ended.error ? "failed" : "ended") : "starting";
     if (!gotFrame) return now() - attachedAt > NO_FRAME_MS ? "stale" : "starting";
     return now() - Math.max(lastFrameAt, aliveAt) > STALE_MS ? "stale" : "live";
@@ -1569,7 +1798,12 @@
     const v = view(), st = sessState(), name = label(sessDevice), cam = sessKind === "camera";
     v.state.setAttribute("data-st", st);
     text(v.st, st === "failed" && ended && ended.frame ? "Ended" : STATE_WORD[st]);
-    text(v.h, (cam ? "Camera · " : "") + name);
+    text(v.h, (cam ? "Camera on " : "Controlling ") + name);
+    const prefix = cam ? "v" : "c";
+    $(prefix + "-stale").hidden = !(sess && gotFrame && st === "stale");
+    text($(prefix + "-stale"), reconnecting ? "Connection lost. Reconnecting… Input is paused." : "Picture paused. Waiting for the computer…");
+    if (sess && st === "stale" && (held.size || heldKeys.size)) releaseAll(true);
+    $(prefix + "-apply").disabled = !sess || starting;
     const pic = !!sess && gotFrame;
     v.img.hidden = !pic;
     v.ph.hidden = pic;
@@ -1588,7 +1822,7 @@
       renderSticky(); for (const b of keyBtns.values()) b.disabled = !canSend(); placeCursor();
       if (canSend() && el.cNote.getAttribute("data-st") === "wait") { text(el.cNote, ""); el.cNote.removeAttribute("data-st"); }
     } else {
-      el.vChrome.hidden = !pic;  // REC, the countdown and the cross only over a live picture
+      el.vChrome.hidden = !pic || st === "stale";  // REC, the countdown and the cross only over a live picture
       fitChrome();
     }
   }
@@ -1623,6 +1857,53 @@
     v.again.addEventListener("click", () => { ended = null; startSession(sessDevice, k); });
   }
 
+  // Extra chrome fades without changing the picture geometry. Disconnect stays visible.
+  function showSessionChrome() {
+    clearTimeout(chromeTimer);
+    for (const k of ["control", "camera"]) scr[k].setAttribute("data-chrome", "shown");
+    chromeTimer = setTimeout(() => {
+      if (!sess || document.hidden) return;
+      scr[sessKind === "camera" ? "camera" : "control"].setAttribute("data-chrome", "quiet");
+    }, 4500);
+  }
+  for (const prefix of ["c", "v"]) {
+    const screen = scr[prefix === "c" ? "control" : "camera"], options = $(prefix + "-options");
+    options.hidden = true;
+    screen.addEventListener("pointerdown", showSessionChrome);
+    screen.addEventListener("focusin", showSessionChrome);
+    $(prefix + "-more").addEventListener("click", () => {
+      options.hidden = !options.hidden;
+      if (prefix === "c" && !options.hidden) setKeys(false);
+      $(prefix + "-more").setAttribute("aria-expanded", String(!options.hidden));
+      $(prefix + "-quality").value = (sess && sess.quality) || prefQuality();
+    });
+    $(prefix + "-apply").addEventListener("click", async () => {
+      const quality = $(prefix + "-quality").value, old = sess;
+      if (!old || !QUALITY.includes(quality) || quality === old.quality) return;
+      store.set("jarvis.phone.quality", quality);
+      const device = sessDevice, kind = sessKind;
+      finish(null, "Changing picture quality…", true);
+      starting = true; renderSess();
+      const tok = ++startTok;
+      await quietStop(old.id, old.kind === "screen");
+      if (tok !== startTok || cur.id !== device || cur.name !== (kind === "camera" ? "camera" : "control")) return;
+      starting = false; options.hidden = true;
+      $(prefix + "-more").setAttribute("aria-expanded", "false");
+      startSession(device, kind);
+    });
+    $(prefix + "-full").addEventListener("click", async () => {
+      try {
+        if (document.fullscreenElement && document.exitFullscreen) await document.exitFullscreen();
+        else if (screen.requestFullscreen) await screen.requestFullscreen();
+        else { text($(prefix === "c" ? "c-note" : "v-note"), "Full screen is unavailable here. Rotate your phone for a wider picture."); return; }
+      } catch (_) { text($(prefix === "c" ? "c-note" : "v-note"), "Full screen couldn't open. Rotate your phone for a wider picture."); }
+    });
+  }
+  document.addEventListener("fullscreenchange", () => {
+    for (const prefix of ["c", "v"]) text($(prefix + "-full"), document.fullscreenElement ? "Exit full screen" : "Full screen");
+    viewport();
+  });
+
   // ---------- wake lock ----------
   let wake = null, waking = false;
   async function lockScreen() {
@@ -1630,7 +1911,7 @@
     waking = true;
     try {
       const w = await navigator.wakeLock.request("screen");
-      if (!sess) { w.release().catch(() => {}); return; }
+      if (!sess || document.hidden) { w.release().catch(() => {}); return; }
       wake = w;
       w.addEventListener("release", () => { if (wake === w) wake = null; });
     } catch (e) { wake = null; /* refused or unsupported: the screen may dim, that's all */ }
@@ -1645,7 +1926,7 @@
   // A network error or HTTP 5xx backs off from 300 ms, doubling to 5 s. Success starts again at 300 ms.
   let q = [], inflight = false, flushTimer = 0, lastSend = 0, inputErr = "", inputFails = 0, releaseAfterStop = false, inputStopped = false;
   const held = new Set(), heldKeys = new Set(), sticky = new Set(), keyBtns = new Map();
-  const canSend = () => !!sess && sess.kind === "screen" && gotFrame;
+  const canSend = () => !!sess && sess.kind === "screen" && gotFrame && !document.hidden && !reconnecting && !inputStopped && sessState() === "live";
   function resetInput() {
     clearTimeout(flushTimer); flushTimer = 0; clearTimeout(longTimer);
     q = []; held.clear(); heldKeys.clear(); sticky.clear(); ptrs.clear(); gest = null; inputErr = "";
@@ -1671,7 +1952,7 @@
     return { queue: q, fails: n + 1, delay, stop: false, releaseOnce: false, clearNote: false };
   }
   function push(ev, urgent) {
-    if (!canSend()) return false;
+    if (ev.t === "release" ? !sess || sess.kind !== "screen" : !canSend()) return false;
     if (inputStopped && ev.t !== "release") return false;
     if (ev.t === "move" && q.length && q[q.length - 1].t === "move") q[q.length - 1] = ev; else q.push(ev);
     if (urgent) pump();
@@ -1681,7 +1962,7 @@
   async function pump() {
     clearTimeout(flushTimer); flushTimer = 0;
     if (!q.length || !sess || inflight) return;
-    const id = sess.id, events = q.slice(0, MAX_EVENTS);
+    const activeSession = sess, id = sess.id, events = q.slice(0, MAX_EVENTS);
     q = q.slice(MAX_EVENTS);
     const preserveNote = releaseAfterStop && events.length === 1 && events[0] && events[0].t === "release";
     releaseAfterStop = false;
@@ -1689,6 +1970,7 @@
     let plan = null;
     try {
       await api("/phone/api/session/input", { session: id, events }, { timeout: 10000 });
+      if (sess !== activeSession) return;
       plan = inputPumpPlan(true, null, inputFails, events, q);
       inputFails = plan.fails;
       q = plan.queue;
@@ -1696,7 +1978,7 @@
       if (plan.clearNote && inputErr && !preserveNote) { inputErr = ""; text(el.cNote, ""); }
     } catch (e) {
       if (e.kind === "auth") return;
-      if (!sess || sess.id !== id) return;
+      if (sess !== activeSession) return;
       if (e.status === 404 || e.status === 410) { finish(e.status === 404 ? GONE : e.message, ""); return; }
       plan = inputPumpPlan(false, e, inputFails, events, q);
       inputFails = plan.fails;
@@ -1709,7 +1991,8 @@
       heldFrom(q);
     } finally {
       inflight = false;
-      const live = plan && sess && sess.id === id;
+      if (sess && sess !== activeSession && q.length) pump();
+      const live = plan && sess === activeSession;
       if (live && plan.releaseOnce && q.length) pump();
       else if (live && !plan.stop && q.length) {
         if (plan.delay) flushTimer = setTimeout(pump, plan.delay);
@@ -1731,10 +2014,11 @@
   }
   // Let go of every key and button on the remote. force: even if nothing seems held.
   function releaseAll(force) {
-    if (!canSend()) return;
+    if (!sess || sess.kind !== "screen") return;
     clearTimeout(longTimer); ptrs.clear(); gest = null;
     if (!force && !held.size && !heldKeys.size) return;
     held.clear(); heldKeys.clear(); sticky.clear(); renderSticky();
+    q = []; // Never replay queued presses after a lifecycle or link-loss release.
     push({ t: "release" }, true);
   }
   const at = (p) => (p ? { x: p.x, y: p.y } : {});
@@ -1802,6 +2086,7 @@
     clearTimeout(ringTimer); ringTimer = setTimeout(() => { el.cRing.hidden = true; }, 450);
   }
   function setMode(m) {
+    if (m !== mode) releaseAll(false);
     mode = m; store.set("jarvis.phone.mode", m);
     el.cDirect.setAttribute("aria-pressed", String(m === "direct"));
     el.cTrack.setAttribute("aria-pressed", String(m === "track"));
@@ -1828,7 +2113,8 @@
   function pdown(e) {
     if (onControl(e)) return;
     e.preventDefault();
-    if (!sess || sess.kind !== "screen" || !gotFrame || e.button > 0) return;
+    if (!canSend() || e.button > 0) return;
+    showSessionChrome();
     try { el.cStage.setPointerCapture(e.pointerId); } catch (_) { /* fine */ }
     ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (ptrs.size === 1) {
@@ -1839,6 +2125,8 @@
       if (gest && gest.kind === "drag") press("left", false, norm(gest.lx, gest.ly, true));
       const [a, b] = [...ptrs.values()], c = mid(a, b);
       gest = { kind: "two", d0: dist(a, b), c0: c, last: c, s0: zoom.s, tx0: zoom.tx, ty0: zoom.ty, acc: 0 };
+    } else {
+      clearTimeout(longTimer); gest = { kind: "done" };
     }
   }
   function pmove(e) {
@@ -2003,21 +2291,31 @@
   el.cSend.addEventListener("pointerdown", (e) => e.preventDefault());
   el.cSend.addEventListener("click", () => { if (el.cText.value) flushText(); else keyTap("Enter"); });
   function setKeys(open) {
+    if (open) { $("c-options").hidden = true; $("c-more").setAttribute("aria-expanded", "false"); }
+    if (!open && document.activeElement === el.cText) el.cText.blur();
     el.cPanel.hidden = !open;
     el.cKeysBtn.setAttribute("aria-expanded", String(open));
     el.cKeysBtn.setAttribute("aria-label", open ? "Hide keys" : "Show keys");
     store.set("jarvis.phone.keys", open ? "1" : "0");
   }
-  el.cKeysBtn.addEventListener("click", () => setKeys(el.cPanel.hidden));
+  el.cKeysBtn.addEventListener("click", () => { $("c-options").hidden = true; $("c-more").setAttribute("aria-expanded", "false"); setKeys(el.cPanel.hidden); });
   // Focus in the tap itself: iOS only opens the soft keyboard from a user gesture.
   el.cType.addEventListener("click", () => { if (el.cPanel.hidden) setKeys(true); el.cText.focus(); });
 
   // ---------- lifecycle ----------
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      clearTimeout(pollTimer); pollTimer = 0;
+      clearTimeout(downTimer); downTimer = 0;
+      if (pairing) {
+        clearTimeout(pairing.timer); clearInterval(pairing.tick); pairing.tick = 0;
+        if (!pairing.resume) pairing.resume = { path: "/phone/pair/status", body: { code: pairing.code, operation_id: pairing.operationId } };
+      }
       hiddenAt = now();
       if (sess) {
         releaseAll(true);  // let go at once; frames pause; the session ends if nobody comes back
+        if (sess.kind === "screen") beacon("/phone/api/session/input", { session: sess.id, events: [{ t: "release" }] });
+        clearInterval(tickTimer); tickTimer = 0; unlockScreen();
         detachLoop();
         armHiddenStop();
       }
@@ -2026,17 +2324,34 @@
     clearTimeout(hiddenTimer); hiddenTimer = 0;
     // A throttled background timer may not have fired: past the limit, end it now.
     if (sess && hiddenAt && now() - hiddenAt >= HIDDEN_STOP_MS) backgroundStop();
-    else if (sess) { startFrames(); lockScreen(); }
+    else if (sess) { startFrames(); lockScreen(); clearInterval(tickTimer); tickTimer = setInterval(renderSess, 500); }
     hiddenAt = 0;
-    if (!el.down.hidden) boot();
-    else if (me) { if (!sess) refresh(); resumeAsk(); }
+    resumeNetwork();
   });
-  addEventListener("blur", () => releaseAll(true));
-  addEventListener("pagehide", () => stopBeacon());
+  addEventListener("blur", () => {
+    releaseAll(true);
+    if (sess && sess.kind === "screen") beacon("/phone/api/session/input", { session: sess.id, events: [{ t: "release" }] });
+  });
+  addEventListener("pagehide", () => { if (sess) { stopBeacon(); finish(null, "Ended when the app closed.", true); } });
   // Back from the page cache with a session the server has long ended.
   addEventListener("pageshow", (e) => { if (e && e.persisted && sess) finish(null, "Ended when the app closed."); });
-  addEventListener("online", () => { if (!el.down.hidden) boot(); else if (me) refresh(); });
-  addEventListener("offline", () => reachable(false));
+  function resumeNetwork() {
+    if (document.hidden || !online) return;
+    if (pairing && pairing.resume) {
+      const next = pairing.resume;
+      if (pairing.waiting) pairWaiting(pairing);
+      pairStep(next.path, next.body);
+    } else if ((!el.down.hidden || store.state("stage") === "boot") && !repairing) boot();
+    else if (me && !repairing) { if (!sess) refresh(); resumeAsk(); scheduleOverview(); }
+  }
+  addEventListener("online", () => { online = true; store.update("online", true); resumeNetwork(); });
+  addEventListener("offline", () => {
+    online = false; store.update("online", false);
+    clearTimeout(pollTimer); pollTimer = 0;
+    clearTimeout(downTimer); downTimer = 0;
+    reachable(false);
+    if (sess) { releaseAll(true); reconnecting = true; renderSess(); }
+  });
 
   // The soft keyboard: keep the app inside the visible part of the screen, so the text field,
   // the key bar and Ask's box sit above it.
@@ -2074,15 +2389,43 @@
 
   function registerWorker() {
     try {
-      if (navigator.serviceWorker && window.isSecureContext !== false) navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+      const sw = navigator.serviceWorker;
+      if (!sw || window.isSecureContext === false) return;
+      let prompt = null;
+      const offerUpdate = () => {
+        if (prompt) return;
+        const msg = h("span", null, "An update is ready.");
+        const reload = h("button", { type: "button", class: "mini" }, "Reload");
+        prompt = h("div", { class: "notice phone-update", role: "status" }, msg, reload);
+        reload.addEventListener("click", () => {
+          if (sess || starting || asking) { text(msg, "Finish the current session or request, then reload for the update."); return; }
+          window.location.reload();
+        });
+        el.app.append(prompt);
+      };
+      if (typeof sw.addEventListener === "function") {
+        const hadController = !!sw.controller;
+        sw.addEventListener("controllerchange", () => { if (hadController) offerUpdate(); });
+      }
+      sw.register("/sw.js", { scope: "/" }).then((reg) => {
+        if (reg.waiting && sw.controller) offerUpdate();
+        if (typeof reg.addEventListener !== "function") return;
+        reg.addEventListener("updatefound", () => {
+          const worker = reg.installing;
+          if (worker) worker.addEventListener("statechange", () => {
+            if (worker.state === "installed" && sw.controller) offerUpdate();
+          });
+        });
+      }).catch(() => {});
     } catch (e) { /* no offline shell, the app still works */ }
   }
 
   // ---------- start ----------
   buildKeys();
   setMode(mode);
-  setKeys(store.get("jarvis.phone.keys", "1") !== "0");
+  setKeys(store.get("jarvis.phone.keys", "0") === "1");
   renderQuality(); renderTheme(); countAsk(); viewport();
   registerWorker();
+  stageTo("boot");
   boot();
 })();
