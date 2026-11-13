@@ -12,6 +12,7 @@ Endpoints read the same state the CLI uses (.jarvis/), so the console and
 """
 
 import ast
+import copy
 import json
 import os
 from .platforms import on_windows
@@ -187,25 +188,33 @@ _MODULES_LOCK = threading.Lock()
 
 
 class _Ttl:
-    """Tiny thread-safe TTL cache. Only successful results are stored, never exceptions."""
+    """Tiny thread-safe TTL cache. Only successful results are stored, never exceptions.
+
+    clear() bumps a generation. A compute() that started before the clear still returns
+    its value to that caller, but the value is stored only when the generation is unchanged.
+    """
 
     def __init__(self, clock=time.monotonic):
         self._clock, self._lock, self._items = clock, threading.Lock(), {}
+        self._gen = 0
 
     def get(self, key, ttl, compute):
         now = self._clock()
         with self._lock:
             hit = self._items.get(key)
+            gen = self._gen
         if hit and now - hit[0] < ttl:
             return hit[1]
         value = compute()  # outside the lock: it can take a second and must not block other keys
         with self._lock:
-            self._items[key] = (self._clock(), value)
+            if self._gen == gen:  # a clear() during compute() must not resurrect this value
+                self._items[key] = (self._clock(), value)
         return value
 
     def clear(self):
         with self._lock:
             self._items.clear()
+            self._gen += 1
 
 
 _LINES = {}  # str(path) -> ((mtime_ns, size), line count), so /api/tree rereads only changed files
@@ -428,6 +437,11 @@ class Console:
 
     # ---- overview ----------------------------------------------------------------
     def overview(self):
+        """Dashboard snapshot, reused for one second. Any POST clears this cache.
+        Callers get their own copy; the cached dict stays put."""
+        return copy.deepcopy(self.ttl.get("overview", 1.0, self._overview))
+
+    def _overview(self):
         from . import daemon
         tasks = self.store.overview()
         try:

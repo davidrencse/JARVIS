@@ -40,6 +40,9 @@ CHUNK = 2 * 1024 * 1024  # raw bytes per cluster job; base64 keeps it under the 
 UPLOAD_ID = re.compile(r"[a-f0-9]{32}")
 PART = ".jarvis-upload-{}.part"
 RESERVE = 2 * 1024 ** 3  # an upload may never leave less than this free in the drop folder
+# Windows returns WinError 5 while Defender or the indexer still has a new file
+# open. A few short waits cover that sharing denial; a real ACL denial still fails.
+_WIN_SHARE_TRIES = 5
 NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_. ()+,@-]{0,199}")
 MAX_TREE = 3000  # files plus folders in one folder copy
 MAX_DEPTH = 32  # folder nesting in one folder copy
@@ -247,7 +250,7 @@ def _plain_path(value):
 def is_path_op(payload):
     """True for the operations that name paths on the receiving computer (storage copies)."""
     action = payload.get("action")
-    return (action in ("brain_receive", "brain_export", "brain_freeze", "brain_stage", "tree", "mkdir")
+    return (action in ("brain_receive", "brain_export", "brain_freeze", "brain_stage", "brain_discard", "tree", "mkdir")
             or (action == "get" and "path" in payload)
             or (action == "put" and payload.get("dest") == "path"))
 
@@ -255,7 +258,7 @@ def is_path_op(payload):
 def validate(payload):
     """Refuse anything but the fixed transfer operations (cluster.validate_action)."""
     action = payload.get("action")
-    if action in ("brain_receive", "brain_export", "brain_freeze", "brain_stage"):
+    if action in ("brain_receive", "brain_export", "brain_freeze", "brain_stage", "brain_discard"):
         from .continuity.brain_channel import validate as validate_brain
         return validate_brain(payload)
     if action == "inbox":
@@ -323,12 +326,131 @@ def _check_space(folder, incoming, declared=0):
             "must stay free. Nothing was received.")
 
 
+def _win_share_retry(action):
+    """Run ``action`` a few times when Windows answers with Access is denied.
+
+    The part file is left in place on failure. Callers must not delete it to
+    "clean up" a WinError 5: that is how a finished upload disappeared.
+    """
+    last = None
+    for attempt in range(_WIN_SHARE_TRIES):
+        try:
+            return action()
+        except PermissionError as exc:
+            last = exc
+            if attempt + 1 == _WIN_SHARE_TRIES:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+    raise last
+
+
+def _win_stat_exists(path):
+    """True when ``path`` can be lstat'd. A missing name is false.
+
+    ``os.path.lexists`` turns PermissionError into false, which on Windows
+    hides a file Defender will not let us stat. A failed stat stays false so
+    a locked directory cannot look like an endless run of taken names.
+    """
+    try:
+        os.lstat(path)
+    except OSError:
+        return False
+    return True
+
+
+def _win_copy_exclusive(part, dest):
+    """Copy ``part`` onto a new file at ``dest``. An existing name is left alone.
+
+    ``os.rename`` needs delete access. A scanner that has the part open
+    without share-delete returns WinError 5, but the bytes are still readable.
+    The new file is created exclusively, so a symlink or an existing file is
+    not written through. The part is removed only after that copy is in place.
+
+    Paths stay strings. ``pathlib.Path`` follows ``os.name``, so constructing
+    one while Windows is being simulated on another OS raises.
+    """
+    part_s, dest_s = os.fspath(part), os.fspath(dest)
+    folder, name = os.path.split(dest_s)
+    part_dir, part_name = os.path.split(part_s)
+
+    def create():
+        if _win_stat_exists(dest_s):
+            raise FileExistsError(dest_s)
+        return pathsafe.open_leaf(folder, name, "xb")
+
+    expect = pathsafe.regular_size(part_s)
+    try:
+        out = _win_share_retry(create)
+    except PermissionError:
+        if _win_stat_exists(dest_s):
+            raise FileExistsError(dest_s) from None
+        raise
+    written = 0
+    try:
+        with out:
+            with pathsafe.open_leaf(part_dir, part_name, "rb") as src:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+        if written != expect:
+            raise ValueError("The landed file does not match the upload.")
+    except Exception:
+        # Only the file this call created. A refused symlink was never opened.
+        try:
+            os.unlink(dest_s)
+        except OSError:
+            pass
+        raise
+    try:
+        os.unlink(part_s)
+    except OSError:
+        pass
+
+
+def _win_publish(part, dest):
+    """Move ``part`` onto a free name. An existing file or link stays as it is.
+
+    CreateHardLink and ``publish_new``'s placeholder replace both return
+    WinError 5 once another process has the new file open, and ``publish_new``
+    then deletes the only copy. ``os.rename`` onto a free name does not replace,
+    but it still needs delete share on the part. When that stays denied, the
+    bytes are copied onto an exclusive new file instead.
+    """
+    def once():
+        pathsafe.regular_size(part)  # a symlink or special file is not published
+        if _win_stat_exists(dest):
+            raise FileExistsError(dest)
+        os.rename(part, dest)
+
+    try:
+        _win_share_retry(once)
+    except FileExistsError:
+        raise
+    except PermissionError:
+        if _win_stat_exists(dest):
+            raise FileExistsError(dest) from None
+        _win_copy_exclusive(part, dest)
+
+
+def _open_upload(folder, name, mode):
+    """Open an upload part. Windows may deny the first exclusive create."""
+    if os.name != "nt":
+        return pathsafe.open_leaf(folder, name, mode)
+    return _win_share_retry(lambda: pathsafe.open_leaf(folder, name, mode))
+
+
 def _land(part, folder, name):
     """Give a finished part a free name in the drop folder, never replacing a file."""
     final, n = name, 1
     while True:
         dest = folder / final
         try:
+            if os.name == "nt":
+                _win_publish(part, dest)
+                return final
             pathsafe.link_new(part, dest)  # fails on an existing name, unlike rename on POSIX
         except FileExistsError:
             n += 1
@@ -336,7 +458,10 @@ def _land(part, folder, name):
             continue
         except ValueError:
             raise
-        except OSError:  # no hard links (FAT, some shares): exclusive placeholder, then replace
+        except OSError:
+            if os.name == "nt":
+                raise
+            # no hard links (FAT, some shares): exclusive placeholder, then replace
             try:
                 pathsafe.publish_new(part, dest)
             except FileExistsError:
@@ -346,6 +471,24 @@ def _land(part, folder, name):
             return final
         part.unlink()
         return final
+
+
+def _land_or_keep(part, folder, name):
+    """Land ``part``. A sharing denial leaves the finished bytes in place.
+
+    ``pull_path`` and ``fetch_file`` used to unlink the part on every error.
+    Windows ``PermissionError`` is the denial ``_win_publish`` already retried;
+    deleting here is how a finished download disappeared.
+    """
+    try:
+        final = _land(part, folder, name)
+    except PermissionError:
+        raise
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+    part.unlink(missing_ok=True)
+    return final
 
 
 def _within(config, path):
@@ -480,7 +623,7 @@ def _path_op(payload, config):
 def run_here(payload, state=None, config=None):
     """One transfer operation on this machine (a cluster job, or the main serving a node)."""
     validate(payload)
-    if payload["action"] in ("brain_receive", "brain_export", "brain_freeze", "brain_stage"):
+    if payload["action"] in ("brain_receive", "brain_export", "brain_freeze", "brain_stage", "brain_discard"):
         from .continuity.brain_channel import run_here as run_brain
         return run_brain(payload, state, config)
     if is_path_op(payload) and payload["action"] != "put":
@@ -539,7 +682,7 @@ def run_here(payload, state=None, config=None):
                                          else CLIP_BYTES):
         part.unlink(missing_ok=True)
         raise ValueError("That is too large to send this way.")
-    with pathsafe.open_leaf(folder, part.name, "xb" if payload["offset"] == 0 else "ab") as stream:
+    with _open_upload(folder, part.name, "xb" if payload["offset"] == 0 else "ab") as stream:
         stream.write(data)
     size = payload["offset"] + len(data)
     if not payload.get("last"):
@@ -699,9 +842,12 @@ def fetch_file(config, state, name, device=None, dest=None):
                     break
                 chunk = call(config, state, target, {"action": "get", "name": name,
                                                      "offset": out.tell()})
-        final = _land(part, folder, safe_name(name))
-    finally:
+    except PermissionError:
+        raise
+    except Exception:
         part.unlink(missing_ok=True)
+        raise
+    final = _land_or_keep(part, folder, safe_name(name))
     return {"fetched": final, "path": str(folder / final), "bytes": (folder / final).stat().st_size}
 
 
@@ -726,6 +872,9 @@ def pull_path(config, state, device, path, folder, name, rel=None):
                     break
                 if not data:
                     raise RuntimeError("The file changed while it was being copied; try again.")
-        return _land(part, folder, safe_name(name))
-    finally:
+    except PermissionError:
+        raise
+    except Exception:
         part.unlink(missing_ok=True)
+        raise
+    return _land_or_keep(part, folder, safe_name(name))

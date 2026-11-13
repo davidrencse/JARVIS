@@ -30,7 +30,7 @@ import threading
 import weakref
 from datetime import date, datetime, timedelta
 
-from .vault import CONFLICT, HEADING, _raw, plain, split_frontmatter
+from .vault import CONFLICT, HEADING, _raw, plain, scan, split_frontmatter
 
 STATUS = {" ": "todo", "x": "done", "X": "done", "/": "in_progress", "-": "cancelled"}
 OPEN = ("todo", "in_progress")
@@ -185,11 +185,18 @@ class Tasks:
     def __init__(self, vault):
         self.vault = vault
         self._cache, self._lock = {}, threading.Lock()
+        self._all_memo = None  # (scan snapshot, today, task list); snapshot kept alive
 
     # -- reading -------------------------------------------------------------------------
-    def _note_tasks(self, rel, full, today, today_rel):
-        stat = full.stat()
-        key = (stat.st_mtime, stat.st_size, today if rel.startswith("daily/") else None)
+    def _note_tasks(self, rel, full, today, today_rel, stamp=None):
+        # stamp is (mtime, size) from the shared vault snapshot. Falling back to stat()
+        # is only for a note the snapshot does not mention.
+        if stamp is None:
+            stat = full.stat()
+            stamp = (stat.st_mtime, stat.st_size)
+        elif stamp[0] is None:  # dangling link: the same skip as a failed stat()
+            raise OSError(rel)
+        key = (stamp[0], stamp[1], today if rel.startswith("daily/") else None)
         cached = self._cache.get(rel)
         if cached and cached[0] == key:
             return cached[1]
@@ -231,18 +238,26 @@ class Tasks:
 
     def all(self, today=None):
         today = today or date.today()
-        today_rel = self.vault.daily_path(today).relative_to(self.vault.root).as_posix()
         with self._lock:
+            # Same list object while the vault snapshot is current. An edit shows up when
+            # scan()'s TTL ends or forget() drops it after a write of ours.
+            snapshot = scan(self.vault.root)
+            memo = self._all_memo
+            if memo is not None and memo[0] is snapshot and memo[1] == today:
+                return list(memo[2])
+            today_rel = self.vault.daily_path(today).relative_to(self.vault.root).as_posix()
+            stamps = {rel: (mtime, size) for rel, _link, mtime, size in snapshot}
             out, live = [], set()
             for rel, full in self.vault.markdown():
                 live.add(rel)
                 try:
-                    out.extend(self._note_tasks(rel, full, today, today_rel))
+                    out.extend(self._note_tasks(rel, full, today, today_rel, stamps.get(rel)))
                 except OSError:
                     continue
             for gone in set(self._cache) - live:
                 self._cache.pop(gone, None)
-        return out
+            self._all_memo = (snapshot, today, out)
+            return list(out)
 
     def get(self, ref, today=None, open_only=False):
         """A task by id, or by its words when they pick out exactly one task."""

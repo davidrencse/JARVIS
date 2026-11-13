@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import transfer
+from .pathsafe import scp_remote_filename
 from .transfer import _check_target, _fail, _ssh_args, collision_name, safe_name, ssh_host
 
 MAX_ENTRIES = 3000
@@ -89,6 +90,21 @@ def _name_ok(name):
         and "\\" not in name and "\x00" not in name
 
 
+def _child_path(parent, name, sep, local):
+    """Join one child of ``parent`` using that computer's separators.
+
+    A Windows destination is ``C:/...`` so scp does not treat ``\\`` as an escape
+    and does not read the drive letter as a host. The drive stays in the path,
+    after ``user@host:``.
+    """
+    if local:
+        return str(Path(parent) / name)
+    child = _pure(sep)(parent) / name
+    if sep == "\\":
+        return PureWindowsPath(child).as_posix()
+    return str(child)
+
+
 class Storage:
     def __init__(self, config, state=None):
         self.config = config
@@ -115,8 +131,18 @@ class Storage:
         return ["~"] if self.is_remote(device_id) else [str(Path.home())]
 
     def devices(self):
-        return [{"id": name, "hostname": d.get("hostname", name), "remote": d.get("transport") == "ssh"}
-                for name, d in self.config.get("devices", {}).items()]
+        """Devices the Files tab can browse. `remote` is relative to this PC (the same test
+        copy() uses), so the two panes are always one local and one remote. A device that is
+        neither this PC, a cluster node, nor an SSH target (e.g. a gateway host) is left out:
+        it has no files to list and a copy to it can only fail."""
+        out = []
+        for name, d in self.config.get("devices", {}).items():
+            remote = self.is_remote(name)
+            if remote and not (d.get("transport") == "cluster"
+                               or (d.get("transport") == "ssh" and d.get("target"))):
+                continue
+            out.append({"id": name, "hostname": d.get("hostname", name), "remote": remote})
+        return out
 
     # ---- listing / resolving -----------------------------------------------------------
     def _local(self, device_id, path, action):
@@ -248,13 +274,16 @@ class Storage:
         if not via_ssh:
             return self._copy_cluster(remote_id, src_device, src, name, dst_device, dst)
         # Normalize before checking collisions: two Linux names can map to one
-        # Windows name. Inspect candidates directly, never infer absence from a
-        # truncated directory listing. lstat also counts broken symlinks as taken.
+        # Windows name (CON, a:b.txt, notes.txt.). Inspect candidates directly,
+        # never infer absence from a truncated directory listing. lstat also
+        # counts broken symlinks as taken. The destination's own exists probe is
+        # what makes Notes.txt and notes.txt collide; it is case-insensitive there.
         local_dst = not self.is_remote(dst_device)
-        final = safe_name(name) if local_dst else name
+        sep = dst.get("sep") or ("\\" if local_dst and os.sep == "\\" else "/")
+        final = safe_name(name) if local_dst or sep == "\\" else name
         normalized, n = final, 1
-        while self.resolve(dst_device, str(Path(dst["path"]) / final) if local_dst
-                           else str(PurePosixPath(dst["path"]) / final), "exists")["exists"]:
+        while self.resolve(dst_device, _child_path(dst["path"], final, sep, local_dst),
+                           "exists")["exists"]:
             n += 1
             if n > MAX_COLLISIONS:
                 raise ValueError(f"{normalized} and {MAX_COLLISIONS} numbered copies of it "
@@ -269,13 +298,19 @@ class Storage:
             base.append("-r")
         target = device["target"]
         # Local arguments are bare names run from their own folder: a Windows path such as
-        # C:\x would otherwise be read by scp as host "C".
+        # C:\x would otherwise be read by scp as host "C". The remote name is checked
+        # the same way `jarvis send` checks it: older scp hands it to a shell.
         if self.is_remote(src_device):
+            remote_path = src["path"]
+            if (src.get("sep") or "/") == "\\":
+                remote_path = PureWindowsPath(remote_path).as_posix()
+            scp_remote_filename(name)
             cwd = dst["path"]
-            args = [*base, "--", f"{target}:{src['path']}", final]
+            args = [*base, "--", f"{target}:{remote_path}", final]
         else:
+            scp_remote_filename(final)
             cwd = str(Path(src["path"]).parent)
-            args = [*base, "--", name, f"{target}:{dst['path'].rstrip('/')}/{final}"]
+            args = [*base, "--", name, f"{target}:{_child_path(dst['path'], final, sep, False)}"]
         try:
             done = subprocess.run(args, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
                                   errors="replace", timeout=3600, shell=False)

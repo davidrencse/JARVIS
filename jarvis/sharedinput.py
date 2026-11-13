@@ -648,7 +648,7 @@ VIRTUAL_IF = re.compile(r"^(lo|tailscale|docker|br-|veth|virbr|vEthernet|Loopbac
                         r"vmnet|vboxnet|cni|flannel|ham)", re.I)
 
 
-def local_networks(families=(4,)):
+def local_networks(families=(4,), *, with_addresses=False):
     """This computer's real LAN subnets (Wi-Fi/Ethernet), virtual and VPN interfaces left out.
     A home LAN can use any range (David's uses 172.1.x, which isn't RFC1918), so "same subnet
     as me" is the test, not "private address". families: IP versions to list; the Lan Mouse
@@ -673,13 +673,14 @@ def local_networks(families=(4,)):
         if VIRTUAL_IF.match(name or ""):
             continue
         try:
-            net = ipaddress.ip_interface(re.sub(r"%[^/]*", "", cidr)).network  # drop fe80::1%12 zone
+            interface = ipaddress.ip_interface(re.sub(r"%[^/]*", "", cidr))
+            net = interface.network  # drop fe80::1%12 zone
         except ValueError:
             continue
         if net.version not in families or net.is_loopback:
             continue
         if 8 <= net.prefixlen < net.max_prefixlen:
-            nets.append(net)
+            nets.append(interface if with_addresses else net)
     return nets
 
 
@@ -886,6 +887,12 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
             reading = {**reading, "why": f"{reading['why']} Stop failed: {exc}"}
         if action == "stopped":
             _notify(f"Sharing is off: {reading['why']} It comes back when the laptops are together again.")
+    elif action == "started" and (remote_session_live(state) or controlling_remote(state)):
+        # The marker landed after the check above (the console connected while this tick was
+        # deciding): Lan Mouse stays off, the debt stays ours, and the next reading decides again.
+        action = None
+        memo.pop("pending_start", None)
+        reading = {**reading, "why": f"{reading['why']} Not started: remote control began."}
     elif action == "started":
         try:
             start_fn()
@@ -893,7 +900,17 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
             action = "start_failed"
             reading = {**reading, "why": f"{reading['why']} Start failed: {exc}"}
         else:
-            if status_fn()["running"]:
+            if (remote_session_live(state) or controlling_remote(state)) and status_fn()["running"]:
+                # Remote control began while start() ran: put it straight back down. Whatever
+                # this does, the debt stays ours (stopped_by_guard) and pending_start is ours too.
+                try:
+                    stop_fn()
+                except Exception:
+                    pass
+                action = "start_failed"
+                memo.pop("pending_start", None)
+                reading = {**reading, "why": f"{reading['why']} Stopped again: remote control began."}
+            elif status_fn()["running"]:
                 memo["stopped_by_guard"] = False
                 memo.pop("pending_start", None)
                 _save_memo(path, memo)
@@ -953,6 +970,7 @@ class ControllerPause:
     set(False) restores Lan Mouse like a normal end."""
 
     TOUCH = 10.0  # s between marker refreshes while a session is live
+    RETRY = 3.0   # s before a stop that didn't land is tried again (set() is called every hub poll)
 
     def __init__(self, state, status_fn=None, start_fn=None, stop_fn=None, clock=None):
         import threading
@@ -962,16 +980,21 @@ class ControllerPause:
         self.stop_fn = stop_fn or (lambda: stop(sharing_only=True))
         self.clock = clock or time.monotonic
         self.want = self.applied = False
+        # applied: Lan Mouse is known stopped (or wasn't running) for this session. It stays
+        # False while a stop failed or didn't take, so the next set(True) tries it again.
+        # engaged: our marker is written, so the end has to remove it even if the stop never landed.
+        self.engaged = False
         self.was_running = False
         self._memo_owed = False  # True once the guard memo records our stop
         self._touched = 0.0
+        self._retry_at = 0.0
         self._lock = threading.Lock()
         try:
             path = self.state / CONTROLLING_MARKER
             left = json.loads(path.read_text(encoding="utf-8"))
             # only this boot's: after a reboot the guard's autostart owns Lan Mouse again
             if isinstance(left, dict) and path.stat().st_mtime > (platforms.boot_time() or 0):
-                self.applied = self.want = True
+                self.applied = self.want = self.engaged = True
                 self.was_running = bool(left.get("was_running"))
         except (OSError, ValueError):
             pass
@@ -979,7 +1002,13 @@ class ControllerPause:
     def set(self, live, wait=False):
         import threading
         self.want = bool(live)
-        if self.want == self.applied and not (self.want and self.clock() - self._touched >= self.TOUCH):
+        if self.want:
+            if self.applied:
+                if self.clock() - self._touched < self.TOUCH:
+                    return
+            elif self.clock() < self._retry_at:
+                return  # a stop just failed: not again on every poll
+        elif not self.applied and not self.engaged:
             return
         thread = threading.Thread(target=self.apply, name="lan-mouse-controller", daemon=True)
         thread.start()
@@ -992,27 +1021,46 @@ class ControllerPause:
             # then an instant failure) returns at once and relies on this loop to catch it.
             while True:
                 live = self.want
-                if live != self.applied or live:
+                if live != self.applied or live or self.engaged:
                     self._apply_once(live)
                 if self.want == live:
                     return
 
+    def _running(self):
+        return bool(self.status_fn().get("running"))
+
+    def _stop_landed(self):
+        """Run stop_fn; True only when it didn't fail and Lan Mouse no longer reads as running."""
+        result = self.stop_fn()
+        if isinstance(result, dict) and result.get("stopped") is False:
+            return False
+        return not self._running()
+
     def _apply_once(self, live):
         import time
         marker = self.state / CONTROLLING_MARKER
+        landed = live
         try:
             if live:
+                running = self._running()
                 if not self.applied:
-                    self._memo_owed = False
-                    self.was_running = bool(self.status_fn().get("running"))
+                    if not self.engaged:
+                        self._memo_owed = False
+                        self.was_running = running
+                    else:  # a retry after a stop that didn't land: don't forget it was running
+                        self.was_running = self.was_running or running
+                    self.engaged = True
                     self._write(marker)  # first: the guard must not bring it back mid-stop
-                    if self.was_running:
-                        self.stop_fn()
-                        _notify("Lan Mouse is paused while you control another computer.")
+                    if running:
+                        landed = self._stop_landed()
+                        if landed:
+                            _notify("Lan Mouse is paused while you control another computer.")
                 else:
                     self._write(marker)
+                    if running:  # the guard (or anything) started it again mid-session: stop it again
+                        landed = self._stop_landed()
                 self._touched = self.clock()
-            elif self.applied:
+            elif self.applied or self.engaged:
                 marker.unlink(missing_ok=True)
                 if self.was_running and self._apart():
                     # Not now: the guard brings it back once the laptops are together. Said
@@ -1027,8 +1075,13 @@ class ControllerPause:
                     self._guard_memo(stopped_by_guard=False, override=False)
                 self.was_running = False
         except Exception:  # never break the remote session over Lan Mouse
-            pass
-        self.applied = live
+            landed = False if live else landed
+        if live:
+            self.applied = landed  # a stop that failed or didn't take is tried again, not assumed
+            if not landed:
+                self._retry_at = self.clock() + self.RETRY
+        else:
+            self.applied = self.engaged = False
 
     def _guard_memo(self, tries=50, **fields):
         return update_guard_memo(self.state, tries=tries, **fields)

@@ -32,6 +32,7 @@ from .platforms import on_windows
 import re
 import socket
 import sqlite3
+import stat
 import threading
 import time
 import unicodedata
@@ -46,6 +47,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from .fsio import atomic_write
+from .store import private_database
 from .stemming import stem
 
 INDEX_VERSION = "3"  # generated personal-record revisions are excluded from ordinary recall
@@ -232,19 +234,38 @@ def moment(fmt, when):
 # -- one shared walk ----------------------------------------------------------------------
 # The index refresh, the task reader, the link resolver and the daemon's change watcher all
 # used to walk the whole vault on their own clocks. They now share one snapshot per vault
-# root: a walk with a stat per file, reused for SCAN_TTL seconds. JARVIS's own writes drop it
-# (forget), so only an edit made by another program waits up to SCAN_TTL to be seen.
-SCAN_TTL = 2.0
-_scans, _scan_lock = {}, threading.Lock()
+# root: a walk with a stat per file, reused for SCAN_TTL seconds. The watcher polls every
+# 3 s, so the snapshot has to outlive that interval or an unchanged vault is walked on every
+# tick. JARVIS's own writes drop it (forget); only an edit made by another program waits up
+# to SCAN_TTL to be seen. Each root has its own lock, held across that root's walk: callers
+# of one root share a single walk, and a different root is not stuck behind it.
+SCAN_TTL = 4.0
+_scans = {}
+_scan_guard = threading.Lock()  # the snapshot map only; never held across the walk
+_root_locks = {}
 
 
-def scan(root, force=False):
+def _lock_for(key):
+    with _scan_guard:
+        lock = _root_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _root_locks[key] = lock
+        return lock
+
+
+def scan(root, force=False, ttl=None):
     """Every file under root as (relative posix path, is_symlink, mtime, size), skipping
-    SKIP_DIRS. Shared and cached; callers must not mutate the list."""
+    SKIP_DIRS. Shared and cached; callers must not mutate the list.
+
+    ttl overrides SCAN_TTL for this call. The default is longer than the watcher's 3 s poll.
+    """
     root = key = os.path.realpath(root)  # Vault and the watcher may spell the path differently
-    with _scan_lock:
-        hit = _scans.get(key)
-        if hit and not force and time.monotonic() - hit[0] < SCAN_TTL:
+    limit = SCAN_TTL if ttl is None else ttl
+    with _lock_for(key):
+        with _scan_guard:
+            hit = _scans.get(key)
+        if hit and not force and time.monotonic() - hit[0] < limit:
             return hit[1]
         found = []
         for folder, dirs, names in os.walk(root):
@@ -258,14 +279,20 @@ def scan(root, force=False):
                     stat = None
                 found.append((name if base == "." else f"{base}/{name}", os.path.islink(path),
                               stat.st_mtime if stat else None, stat.st_size if stat else None))
-        _scans[key] = (time.monotonic(), found)
+        with _scan_guard:
+            _scans[key] = (time.monotonic(), found)
         return found
 
 
 def forget(root):
-    """Drop a root's snapshot after a write we made, so the next reader sees it."""
-    with _scan_lock:
-        _scans.pop(os.path.realpath(root), None)
+    """Drop a root's snapshot after a write we made, so the next reader sees it.
+
+    Waits out an in-flight walk of this root, then drops whatever that walk stored.
+    """
+    key = os.path.realpath(root)
+    with _lock_for(key):
+        with _scan_guard:
+            _scans.pop(key, None)
 
 
 @lru_cache(maxsize=65536)
@@ -323,6 +350,7 @@ class Vault:
 
     @contextmanager
     def connect(self):
+        private_database(self.db_path)
         db = sqlite3.connect(self.db_path, timeout=10)
         db.row_factory = sqlite3.Row
         try:
@@ -432,6 +460,32 @@ class Vault:
         if any(part in SKIP_DIRS for part in full.relative_to(self.root).parts):
             return None
         return full
+
+    def _read_safe(self, full):
+        """Text of a vault file JARVIS may read, or None. The path must stay inside the vault
+        once resolved (so a `../` or absolute value from .obsidian/daily-notes.json can't
+        reach outside), the last component must not be a symlink and the file must be a
+        regular one. Checked on the opened handle, before any text is read."""
+        try:
+            rel = Path(full).relative_to(self.root).as_posix()
+        except ValueError:
+            return None
+        if self._inside(rel) is None:
+            return None
+        try:
+            if os.path.islink(full):
+                return None
+            fd = os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                         | getattr(os, "O_BINARY", 0))
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                return stream.read().decode("utf-8", errors="replace")
+        finally:
+            os.close(fd)
 
     # -- reading ---------------------------------------------------------------------
     def labels(self):
@@ -606,9 +660,8 @@ class Vault:
             parts.append(("Current courses: " + "; ".join(courses) + ".", 2))
         if projects:
             parts.append(("Active projects: " + "; ".join(projects) + ".", 1))
-        daily = self.daily_path(today)
-        if daily.is_file():
-            text = daily.read_text(encoding="utf-8", errors="replace")
+        text = self.daily_text(today)
+        if text is not None:
             focus = [plain(m) for m in re.findall(r"^\s*\d+\.\s+- \[[ /]\]\s+(\S.*)$", text, re.M)]
             logged = [plain(l) for l in self._section_lines(text, "Log")
                       if l.strip() not in ("- Done:", "- Didn't:")]
@@ -651,15 +704,15 @@ class Vault:
         return lines
 
     def _section_bullets(self, rel, heading, limit):
-        full = self.root / rel
-        if not full.is_file():
+        text = self._read_safe(self.root / rel)
+        if text is None:
             return []
-        lines = self._section_lines(full.read_text(encoding="utf-8", errors="replace"), heading)
+        lines = self._section_lines(text, heading)
         bullets = [plain(re.sub(r"^\s*[-*]\s+", "", l)) for l in lines if re.match(r"^\s*[-*]\s", l)]
         return [b if len(b) <= 220 else b[:219] + "…" for b in bullets[:limit]]
 
     def _next_step(self, rel):
-        text = (self.root / rel).read_text(encoding="utf-8", errors="replace")
+        text = self._read_safe(self.root / rel) or ""
         open_items = [l for l in self._section_lines(text, "Next step") + text.splitlines()
                       if re.match(r"^\s*- \[ \]\s+\S", l)]
         if not open_items:
@@ -672,11 +725,11 @@ class Vault:
         Deadlines are dated bullets outside a day heading ("Exams and deadlines");
         events sit under a day heading ("### Wed 2026-10-21")."""
         today = today or date.today()
-        full = self.root / self.calendar
-        if not full.is_file():
+        text = self._read_safe(self.root / self.calendar)
+        if text is None:
             return []
         items, day, horizon = [], None, today + timedelta(days=days)
-        for line in full.read_text(encoding="utf-8", errors="replace").splitlines():
+        for line in text.splitlines():
             heading = re.match(r"^#{2,4}\s+(.*)$", line)
             if heading:
                 found = DATE.search(heading.group(1))
@@ -727,12 +780,17 @@ class Vault:
         rel = (folder.strip("/") + "/" if folder else "") + moment(fmt, when) + ".md"
         return self.root / rel
 
+    def daily_text(self, when=None):
+        """The daily note's text, or None when it is missing or unsafe to read (a path out
+        of the vault from daily-notes.json, or a symlink). Never follows either."""
+        return self._read_safe(self.daily_path(when))
+
     def _new_daily(self, when):
         """Today's daily note from the vault's own template, placeholders filled in."""
         _, _, template = self._daily_settings()
         source = self.root / (template if template.endswith(".md") else template + ".md")
-        if template and source.is_file():
-            text = source.read_text(encoding="utf-8")
+        text = self._read_safe(source) if template else None
+        if text is not None:
             text = re.sub(r"\{\{date(?::([^}]*))?\}\}",
                           lambda m: moment(m.group(1) or "YYYY-MM-DD", when), text)
             text = re.sub(r"\{\{time(?::([^}]*))?\}\}",
@@ -1365,20 +1423,73 @@ def _archive_words(text):
     return [w for w in re.findall(r"[a-z0-9]{4,}", (text or "").lower()) if w not in STOPWORDS]
 
 
-def _archive_line(obj, words):
-    """One line for this payload, or None. The search JSON is not kept.
+def _json_strings(value):
+    """String values inside a JSON column. Keys are not content."""
+    if not isinstance(value, str) or not value:
+        return
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        return
+    yield from _nested_strings(parsed)
 
-    The string is fields and children only, for this payload only. A lowercase copy is
-    used to find the hit, then both are dropped. The line keeps an 80-character label
-    and 160 characters of that JSON around the hit (40 before, 120 after)."""
-    blob = json.dumps({"fields": obj.get("fields") or {}, "children": obj.get("children")},
-                      ensure_ascii=False, sort_keys=True)
-    low = blob.lower()
+
+def _nested_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _nested_strings(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _nested_strings(item)
+
+
+def _recall_view(obj):
+    """The one canonical-recall policy.
+
+    A memory-item whose kind is in memory.RETIRED_KINDS is absent (None). Every other
+    record is matched on selected text values: body, title, history request/text/result,
+    hop names, and task spec/detail values. Column names are not searched. History and
+    task records are not retired by that tuple. The archive note is left as it is."""
+    if not isinstance(obj, dict):
+        return ""
+    fields = obj.get("fields") or {}
+    kind = obj.get("kind")
+    if kind == "memory-item":
+        from .memory import RETIRED_KINDS
+        if fields.get("kind") in RETIRED_KINDS:
+            return None
+        parts = [fields.get("title") or "", fields.get("body") or ""]
+    elif kind == "history-command":
+        parts = [fields.get(name) or "" for name in ("request", "text", "result")]
+        for hop in ((obj.get("children") or {}).get("hops") or []):
+            if isinstance(hop, dict):
+                parts.append(hop.get("name") or "")
+    elif kind == "task":
+        parts = list(_json_strings(fields.get("spec") or ""))
+        for event in ((obj.get("children") or {}).get("events") or []):
+            if isinstance(event, dict):
+                parts.extend(_json_strings(event.get("detail") or ""))
+    else:
+        parts = [fields.get(name) or "" for name in ("title", "body", "text", "content", "request")
+                 if isinstance(fields.get(name), str)]
+    return "\n".join(str(part) for part in parts if part)
+
+
+def _archive_line(obj, words, text):
+    """One line for this payload, or None. `text` is the recall policy's values.
+
+    A lowercase copy is used to find the hit, then dropped. The line keeps an
+    80-character label and 160 characters of that text around the hit (40 before,
+    120 after). Column names are not part of the snippet unless the value itself
+    contains them."""
+    low = text.lower()
     if not any(word in low for word in words):
         return None
     hit = next(word for word in words if word in low)
     at = low.find(hit)
-    snippet = blob[max(0, at - 40):at + 120].replace("\n", " ")
+    snippet = text[max(0, at - 40):at + 120].replace("\n", " ")
     fields = obj.get("fields") or {}
     label = str(fields.get("title") or fields.get("text") or obj.get("kind") or "record")[:80]
     rid = f"{obj.get('store')}/{obj.get('kind')}/{obj.get('key')}"
@@ -1390,7 +1501,8 @@ def _canonical_recall(config, state, text, limit=4, max_chars=900):
 
     Streams one validated payload at a time across those three stores. The scan keeps
     filenames. One payload is in hand, and only while the output still has room is its
-    fields/children JSON built for matching. That JSON is dropped before the next note.
+    selected text matched. That text is dropped before the next note. Retired memory
+    items are skipped after the note is validated. Column names are not query terms.
     A chunked payload cannot exceed the loader's MAX_OVERFLOW_BYTES (64 MiB). The result
     itself is at most the clamped line count (1..8, default 4) and character cap
     (80..4000, default 900). That cap is the length of the newline-joined lines: a
@@ -1417,7 +1529,10 @@ def _canonical_recall(config, state, text, limit=4, max_chars=900):
             for obj in brain.iter_canonical_records(store=name):
                 if full:
                     continue
-                line = _archive_line(obj, words)
+                text = _recall_view(obj)
+                if not text:
+                    continue
+                line = _archive_line(obj, words, text)
                 if line is None:
                     continue
                 # Cap is the joined lines. A separator counts only between them.

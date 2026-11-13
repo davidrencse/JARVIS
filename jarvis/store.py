@@ -24,9 +24,41 @@ PRUNE_EVERY = 86400   # seconds between prunes, per ledger
 MAX_LANES = 4  # more than this thrashes the subscription without finishing sooner
 
 
+def private_database(path):
+    """Keep a ledger's state folder 0700 and its database (plus -wal/-shm/-journal) 0600.
+
+    The files hold command arguments, memory bodies and note text, so they must not
+    follow the process umask. Created with the private mode before SQLite opens them;
+    an existing install is tightened on open, only when this account owns it.
+    POSIX modes don't exist on Windows, where the profile's ACL applies: skipped.
+    """
+    if os.name == "nt" or str(path).startswith(":") or str(path).startswith("file:"):
+        return
+    path = os.fspath(path)
+    uid = os.getuid()
+    folder = os.path.dirname(os.path.abspath(path))
+    try:
+        info = os.stat(folder)
+        if info.st_uid == uid and info.st_mode & 0o077:
+            os.chmod(folder, 0o700)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            if os.fstat(fd).st_uid == uid:
+                os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        for suffix in ("-wal", "-shm", "-journal"):
+            side = path + suffix
+            if os.path.isfile(side) and not os.path.islink(side) and os.stat(side).st_uid == uid:
+                os.chmod(side, 0o600)
+    except OSError:
+        pass  # a read-only or foreign folder: SQLite reports the real problem on connect
+
+
 @contextmanager
 def connect_database(path):
     """Open a row-based ledger transaction and always close its connection."""
+    private_database(path)
     db = sqlite3.connect(path, timeout=10)
     db.row_factory = sqlite3.Row
     try:
@@ -110,6 +142,7 @@ class Store:
     def add(self, spec):
         task_id = uuid.uuid4().hex
         with self.connect() as db:
+            archive_queue.enter(db)
             db.execute("INSERT INTO tasks VALUES(?,?,?,?,?)",
                        (task_id, json.dumps(spec), "queued", now(), now()))
             db.execute("INSERT INTO events(task_id,at,kind,detail) VALUES(?,?,?,?)",
@@ -153,6 +186,7 @@ class Store:
             detail = {**(detail or {}), "pid": os.getpid()}
         for attempt in (1, 2):
             with self.connect() as db:
+                archive_queue.enter(db)
                 if state == "running":
                     # One statement: the lane count is evaluated under the write lock, so
                     # two processes can never be handed the same free lane.
@@ -189,6 +223,7 @@ class Store:
         from .daemon import _alive
         reaped = []
         with self.connect() as db:
+            archive_queue.enter(db)
             for row in db.execute("SELECT id, updated_at FROM tasks WHERE state='running'"
                                   ).fetchall():
                 event = db.execute("SELECT detail FROM events WHERE task_id=? AND kind='running' "

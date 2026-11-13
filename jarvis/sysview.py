@@ -8,12 +8,16 @@ Three parts, all read-only:
 - stores: where JARVIS keeps what it knows, and how much is there.
 """
 
+import ast
 import importlib.util
 import json
-from .platforms import on_windows
+import os
 import shutil
 import sys
+import threading
 from pathlib import Path
+
+from .platforms import on_windows
 
 STATIONS = [
     {"id": "hear", "title": "Hear", "verb": "listens",
@@ -49,12 +53,19 @@ STATIONS = [
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay, the phone app.",
-     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "deploy", "release", "node", "platforms", "autostart", "settings", "rest"]},
+     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "cluster_recovery", "cluster_discovery", "linkfinder", "deploy", "release", "node", "platforms", "autostart", "settings", "rest"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",
      "modules": ["devices", "lanmouse_peer_ips", "inventory", "hostmeter", "probe", "desktop", "selftest", "credits",
-                 "cluster", "topology", "locate"]},
+                 "cluster", "topology", "locate",
+                 "fleet", "fleet.legacy_topology", "fleet.readiness",
+                 "continuity", "continuity.authority", "continuity.brain_channel", "continuity.cli",
+                 "continuity.clock", "continuity.console", "continuity.executor", "continuity.gateway",
+                 "continuity.hub_control", "continuity.ingress", "continuity.integration",
+                 "continuity.lifecycle", "continuity.participant", "continuity.recovery",
+                 "continuity.renewal", "continuity.repoint", "continuity.return_brain",
+                 "continuity.runtime"]},
 ]
 # Which station a request's tier lights up, in order.
 PATHS = {
@@ -65,9 +76,129 @@ PATHS = {
 }
 
 
+def _module_name(path, package):
+    """Import path relative to the jarvis package. None for the top-level ``__init__``."""
+    parts = Path(path).relative_to(package).with_suffix("").parts
+    if parts == ("__init__",):
+        return None
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _import_targets(tree, package_parts):
+    """Jarvis-relative names this file imports, including imports inside functions."""
+    found = []
+    if tree is None:
+        return found
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "jarvis" or alias.name.startswith("jarvis."):
+                    tail = alias.name.split(".", 1)[1] if "." in alias.name else ""
+                    if tail:
+                        found.append(tail)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            keep = len(package_parts) - (node.level - 1)
+            if keep < 0:
+                continue
+            base = package_parts[:keep]
+            if node.module:
+                found.append(".".join((*base, node.module)))
+            else:
+                found.extend(".".join((*base, alias.name)) for alias in node.names)
+            continue
+        module = node.module or ""
+        if module == "jarvis":
+            found.extend(alias.name for alias in node.names)
+        elif module.startswith("jarvis."):
+            tail = module.split(".", 1)[1]
+            found.append(tail)
+            found.extend(f"{tail}.{alias.name}" for alias in node.names)
+    return found
+
+
+# str(path) -> ((mtime_ns, size), node, import targets). The tree is not kept.
+_NESTED = {}
+_NESTED_LOCK = threading.Lock()
+
+
+def _read_nested(path, package_parts):
+    text = path.read_text(encoding="utf-8")
+    doc, defs, tree = "", [], None
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        lines = (ast.get_docstring(tree) or "").strip().splitlines()
+        doc = lines[0] if lines else ""
+        defs = [n.name for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and not n.name.startswith("_")][:12]
+    node = {"loc": text.count("\n") + 1, "doc": doc, "defs": defs}
+    return node, _import_targets(tree, package_parts)
+
+
+def _publish_nested(node, targets):
+    """design() keeps the node and puts defs on the response, so each call gets its own lists."""
+    return {"loc": node["loc"], "doc": node["doc"], "defs": list(node["defs"])}, list(targets)
+
+
+def _forget_nested(package, live):
+    """Drop cache entries under package that this scan did not see (deleted files)."""
+    prefix = f"{package}{os.sep}"
+    with _NESTED_LOCK:
+        for key in [k for k in _NESTED if k.startswith(prefix) and k not in live]:
+            del _NESTED[key]
+
+
+def _nested_modules(package):
+    """Subpackage modules. ``system_graph`` globs only ``jarvis/*.py``, so continuity/ and fleet/ never appear there.
+
+    A package ``__init__.py`` is named after the package (``continuity``), the same way a
+    module is named after its file. A file is parsed again only when its mtime or size changes.
+    """
+    nodes, imports = {}, {}
+    package = Path(package)
+    if not package.is_dir():
+        _forget_nested(package, set())
+        return nodes, imports
+    live = set()
+    for path in sorted(package.rglob("*.py")):
+        rel = path.relative_to(package)
+        if len(rel.parts) == 1:
+            continue
+        name = _module_name(path, package)
+        if not name:
+            continue
+        key = str(path)
+        live.add(key)
+        qual = tuple(name.split("."))
+        parts = qual if rel.name == "__init__.py" else qual[:-1]
+        st = path.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+        with _NESTED_LOCK:
+            hit = _NESTED.get(key)
+        if hit is not None and hit[0] == stamp:
+            node, targets = hit[1], hit[2]
+        else:
+            node, targets = _read_nested(path, parts)
+            with _NESTED_LOCK:
+                _NESTED[key] = (stamp, node, targets)
+        nodes[name], imports[name] = _publish_nested(node, targets)
+    _forget_nested(package, live)
+    return nodes, imports
+
+
 def design(console):
     graph = console.system_graph()
     mods = {n["id"][4:]: n for n in graph["nodes"] if n["kind"] == "module"}
+    nested, nested_imports = _nested_modules(Path(console.base) / "jarvis")
+    for name, node in nested.items():
+        mods.setdefault(name, node)
     home = {m: s["id"] for s in STATIONS + SIDE for m in s["modules"]}
     imports, used_by = {}, {}
     for e in graph["edges"]:
@@ -75,6 +206,19 @@ def design(console):
             a, b = e["src"][4:], e["dst"][4:]
             imports.setdefault(a, []).append(b)
             used_by.setdefault(b, []).append(a)
+    known = set(mods)
+    for src, targets in nested_imports.items():
+        if src not in known:
+            continue
+        for dst in targets:
+            if dst not in known or dst == src:
+                continue
+            bucket = imports.setdefault(src, [])
+            if dst not in bucket:
+                bucket.append(dst)
+            back = used_by.setdefault(dst, [])
+            if src not in back:
+                back.append(src)
     modules = [{"name": name, "station": home.get(name, "other"), "lines": n.get("loc", 0),
                 "doc": n.get("doc", ""), "public": n.get("defs", []),
                 "imports": sorted(imports.get(name, [])), "used_by": sorted(used_by.get(name, []))}

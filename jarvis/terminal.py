@@ -448,6 +448,173 @@ def _sockets(top, depth=4):
     return sorted(found)
 
 
+# seccomp filter for bwrap (audit 2026-11-13). Classic BPF built by hand, so there is no libseccomp
+# dependency. Denied with EPERM: mount, umount2, pivot_root, chroot, unshare, setns and the new
+# mount API (open_tree, move_mount, fsopen, fsconfig, fsmount, fspick, mount_setattr), plus clone
+# with any CLONE_NEW* flag (a nested user+mount namespace). clone3 reads its flags from memory a
+# filter can't see, so it gets ENOSYS and libc falls back to clone. Other architectures,
+# including 32-bit and x32 calls, are refused outright.
+_SECCOMP_ARCHES = {  # machine: (AUDIT_ARCH, {name: syscall number}, x32-style bit or 0)
+    "x86_64": (0xC000003E, {"mount": 165, "umount2": 166, "pivot_root": 155, "chroot": 161, "unshare": 272,
+                            "setns": 308, "open_tree": 428, "move_mount": 429, "fsopen": 430,
+                            "fsconfig": 431, "fsmount": 432, "fspick": 433, "mount_setattr": 442},
+               {"clone": 56, "clone3": 435}, 0x40000000),
+    "aarch64": (0xC00000B7, {"mount": 40, "umount2": 39, "pivot_root": 41, "chroot": 51, "unshare": 97,
+                             "setns": 268, "open_tree": 428, "move_mount": 429, "fsopen": 430,
+                             "fsconfig": 431, "fsmount": 432, "fspick": 433, "mount_setattr": 442},
+                {"clone": 220, "clone3": 435}, 0),
+}
+_CLONE_NEW = 0x00020000 | 0x02000000 | 0x04000000 | 0x08000000 | 0x10000000 | 0x20000000 | 0x40000000 | 0x80
+_RET_ALLOW, _RET_EPERM, _RET_ENOSYS = 0x7FFF0000, 0x00050000 | 1, 0x00050000 | 38
+
+
+def seccomp_program(machine=None):
+    """The BPF program (bytes, sock_filter structs) bwrap loads with --seccomp. Raises OSError
+    on an architecture it has no syscall table for: never run without the filter."""
+    import platform
+    import struct
+    machine = machine or platform.machine()
+    if machine == "arm64":
+        machine = "aarch64"
+    if machine not in _SECCOMP_ARCHES:
+        raise OSError(f"The terminal sandbox has no seccomp filter for {machine!r}; refusing to run unfiltered.")
+    arch, denied, special, x32 = _SECCOMP_ARCHES[machine]
+    LD, JEQ, JGE, JSET, RET = 0x20, 0x15, 0x35, 0x45, 0x06  # BPF_LD|W|ABS, JMP|K variants, RET|K
+    # Layout: arch check, [x32 check], syscall numbers, clone flags check, then the verdicts.
+    steps = [("ld", 4)]                                        # seccomp_data.arch
+    steps += [("jeq", arch, None, "eperm"), ("ld", 0)]           # a foreign ABI fails; then .nr
+    if x32:
+        steps += [("jge", x32, "eperm", None)]
+    steps += [("jeq", nr, "eperm", None) for nr in denied.values()]
+    steps += [("jeq", special["clone3"], "enosys", None), ("jeq", special["clone"], "clonecheck", None),
+              ("ret", _RET_ALLOW), ("label", "clonecheck"), ("ld", 16),  # args[0] low word = clone flags
+              ("jset", _CLONE_NEW, "eperm", None), ("ret", _RET_ALLOW),
+              ("label", "eperm"), ("ret", _RET_EPERM), ("label", "enosys"), ("ret", _RET_ENOSYS)]
+    index, position = {}, 0
+    for step in steps:
+        if step[0] == "label":
+            index[step[1]] = position
+        else:
+            position += 1
+    out, position = [], 0
+    for step in steps:
+        if step[0] == "label":
+            continue
+        position += 1
+        kind = step[0]
+        if kind == "ld":
+            out.append(struct.pack("HBBI", LD, 0, 0, step[1]))
+        elif kind == "ret":
+            out.append(struct.pack("HBBI", RET, 0, 0, step[1]))
+        else:
+            _, value, true_to, false_to = step
+            jump = lambda label: 0 if label is None else index[label] - position
+            code = {"jeq": JEQ, "jge": JGE, "jset": JSET}[kind]
+            out.append(struct.pack("HBBI", code, jump(true_to), jump(false_to), value))
+    return b"".join(out)
+
+
+def _sandbox_stdin(argv):
+    """(stdin, close) for a sandboxed command. bwrap's `--seccomp 0` reads the filter from stdin,
+    so that stdin is a pipe holding the program (the command then sees end-of-file, like
+    /dev/null). Anything else keeps /dev/null. Raises OSError when the filter can't be built."""
+    for i, arg in enumerate(argv[:-1]):
+        if arg == "--seccomp" and argv[i + 1] == "0":
+            blob = seccomp_program()
+            read, write = os.pipe()
+            try:
+                os.write(write, blob)  # a few hundred bytes: far below the pipe buffer
+            except OSError:
+                os.close(read)
+                raise
+            finally:
+                os.close(write)
+            return read, lambda: os.close(read)
+    return subprocess.DEVNULL, lambda: None
+
+
+# Hooks and config of every git repo inside a writable folder run at David's next git command
+# outside the sandbox (core.hooksPath, filter and alias entries run code too), so they stay
+# read-only. Found by a bounded walk that never follows symlinks and skips build/dependency
+# trees; each folder is walked again for every command, so the budget keeps that quick.
+_GIT_SKIP = {"node_modules", ".venv", "venv", "__pycache__", "target", ".cache", "site-packages",
+             ".tox", "dist", "build", ".next", ".gradle", ".m2", ".npm", ".cargo", ".mypy_cache"}
+GIT_DEPTH = 6        # folders below a writable root searched for .git
+GIT_BUDGET = 20000   # folders scanned per writable root before giving up on the rest
+
+
+def _gitdir_guards(gitdir, inside, guards, _seen=None):
+    """Add the read-only targets of one git dir: hooks/, config, config.worktree, the shared
+    dir of a linked worktree (commondir) and the same for each submodule under modules/."""
+    gitdir = Path(gitdir)
+    seen = _seen if _seen is not None else set()
+    if gitdir in seen or not inside(gitdir):
+        return
+    seen.add(gitdir)
+    for name in ("hooks", "config", "config.worktree"):
+        target = gitdir / name
+        if not target.is_symlink() and target.exists():
+            guards.add(str(target))
+    try:  # a linked worktree: its hooks and config live in the main repo's git dir
+        common = (gitdir / "commondir").read_text().strip()
+        if common and len(common) < 4096:
+            _gitdir_guards(os.path.realpath(gitdir / common), inside, guards, seen)
+    except OSError:
+        pass
+    modules = gitdir / "modules"
+    if modules.is_dir() and not modules.is_symlink():
+        stack = [(modules, 0)]
+        while stack:
+            here, level = stack.pop()
+            try:
+                entries = list(os.scandir(here))
+            except OSError:
+                continue
+            if (here / "HEAD").is_file():  # a submodule's git dir (nested ones sit inside modules/)
+                _gitdir_guards(here, inside, guards, seen)
+            for entry in entries:
+                try:
+                    if level < 4 and entry.is_dir(follow_symlinks=False) and entry.name not in ("objects", "refs"):
+                        stack.append((Path(entry.path), level + 1))
+                except OSError:
+                    pass
+
+
+def _git_guards(roots, depth=GIT_DEPTH, budget=GIT_BUDGET):
+    """Sorted hooks/config paths of every git repo found under `roots` (writable folders)."""
+    roots = [Path(r) for r in roots]
+    real = [str(Path(os.path.realpath(r))) for r in roots]
+    def inside(path):
+        path = os.path.realpath(path)
+        return any(path == r or path.startswith(r.rstrip("/") + "/") for r in real)
+    guards = set()
+    for root in roots:
+        stack, scanned = [(root, 0)], 0
+        while stack and scanned < budget:
+            here, level = stack.pop()
+            scanned += 1
+            try:
+                entries = list(os.scandir(here))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.name == ".git":
+                        if entry.is_dir(follow_symlinks=False):
+                            _gitdir_guards(entry.path, inside, guards)
+                        elif entry.is_file(follow_symlinks=False):  # worktree or submodule: "gitdir: <path>"
+                            line = Path(entry.path).read_text(errors="replace")[:4096].splitlines()[0]
+                            if line.startswith("gitdir:"):
+                                target = Path(line[7:].strip())
+                                target = target if target.is_absolute() else Path(here) / target
+                                _gitdir_guards(os.path.realpath(target), inside, guards)
+                    elif level + 1 < depth and entry.name not in _GIT_SKIP and entry.is_dir(follow_symlinks=False):
+                        stack.append((Path(entry.path), level + 1))
+                except (OSError, IndexError):
+                    pass
+    return sorted(guards)
+
+
 def sandbox(folder=None, repo=None, config=None):
     """The bwrap prefix for a terminal command on Linux, or [] where it can't run (Windows,
     macOS, no bwrap, or terminal.sandbox: false in jarvis.config.json)."""
@@ -463,16 +630,21 @@ def sandbox(folder=None, repo=None, config=None):
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
     # Order matters: a later mount covers an earlier one. Read-only root, then the writable
     # folders, then read-only again inside them, then the hidden things on top of everything.
+    # --cap-drop ALL + --seccomp 0 (audit 2026-11-13): under pasta the command is root with every
+    # capability inside a user namespace, so `umount ~/.ssh` lifted the tmpfs that hides it and
+    # exposed the real folder. No capabilities, and mount/umount/pivot_root/unshare/setns/clone
+    # with namespace flags/the new mount API fail with EPERM. The filter is read from stdin (pasta
+    # closes every other fd), which _run_shell feeds; without a filter the sandbox won't start.
     args = ["bwrap", "--ro-bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
-            "--unshare-pid", "--new-session", "--die-with-parent"]
+            "--unshare-pid", "--new-session", "--die-with-parent", "--cap-drop", "ALL", "--seccomp", "0"]
+    writable = []
     for path in WRITABLE:
         if expand(path).is_dir() and not expand(path).is_symlink():
             args += ["--bind", str(expand(path)), str(expand(path))]
+            writable.append(expand(path))
     vault = (config.get("vault") or {}).get("path")
     vaults = list(vault.values()) if isinstance(vault, dict) else [vault]
-    projects = expand("~/projects")
-    hooks = [p for child in (sorted(projects.iterdir()) if projects.is_dir() else []) if child != repo
-             for p in (child / ".git" / "hooks", child / ".git" / "config")]  # run at David's next git command
+    hooks = [p for p in _git_guards(writable) if p != str(repo) and not p.startswith(str(repo) + "/")]
     for path in (repo, repo / "jarvis", repo / ".git", repo / ".venv",  # repo root covers all; subpaths for older checks
                  *[expand(v) for v in vaults if v], *[expand(p) for p in PROTECT], *hooks):
         if Path(path).exists():
@@ -484,9 +656,10 @@ def sandbox(folder=None, repo=None, config=None):
     for path in (*HIDDEN_FILES, *secrets):
         if expand(path).is_file():
             args += ["--ro-bind", "/dev/null", str(expand(path))]
-    devices = [*sorted(Path("/dev").glob("hidraw*")), Path("/dev/uinput"), *sorted(Path("/dev").glob("video*"))]
+    devices = [*sorted(Path("/dev").glob("hidraw*")), Path("/dev/uinput"), *sorted(Path("/dev").glob("video*")),
+               *sorted(Path("/dev/snd").glob("pcmC*D*c"))]  # ALSA capture nodes are 0660 audio: the mic
     for raw in devices:
-        if raw.exists():  # raw keyboard/mouse devices, synthetic input, cameras
+        if raw.exists():  # raw keyboard/mouse devices, synthetic input, cameras, microphones
             args += ["--ro-bind", "/dev/null", str(raw)]
     for top in SOCKET_DIRS:
         for sock in _sockets(top):
@@ -605,9 +778,13 @@ def _run_shell(argv, folder):
     import threading
     extra = ({"creationflags": NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if on_windows()
              else {"start_new_session": True})
-    proc = subprocess.Popen(argv, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace",
-                            stdin=subprocess.DEVNULL, **extra)
+    stdin, release = _sandbox_stdin(argv)
+    try:
+        proc = subprocess.Popen(argv, cwd=folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                stdin=stdin, **extra)
+    finally:
+        release()
     total, out, err = [0, False, threading.Lock()], [], []
     readers = [threading.Thread(target=_drain, args=(pipe, keep, total, proc), daemon=True)
                for pipe, keep in ((proc.stdout, out), (proc.stderr, err))]
