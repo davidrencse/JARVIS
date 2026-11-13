@@ -9,6 +9,19 @@ from . import authority
 def add_arguments(parser):
     sub = parser.add_subparsers(dest="continuity_action", required=True)
     sub.add_parser("status")
+    recover = sub.add_parser("recover", aliases=["lease"])
+    recover.add_argument("--hub-config", required=True, help="local JARVIS config (read only)")
+    recover.add_argument("--state", dest="recovery_state", required=True, help="local running hub state directory")
+    recover.add_argument("--request-id", required=True, help="stable manual recovery request id")
+    prepare = sub.add_parser("return-prepare", help="offline, explicit hash-bound archive of a frozen former MAIN")
+    prepare.add_argument("--hub-config", required=True)
+    prepare.add_argument("--state", dest="recovery_state", required=True)
+    prepare.add_argument("--bundle", required=True)
+    prepare.add_argument("--incoming-memory-sha256", required=True)
+    prepare.add_argument("--current-memory-sha256", required=True)
+    prepare.add_argument("--freeze-sha256", required=True)
+    refreeze = sub.add_parser("return-refreeze", help="preserve incoming memory and restore freeze after a failed return")
+    refreeze.add_argument("--state", dest="recovery_state", required=True)
     en = sub.add_parser("enroll"); en.add_argument("device")
     ack = sub.add_parser("ack")
     ack.add_argument("--next-version", action="store_true",
@@ -42,6 +55,24 @@ def run(args, client_factory=build_client, output=print, confirm=input):
         if action != "status" and not args.yes and confirm("Proceed? [y/N] ").strip().lower() != "y":
             return 1
         if action == "status": result = client.status()
+        elif action == "return-prepare":
+            from .return_brain import prepare
+            hub_config = json.loads(Path(args.hub_config).read_text(encoding="utf-8"))
+            result = prepare(hub_config, args.recovery_state, client, args.bundle,
+                incoming_sha256=args.incoming_memory_sha256, current_sha256=args.current_memory_sha256,
+                freeze_sha256=args.freeze_sha256, confirmed=True)
+        elif action == "return-refreeze":
+            from .return_brain import refreeze
+            from types import SimpleNamespace
+            result = refreeze(SimpleNamespace(client=client, state=args.recovery_state))
+        elif action in ("recover", "lease"):
+            from .hub_control import request_recover
+            hub_config = json.loads(Path(args.hub_config).read_text(encoding="utf-8"))
+            from jarvis.topology import identity
+            device = identity(hub_config)[0]
+            if cfg.get("device_id") != device:
+                raise ValueError("operator config does not belong to the local PC")
+            result = request_recover(hub_config, args.recovery_state, device, args.request_id)
         elif action == "ack":
             status = client.status()
             next_version = getattr(args, "next_version", False)
@@ -66,6 +97,7 @@ def run(args, client_factory=build_client, output=print, confirm=input):
                 result = client.disable_participant(args.device, installation)
             else:
                 output(json.dumps({"error": "not available yet"})); return 2
-        output(json.dumps(result, indent=2, ensure_ascii=False)); return 0
+        output(json.dumps(result, indent=2, ensure_ascii=False))
+        return 1 if action in ("recover", "lease") and result.get("ok") is not True else 0
     except Exception as exc:
         output(json.dumps({"error": str(exc)})); return 1

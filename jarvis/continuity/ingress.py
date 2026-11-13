@@ -94,6 +94,7 @@ CODE_LEN = 8
 CODE_TTL = 300
 APPROVED_GRACE = 60
 BAD_CODES, BAD_WINDOW = 5, 600
+GLOBAL_BAD = 50  # wrong codes from every source in that same window
 MAX_BODY = 256 * 1024
 ASK_MAX = 2000
 NAME_MAX = 40
@@ -457,6 +458,13 @@ def _origin_of(value):
 def _header(headers, name):
     if headers is None:
         return ""
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        raw = list(get_all(name) or [])
+        if len(raw) > 1:
+            return ""  # a second value must not hide behind Message.get's first
+        if len(raw) == 1:
+            return str(raw[0] or "").strip()
     getter = getattr(headers, "get", None)
     if getter is None:
         return ""
@@ -1173,6 +1181,7 @@ class MobileIngress:
         self._principals = set()
         self._lock = threading.RLock()
         self._hits = {}
+        self._global_hits = []
         self._writer = _writer_lock(str(self.path) + ".writer")
         try:
             self._db = sqlite3.connect(str(self.path), isolation_level=None, check_same_thread=False)
@@ -1505,6 +1514,7 @@ class MobileIngress:
         if outcome == "bad":
             for key in keys:
                 self._hit(key)
+            self._hit_global()  # once per attempt, not once per source key
             raise IngressError("forbidden", 403, "That code is wrong or has expired. Make a new one on your PC.")
         if outcome == "unclaimed":
             raise IngressError("bad_request", 400, "Send the code first.")
@@ -1601,6 +1611,9 @@ class MobileIngress:
     def _blocked_key(self, key):
         now = self._clock()
         with self._lock:
+            self._global_hits = [t for t in self._global_hits if now - t < BAD_WINDOW]
+            if len(self._global_hits) >= GLOBAL_BAD:
+                return True
             hits = [t for t in self._hits.get(key, ()) if now - t < BAD_WINDOW]
             if hits:
                 self._hits[key] = hits
@@ -1610,10 +1623,23 @@ class MobileIngress:
 
     def _hit(self, key):
         with self._lock:
+            now = self._clock()
             if len(self._hits) > 1024:
-                self._hits.clear()
-            self._hits[key] = [t for t in self._hits.get(key, ()) if self._clock() - t < BAD_WINDOW]
-            self._hits[key].append(self._clock())
+                kept = {}
+                for name, stamps in self._hits.items():
+                    fresh = [t for t in stamps if now - t < BAD_WINDOW]
+                    if len(fresh) >= BAD_CODES:
+                        kept[name] = fresh
+                self._hits = kept  # locked sources stay; the global count is not cleared
+            fresh = [t for t in self._hits.get(key, ()) if now - t < BAD_WINDOW]
+            fresh.append(now)
+            self._hits[key] = fresh
+
+    def _hit_global(self):
+        with self._lock:
+            now = self._clock()
+            self._global_hits = [t for t in self._global_hits if now - t < BAD_WINDOW]
+            self._global_hits.append(now)
 
     # --- reads and effects -------------------------------------------------------------
 

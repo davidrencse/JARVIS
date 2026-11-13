@@ -66,7 +66,8 @@ from jarvis.continuity.authority import (
 DEVICE_NS = "jarvis-continuity-device-v1"
 OWNER_NS = "jarvis-continuity-owner-v1"
 TICKET_NS = "jarvis-continuity-ticket-v1"
-_NAMESPACES = (DEVICE_NS, OWNER_NS, TICKET_NS)
+RUNTIME_NS = "jarvis-continuity-runtime-v1"
+_NAMESPACES = (DEVICE_NS, OWNER_NS, TICKET_NS, RUNTIME_NS)
 
 MAX_BODY = 8192
 MAX_RESPONSE = 8192
@@ -399,6 +400,48 @@ def _opener():
         urllib.request.ProxyHandler({}),
         _no_redirect(urllib.request.HTTPRedirectHandler),
     )
+
+
+def _loopback_ip(value):
+    """True for 127.0.0.1, ::1, and an IPv4-mapped loopback. Not a name."""
+    text = str(value or "").strip()
+    if text.startswith("[") and "]" in text:
+        text = text[1:text.index("]")]
+    text = text.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_loopback)
+
+
+def _split_host(value):
+    """(hostname, port or None) from one Host header. Bare IPv6 without brackets is refused."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return None, None
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 1:
+            return None, None
+        name = text[1:end]
+        rest = text[end + 1:]
+        if rest == "":
+            return name, None
+        if rest.startswith(":") and rest[1:].isdigit():
+            return name, int(rest[1:])
+        return None, None
+    if text.count(":") > 1:
+        return None, None
+    if ":" in text:
+        name, _, port = text.partition(":")
+        if not port.isdigit():
+            return None, None
+        return name.rstrip("."), int(port)
+    return text.rstrip("."), None
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1286,12 +1329,91 @@ class ContinuityGateway:
 
     # --- HTTP --------------------------------------------------------------------------
 
+    def _bound_endpoint(self):
+        httpd = self._httpd
+        if httpd is None:
+            return None
+        host, port = httpd.server_address[:2]
+        return str(host), int(port)
+
+    def _one_header(self, handler, name):
+        """One header value, or None when it is missing or repeated."""
+        headers = handler.headers
+        get_all = getattr(headers, "get_all", None)
+        if get_all is None:
+            found = headers.get(name) if hasattr(headers, "get") else None
+            return None if found is None else str(found).strip()
+        values = [str(value).strip() for value in (get_all(name) or [])]
+        if len(values) != 1:
+            return None
+        return values[0]
+
+    def _peer_ok(self, handler):
+        """A loopback bind accepts only a loopback TCP peer. Tailscale headers are not read."""
+        bound = self._bound_endpoint()
+        if bound is None or not _loopback_ip(bound[0]):
+            return bound is not None
+        addr = getattr(handler, "client_address", None)
+        peer = addr[0] if isinstance(addr, tuple) and addr else addr
+        return _loopback_ip(peer)
+
+    def _host_ok(self, handler):
+        """Host is the bound address, with or without :port. A loopback bind also allows
+        127.0.0.1, localhost, and ::1, so a raw `Host: 127.0.0.1` (no port) still reaches
+        the body-size check. A second Host header is refused."""
+        bound = self._bound_endpoint()
+        raw = self._one_header(handler, "Host")
+        if bound is None or not raw:
+            return False
+        host, port = bound
+        name, got = _split_host(raw)
+        if name is None:
+            return False
+        bound_name = host.lower().strip("[]")
+        if _loopback_ip(host):
+            if name in {bound_name, "127.0.0.1", "localhost", "::1"}:
+                return got in (None, port)
+            # tailscale serve keeps the caller's Host; the TCP peer is still loopback (tailscaled)
+            return (got in (None, 443) and name.endswith(".ts.net")
+                    and re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*", name))
+        return name == bound_name and got in (None, port)
+
+    def _origin_ok(self, handler):
+        """A missing Origin is allowed. A present Origin must be this listener, once."""
+        headers = handler.headers
+        get_all = getattr(headers, "get_all", None)
+        if get_all is None:
+            found = headers.get("Origin") if hasattr(headers, "get") else None
+            values = [] if not found else [str(found).strip()]
+        else:
+            values = [str(value).strip() for value in (get_all("Origin") or []) if str(value or "").strip()]
+        if not values:
+            return True
+        if len(values) != 1:
+            return False
+        bound = self._bound_endpoint()
+        if bound is None:
+            return False
+        host, port = bound
+        origin = values[0]
+        if origin.casefold() == "null" or origin.endswith("/"):
+            return False
+        scheme = "https" if self._tls else "http"
+        names = ["127.0.0.1", "localhost", "::1"] if _loopback_ip(host) else [host]
+        allowed = set()
+        for name in names:
+            shown = f"[{name}]" if ":" in name else name
+            allowed.add(f"{scheme}://{shown}:{port}")
+        return origin in allowed
+
     def _http(self, handler):
         if self._closing or self._closed:
             self._reply(handler, 503, {"error": "unavailable"}, None, "unavailable")
             return
         code, status, wait, device_id, operation_id = "unavailable", 503, None, None, None
         try:
+            if not self._peer_ok(handler) or not self._host_ok(handler) or not self._origin_ok(handler):
+                raise GatewayError("forbidden")
             if "?" in handler.path or handler.path != handler.path.split("?")[0]:
                 raise GatewayError("bad_request")
             parsed = self._read_json(handler)
@@ -1403,6 +1525,12 @@ class ContinuityGateway:
             handler.send_header("Content-Type", "application/json")
             handler.send_header("Content-Length", str(len(raw)))
             handler.send_header("Cache-Control", "no-store")
+            handler.send_header("X-Content-Type-Options", "nosniff")
+            handler.send_header("Referrer-Policy", "no-referrer")
+            handler.send_header("X-Frame-Options", "DENY")
+            handler.send_header("Content-Security-Policy",
+                                "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+            handler.send_header("Cross-Origin-Resource-Policy", "same-origin")
             handler.send_header("Connection", "close")
             if wait is not None:
                 handler.send_header("Retry-After", str(max(0, math.ceil(wait))))

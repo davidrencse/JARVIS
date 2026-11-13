@@ -1,0 +1,172 @@
+"""Brain bundles over owner-only cluster transfer path operations (no shell/SSH).
+
+The explicit per-peer brain_transfer_dir has no default. It must already exist
+inside that peer's storage roots and outside every Git checkout. Ordinary transfer
+admission still applies; this module does not bypass a drained runtime's fence.
+"""
+import base64
+import hashlib
+import io
+import re
+import uuid
+from pathlib import Path
+
+ACTIONS = frozenset({'brain_receive', 'brain_export', 'brain_freeze', 'brain_stage'})
+
+
+def validate(payload):
+    action = payload.get('action')
+    required = ({'action', 'path'} if action == 'brain_stage' else
+                {'action', 'path', 'sha256'} if action == 'brain_receive' else
+                {'action', 'path', 'request'} if action == 'brain_export' else
+                {'action', 'request'})
+    if action not in ACTIONS or set(payload) != required:
+        raise ValueError('Invalid brain transfer operation.')
+    if 'path' in payload and (not isinstance(payload['path'], str) or
+            not 0 < len(payload['path']) <= 4096 or '\x00' in payload['path']):
+        raise ValueError('Invalid brain transfer path.')
+    if 'sha256' in payload and not (isinstance(payload['sha256'], str) and
+            re.fullmatch('[a-f0-9]{64}', payload['sha256'])):
+        raise ValueError('Invalid brain transfer digest.')
+    if 'request' in payload and not (isinstance(payload['request'], str) and
+                                     len(payload['request'].encode('utf-8')) <= 4096):
+        raise ValueError('Invalid brain transfer request.')
+
+
+def _outside_git(path):
+    if any((parent / '.git').exists() for parent in (path, *path.parents)):
+        raise ValueError('Brain staging must be outside Git checkouts.')
+
+
+def run_here(payload, state, config):
+    from jarvis import brainsync, transfer
+    validate(payload)
+    base = Path(state).resolve().parent
+    if payload['action'] == 'brain_freeze':
+        return brainsync.freeze(config, base, payload['request'].encode('utf-8'))
+    where = transfer._within(config, payload['path'])
+    path = Path(where['path'])
+    _outside_git(path)
+    if payload['action'] == 'brain_receive':
+        if where['dir'] or path.stat().st_size > brainsync.MAX_BUNDLE_BYTES:
+            raise ValueError('Invalid brain bundle.')
+        blob = path.read_bytes()
+        if hashlib.sha256(blob).hexdigest() != payload['sha256']:
+            raise ValueError('Brain bundle digest mismatch.')
+        from .return_brain import receive
+        result = receive(config, state, blob)
+        if result.get('ok') is True:
+            path.unlink()
+        return result
+    if not where['dir']:
+        raise ValueError('Brain staging must be a directory.')
+    if payload['action'] == 'brain_stage':
+        return {'ok': True}
+    result = brainsync.export_result(config, base, payload['request'].encode('utf-8'))
+    if result.get('ok') is not True:
+        return result
+    blob = base64.b64decode(result['payload'], validate=False)
+    name = 'brain-' + uuid.uuid4().hex + '.bundle'
+    # Private staging file; never commit the memory snapshot to the vault repo.
+    brainsync._write_private(path / name, blob, 0o600)
+    return {'ok': True, 'name': name, 'size': len(blob),
+            'sha256': hashlib.sha256(blob).hexdigest()}
+
+
+class ClusterBundleTransport:
+    def __init__(self, config, base, *, call=None):
+        self.config, self.state = config, Path(base) / '.jarvis'
+        self._caller = call
+
+    def _folder(self, node):
+        value = self.config.get('devices', {}).get(node, {}).get('brain_transfer_dir')
+        if not isinstance(value, str) or not value or '\x00' in value:
+            raise ValueError('Peer brain_transfer_dir is required.')
+        return value
+
+    def _call(self, node, payload):
+        from jarvis.transfer import call
+        if self._caller is not None:
+            return self._caller(node, payload)
+        return call(self.config, self.state, node, payload, timeout=180)
+
+    def _attempt(self, callback):
+        try:
+            return callback()
+        except (ConnectionError, OSError, TimeoutError):
+            return {'ok': False, 'status': 'source_offline', 'error': 'source_offline'}
+        except (ValueError, RuntimeError, KeyError, TypeError):
+            return {'ok': False, 'status': 'transport_failed', 'error': 'transport_failed'}
+
+    def push(self, node, bundle):
+        return self._attempt(lambda: self._push(node, bundle))
+
+    def pull(self, node, request):
+        return self._attempt(lambda: self._pull(node, request))
+
+    def freeze(self, node, request):
+        return self._attempt(lambda: self._call(node, {
+            'action': 'brain_freeze', 'request': request.decode('utf-8')}))
+
+    def _push(self, node, bundle):
+        from jarvis.transfer import push
+        from jarvis import brainsync
+        if len(bundle) > brainsync.MAX_BUNDLE_BYTES:
+            raise ValueError('Brain bundle too large.')
+        folder = self._folder(node)
+        checked = self._call(node, {'action': 'brain_stage', 'path': folder})
+        if checked.get('ok') is not True:
+            raise ValueError('Peer refused brain staging.')
+        name = 'brain-' + uuid.uuid4().hex + '.bundle'
+        sent = push(self.config, self.state, node, io.BytesIO(bundle), len(bundle),
+                    name=name, dest='path', folder=folder,
+                    **({'call_fn': lambda cfg, state, peer, body: self._call(peer, body)}
+                       if self._caller is not None else {}))
+        # Join using the peer's path convention, independent of this host's OS.
+        import ntpath, posixpath
+        join = ntpath.join if '\\' in folder else posixpath.join
+        return self._call(node, {'action': 'brain_receive',
+            'path': join(folder, sent['sent']), 'sha256': hashlib.sha256(bundle).hexdigest()})
+
+    def _pull(self, node, request):
+        from jarvis import brainsync
+        folder = self._folder(node)
+        result = self._call(node, {'action': 'brain_export', 'path': folder,
+                                   'request': request.decode('utf-8')})
+        if result.get('ok') is not True:
+            return result
+        size = result.get('size')
+        if type(size) is not int or not 0 <= size <= brainsync.MAX_BUNDLE_BYTES:
+            raise ValueError('Invalid brain bundle size.')
+        blob = bytearray()
+        while len(blob) < size:
+            chunk = self._call(node, {'action': 'get', 'path': folder,
+                'rel': [result['name']], 'offset': len(blob)})
+            data = base64.b64decode(chunk['data'], validate=True)
+            if not data or len(blob) + len(data) > size or chunk['size'] != size:
+                raise ValueError('Brain bundle changed during transfer.')
+            blob.extend(data)
+        if hashlib.sha256(blob).hexdigest() != result['sha256']:
+            raise ValueError('Brain bundle digest mismatch.')
+        return {'ok': True, 'bundle': bytes(blob)}
+
+
+
+class TransitionBundleTransport(ClusterBundleTransport):
+    """All chunks and import/freeze actions require the same live transition.
+
+    remote(device) returns Participant RemoteRuntime for that installation. Its
+    _request reads the current tuple on every chunk; receiver validates it again.
+    The ordinary transfer channel and ExecutorGuard are never disabled.
+    """
+    def __init__(self, config, base, remote):
+        from jarvis.topology import identity
+        from .participant import transition_scope
+        from .runtime import RuntimeRefusal
+        status = remote(identity(config)[0]).port.status()
+        if ((status.get('transition') or {}).get('state') != 'GRANTED_NOT_READY' or
+                status.get('lease_valid') is not True or status.get('main_ready') is not False):
+            raise RuntimeRefusal('bad_state')
+        scope = transition_scope(status)
+        super().__init__(config, base, call=lambda node, body: remote(node)._request(
+            'brain', _scope=scope, operation=body))

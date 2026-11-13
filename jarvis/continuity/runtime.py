@@ -1357,7 +1357,9 @@ class SafeHandoff:
     """
 
     def __init__(self, port, *, source_runtime, candidate_runtime, readiness, repoint, canary,
-                 journal_path=None):
+                 journal_path=None, brain=None):
+        if brain is not None and not callable(brain):
+            raise RuntimeRefusal("bad_request")
         if any(not callable(getattr(port, name, None)) for name in _PORT_HANDOFF):
             raise RuntimeRefusal("bad_request")
         if candidate_runtime is None or not _ident_ok(getattr(candidate_runtime, "device_id", None)):
@@ -1376,6 +1378,7 @@ class SafeHandoff:
         self._readiness = readiness
         self._repoint = repoint
         self._canary = canary
+        self._brain = _brainsync_handoff if brain is None else brain
         self._journal_path = journal_path
         self._active_journal = None
 
@@ -1653,7 +1656,7 @@ class SafeHandoff:
         if not journal.bind(transition, snap["incarnation"], snap["epoch"]):
             return self._uncertain(transition, "reconcile")
         brain = self._callback(
-            transition, "brain", lambda _snap: _brainsync_handoff(old_main, new_main, config, base),
+            transition, "brain", lambda _snap: self._brain(old_main, new_main, config, base),
             lambda result: isinstance(result, dict) and result.get("ok") is True,
             lambda result: "missing_hook" if isinstance(result, dict) and result.get("error") == "missing_hook" else "brain")
         if brain is not None:
