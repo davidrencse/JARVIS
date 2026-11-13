@@ -323,8 +323,16 @@ class ConsoleHistoryTests(HistoryCase):
         # A dict literal with "/api/history" twice silently keeps the last one.
         import inspect
         from jarvis import ui
-        src = inspect.getsource(ui.Handler.do_GET)
-        self.assertEqual(src.count('"/api/history"'), 1, "duplicate route key")
+        # Parse the module, rather than using the loaded function's line offsets:
+        # the shared checkout may be edited after this test process imports it.
+        # AST keys also catch duplicates regardless of quoting or formatting.
+        import ast
+        tree = ast.parse(inspect.getsource(ui))
+        handler = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "Handler")
+        getter = next(node for node in handler.body if isinstance(node, ast.FunctionDef) and node.name == "do_GET")
+        keys = [key.value for node in ast.walk(getter) if isinstance(node, ast.Dict)
+                for key in node.keys if isinstance(key, ast.Constant) and isinstance(key.value, str)]
+        self.assertEqual(keys.count("/api/history"), 1, "duplicate route key")
 
 
 if __name__ == "__main__":
