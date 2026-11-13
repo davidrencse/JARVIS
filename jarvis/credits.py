@@ -13,6 +13,7 @@ Keys come from the environment first, then .jarvis/secrets.json. They are sent o
 to the provider they belong to. Nothing here estimates or invents a balance.
 """
 
+import io
 import json
 import math
 import os
@@ -91,6 +92,14 @@ def _get_json(url, headers):
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise RuntimeError(f"Couldn't reach {urllib.parse.urlparse(url).netloc}: "
                            f"{getattr(exc, 'reason', exc)}") from None
+
+
+_UNIT_JUNK = re.compile(r"[^A-Za-z0-9%$€£¥ ]")
+
+
+def _clean_unit(unit, default=""):
+    """A display unit is a short token; the console renders it, so drop markup-ish characters."""
+    return _UNIT_JUNK.sub("", str(unit if unit is not None else ""))[:12].strip() or default
 
 
 def _meter(label, used, limit, resets_at=None, unit=""):
@@ -216,7 +225,7 @@ class Credits:
         self.config = config or {}
         self.manual_path = self.state / "credits-manual.json"
         self._cache, self._lock = {}, threading.Lock()
-        self._claude_files = {}  # path -> (mtime, size, [(ts, tokens_in, tokens_out)])
+        self._claude_files = {}  # path -> (mtime, size, inode, offset, usage rows)
         self._claude_log_lock = threading.RLock()
         self._usage_cache = {}
         # One lock per provider: a slow Claude renewal must not hold up a Codex read.
@@ -358,7 +367,7 @@ class Credits:
                 if not math.isfinite(rem) or (tot is not None and not math.isfinite(tot)):
                     raise ValueError("Credit amounts must be finite numbers.")
                 data[provider] = {"remaining": rem, "total": tot,
-                                  "unit": str(unit)[:12] or "USD", "note": str(note)[:200],
+                                  "unit": _clean_unit(unit, "USD"), "note": str(note)[:200],
                                   "updated_at": _now().isoformat()}
             atomic_write(self.manual_path, json.dumps(data, indent=2))
         with self._lock:
@@ -400,12 +409,12 @@ class Credits:
         if not entry or (reading["source"] == "live" and reading["status"] == "ok"):
             return
         reading.update(source="manual", status="ok")
-        reading["headline"] = {"value": entry["remaining"], "unit": entry["unit"],
+        reading["headline"] = {"value": entry["remaining"], "unit": _clean_unit(entry.get("unit"), "USD"),
                                "label": "remaining (entered)"}
         if entry.get("total"):
             reading["meters"].insert(0, _meter("Spent of entered total",
                                                entry["total"] - entry["remaining"],
-                                               entry["total"], unit=entry["unit"]))
+                                               entry["total"], unit=_clean_unit(entry.get("unit"), "USD")))
         reading["facts"].append(["Entered", entry["updated_at"][:10]])
         if entry.get("note"):
             reading["facts"].append(["Note", entry["note"]])
@@ -529,10 +538,18 @@ class Credits:
                 continue
             active.add(path)
             cached = self._claude_files.get(path)
-            if not cached or cached[:2] != (stat.st_mtime, stat.st_size):
-                cached = (stat.st_mtime, stat.st_size, claude_usage_rows(path))
-                self._claude_files[path] = cached
-            rows.extend(cached[2])
+            if (cached and len(cached) == 5 and cached[0] == stat.st_mtime
+                    and cached[1] == stat.st_size and cached[2] == stat.st_ino):
+                parsed = cached[4]
+            else:
+                # Same inode and no shrink: only bytes after the last complete line are new.
+                append = (cached and len(cached) == 5 and cached[2] == stat.st_ino
+                          and stat.st_size >= cached[1] and cached[3] <= stat.st_size)
+                fresh, new_offset = claude_usage_rows_from(path, cached[3] if append else 0)
+                parsed = cached[4] + fresh if append else fresh
+                self._claude_files[path] = (
+                    stat.st_mtime, stat.st_size, stat.st_ino, new_offset, parsed)
+            rows.extend(parsed)
         self._claude_files = {p: v for p, v in self._claude_files.items() if p in active}
         now = time.time()
         seen, five, week, msgs5 = set(), [0, 0], [0, 0], 0
@@ -563,8 +580,8 @@ class Credits:
         now = time.time()
         start = (int(now // 3600) - hours + 1) * 3600
         buckets, replies, seen = [0] * hours, [0] * hours, set()
-        for _, _, rows in cached_rows:
-            for message_id, ts, _context, out in rows:
+        for cached in cached_rows:
+            for message_id, ts, _context, out in cached[-1]:
                 if ts < start or ts > now or message_id in seen:
                     continue
                 seen.add(message_id)
@@ -586,7 +603,7 @@ class Credits:
         if infos:
             main = infos[0]
             reading["headline"] = {"value": float(main.get("total_balance", 0)),
-                                   "unit": main.get("currency", ""), "label": "balance"}
+                                   "unit": _clean_unit(main.get("currency")), "label": "balance"}
             reading["facts"] += [["Granted", main.get("granted_balance")],
                                  ["Topped up", main.get("topped_up_balance")]]
         reading["facts"].append(["Usable", "yes" if data.get("is_available") else "no"])
@@ -731,33 +748,72 @@ def _find(value, key):
     return None
 
 
+def _claude_usage_row(line):
+    if '"usage"' not in line or '"assistant"' not in line:
+        return None
+    try:
+        event = json.loads(line)
+        message = event.get("message") or {}
+        usage = message.get("usage") or {}
+        ts = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+    try:
+        context = sum(int(usage.get(k) or 0) for k in (
+            "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+        output = int(usage.get("output_tokens") or 0)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if context < 0 or output < 0:
+        return None
+    return (message.get("id") or event.get("uuid"), ts, context, output)
+
+
+def _claude_usage_rows_in(data):
+    rows = []
+    if not data:
+        return rows
+    with io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            row = _claude_usage_row(line)
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+def claude_usage_rows_from(path, offset=0):
+    """Newline-terminated assistant rows from byte `offset`.
+
+    Returns (rows, new_offset). new_offset is the byte just after the last
+    complete line. A trailing partial line is left for the next pass.
+    """
+    try:
+        handle = open(path, "rb")
+    except OSError:
+        return [], offset
+    with handle:
+        try:
+            handle.seek(offset)
+            data = handle.read()
+        except (OSError, ValueError, TypeError):
+            return [], offset
+    end = data.rfind(b"\n")
+    if end < 0:
+        return [], offset
+    return _claude_usage_rows_in(data[:end + 1]), offset + end + 1
+
+
 def claude_usage_rows(path):
     """(message_id, unix_ts, context_tokens, output_tokens) per assistant message."""
-    rows = []
+    rows, offset = claude_usage_rows_from(path, 0)
     try:
-        handle = open(path, encoding="utf-8", errors="replace")
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            tail = handle.read()
     except OSError:
         return rows
-    with handle:
-        for line in handle:
-            if '"usage"' not in line or '"assistant"' not in line:
-                continue
-            try:
-                event = json.loads(line)
-                message = event.get("message") or {}
-                usage = message.get("usage") or {}
-                ts = datetime.fromisoformat(event["timestamp"].replace("Z", "+00:00")).timestamp()
-            except (ValueError, KeyError, TypeError, AttributeError):
-                continue
-            try:
-                context = sum(int(usage.get(k) or 0) for k in (
-                    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
-                output = int(usage.get("output_tokens") or 0)
-            except (ValueError, TypeError, OverflowError):
-                continue
-            if context < 0 or output < 0:
-                continue
-            rows.append((message.get("id") or event.get("uuid"), ts, context,
-                         output))
+    # A final record with no trailing newline still counts for a one-shot read.
+    if tail:
+        rows.extend(_claude_usage_rows_in(tail))
     return rows
 

@@ -628,6 +628,165 @@ WRITE_DEST = frozenset({"cp", "mv", "install", "ln", "rsync", "scp", "copy-item"
 WRITE_ALL = frozenset({"tee", "touch", "truncate", "mkdir", "set-content", "sc", "add-content", "ac", "out-file",
                        "new-item", "ni", "md"})
 
+# audit 2026-11-13: the program word itself must be readable, or every name-based check (rm, git,
+# chmod...) is blind. `{rm,-rf,~}`, `r{m,m}`, `$'\162\155'`, `$(printf rm)`, `$x` all run rm.
+_DYN_BRACE = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
+_PS_VALUE = re.compile(r"\$\{?[\w:]+\}?(?:[.\[][^\s=]*)?(?:[-+*/%]?=.*)?")  # $x, $x.Foo, $x=5 (PowerShell)
+_PS_ASSIGN = re.compile(r"[-+*/%]?=|\+\+|--")
+_CMD_LEAD = r"(?:^|&&|\|\||[;|&\n({`]|\b(?:then|do|else|elif|if|while|until)\s)\s*"
+_CMD_PRE = r"(?:[A-Za-z_]\w*=\S*\s+)*(?:(?:" + "|".join(sorted(WRAPPERS - SHELL_KEYWORDS)) + r")\s+(?:-\S+\s+)*)*"
+# A substitution where the program word should be: `$(printf '\162\155') -rf ~`, `` `which rm` -rf ~ ``.
+DYNAMIC_COMMAND = re.compile(_CMD_LEAD + _CMD_PRE + r"[\"']?(?:\$\(|`)")
+_DYNAMIC_WHY = "JARVIS can't tell which program that command runs (variable, substitution or brace list); name it plainly"
+
+
+def _dynamic_word(value, bare, alone, following):
+    """True when the program word (value: quotes removed; bare: unquoted characters only) is
+    filled in by the shell. A lone PowerShell `$x` / `$x.Foo` / `$x = 1` is an expression, not a run."""
+    if _DYN_BRACE.search(bare):
+        return True
+    if not re.search(r"[$`]", value):
+        return False
+    if _PS_VALUE.fullmatch(value) and (alone or _PS_ASSIGN.fullmatch(following or "")):
+        return False
+    return True
+
+
+# Programs that take -r/-R and only read or copy (or are interpreters whose script decides): the
+# generic "recursive flag against home/repo/vault" refusal skips them. Everything else is judged
+# like rm: a copied or renamed binary (`cp /bin/rm /tmp/r; /tmp/r -rf ~`) must not slip through.
+RECURSIVE_OK = frozenset({
+    "ls", "dir", "gci", "get-childitem", "cp", "copy", "copy-item", "cpi", "scp", "rsync", "grep", "egrep", "fgrep",
+    "rg", "ag", "ack", "du", "tar", "zip", "unzip", "7z", "diff", "tree", "stat", "file", "wc", "sed", "sort", "cat",
+    "head", "tail", "git", "chmod", "chown", "chgrp", "setfacl", "find", "xargs", "pip", "pip3", "npm", "pnpm", "yarn",
+    "pytest", "python", "python3", "py", "node", "deno", "bun", "perl", "ruby", "php", "make", "cargo", "go", "docker",
+    "mkdir", "md", "touch", "ln", "install", "du", "ncdu", "bat", "less", "more", "open", "xdg-open", "code", "ssh"})
+_RECURSIVE_FLAG = re.compile(r"-[rRf]*[rR][rRf]*|--recursive|-recurse|-recurse:\S*", re.I)
+_GENERIC_WIPE_WHY = "that recursive command would wipe JARVIS, its vault or the home folder"
+
+# Everything run as a program or read as a script: a file this command wrote (or made executable)
+# earlier must not be handed to one of these in the same command line.
+RUNNERS = SHELLS | frozenset({"python", "python3", "py", "perl", "ruby", "node", "php", "lua", "deno", "bun",
+                              "source", ".", "cscript", "wscript", "start-process", "saps", "invoke-item", "ii"})
+_NOT_FILES = frozenset({"null", "stdout", "stderr", "stdin", "tty", "con", "nul"})
+_PS_WRITERS = frozenset({"set-content", "sc", "add-content", "ac", "out-file", "new-item", "ni", "tee-object"})
+_WRITE_RUN_WHY = ("JARVIS doesn't write, copy or chmod +x a file and run it in one command; "
+                  "create it first, then ask to run it")
+
+
+def _leaf(path):
+    path = str(path).strip("'\"").replace("\\", "/")
+    if path.startswith("/dev/"):
+        return ""
+    leaf = posixpath.basename(posixpath.normpath(path)).casefold() if path else ""
+    return "" if leaf in (".", "..") or leaf in _NOT_FILES else leaf
+
+
+def _runs_what_it_wrote(pieces):
+    """True when a later step of one command line runs (command word) or hands to a shell or
+    interpreter a file an earlier step wrote, copied or made executable (audit 2026-11-13:
+    `printf 'rm -rf ~' > /tmp/x; chmod +x /tmp/x; /tmp/x`, `cp /bin/rm /tmp/r && /tmp/r -rf ~`,
+    `Set-Content x '...'; pwsh -File x`). Judged on file names, so `cd` in between changes nothing."""
+    from . import terminal
+    made = set()
+    for piece in pieces:
+        text = _winslash(piece)
+        values = [v for v, _ in (terminal._words(text) or [(w, w) for w in text.split()])]
+        at, name = _command_name(values) if values else (0, "")
+        rest = values[at + 1:] if name else []
+        if made and name:
+            plain = [v for v in rest if not v.startswith("-")]
+            if _leaf(values[at]) in made or (name in RUNNERS and any(_leaf(v) in made for v in plain)):
+                return True
+        for m in re.finditer(r"(?<![0-9&])>>?\s*(?:\"([^\"]+)\"|'([^']+)'|([^\s;&|<>()]+))", piece):
+            made.add(_leaf(m.group(1) or m.group(2) or m.group(3)))
+        if not name:
+            continue
+        plain = [v for v in rest if not v.startswith("-")]
+        if name in WRITE_DEST and plain:
+            made.add(_leaf(plain[-1]))
+        elif name == "tee" or name in _PS_WRITERS and not any(v.casefold() in ("directory", "dir") for v in rest):
+            made.update(_leaf(v) for v in plain)
+        elif name == "chmod" and plain:
+            mode = plain[0]
+            if re.search(r"[+=][rwXst]*x", mode) or re.fullmatch(r"[0-7]{3,4}", mode) and any(c in "1357" for c in mode):
+                made.update(_leaf(v) for v in plain[1:])
+        for k, v in enumerate(rest[:-1]):
+            if v.casefold() in ("-o", "--output", "-outfile", "--output-document", "-out-file"):
+                made.add(_leaf(rest[k + 1]))
+        made.update(_leaf(v.split("=", 1)[1]) for v in rest if v.startswith("of="))
+        made.discard("")
+    return False
+
+
+# Places a written file runs from later on its own, as path segments (lower case): a wildcard or
+# brace list in a write target is judged against these (`touch .git/hoo{ks}/pre-commit`).
+_PERSIST_SEGMENTS = [
+    (".local", "bin"), (".local", "share", "systemd"), (".config", "systemd"), (".config", "autostart"),
+    (".gitconfig",), (".config", "git"), (".git", "hooks"), (".git", "config"), (".local", "share", "applications"),
+    ("library", "launchagents"), ("start menu", "programs", "startup"), ("usr", "local", "bin"), ("usr", "bin"),
+    ("usr", "sbin"), ("usr", "local", "sbin"), (".bashrc",), (".bashrc.d",), (".bash_profile",), (".bash_login",),
+    (".bash_logout",), (".profile",), (".zshrc",), (".zprofile",), (".zshenv",), (".zlogin",), (".xprofile",),
+    (".xinitrc",), (".xsession",), (".xsessionrc",), (".config", "fish"), (".config", "hypr"), (".config", "uwsm"),
+    (".config", "environment.d"), (".ssh",), (".gnupg",), (".jarvis",), (".codex",), (".claude",)]
+_BRACE_CAP = 256
+
+
+def _brace_expand(text, cap=_BRACE_CAP):
+    """Every spelling bash gives `a{b,c}d` (nested too); a {group} without a comma or .. is kept
+    as a wildcard. None when there would be more than `cap` of them."""
+    out, stack, start = [text], [], None
+    for i, c in enumerate(text):
+        if c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            start = stack.pop()
+            if not stack:
+                break
+    else:
+        return [text]
+    body = text[start + 1:i]
+    parts, depth, cur = [], 0, ""
+    for c in body:
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += c
+    parts.append(cur)
+    if len(parts) == 1:  # {x} or {a..b}: not a list bash expands to known names
+        parts = ["*"]
+    result = []
+    for part in parts:
+        sub = _brace_expand(text[:start] + part + text[i + 1:], cap)
+        if sub is None or len(result) + len(sub) > cap:
+            return None
+        result += sub
+    return result
+
+
+def _could_persist(path):
+    """True when a write target holding {}, *, ? or [ could land in autostart, a PATH folder, a git
+    hook/config, a shell startup file or the key folders. Segments are matched as globs; a window
+    of segments needs at least one literal piece, so `~/Documents/*` or `/tmp/{a,b}` stay allowed."""
+    import fnmatch
+    variants = _brace_expand(path.replace("\\", "/"))
+    if variants is None:
+        return True
+    for variant in variants:
+        segs = [s.casefold() for s in variant.split("/") if s]
+        for sample in _PERSIST_SEGMENTS:
+            for i in range(len(segs) - len(sample) + 1):
+                window = segs[i:i + len(sample)]
+                if all(fnmatch.fnmatchcase(s, w) for s, w in zip(sample, window)) and \
+                        any(re.search(r"[^*?\[\]]", w) for w in window):
+                    return True
+    return False
+
 
 # Folder moves the cwd tracking below can't follow (audit 2026-11-04: `cd /tmp; cd -; rm -rf
 # projects` deleted ~/projects): back-jumps, the directory stack, and $PWD/$OLDPWD, which _abs
@@ -836,6 +995,9 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
             if found:
                 return found
         at, name = _command_name(values)
+        if at < len(words) and _dynamic_word(words[at][0], words[at][1], len(words) - at == 1,
+                                              words[at + 1][0] if at + 1 < len(words) else ""):
+            return _DYNAMIC_WHY
         if not name and _base(values[0]) in WRAPPERS - SHELL_KEYWORDS:
             return "JARVIS can't tell which command that wrapper runs; write it plainly"
         values = values[at:] or values
@@ -918,6 +1080,10 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
         for path in written + by_name:
             if PERSIST_STARTUP.search(path):
                 return "JARVIS doesn't write shell or desktop startup files"
+        for w in wrote:  # a wildcard or brace list could spell .git/hooks, .local/bin, ~/.ssh...
+            if re.search(r"[{}*?\[]", w) and _could_persist(_abs(w, here, real=False)):
+                return ("JARVIS can't tell where that write lands (wildcard or brace list) and it could reach "
+                        "autostart, PATH, git hooks or key folders; name the path plainly")
         for path in written + by_name:  # the repo's own root: sitecustomize.py, conftest.py, .claude/...
             if path.casefold() == repo_s.casefold() or \
                     posixpath.dirname(path).casefold() == repo_s.casefold() and not os.path.isdir(path) \
@@ -979,6 +1145,17 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
                 if any(_under(g, path) for g in [repo_s, home, "/"] + vaults) or TOP_FOLDERS.match(path) or \
                         HOME_DIRS.match(path):
                     return "icacls/takeown can't change the permissions of home, JARVIS or the vault"
+        if name and name not in RM_NAMES and name not in RECURSIVE_OK and \
+                any(_RECURSIVE_FLAG.fullmatch(v) or v == "--no-preserve-root" for v in values[1:]):
+            # Any other program with rm's flags (a copied or renamed rm, a script): home, the repo,
+            # the vault or a folder above them is never its target (audit 2026-11-13).
+            for t in targets:
+                if t.startswith("-") or EXPANDS.search(t.replace("\\", "/")) and not re.search(r"/\*+$", t):
+                    continue  # wildcards that reach protected folders were refused above
+                path = _abs(re.sub(r"/\*+$", "", t.replace("\\", "/")) or "/", here)
+                if any(_under(g, path) for g in [repo_s, home, "/"] + vaults) or TOP_FOLDERS.match(path) or \
+                        HOME_DIRS.match(path):
+                    return _GENERIC_WIPE_WHY
         if name in RM_NAMES:
             # -Path:C:\x / -LiteralPath:x carry their target inside the option.
             switch = r"-(?:r\w*|fo\w*|wh\w*|conf\w*|inc\w*|exc\w*):"  # -Recurse:$true is not a path
@@ -1026,6 +1203,10 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
         at = m.end()
     pieces.append(split_text[at:])
     seps.append("")
+    if DYNAMIC_COMMAND.search(command) or DYNAMIC_COMMAND.search(plain):
+        return _DYNAMIC_WHY
+    if _runs_what_it_wrote(pieces):
+        return _WRITE_RUN_WHY
     # Folders the shell may be in. A cd that fails (`cd /nonexistent; rm -rf x`), runs in a
     # pipeline or subshell, or is backgrounded leaves it where it was, so every cd adds a
     # possibility; only `cd d && ...` (not after ||) is sure to be in d for what follows.

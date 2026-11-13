@@ -22,9 +22,21 @@ from .topology import DEFAULT_PORT, identity
 from .transfer import _check_target, _ssh_args, ssh_device, ssh_host
 
 NAME = "cluster-tunnel"
-# While on a fallback target (e.g. Tailscale), how often to look for an earlier one (the
-# LAN) again. Doubles after each switch back that does not hold, up to LAN_RETRY_MAX.
-LAN_RETRY, LAN_RETRY_MAX = 60, 30 * 60
+# Operator stop. The worker deletes cluster-tunnel.stop when it starts, so that
+# marker cannot keep the supervisor from bringing the tunnel back.
+MANUAL_STOP = "cluster-tunnel.manual-stop"
+BOOT_JITTER = 120  # same boot window as a clipboard stop by hand
+ROLE_KEYS = ("local", "main", "mode", "link")
+# While connected on a worse target, re-probe better ones this often. The interval does not
+# grow with session length and does not use the reachability rank from when SSH started
+# (that rank puts the only open port first, so the LAN was never checked again).
+FAILBACK_PROBE_S = 60
+# Port-22 check for ranking and failback. Short, and failback runs the checks together, so a
+# round cannot stall the 5 s health loop. status() treats a note older than 15 s as dead.
+REACH_TIMEOUT = 0.3
+# LAN_RETRY is the same interval under the older name. LAN_RETRY_MAX is the old ceiling for a
+# stretched gap; the probe does not stretch.
+LAN_RETRY, LAN_RETRY_MAX = FAILBACK_PROBE_S, 30 * 60
 # A session counts as stable (backoff back to 1 s) only after STABLE_SESSION seconds; a shorter
 # one leaves the backoff growing, so a tunnel that flaps every few minutes isn't redialled every
 # second. TARGET_PAUSE separates attempts on successive targets.
@@ -33,12 +45,49 @@ HEARTBEAT = 5  # seconds between liveness refreshes of the status note (status()
 
 
 def reachable(target, timeout=2):
-    """Cheap check that the target's sshd answers; the SSH attempt itself proves the rest."""
+    """Cheap check that the target's sshd answers; the SSH attempt itself proves the rest.
+
+    The supervisor passes REACH_TIMEOUT. The default is for one-off checks outside the
+    5 s health loop.
+    """
     try:
         socket.create_connection((target.split("@", 1)[1], 22), timeout=timeout).close()
         return True
     except OSError:
         return False
+
+
+def targets_ahead(fresh, current):
+    """Better targets in the latest candidates() order, not reachability-rank order.
+
+    A refreshed list can put a learned address in front of the target SSH started on.
+    A target that has dropped out of the list yields the whole new list.
+    """
+    try:
+        place = fresh.index(current)
+    except ValueError:
+        return [item for item in fresh if item != current]
+    return list(fresh[:place])
+
+
+def preferred_failback(config, state, current):
+    """Best reachable target ahead of the connected one, or None.
+
+    candidates() is read again so an address learned during a long session is visible.
+    The probes share one short timeout and run together.
+    """
+    try:
+        ahead = targets_ahead(candidates(config, state), current)
+    except (OSError, ValueError):
+        return None
+    if not ahead:
+        return None
+    from .cluster_recovery import parallel_probe
+    try:
+        hits = parallel_probe(lambda item: reachable(item, timeout=REACH_TIMEOUT), ahead)
+    except OSError:
+        return None
+    return next((item for item, ok in zip(ahead, hits) if ok), None)
 
 
 def pinned_host(machine, state):
@@ -108,6 +157,43 @@ def peer(config, state=None):
     return ssh_device(config, config.get("cluster", {}).get("tunnel_device"))
 
 
+def candidates(config, state):
+    """Tunnel targets, best first: verified scan finds, freshest learned addresses, then the
+    ones saved at join time. Every target is validated; the list is capped."""
+    from .cluster_recovery import merge_candidates
+    machine = peer(config, state)
+    configured = [t for t in [machine.get("target"), *machine.get("fallback_targets", [])] if t]
+    fresh, found = [], []
+    if configured:
+        from .linkfinder import learned, device_for_peer, addresses_for, discovered
+        device = device_for_peer(config, machine)
+        fresh = addresses_for(config, state, device)
+        if mode(config) == "forward":
+            fresh = fresh or learned(config, state)
+        found = discovered(machine, state)
+    result = merge_candidates(found, fresh, configured, configured[0].split("@", 1)[0] if configured else "")
+    for target in result:
+        _check_target(target)
+    return result
+
+
+def hub_healthy(config, state):
+    """Probe the forwarded hub, not merely a live ssh -N process."""
+    from .cluster import Client
+    try:
+        from .cluster_recovery import signature
+        import secrets
+        import hmac
+        client = Client(config, state)
+        nonce = secrets.token_hex(24)
+        response = client.request("/v1/link-health", {"nonce": nonce}, timeout=2)
+        expected = signature(client.token, client.main, client.local, nonce, [])
+        return (isinstance(response, dict) and isinstance(response.get("signature"), str)
+                and hmac.compare_digest(response["signature"], expected))
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
 def command(config, state, target):
     machine = peer(config, state)
     _check_target(target)
@@ -134,23 +220,106 @@ def status(state):
     except (OSError, ValueError, KeyError, TypeError):
         note, running = {}, False
     return {**note, "running": running, "ssh_alive": running and note.get("ssh_alive", False),
-            "autostart": startup_path().is_file()}
+            "hub_healthy": running and note.get("hub_healthy", False),
+            "autostart": startup_path().is_file(),
+            "manual_stop": manual_stop_path(state).is_file()}
+
+
+def current_boot():
+    from .platforms import boot_time
+    return boot_time()
+
+
+def manual_stop_path(state):
+    return Path(state) / MANUAL_STOP
+
+
+def clear_manual_stop(state):
+    try:
+        manual_stop_path(state).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def link_disposition(state):
+    """How this role treats the forward tunnel. Matches ensure_tunnel's link rule."""
+    from .fsio import read_json
+    path = Path(state) / "continuity-endpoint.json"
+    if not path.exists():
+        return "plain"
+    instruction = read_json(path, {})
+    if not instruction:
+        return "plain"
+    body = instruction.get("body") if isinstance(instruction, dict) else None
+    if not isinstance(body, dict) or body.get("link") is None:
+        return "off"
+    return "on"
+
+
+def tunnel_role(config, state):
+    from .linkfinder import role
+    resolved, local, main = role(config, state)
+    return {"local": local, "main": main, "mode": mode(resolved), "link": link_disposition(state)}
+
+
+def record_manual_stop(config, state):
+    """Persist an operator stop for this boot and role. Does not edit config."""
+    state = Path(state)
+    state.mkdir(parents=True, exist_ok=True)
+    save_json(manual_stop_path(state), {**tunnel_role(config, state), "boot": current_boot()})
+
+
+def _same_boot(saved, now):
+    if saved is None or now is None:
+        return True  # unknown boot is not permission to start
+    try:
+        return abs(float(saved) - float(now)) <= BOOT_JITTER
+    except (TypeError, ValueError):
+        return True
+
+
+def manual_stop_holds(config, state):
+    """True when an operator stop still applies to this boot and this role.
+
+    A different role or a later boot deletes the record. Promotion, demotion, and
+    a continuity link that turns the forward tunnel off must not leave a stuck
+    disabled tunnel, and this function does not write config.
+    """
+    path = manual_stop_path(state)
+    if not path.exists():
+        return False
+    from .fsio import read_json
+    note = read_json(path, None)
+    if not isinstance(note, dict) or any(key not in note for key in (*ROLE_KEYS, "boot")):
+        clear_manual_stop(state)
+        return False
+    if not _same_boot(note.get("boot"), current_boot()):
+        clear_manual_stop(state)
+        return False
+    current = tunnel_role(config, state)
+    if any(note.get(key) != current[key] for key in ROLE_KEYS):
+        clear_manual_stop(state)
+        return False
+    return True
 
 
 def run(config, state):
-    from .continuity.repoint import effective_config
-    config = effective_config(config, state)
+    if manual_stop_holds(config, state):
+        return  # operator stop: do not delete it and do not open SSH
+    from .linkfinder import role
+    original_config = config
+    config, _, _ = role(config, state)
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True)
     machine = peer(config, state)
-    targets = list(dict.fromkeys(t for t in [machine.get("target"), *machine.get("fallback_targets", [])] if t))
+    targets = candidates(config, state)
     if not targets:
         raise ValueError("No cluster tunnel targets configured.")
     # Validate before claiming the worker lock.
     for target in targets:
         command(config, state, target)
     marker = state / f"{NAME}.stop"
-    note = {"pid": os.getpid(), "ssh_alive": False}
+    note = {"pid": os.getpid(), "ssh_alive": False, "hub_healthy": False}
     written = {}  # last content saved (sans `updated`) and when; wait() calls publish ~4x/s
 
     def publish(**values):
@@ -180,60 +349,83 @@ def run(config, state):
 
     with exclusive_lock(state / f"{NAME}.lock"):
         marker.unlink(missing_ok=True)
-        delay, proc, retry = 1, None, LAN_RETRY
+        delay, proc = 1, None
         logs = state / "logs"
         logs.mkdir(exist_ok=True)
         try:
             while not marker.exists():
-                for index, target in enumerate(targets):
+                config, local, main = role(original_config, state)
+                if mode(config) == "forward" and local == main:
+                    break  # a promoted main no longer owns a node's forward tunnel
+                targets = candidates(config, state)  # pick up addresses learned while connected
+                # Probe every candidate first; never spend a full SSH timeout on a dead LAN.
+                from .cluster_recovery import rank_targets, SessionHealth, parallel_probe, next_backoff
+                ordered = rank_targets(targets, lambda t: reachable(t, timeout=REACH_TIMEOUT), parallel_probe)
+                for target in ordered:
                     if marker.exists():
                         break
                     started = probed = time.monotonic()
                     preferred = None
-                    publish(target=target, ssh_alive=False, error=None)
+                    refresh = False
+                    health = SessionHealth()
+                    publish(target=target, ssh_alive=False, hub_healthy=False, error=None)
                     try:
                         with (logs / f"{NAME}.log").open("a", encoding="utf-8") as log:
                             proc = subprocess.Popen(command(config, state, target), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=log,
                                 creationflags=NO_WINDOW)
                             while proc.poll() is None and not marker.exists():
-                                # SSH -N has no application handshake. This reports a
-                                # living SSH session, not node health; cluster status owns that.
-                                publish(ssh_alive=time.monotonic() - started >= 9)
-                                wait(1)
-                                if index and time.monotonic() - probed >= retry:
+                                reconnect = state / 'cluster-tunnel-reconnect'
+                                if reconnect.exists():
+                                    reconnect.unlink(missing_ok=True)
+                                    refresh = True
+                                    proc.terminate()
+                                    break
+                                if role(original_config, state)[2] != identity(config)[1]:
+                                    refresh = True
+                                    proc.terminate()
+                                    break
+                                healthy = (hub_healthy(config, state) if mode(config) == "forward"
+                                           else time.monotonic() - started >= 9)
+                                publish(ssh_alive=healthy, hub_healthy=healthy)
+                                if health.observe(time.monotonic(), healthy):
+                                    proc.terminate()
+                                    break
+                                wait(5)
+                                # Fresh preference order, not ordered[:index] from this session's rank.
+                                if time.monotonic() - probed >= FAILBACK_PROBE_S:
                                     probed = time.monotonic()
-                                    preferred = next((t for t in targets[:index] if reachable(t)), None)
+                                    preferred = preferred_failback(config, state, target)
                                     if preferred:
                                         proc.terminate()
                                         break
                             if marker.exists() and proc.poll() is None:
                                 proc.terminate()
                             proc.wait(timeout=5)
-                            publish(ssh_alive=False, error=f"{preferred} is reachable again; switching back"
+                            publish(ssh_alive=False, hub_healthy=False, error=f"{preferred} is reachable again; switching back"
                                     if preferred else f"SSH exited ({proc.returncode})")
                     except (OSError, subprocess.SubprocessError) as exc:
-                        publish(ssh_alive=False, error=str(exc))
+                        publish(ssh_alive=False, hub_healthy=False, error=str(exc))
                     finally:
                         if proc is not None and proc.poll() is None:
                             proc.kill()
                             proc.wait()
                         proc = None
+                    if refresh:
+                        break  # reload current roles and learned candidates before another SSH attempt
                     lasted = time.monotonic() - started
                     if lasted >= STABLE_SESSION:
                         delay = 1
-                    if lasted > 60 and not index:
-                        retry = LAN_RETRY
                     if preferred:
-                        # Restart from the first target. If the switch back does not hold,
-                        # we land on the fallback again and wait longer before the next try.
-                        retry = min(retry * 2, LAN_RETRY_MAX)
-                        break
+                        break  # next round ranks again and dials the better target
                     wait(TARGET_PAUSE)  # no instant redial of the next target
+                if not marker.exists():
+                    from .linkfinder import discover
+                    discover(peer(config, state), state, config)
                 wait(delay)
-                delay = min(delay * 2, 60)
+                delay = next_backoff(delay)
         finally:
-            publish(ssh_alive=False, pid=0)
+            publish(ssh_alive=False, hub_healthy=False, pid=0)
 
 
 TITLE = "JARVIS Cluster Tunnel"
@@ -261,6 +453,9 @@ def autostart(config_path, state, enable):
 
 
 def start(config_path, state):
+    # Explicit start clears the operator stop. ensure_tunnel does not call start
+    # while that stop holds, so recovery cannot clear it.
+    clear_manual_stop(state)
     if status(state)["running"]:
         return {"started": False, **status(state)}
     state = Path(state).resolve()
@@ -282,12 +477,26 @@ def start(config_path, state):
     return {"started": False, "note": "Worker did not start; inspect configuration and the tunnel log.", **status(state)}
 
 
-def stop(state):
+def stop(state, *, operator=False, config=None, sleep=None):
+    """Ask the worker to exit. operator=True persists that choice for this boot and role.
+
+    Role lifecycle and leave call stop without operator, so their marker is only
+    the cooperative request. sleep is the pause between status checks (tests pass
+    their own). Config is not rewritten.
+    """
+    pause = time.sleep if sleep is None else sleep
+    if operator:
+        if config is None:
+            raise ValueError("An operator tunnel stop needs the current config.")
+        record_manual_stop(config, state)
     if not status(state)["running"]:
-        return {"stopped": False, "note": "Not running."}
-    (Path(state) / f"{NAME}.stop").touch()
+        return {"stopped": False, "note": "Not running.", "manual_stop": operator}
+    state = Path(state)
+    state.mkdir(parents=True, exist_ok=True)
+    (state / f"{NAME}.stop").touch()
     for _ in range(40):
-        time.sleep(0.25)
+        pause(0.25)
         if not status(state)["running"]:
-            return {"stopped": True}
-    return {"stopped": False, "note": "Stop requested; SSH is still shutting down."}
+            return {"stopped": True, "manual_stop": operator}
+    return {"stopped": False, "note": "Stop requested; SSH is still shutting down.",
+            "manual_stop": operator}

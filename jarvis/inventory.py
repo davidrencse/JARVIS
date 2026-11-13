@@ -7,6 +7,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .hostmeter import _FAIL_TTL, _FlightCache
+
 
 def command(args):
     try:
@@ -80,13 +82,31 @@ $data = [ordered]@{
 $data | ConvertTo-Json -Depth 6
 """
 
+# Computer, CPU, RAM, disks, OS, BIOS, GPU and monitors. One PowerShell process.
+_HARDWARE_TTL = 300
+_hardware_cache = _FlightCache(_HARDWARE_TTL, _FAIL_TTL)
 
-def collect():
+
+def _hardware_failed(value):
+    """Timeouts, exits and non-JSON replies. A hardware object uses the long TTL."""
+    return not isinstance(value, dict) or value.get("status") == "unavailable"
+
+
+def clear_cache():
+    """Drop the cached Windows hardware reading. Tests call this between cases."""
+    _hardware_cache.clear()
+
+
+def collect(*, clock=None):
     data = {"collected_at": datetime.now(timezone.utc).isoformat(),
             "source": "live_local_probe", "platform": platform.system()}
     if platform.system() == "Windows":
-        data["hardware"] = command(["powershell.exe", "-NoProfile", "-NonInteractive",
-                                    "-Command", WINDOWS_SCRIPT])
+        # Cached on its own. Meters are a second process (_attach_meters), so a CIM
+        # hang there cannot blank this hardware reading.
+        data["hardware"] = _hardware_cache.get(
+            lambda: command(["powershell.exe", "-NoProfile", "-NonInteractive",
+                             "-Command", WINDOWS_SCRIPT]),
+            clock=clock, failed=_hardware_failed)
         data["nvidia"] = command(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
                                   "--format=csv,noheader"])
     elif platform.system() == "Linux":

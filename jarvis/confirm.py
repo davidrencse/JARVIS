@@ -65,6 +65,15 @@ def describe(item):
             "can_grant": stakes == "low" and bool(site) and bool(meta.get("named"))}
 
 
+def _browser_due(command_json):
+    """The browser ask's own deadline (epoch seconds) from a stored command, 0 when it has none."""
+    try:
+        return float((((json.loads(command_json).get("args") or {}).get("browser") or {})
+                      .get("expires_at")) or 0)
+    except (ValueError, TypeError, AttributeError):
+        return 0.0
+
+
 def prompt(item):
     return (f"I need your OK to {item['summary']}. "
             f"Say 'Jarvis, yes' or press Confirm ({item['id']}).")
@@ -114,17 +123,14 @@ class ConfirmQueue:
         return item
 
     def expire(self):
-        now = time.time()
         with self.history.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()  # read only once the write lock is ours: a wait for it can't backdate "now"
             count = db.execute("UPDATE confirmations SET status='expired', resolved=expires "
                                "WHERE status='pending' AND expires<=?", (now,)).rowcount
             # A browser ask carries its own (shorter) deadline.
             for row in db.execute("SELECT number, command FROM confirmations WHERE status='pending'").fetchall():
-                try:
-                    args = json.loads(row["command"]).get("args") or {}
-                    due = float((args.get("browser") or {}).get("expires_at") or 0)
-                except (ValueError, TypeError, AttributeError):
-                    continue
+                due = _browser_due(row["command"])
                 if due and due <= now:
                     count += db.execute("UPDATE confirmations SET status='expired', resolved=? "
                                         "WHERE number=? AND status='pending'", (now, row["number"])).rowcount
@@ -145,9 +151,13 @@ class ConfirmQueue:
         return [self._item(r) for r in rows]
 
     def _resolve(self, db, identifier, origin, bare_guard=False):
+        now = time.time()  # callers hold the write lock (BEGIN IMMEDIATE), so this is not stale
+        def late(row):  # the row's own 600 s window or the browser ask's shorter deadline
+            due = _browser_due(row["command"])
+            return row["expires"] <= now or bool(due and due <= now)
         if identifier is None:
-            rows = db.execute("SELECT * FROM confirmations WHERE status='pending' AND origin=? AND expires>? ORDER BY number",
-                              (origin, time.time())).fetchall()
+            rows = [r for r in db.execute("SELECT * FROM confirmations WHERE status='pending' AND origin=? "
+                                          "ORDER BY number", (origin,)).fetchall() if not late(r)]
             if len(rows) > 1:
                 raise ValueError("Which one? " + " or ".join("C" + str(r["number"]) for r in rows))
             if not rows:
@@ -164,7 +174,7 @@ class ConfirmQueue:
         row = db.execute("SELECT * FROM confirmations WHERE number=?", (int(identifier[1:]),)).fetchone()
         if row is None or (origin is not None and row["origin"] != origin):
             raise ValueError("No pending confirmation for this device.")
-        if row["status"] != "pending" or row["expires"] <= time.time():
+        if row["status"] != "pending" or late(row):
             raise ValueError("That confirmation expired or was already handled; request it again.")
         return row
 
@@ -179,8 +189,12 @@ class ConfirmQueue:
             if not hmac.compare_digest(digest, row["hash"]) or (
                     hash is not None and not hmac.compare_digest(str(hash), digest)):
                 raise ValueError("The command changed; request a new confirmation.")
+            resolved = time.time()
+            due = _browser_due(row["command"])
+            if due and due <= resolved:  # the ask's own deadline passed while we waited for the lock
+                raise ValueError("That confirmation expired or was already handled; request it again.")
             db.execute("UPDATE confirmations SET status='approved', resolved=? WHERE number=?",
-                       (time.time(), row["number"]))
+                       (resolved, row["number"]))
             self.history.record_confirmation(db, "C" + str(row["number"]), origin, "approve", digest)
             return json.loads(row["command"])
 
@@ -188,18 +202,18 @@ class ConfirmQueue:
         """pending, approved, rejected or expired; browser_gate polls this while it waits.
         Read-only: a locked database can't make the poll fail mid-wait (see expire_safely)."""
         with self.history.connect() as db:
-            row = db.execute("SELECT status, expires, command FROM confirmations WHERE number=?",
+            row = db.execute("SELECT status, expires, command, resolved FROM confirmations WHERE number=?",
                              (number,)).fetchone()
         if row is None:
             return None
+        due = _browser_due(row["command"])
+        if row["status"] == "approved":
+            # An approval stamped after the ask's own deadline never counts (an approval that
+            # landed in time still reads approved, however late it is polled).
+            return "expired" if due and (row["resolved"] is None or row["resolved"] > due) else "approved"
         if row["status"] != "pending":
             return row["status"]
         now = time.time()
-        try:
-            due = float((((json.loads(row["command"]).get("args") or {}).get("browser") or {})
-                         .get("expires_at")) or 0)
-        except (ValueError, TypeError, AttributeError):
-            due = 0
         return "expired" if row["expires"] <= now or (due and due <= now) else "pending"
 
     def expire_safely(self, tries=3):

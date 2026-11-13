@@ -165,6 +165,8 @@ class FastLane:
         self.system, self.mcp_config, self.allowed_tools = system, mcp_config, tuple(allowed_tools)
         self.builtin_tools, self.permission_mode, self.persona = builtin_tools, permission_mode, persona
         self.tool_log = []  # (name, ok, text) per finished tool call this turn, like ChatGPTLane
+        self._tool_pending = {}  # tool_use id -> name; a start with no result is unfinished
+        self._mine = threading.local()  # this thread's frozen turn, not the shared tool_log
 
     def _args(self, binary):
         flags = list(LEAN_FLAGS)
@@ -212,21 +214,65 @@ class FastLane:
                 self.close()
                 self._spawn()
 
+    def _remember_turn(self):
+        """Freeze this turn's finished tools while the lane lock is held.
+
+        The tuple is per thread. The next ask rebinds the shared tool_log."""
+        owned = self.tool_log if isinstance(getattr(self, "tool_log", None), list) else None
+        self._mine.owned = owned
+        self._mine.log = tuple(owned or ())
+
+    def turn_log(self):
+        """This thread's last finished turn, copied out of the snapshot. None if this
+        thread has not finished a turn since ask() started. An empty list is a real
+        snapshot: the caller must not fall back to the shared tool_log."""
+        snap = getattr(self._mine, "log", None)
+        if snap is None:
+            return None
+        return list(snap)
+
+    def owned_log(self):
+        """The list object snapshotted for this thread, or None. Not a copy."""
+        return getattr(self._mine, "owned", None)
+
+    def _attach_evidence(self, exc):
+        """Copy this turn's tools onto exc before close() and before the lock drops."""
+        self._remember_turn()
+        ran = list(self._mine.log or ())
+        unfinished = list(dict.fromkeys(self._tool_pending.values()))
+        if unfinished:
+            exc.tool_unfinished = unfinished
+        if not hasattr(exc, "tool_log"):
+            try:  # a copy, so a later rebind cannot mutate the caller's evidence
+                exc.tool_log = ran
+            except Exception:
+                pass
+
     def ask(self, text, recall=(), on_sentence=None):
         """One turn. Restarts the process if it died; recycles it after max_turns.
 
         on_sentence(str) is called with each complete sentence as it streams in, so
         speech can start ~1-2 s before the CLI finishes the turn."""
+        self._mine.log = None
+        self._mine.owned = None
         limited = claude_limit()
         if limited and not self.command:  # a fake test CLI isn't the real plan
-            raise RuntimeError(f"Claude usage limit {limited}; not starting a run.")
+            exc = RuntimeError(f"Claude usage limit {limited}; not starting a run.")
+            exc.tool_log = []  # nothing ran; the shared log may belong to another turn
+            raise exc
         with self.lock:
+            self.tool_log = []  # a stale log from an earlier turn must not block the retry
+            self._tool_pending = {}
             try:
-                return self._ask(text, recall, on_sentence)
-            except BaseException:
+                result = self._ask(text, recall, on_sentence)
+            except BaseException as exc:
                 # Abandoned output must never become the next request's answer.
+                # Stamp first: close() and the next ask both drop this turn's log.
+                self._attach_evidence(exc)
                 self.close()
                 raise
+            self._remember_turn()
+            return result
 
     def _ask(self, text, recall, on_sentence):
         if not self.proc or self.proc.poll() is not None or self.turns >= self.max_turns:
@@ -268,17 +314,22 @@ class FastLane:
             if event.get("type") == "assistant":
                 for block in (event.get("message") or {}).get("content") or []:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
-                        calls[block.get("id")] = str(block.get("name") or "")
+                        key, raw = block.get("id"), block.get("name")
+                        calls[key] = str(raw or "")
+                        # A later result pops this. Still present at a timeout: unfinished.
+                        self._tool_pending[key] = _tool_name(str(raw or "")) or "tool"
                         if self.on_tool:
                             try:
-                                self.on_tool(block.get("id"), block.get("name"), None, "")
+                                self.on_tool(key, raw, None, "")
                             except Exception:  # reporting must never fail the turn
                                 pass
             if event.get("type") == "user":
                 content = (event.get("message") or {}).get("content")
                 for block in content if isinstance(content, list) else []:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
-                        name = calls.get(block.get("tool_use_id"), "tool")
+                        key = block.get("tool_use_id")
+                        name = calls.get(key, "tool")
+                        self._tool_pending.pop(key, None)  # finished: not an ambiguous start
                         ok = not block.get("is_error")
                         body = block.get("content")
                         text = body if isinstance(body, str) else " ".join(

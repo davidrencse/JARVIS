@@ -99,11 +99,13 @@ STATEMENT_MARGIN = 0.05  # notes must beat "none" by this much for a plain state
 def wants_notes(text):
     """False only when a request is clearly not about David's own notes (small talk, general
     knowledge, commands); True when it is, or it's close, or the model is unavailable.
-    While another thread is still building the recall vectors, True at once (keep the
-    notes) rather than wait on the request path."""
+    Never blocks: until the recall vectors exist it says True (keep the notes) and builds
+    them in the background, never embedding every prototype on the request thread."""
     with _lock:
-        if "recall" not in _cache and _building.get("recall"):
-            return True
+        built = "recall" in _cache
+    if not built:
+        warm("recall")
+        return True
     found = choose("recall", text)
     if found is None:
         return True

@@ -218,6 +218,23 @@ def verify_job(job, node, key, now=None):
 BUNDLE_DOMAIN = b"jarvis-code-v2\n"  # a versioned bundle's signature can't pass as a job's or a legacy one
 VERSION_FILE = "cluster-code-version.json"
 
+# Nodes pull updates themselves. One that has never installed a versioned bundle (no
+# cluster-code-version.json — the Dell is in that set and cannot be fixed by hand) still
+# has to accept a zip signed only with `signature`, or refusing it strands the node.
+# code_bundle() already serves `version` + `vsig` beside that signature, and the release
+# those nodes run installs a versioned bundle and records the version, so one pull from
+# the current main leaves this path. At and after this instant a signature-only bundle
+# is refused. To close the window once the date has passed: delete LEGACY_UNVERSIONED_UNTIL,
+# unversioned_allowed, and the accept branch in apply_bundle (keep the refusal).
+LEGACY_UNVERSIONED_UNTIL = 1799971200  # 2027-01-15 00:00:00 UTC
+
+
+def unversioned_allowed(now=None):
+    """True while a never-versioned node may still install a signature-only bundle."""
+    if now is None:
+        now = time.time()
+    return now < LEGACY_UNVERSIONED_UNTIL
+
 
 def _bundle_bytes(raw, version, code):
     return BUNDLE_DOMAIN + f"{int(version)}\n{code}\n".encode("ascii") + raw
@@ -274,7 +291,9 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
 
     state: this node's state folder. With it, a bundle older than the newest one installed
     here is refused (a replayed old signed bundle would downgrade the node), and once a
-    versioned bundle was installed an unversioned one is refused too."""
+    versioned bundle was installed an unversioned one is refused too. Until
+    LEGACY_UNVERSIONED_UNTIL a node with no version on record may still install a
+    signature-only bundle; that bundle does not write a version file."""
     repo = Path(repo).resolve()
     if not key:
         raise ValueError("No code-signing key is pinned for the main PC; re-join with a fresh "
@@ -293,6 +312,11 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
     elif have:
         raise ValueError("The code bundle carries no version but this node already installed a "
                          "versioned one; refused as a possible replay.")
+    elif state is not None and not unversioned_allowed():  # state=None: tests/legacy callers; every node passes state
+        raise ValueError("The code bundle carries no version; unversioned bundles are no longer "
+                         "accepted. Update from the main (versioned bundles) or re-join.")
+    # Compat window (LEGACY_UNVERSIONED_UNTIL): the zip's own signature is enough.
+    # `version` stays None, so the write below never records a version file for it.
     elif not verify(raw, bundle.get("signature"), key):
         raise ValueError("The code bundle isn't signed by the main PC's pinned key; not installed.")
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:

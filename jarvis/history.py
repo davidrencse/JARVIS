@@ -86,6 +86,7 @@ class History:
         state = outcome.get("state", "not_sent")
         ok = bool(outcome.get("ok"))
         with self.connect() as db:
+            archive_queue.enter(db)
             db.execute("INSERT INTO commands VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 cid, request, now, origin, origin_class, text[:500], command_key(command),
                 command["device"], command["intent"],

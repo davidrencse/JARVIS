@@ -93,6 +93,7 @@ def stop(state=None, minutes=STOP_MINUTES):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(time.time() + minutes * 60), encoding="utf-8")
     _release()
+    _release_remote()
     return True, f"Desktop control stopped for {minutes} minutes."
 
 
@@ -213,8 +214,8 @@ def _parse_keys(keys):
 
 
 class Hyprland:
-    def _run(self, *args, data=None):
-        return subprocess.run(list(args), capture_output=True, timeout=15, check=True,
+    def _run(self, *args, data=None, timeout=15):
+        return subprocess.run(list(args), capture_output=True, timeout=timeout, check=True,
                               input=data)
 
     def _monitor(self):
@@ -237,9 +238,9 @@ class Hyprland:
     def move(self, x, y):
         self._run("hyprctl", "dispatch", f"hl.dsp.cursor.move({{ x = {round(x)}, y = {round(y)} }})")
 
-    def button(self, which, how):  # how: click, down, up
+    def button(self, which, how, timeout=15):  # how: click, down, up
         code = {"left": 0, "right": 1, "middle": 2}[which] | {"click": 0xC0, "down": 0x40, "up": 0x80}[how]
-        self._run("ydotool", "click", hex(code))
+        self._run("ydotool", "click", hex(code), timeout=timeout)
 
     def type(self, text):
         self._run("wtype", "--", text)
@@ -258,10 +259,25 @@ class Hyprland:
         self._run("ydotool", "mousemove", "--wheel", "-x", "0", "-y",
                   str(-amount if direction == "up" else amount))
 
+    # evdev codes of every modifier key: LCtrl, LShift, LAlt, LSuper, RCtrl, RShift, RAlt, RSuper
+    MODIFIER_CODES = (29, 42, 56, 125, 97, 54, 100, 126)
+
     def release(self):
+        """Let go of the mouse buttons and every modifier, like Windows.release. key() sends
+        its modifier ups only if wtype lives to the end: a wtype killed after a modifier-down
+        (the 15 s timeout) would leave Ctrl/Alt/Super held. Two independent ways, each best
+        effort with a short timeout (this runs from a stop and from error paths: never raise,
+        never hang): wtype -m releases its modifiers, ydotool sends the key-up codes."""
         for which in ("left", "right"):
             try:
-                self.button(which, "up")
+                self.button(which, "up", timeout=3)
+            except (subprocess.SubprocessError, OSError):
+                pass
+        attempts = (["wtype"] + [a for m in ("ctrl", "shift", "alt", "logo") for a in ("-m", m)],
+                    ["ydotool", "key"] + [f"{code}:0" for code in self.MODIFIER_CODES])
+        for args in attempts:
+            try:
+                subprocess.run(args, capture_output=True, timeout=3, check=True)
             except (subprocess.SubprocessError, OSError):
                 pass
 
@@ -497,6 +513,17 @@ def backend():
 def _release():
     try:
         backend().release()
+    except Exception:
+        pass
+
+
+def _release_remote():
+    """The backend sweep above only knows buttons (and, on Windows, modifiers). A remote
+    session here (or an ended one still retrying a refused key-up) tracks its own held keys:
+    let go of those too, so a stop never leaves one down. Best effort, never raises."""
+    try:
+        from . import remote_view
+        remote_view.release_held()
     except Exception:
         pass
 

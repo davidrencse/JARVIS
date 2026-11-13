@@ -89,7 +89,10 @@ def claude_brain(config, base, state):
     return claude_lane(config, base, "tools", system=system, persona=BRAIN_PERSONA,
                        mcp_config=servers,
                        allowed_tools=tuple(f"mcp__{name}" for name in servers["mcpServers"]),
-                       builtin_tools=("WebSearch", "WebFetch"), permission_mode="dontAsk")
+                       # No built-in WebSearch/WebFetch: they would fetch any URL with no
+                       # approve_browser / local-address / off-limits check. Browsing goes
+                       # through the gated browser MCP servers, like the ChatGPT lane (web_search off).
+                       builtin_tools=(), permission_mode="dontAsk")
 
 
 class _Request:
@@ -307,7 +310,8 @@ class Failover:
             raise
         else:
             # After the lane's ask has returned (and released its lock). A later turn may
-            # already have replaced tool_log; the snapshot was taken under that lock.
+            # already have replaced tool_log. The lane froze turn_log() under that lock;
+            # _capture only copies it afterward. A lane with no turn_log still uses tool_log.
             self._local.log = tuple(self._capture())
             return reply
         finally:
@@ -381,31 +385,130 @@ LEVELS = {
 }
 
 
-def ask_level(config, base, level, prompt, instructions="", timeout=180):
-    """One stateless, tool-free question at brain level 1-3: ChatGPT first, Claude while
-    ChatGPT is limited. Returns (reply, engine) with engine "chatgpt" or "claude"."""
-    from .chatgpt import ChatGPTLane, usage_limit
-    spec = LEVELS[max(1, min(3, int(level)))]
-    if not usage_limit():
-        models = dict((config or {}).get("models") or {})
-        models.setdefault(spec["chatgpt"], spec["default"])
-        lane = ChatGPTLane({**(config or {}), "models": models}, base, max_turns=1, timeout=timeout,
-                           tier_key=spec["chatgpt"], instructions=instructions,
-                           overrides=['web_search="disabled"'])
-        try:
-            return lane.ask(prompt), "chatgpt"
-        except Exception as exc:
-            if not is_limit(exc):
-                raise
-        finally:
-            lane.close()
-    from .fastlane import FastLane
-    lane = FastLane(config, base, tier=spec["claude"], timeout=timeout, max_turns=1, persona="",
-                    builtin_tools=())
+class LevelLanes:
+    """One ChatGPTLane per brain level, kept open across ask_level calls.
+
+    max_turns=1 starts a fresh thread on every ask, so the process can be reused.
+    Workers run three at a time: each level has its own lock, and two steps at the
+    same level take turns on that one lane. close() drops whatever is still open;
+    it is safe more than once (orchestrate calls it from finally).
+    """
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._lanes = {}
+        self._locks = {}
+        self._open = True
+
+    def lock(self, level):
+        with self._guard:
+            return self._locks.setdefault(level, threading.Lock())
+
+    def get(self, level, factory):
+        """The lane for level, built at most once. The caller holds lock(level)."""
+        with self._guard:
+            if not self._open:
+                raise RuntimeError("level lanes are closed")
+            found = self._lanes.get(level)
+            if found is not None:
+                return found
+        created = factory()
+        with self._guard:
+            if self._open:
+                found = self._lanes.setdefault(level, created)
+            else:
+                found = None
+        if found is not created:  # lost the race, or the cache closed while we built
+            try:
+                created.close()
+            except Exception:
+                pass
+        if found is None:
+            raise RuntimeError("level lanes are closed")
+        return found
+
+    def pop(self, level):
+        """Detach the lane without closing it. The caller holds lock(level)."""
+        with self._guard:
+            return self._lanes.pop(level, None)
+
+    def close(self):
+        with self._guard:
+            self._open = False
+            lanes = list(self._lanes.values())
+            self._lanes.clear()
+        for lane in lanes:
+            try:
+                lane.close()
+            except Exception:
+                pass
+
+
+def _open_level_lane(config, base, spec, timeout, instructions):
+    from .chatgpt import ChatGPTLane
+    models = dict((config or {}).get("models") or {})
+    models.setdefault(spec["chatgpt"], spec["default"])
+    return ChatGPTLane({**(config or {}), "models": models}, base, max_turns=1, timeout=timeout,
+                       tier_key=spec["chatgpt"], instructions=instructions,
+                       overrides=['web_search="disabled"'])
+
+
+def _close_quiet(lane):
+    if lane is None:
+        return
     try:
-        return lane.ask((instructions + "\n\n" + prompt) if instructions else prompt), "claude"
-    finally:
         lane.close()
+    except Exception:
+        pass
+
+
+def ask_level(config, base, level, prompt, instructions="", timeout=180, lanes=None):
+    """One stateless, tool-free question at brain level 1-3: ChatGPT first, Claude while
+    ChatGPT is limited. Returns (reply, engine) with engine "chatgpt" or "claude".
+
+    lanes: a LevelLanes the caller keeps. One ChatGPTLane per level is reused and the
+    caller closes the cache. Without lanes, each call builds a lane and closes it.
+    A limit from a reused lane still falls through to Claude, and that lane is closed.
+    """
+    from .chatgpt import usage_limit
+    level_n = max(1, min(3, int(level)))
+    spec = LEVELS[level_n]
+    if not usage_limit():
+        if lanes is None:
+            lane = _open_level_lane(config, base, spec, timeout, instructions)
+            try:
+                return lane.ask(prompt), "chatgpt"
+            except Exception as exc:
+                if not is_limit(exc):
+                    raise
+            finally:
+                lane.close()
+        else:
+            # Held across the ask: pool threads at this level must not share the process.
+            with lanes.lock(level_n):
+                lane = lanes.get(level_n, lambda: _open_level_lane(
+                    config, base, spec, timeout, instructions))
+                # The next thread/start reads these. Hops at one level differ (plan, work, check).
+                lane.instructions = instructions
+                lane.timeout = timeout
+                try:
+                    return lane.ask(prompt), "chatgpt"
+                except Exception as exc:
+                    # The failed process is done, same as a one-shot lane's finally.
+                    # A limit falls through to Claude; anything else is still raised.
+                    dead = lanes.pop(level_n)
+                    limited = is_limit(exc)
+                    error = exc
+            _close_quiet(dead)
+            if not limited:
+                raise error
+    from .fastlane import FastLane
+    claude = FastLane(config, base, tier=spec["claude"], timeout=timeout, max_turns=1, persona="",
+                      builtin_tools=())
+    try:
+        return claude.ask((instructions + "\n\n" + prompt) if instructions else prompt), "claude"
+    finally:
+        claude.close()
 
 
 def ask(config, base, name, prompt, instructions="", lane=None):

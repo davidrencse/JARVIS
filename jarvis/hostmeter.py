@@ -9,6 +9,7 @@ pass fixtures in tests; `sample()` is the only function that touches this
 machine. GB in the labels is 1024^3, the figure `free -h` prints.
 """
 
+import copy
 import json
 import os
 import re
@@ -33,7 +34,9 @@ _NAME = re.compile(r"[A-Za-z0-9_.-]{1,32}\Z")
 _NUM = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)\Z")
 _CACHE = {"at": 0.0, "raw": None}
 _CACHE_LOCK = threading.Lock()
-_CACHE_TTL = 20
+_CACHE_TTL = 20  # Linux /proc read only; the node poll is longer than this
+_SAMPLE_TTL = 10  # Windows CIM meters: a 5 s console poll and the node share one query
+_FAIL_TTL = 5  # a fast CIM failure is not retried in a tight loop, and recovers quickly
 
 # One fixed script. No format fields, so nothing the node knows is spliced in.
 WINDOWS_METERS_SCRIPT = r"""
@@ -1306,6 +1309,98 @@ def summarize(device, inv, node, *, here=False, presence=None, now=None):
                     now=now, presence=presence)
 
 
+def _copy_out(value):
+    """A caller-owned copy. A cached exception propagates; the cache keeps its own."""
+    if isinstance(value, Exception):
+        raise value
+    return copy.deepcopy(value)
+
+
+def _copy_in(value):
+    if isinstance(value, Exception):
+        return value
+    return copy.deepcopy(value)
+
+
+class _FlightCache:
+    """TTL cache with one in-flight call. Waiters share that result.
+
+    `clock` is a monotonic clock, injectable so tests can expire an entry.
+    A result for which `failed` is true is kept only for `fail_ttl`.
+    """
+
+    def __init__(self, ttl, fail_ttl=_FAIL_TTL):
+        self.ttl = ttl
+        self.fail_ttl = fail_ttl
+        self._cond = threading.Condition()
+        self._has = False
+        self._ok = False
+        self._at = 0.0
+        self._value = None
+        self._flight = False
+
+    def clear(self):
+        with self._cond:
+            self._has = False
+            self._value = None
+
+    def _hit(self, clock):
+        if not self._has:
+            return False
+        limit = self.ttl if self._ok else self.fail_ttl
+        return clock() - self._at < limit
+
+    def get(self, produce, *, clock=None, failed=None):
+        clock = clock or time.monotonic
+        failed = failed or (lambda _value: False)
+        with self._cond:
+            while True:
+                if self._hit(clock):
+                    return _copy_out(self._value)
+                if not self._flight:
+                    self._flight = True
+                    break
+                self._cond.wait()
+        try:
+            value = produce()
+            bad = bool(failed(value))
+            stored = _copy_in(value)
+        except Exception as exc:
+            stored, bad = exc, True
+        with self._cond:
+            self._value = stored
+            self._ok = not bad
+            self._has = True
+            self._at = clock()
+            self._flight = False
+            self._cond.notify_all()
+            return _copy_out(stored)
+
+
+def _meter_failed(reading):
+    """Whole-query failures only. One CIM class failing is still a reading."""
+    if not isinstance(reading, dict):
+        return True
+    if reading.get("status") == "unavailable":
+        return True
+    return reading.get("applicability") == "unavailable" and "ram" not in reading
+
+
+_meter_cache = _FlightCache(_SAMPLE_TTL, _FAIL_TTL)
+
+
+def clear_cache():
+    """Drop cached Windows meter readings. Tests call this between cases."""
+    _meter_cache.clear()
+    with _CACHE_LOCK:
+        _CACHE["at"] = 0.0
+        _CACHE["raw"] = None
+
+
+def _use_windows_meters():
+    return os.name == "nt" or _is_windows()
+
+
 def live_if_host(device):
     """This computer's reading when the device hostname is this hostname, else None."""
     host = socket.gethostname().split(".")[0].lower()
@@ -1315,7 +1410,11 @@ def live_if_host(device):
     return cached_sample()
 
 
-def cached_sample(ttl=_CACHE_TTL):
+def cached_sample(ttl=_CACHE_TTL, *, clock=None):
+    # Windows CIM is cached inside sample() (single-flight, _SAMPLE_TTL). A second
+    # cache here would hold a failure longer than _FAIL_TTL. Linux keeps this one.
+    if _use_windows_meters():
+        return slim(sample(clock=clock))
     now = time.time()
     with _CACHE_LOCK:
         if _CACHE["raw"] is not None and now - _CACHE["at"] < ttl:
@@ -1327,11 +1426,17 @@ def cached_sample(ttl=_CACHE_TTL):
     return raw
 
 
-def sample(timeout=8):
-    """Read this computer. Never raises. Windows uses one bounded CIM query."""
+def sample(timeout=8, *, clock=None):
+    """Read this computer. Never raises. Windows uses one bounded CIM query.
+
+    That query is shared for _SAMPLE_TTL (a poll and the Devices page). A failure
+    is kept only for _FAIL_TTL. Linux stays a direct read.
+    """
     try:
-        if os.name == "nt" or _is_windows():
-            return windows_canonical(_run_windows(timeout), _iso(time.time()))
+        if _use_windows_meters():
+            return _meter_cache.get(
+                lambda: windows_canonical(_run_windows(timeout), _iso(time.time())),
+                clock=clock, failed=_meter_failed)
         mounts = [("system", "/")]
         home = Path.home()
         try:
