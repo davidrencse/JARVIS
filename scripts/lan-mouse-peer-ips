@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# JARVIS: look up the Dell's current IPs instead of hard-coding them in the Lan Mouse config.
+# Sources: mDNS (WinLaptop.local), Tailscale's direct endpoint (its LAN IP when on the
+# same Wi-Fi). Never its Tailscale IP: input sharing is for laptops side by side (2026-11-06).
+#   lan-mouse-peer-ips           update ~/.config/lan-mouse/config.toml `ips = [...]` once
+#   lan-mouse-peer-ips --dry-run print what it finds
+#   lan-mouse-peer-ips --watch   every 30s; when a NEW address appears, update + restart lan-mouse
+# Used by lan-mouse.service (ExecStartPre) and lan-mouse-ipwatch.service.
+set -u
+PEER=WinLaptop
+CONFIG=$HOME/.config/lan-mouse/config.toml
+JARVIS_DIR=$HOME/projects/JARVIS
+JARVIS_PY=$JARVIS_DIR/.venv/bin/python
+
+peer_ips() {
+    {
+        timeout 3 avahi-resolve -4 -n "$PEER.local" 2>/dev/null | awk '{print $2}'
+        tailscale status --json 2>/dev/null | python3 -c '
+import json, sys
+peer = sys.argv[1]
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit()
+for p in (d.get("Peer") or {}).values():
+    if p.get("HostName") != peer:
+        continue
+    cur = p.get("CurAddr") or ""
+    if cur.count(".") == 3:
+        print(cur.rsplit(":", 1)[0])
+' "$PEER"
+    } | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -vE '^(127|169\.254)\.' | awk '!seen[$0]++'
+}
+
+config_ips() { sed -n 's/^ips = \[\(.*\)\]/\1/p' "$CONFIG" | tr -d '" ' | tr ',' '\n' | sed '/^$/d'; }
+
+write_ips() {
+    [ $# -gt 0 ] || return 1
+    ( cd "$JARVIS_DIR" && "$JARVIS_PY" -m jarvis.lanmouse_peer_ips "$CONFIG" "$PEER" "$@" ) || return 1
+    logger -t lan-mouse-peer-ips "peer IPs now $*"
+}
+
+restart_lan_mouse() {
+    for u in lan-mouse lan-mouse-fallback; do
+        systemctl --user is-active -q "$u" && systemctl --user restart "$u"
+    done
+}
+
+case "${1:-}" in
+--dry-run) echo "found: $(peer_ips | paste -sd, -)"; grep '^ips = ' "$CONFIG" ;;
+--watch)
+    while sleep 30; do
+        # JARVIS 2026-11-02: Lan Mouse off while the laptops are apart, back on when together
+        # (only if the guard stopped it). Set lan_mouse.off_when_apart=false in jarvis.config.json to disable.
+        ( cd "$JARVIS_DIR" && timeout 25 "$JARVIS_PY" -m jarvis lanmouse guard >/dev/null 2>&1 )
+        # Apart: Lan Mouse is off and nothing to update. Skips avahi's 3 s timeout and a
+        # second tailscale + python3 per tick; lan-mouse.service's ExecStartPre looks the
+        # IPs up again when the guard brings it back (JARVIS 2026-11-07).
+        grep -q '"apart_now": true' "$JARVIS_DIR/.jarvis/lanmouse-guard.json" 2>/dev/null && continue
+        mapfile -t now < <(peer_ips)
+        [ ${#now[@]} -gt 0 ] || continue
+        old=$(config_ips)
+        new_one=0
+        for ip in "${now[@]}"; do grep -qxF "$ip" <<<"$old" || new_one=1; done
+        # only a new address restarts; one briefly vanishing (Tailscale relaying) is harmless
+        if [ $new_one = 1 ] && write_ips "${now[@]}"; then restart_lan_mouse; fi
+    done ;;
+*) mapfile -t now < <(peer_ips); write_ips "${now[@]}"; exit 0 ;;
+esac
