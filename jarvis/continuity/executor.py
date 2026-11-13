@@ -10,6 +10,7 @@ docs/design/mobile-continuity/EXECUTOR-IMPLEMENTATION.md.
 """
 
 from ..locking import transaction
+from contextlib import contextmanager
 import hashlib
 import json
 import sqlite3
@@ -130,6 +131,13 @@ class ExecutorGuard:
         self._wall = wall or time.time
         self._managed = bool(managed)
         self._lock = threading.RLock()
+        # Journal sections take ``_lock``. Authority calls and sinks release it.
+        # ``_inflight`` counts sinks already running; ``fence`` waits for zero
+        # before acknowledge. ``_active`` serializes one operation at a time.
+        self._cv = threading.Condition(self._lock)
+        self._inflight = 0
+        self._active = set()
+        self._tls = threading.local()
         self._writer = None
         self._db = None
         self._quarantined = False
@@ -140,7 +148,6 @@ class ExecutorGuard:
         self._high_mode = 0
         self._fenced = (-1, -1)
         self._fence_boot = None
-        self._depth = 0
         if self._managed and not _exists(path):
             # A missing journal must not look like a fresh legacy install.
             self._quarantined = True
@@ -151,15 +158,39 @@ class ExecutorGuard:
             self._open_existing()
 
     def _enter(self):
-        if self._depth:
+        # Per-thread, so a sink blocks re-entry on this thread only. Another
+        # thread may admit, fence, or read while a sink is running.
+        if getattr(self._tls, "depth", 0):
             raise AuthorityError("busy", "executor guard cannot be re-entered from a sink")
-        self._depth = 1
+        self._tls.depth = 1
 
     def _leave(self):
-        self._depth = 0
+        self._tls.depth = 0
+
+    @contextmanager
+    def _unlocked(self):
+        """Release the journal lock for one authority call or sink.
+
+        The caller holds ``self._lock`` once. Other threads may fence, read, or
+        admit until this block re-acquires it, including when the body raises.
+        """
+        self._lock.release()
+        try:
+            yield
+        finally:
+            self._lock.acquire()
+
+    def _operation_busy(self, key):
+        target, operation_id, _attempt = key
+        return any(item[0] == target and item[1] == operation_id for item in self._active)
 
     def close(self):
         with self._lock:
+            # Waiting on our own sink would deadlock. Same refusal as fence.
+            if getattr(self._tls, "depth", 0):
+                raise AuthorityError("busy", "executor guard cannot be re-entered from a sink")
+            while self._inflight:
+                self._cv.wait()
             if self._db is not None:
                 self._db.close()
                 self._db = None
@@ -168,7 +199,10 @@ class ExecutorGuard:
                 self._writer = None
 
     def local_view(self):
-        """Local journal only. Not fleet authority, and not permission to run an effect."""
+        """Local journal only. Not fleet authority, and not permission to run an effect.
+
+        Does not wait for a running sink or an authority call.
+        """
         with self._lock:
             present = self._db is not None or self._quarantined
             return {
@@ -188,14 +222,24 @@ class ExecutorGuard:
             }
 
     def legacy_effect(self, sink):
-        """Today's dispatch. Refused once this installation has a durable v2 fence."""
+        """Today's dispatch. Refused once this installation has a durable v2 fence.
+
+        The refusal is decided under the journal lock. The sink itself runs without
+        that lock. ``fence`` does not acknowledge until this sink has returned.
+        """
         if not callable(sink):
             raise AuthorityError("bad_request", "sink must be callable")
         with self._lock:
             self._enter()
             try:
                 self._reject_closed_legacy()
-                return sink()
+                self._inflight += 1
+                try:
+                    with self._unlocked():
+                        return sink()
+                finally:
+                    self._inflight -= 1
+                    self._cv.notify_all()
             finally:
                 self._leave()
 
@@ -203,8 +247,9 @@ class ExecutorGuard:
         """Durably ack a mode version and the highest epoch this process refuses.
 
         The tuple is written locally before `acknowledge`, so a crash cannot leave the
-        authority believing we stopped while this process still runs legacy. A refused
-        acknowledge does not roll that back: rolling back would reopen legacy.
+        authority believing we stopped while this process still runs legacy. Sinks that
+        have already started, including legacy sinks, finish before `acknowledge`.
+        A refused acknowledge does not roll that back: rolling back would reopen legacy.
         `reopen_legacy` is the rollback protocol's local half and only applies when the
         authority status is already `LEGACY_ACTIVE` at a newer mode version.
         """
@@ -223,7 +268,13 @@ class ExecutorGuard:
         boot = self._current_boot()
         if boot is None:
             raise AuthorityError("no_boot_id", "fencing requires a boot id")
-        status = self._status()
+        with self._unlocked():
+            status = self._status()
+        if self._quarantined:
+            raise AuthorityError("quarantined", "executor journal is unusable")
+        boot = self._current_boot()
+        if boot is None:
+            raise AuthorityError("no_boot_id", "fencing requires a boot id")
         self._check_pinned(status)
         if status["mode"] not in MODES or status["mode"] == "QUARANTINED":
             raise AuthorityError("quarantined", "authority state is unrecognized")
@@ -248,21 +299,30 @@ class ExecutorGuard:
         fenced = requested if requested > self._fenced else self._fenced
         high_mode = max(self._high_mode, mode_version)
         self._write_fence(high, high_mode, fenced, close, boot)
+        # The durable tuple now refuses older effects. Acknowledge only after
+        # sinks that already passed ACCEPTED (and legacy sinks) have returned.
+        while self._inflight:
+            self._cv.wait()
+        recorded = self._fence_ack(True)
         try:
-            self._authority.acknowledge(
-                self.device_id, self.installation_id, mode_version, fenced[1], boot_id=boot)
+            with self._unlocked():
+                self._authority.acknowledge(
+                    self.device_id, self.installation_id, mode_version, fenced[1], boot_id=boot)
         except AuthorityError:
             raise
         except OSError:
             raise AuthorityError("unavailable", "authority unreachable") from None
-        return self._fence_ack(True)
+        return recorded
 
     def accept(self, signed_operation, admission_ticket, sink, *, failpoint=None):
         """Validate, consume online, persist the receipt, and only then call `sink`.
 
         `sink` is zero-argument. The guard does not pass operation fields into it and
         does not keep its return value. `failpoint` only raises after a durable write;
-        it never skips a check.
+        it never skips a check. Authority calls and the sink run without the journal
+        lock. ACCEPTED is fsynced immediately before the sink, and only after a fresh
+        check that the tuple is still above the fence, the session is not released,
+        and the receipt is still CONSUMED.
         """
         if not callable(sink):
             raise AuthorityError("bad_request", "sink must be callable")
@@ -272,7 +332,17 @@ class ExecutorGuard:
                 if self._quarantined:
                     raise AuthorityError("quarantined", "executor journal is unusable")
                 op = _operation(signed_operation, admission_ticket)
-                return self._accept_locked(signed_operation, op, sink, failpoint)
+                # One operation at a time. A second attempt waits, then sees the
+                # finished receipt instead of starting another effect.
+                key = (op["target"], op["operation_id"], op["attempt_id"])
+                while self._operation_busy(key):
+                    self._cv.wait()
+                self._active.add(key)
+                try:
+                    return self._accept_locked(signed_operation, op, sink, failpoint)
+                finally:
+                    self._active.discard(key)
+                    self._cv.notify_all()
             finally:
                 self._leave()
 
@@ -296,6 +366,14 @@ class ExecutorGuard:
             raise AuthorityError("released", "interactive session was released")
         self._pin_expiry_if_needed(op)
         prior = self._lookup_admission(op["admission_id"])
+        raced = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
+        if raced is not None:
+            _same_attempt(raced, op)
+            return self._finish_existing(raced, op, sink, failpoint)
+        self._reject_blocked_attempt(op)
+        self._revalidate_open(op)
+        if self._wall() >= op["admit_until"]:
+            self._pin_expiry_if_needed(op)
         if prior is not None:
             _same_admission(prior, op)
             self._insert_receipt(op, "UNCERTAIN", "authority_consumed")
@@ -305,7 +383,10 @@ class ExecutorGuard:
         return self._drive(op, sink, failpoint, already=False)
 
     def reconcile(self, operation_id, attempt_id):
-        """Local receipt only. Does not consume, does not call the sink, does not need Oracle."""
+        """Local receipt only. Does not consume, does not call the sink, does not need Oracle.
+
+        Does not wait for a running sink or an authority call.
+        """
         with self._lock:
             self._enter()
             try:
@@ -320,7 +401,10 @@ class ExecutorGuard:
                 self._leave()
 
     def stop_interactive(self, session_id, reason):
-        """Record that a session's input must not run or replay. Does not press keys or consume."""
+        """Record that a session's input must not run or replay. Does not press keys or consume.
+
+        Does not wait for a running sink or an authority call.
+        """
         session_id, reason = _ident(session_id, "session_id"), _ident(reason, "reason")
         with self._lock:
             self._enter()
@@ -480,6 +564,37 @@ class ExecutorGuard:
         if tup < self._high or tup <= self._fenced:
             raise AuthorityError("stale", "ticket is older than this installation's durable fence")
 
+    def _revalidate_open(self, op):
+        """Re-check fence, high-water, and session after the lock was released.
+
+        The caller holds the lock and has not written the next receipt state yet.
+        A fenced open receipt becomes REJECTED so the sink cannot start. Session
+        release keeps the messages the locked path already used. No row yet uses
+        the same stale refusal as the pre-network check.
+        """
+        if self._quarantined:
+            raise AuthorityError("quarantined", "executor journal is unusable")
+        row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
+        state = None if row is None else row["state"]
+        if state not in (None, "PREPARED", "CONSUMED"):
+            return row
+        tup = (op["incarnation"], op["epoch"])
+        if tup <= self._fenced or tup < self._high:
+            if state in ("PREPARED", "CONSUMED") and tup <= self._fenced:
+                self._update_receipt(op, "REJECTED", "stale", None)
+                raise AuthorityError("stale", "this installation has fenced that epoch")
+            if state in ("PREPARED", "CONSUMED") and tup < self._high:
+                raise AuthorityError("stale", "authority tuple is older than the durable high-water mark")
+            raise AuthorityError("stale", "ticket is older than this installation's durable fence")
+        if op["effect_class"] == "interactive" and self._session_state(op.get("session_id")) == "released":
+            if state == "PREPARED":
+                self._update_receipt(op, "RELEASED", "released", None)
+                raise AuthorityError("released", "interactive session was released")
+            if state == "CONSUMED":
+                raise AuthorityError("released", "interactive session was released before the effect")
+            raise AuthorityError("released", "interactive session was released")
+        return row
+
     def _reject_blocked_attempt(self, op):
         if self._db is None:
             return
@@ -532,9 +647,10 @@ class ExecutorGuard:
         is uncertain and is never retried.
 
         The status check, the consume, and the sink are not one distributed atomic
-        effect. A revoke or fence that commits after this consume returns can still
-        overlap the sink. The contract boundary is ACCEPTED: once written, the effect
-        is not attempted again.
+        effect with a revoke. A fence that is durable before ACCEPTED refuses the
+        sink. A fence or revoke that lands after ACCEPTED can overlap the running
+        sink; fence's acknowledge waits until that sink returns. Once ACCEPTED is
+        written, the effect is not attempted again.
         """
         row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
         if row["state"] == "PREPARED":
@@ -542,6 +658,10 @@ class ExecutorGuard:
                 self._update_receipt(op, "RELEASED", "released", None)
                 raise AuthorityError("released", "interactive session was released")
             prior = self._lookup_admission(op["admission_id"])
+            row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
+            if row["state"] != "PREPARED":
+                return self._finish_existing(row, op, sink, failpoint)
+            self._revalidate_open(op)
             if prior is not None:
                 try:
                     _same_admission(prior, op)
@@ -549,6 +669,9 @@ class ExecutorGuard:
                     self._on_consume_error(op, exc)
                     raise
             consumed = self._consume_authorized(op)
+            row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
+            if row["state"] != "PREPARED":
+                return self._finish_existing(row, op, sink, failpoint)
             self._update_receipt(op, "CONSUMED", None, consumed.get("consumed_at"))
             self._advance_high(op["incarnation"], op["epoch"], op["mode_version"])
             self._crash(failpoint, "after_consume")
@@ -563,19 +686,30 @@ class ExecutorGuard:
         row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
         if row["state"] != "CONSUMED":
             return self._finish_existing(row, op, sink, failpoint)
+        self._revalidate_open(op)
+        row = self._receipt(op["target"], op["operation_id"], op["attempt_id"])
+        if row["state"] != "CONSUMED":
+            return self._finish_existing(row, op, sink, failpoint)
         # Fsync the accepted receipt before the effect. A crash here leaves ACCEPTED, which
         # is uncertain and is never fed to the sink again.
-        self._update_receipt(op, "ACCEPTED", None, row["consumed_at"])
+        consumed_at = row["consumed_at"]
+        self._update_receipt(op, "ACCEPTED", None, consumed_at)
         self._crash(failpoint, "after_accept")
+        self._inflight += 1
         try:
-            sink()
-            self._crash(failpoint, "during_effect")
-        except AuthorityError:
-            raise
-        except Exception:
-            raise AuthorityError("uncertain", "effect outcome unknown") from None
-        self._update_receipt(op, "COMPLETED", "completed", row["consumed_at"])
-        return _public(self._receipt(op["target"], op["operation_id"], op["attempt_id"]), already=already)
+            with self._unlocked():
+                try:
+                    sink()
+                    self._crash(failpoint, "during_effect")
+                except AuthorityError:
+                    raise
+                except Exception:
+                    raise AuthorityError("uncertain", "effect outcome unknown") from None
+            self._update_receipt(op, "COMPLETED", "completed", consumed_at)
+            return _public(self._receipt(op["target"], op["operation_id"], op["attempt_id"]), already=already)
+        finally:
+            self._inflight -= 1
+            self._cv.notify_all()
 
     def _consume_authorized(self, op):
         """Current tuple, mode, and readiness, then an exact authenticated consume.
@@ -587,21 +721,27 @@ class ExecutorGuard:
         """
         self._status_for_ticket(op)
         try:
-            consumed = self._authority.consume(
-                admission_id=op["admission_id"], target=op["target"], operation_id=op["operation_id"],
-                attempt_id=op["attempt_id"], digest=op["digest"], main=op["main"],
-                incarnation=op["incarnation"], epoch=op["epoch"], issued_at=op["issued_at"],
-                admit_until=op["admit_until"], issuer_incarnation=op["issuer_incarnation"])
+            with self._unlocked():
+                consumed = self._authority.consume(
+                    admission_id=op["admission_id"], target=op["target"], operation_id=op["operation_id"],
+                    attempt_id=op["attempt_id"], digest=op["digest"], main=op["main"],
+                    incarnation=op["incarnation"], epoch=op["epoch"], issued_at=op["issued_at"],
+                    admit_until=op["admit_until"], issuer_incarnation=op["issuer_incarnation"])
         except AuthorityError as exc:
             self._on_consume_error(op, exc)
             raise
         except OSError:
             raise AuthorityError("unavailable", "authority unreachable") from None
         _same_admission(consumed, op)
+        # Fence, stop, or a higher tuple may have landed while consume ran.
+        self._revalidate_open(op)
         return consumed
 
     def _status_for_ticket(self, op):
-        status = self._status()
+        with self._unlocked():
+            status = self._status()
+        if self._quarantined:
+            raise AuthorityError("quarantined", "executor journal is unusable")
         self._check_pinned(status)
         issued = (int(status["incarnation"]), int(status["epoch"]))
         if issued < self._high or int(status["mode_version"]) < self._high_mode:
@@ -671,7 +811,8 @@ class ExecutorGuard:
 
     def _lookup_admission(self, admission_id):
         try:
-            return self._authority.admission(admission_id)
+            with self._unlocked():
+                return self._authority.admission(admission_id)
         except AuthorityError:
             raise
         except OSError:

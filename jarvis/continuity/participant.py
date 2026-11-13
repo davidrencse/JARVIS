@@ -126,7 +126,7 @@ class Participant:
             if operation.get('path') != root:
                 raise RuntimeRefusal('forbidden')
             name = None
-        elif action == 'brain_receive':
+        elif action in ('brain_receive', 'brain_discard'):
             if paths.dirname(operation['path']) != root:
                 raise RuntimeRefusal('forbidden')
             name = paths.basename(operation['path'])

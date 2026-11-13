@@ -8,6 +8,8 @@ import copy
 import hashlib
 import json
 import secrets
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 from .gateway import RUNTIME_NS, _message, sign_message, verify_message, pin_relay
@@ -17,6 +19,39 @@ SCHEMA = 'jarvis-continuity-repoint/1'
 FILE = 'continuity-endpoint.json'
 FIELDS = {'schema', 'authority_id', 'fleet_id', 'incarnation', 'epoch', 'transition_id',
           'main', 'installation_id', 'target', 'endpoint', 'code_key', 'token', 'link'}
+# One signed instruction is re-read every few seconds. A handful of distinct
+# successes covers that hot path; the least recently used entry drops first.
+_VERIFY_CACHE_MAX = 8
+_VERIFY_CACHE = OrderedDict()
+_VERIFY_CACHE_LOCK = threading.Lock()
+
+
+def clear_verify_cache():
+    """Drop remembered signature successes. Tests call this between cases."""
+    with _VERIFY_CACHE_LOCK:
+        _VERIFY_CACHE.clear()
+
+
+def _verify_cache_key(instruction, authority_id, target, pins):
+    """sha256 of the canonical instruction plus authority, target, and pins.
+
+    None when those inputs cannot be fingerprinted. That call is not cached,
+    so an unusual pins object still goes through ssh-keygen every time.
+    """
+    try:
+        instruction_raw = json.dumps(
+            instruction, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
+        pins_raw = json.dumps(
+            pins, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
+        hash((authority_id, target))
+    except (TypeError, ValueError):
+        return None
+    return (
+        hashlib.sha256(instruction_raw.encode('utf-8')).hexdigest(),
+        authority_id,
+        target,
+        hashlib.sha256(pins_raw.encode('utf-8')).hexdigest(),
+    )
 
 
 def _regular(path):
@@ -71,7 +106,7 @@ def _shape(body):
             _check_target(target)
 
 
-def verify(instruction, *, authority_id, target, pins):
+def _verify_uncached(instruction, *, authority_id, target, pins):
     if not isinstance(instruction, dict) or set(instruction) != {'body', 'signature'}:
         raise RuntimeRefusal('bad_request')
     body = instruction['body']; _shape(body)
@@ -81,6 +116,34 @@ def verify(instruction, *, authority_id, target, pins):
             not verify_message(RUNTIME_NS, _message(RUNTIME_NS, body), instruction['signature'], record.get('public_key'))):
         raise RuntimeRefusal('signature')
     return body
+
+
+def verify(instruction, *, authority_id, target, pins):
+    """Return the signed body, or raise the same refusal an uncached check raises.
+
+    Successes are remembered so a steady re-read does not spawn ssh-keygen.
+    effective_config and the installer's prior check are that hot path. The
+    installer's new-instruction check uses this same cache: the key is the
+    canonical instruction plus authority_id, target, and a fingerprint of
+    pins, failures are not stored, and every caller gets its own deep copy.
+    A changed file is a different instruction from _read, so it misses.
+    """
+    key = _verify_cache_key(instruction, authority_id, target, pins)
+    if key is not None:
+        with _VERIFY_CACHE_LOCK:
+            cached = _VERIFY_CACHE.get(key)
+            if cached is not None:
+                _VERIFY_CACHE.move_to_end(key)
+                return copy.deepcopy(cached)
+    body = _verify_uncached(instruction, authority_id=authority_id, target=target, pins=pins)
+    stored = copy.deepcopy(body)
+    if key is not None:
+        with _VERIFY_CACHE_LOCK:
+            _VERIFY_CACHE[key] = stored
+            _VERIFY_CACHE.move_to_end(key)
+            while len(_VERIFY_CACHE) > _VERIFY_CACHE_MAX:
+                _VERIFY_CACHE.popitem(last=False)
+    return copy.deepcopy(stored)
 
 
 def _grant(status, body):
@@ -237,6 +300,11 @@ def effective_config(config, state):
     if any(note.get(k) != v for k, v in {'node_id': local, 'main_device': body['main'],
             'code_key': body['code_key'], 'token': body['token']}.items()):
         raise RuntimeRefusal('bad_state')
-    result = copy.deepcopy(config)
-    result['cluster'].update(main_device=body['main'], main_url=body['endpoint'])
-    return result
+    # Omitted and JSON null are the same direct-HTTPS route. The signed link owns
+    # every SSH field; a note-only rewrite must not reach the tunnel reader.
+    signed_link = body['link']
+    saved_link = note['link'] if 'link' in note else None
+    if saved_link != signed_link:
+        raise RuntimeRefusal('bad_state')
+    from jarvis.linkfinder import handoff_config
+    return handoff_config(config, body)

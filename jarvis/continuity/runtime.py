@@ -19,11 +19,13 @@ prototype value. ``GatewayPort`` speaks the authority client's method names.
 It does not sign, does not enroll, and does not change the authority mode.
 """
 
+import copy
 import hashlib
 import importlib
 import json
 import os
 import re
+import threading
 from pathlib import Path
 
 from jarvis.fsio import atomic_write
@@ -61,6 +63,12 @@ _LINK_CODES = frozenset({
     "partition", "unavailable", "no_relay", "redirect", "authority_mismatch",
     "bad_origin", "refused_bind",
 })
+# Transport failure from lease_snapshot. Distinct from None (no grant in memory).
+_SNAPSHOT_DOWN = object()
+# Status plus public snapshot, when the failure is a link blip. Not a cancel.
+_GRANT_READS = 3
+# Seconds a caller waits before retrying a step whose journal write failed.
+_JOURNAL_RETRY = 5.0
 _CODE = re.compile(r"^[a-z_]{1,40}$")
 # Outbound only. A wider set than the readiness probe, matching the gateway's refusal.
 _WIRE_BANNED = _BANNED | frozenset({
@@ -438,6 +446,25 @@ class MainRuntime:
         self._last = None
         self._stale = None
         self._releasing = False
+        self._renewal_paused = False
+        # One lock for block, hold, cache and lease. Never held across a port call.
+        # ``_gen`` moves on every block change. A status read that began before a
+        # change must not clear or replace the block set after it.
+        self._lock = threading.RLock()
+        self._gen = 0
+
+    def _set_block(self, value, gen=None):
+        """Set the block. With ``gen``, only when nothing changed it since then."""
+        with self._lock:
+            if gen is not None and self._gen != gen:
+                return False
+            self._block = value
+            self._gen += 1
+            return True
+
+    def _generation(self):
+        with self._lock:
+            return self._gen
 
     def start(self):
         self._started = True
@@ -448,13 +475,13 @@ class MainRuntime:
             return self.state()
         self._last = status
         if status["mode"] in _LEGACY_MODES:
-            self._block = "legacy"
+            self._set_block("legacy")
             return self.state()
         if status["mode"] == "QUARANTINED":
-            self._block = "quarantined"
+            self._set_block("quarantined")
             return self.state()
         if self._block in ("legacy", "quarantined"):
-            self._block = None
+            self._set_block(None)
         if (self._lease and status.get("main") == self.device_id and status.get("lease_valid")
                 and self._block not in _NO_RENEW and not self._hold):
             self.renew_once()
@@ -509,8 +536,12 @@ class MainRuntime:
             raise RuntimeRefusal("stale")
         if status.get("main") != self.device_id:
             raise RuntimeRefusal("not_holder")
-        self._lease = {key: lease[key] for key in _LEASE_FIELDS}
-        self._cache.invalidate("accepted")
+        with self._lock:
+            self._lease = {key: lease[key] for key in _LEASE_FIELDS}
+            # A new grant is allowed to renew. The handoff pause applied to the
+            # previous not-ready lease and must not stick to this one.
+            self._renewal_paused = False
+            self._cache.invalidate("accepted")
 
     def lease_snapshot(self):
         """Copied grant tuple, or None when this PC has no grant in memory.
@@ -566,50 +597,79 @@ class MainRuntime:
         # Keep the local tuple. A later renew must be refused by the authority.
         return {"released": True, "code": "released", "fence": False}
 
+    def pause_renewal(self):
+        """Stop this PC from extending its lease.
+
+        ``renew_once`` then returns ``{"code": "renewal_paused", "wait": None}``
+        and does not call the authority. The lease already issued lapses on the
+        authority clock. ``accept_lease`` of a grant clears the pause. This
+        does not release the lease, cancel a transition, or reveal a lease id.
+        """
+        self._renewal_paused = True
+
     def renew_once(self):
-        if not self._started:
-            raise RuntimeRefusal("not_started")
-        if self._hold:
-            return {"code": self._hold, "wait": None}
-        if self._block == "suspend":
-            return {"code": "suspend", "wait": None}
-        if self._block == "draining":
+        while True:
+            with self._lock:
+                if not self._started:
+                    raise RuntimeRefusal("not_started")
+                if self._renewal_paused:
+                    return {"code": "renewal_paused", "wait": None}
+                if self._hold:
+                    return {"code": self._hold, "wait": None}
+                if self._block == "suspend":
+                    return {"code": "suspend", "wait": None}
+                if self._block != "draining":
+                    lease = self._lease
+                    if lease is None:
+                        return {"code": "no_lease", "wait": None}
+                    gen = self._gen
+                    started = self._cache.now()
+                    break
+            # A drain latch lasts only while the authority transition is open. The
+            # check reads the authority, so it runs outside the lock; the loop
+            # re-reads every latch once it clears.
             if not self._drain_finished():
-                return {"code": self._block, "wait": None}
-        if self._lease is None:
-            return {"code": "no_lease", "wait": None}
-        started = self._cache.now()
+                return {"code": "draining", "wait": None}
         try:
-            answer = self._port.renew(self._lease)
+            answer = self._port.renew(lease)
         except LinkError:
             self._lose_link()
             return {"code": "partition", "wait": None}
         except AuthorityError as err:
-            self._cache.invalidate(err.code)
-            self._block = err.code
+            with self._lock:
+                self._cache.invalidate(err.code)
+                # A newer block (a drain begun during this call) is not replaced.
+                self._set_block(err.code, gen)
             return {"code": err.code, "wait": err.wait}
         cached = False
-        if started is not None and isinstance(answer, dict):
-            cached = self._cache.observe(
-                holder=self._lease["holder"], incarnation=self._lease["incarnation"],
-                epoch=self._lease["epoch"], valid_for=answer.get("valid_for"),
-                ready=answer.get("ready") is True, request_started=started)
+        with self._lock:
+            if self._gen == gen and started is not None and isinstance(answer, dict):
+                cached = self._cache.observe(
+                    holder=lease["holder"], incarnation=lease["incarnation"],
+                    epoch=lease["epoch"], valid_for=answer.get("valid_for"),
+                    ready=answer.get("ready") is True, request_started=started)
         try:
             status = self._port.status()
         except LinkError:
             self._lose_link()
             return {"code": "partition", "wait": None}
-        self._last = status
-        ready = isinstance(answer, dict) and answer.get("ready") is True
-        if (ready and status.get("mode") == "V2_ACTIVE" and not status.get("transition")
-                and status.get("main") == self.device_id and status.get("main_ready")):
-            self._block = None
-        remaining = self._cache.remaining(self.device_id) if self._cache.now() is not None else 0.0
+        with self._lock:
+            self._last = status
+            ready = isinstance(answer, dict) and answer.get("ready") is True
+            # The status read began after ``gen`` was taken. If any block was set
+            # since (a drain, suspend, hold of a later call), that block stays.
+            if (ready and status.get("mode") == "V2_ACTIVE" and not status.get("transition")
+                    and status.get("main") == self.device_id and status.get("main_ready")
+                    and self._gen == gen):
+                self._block = None
+            remaining = self._cache.remaining(self.device_id) if self._cache.now() is not None else 0.0
+            reason = self._cache.reason
+            now_set = self._cache.now() is None
         renew_after = answer.get("renew_after", RENEW_SECONDS) if isinstance(answer, dict) else RENEW_SECONDS
         return {
-            "code": "ok" if cached or self._cache.now() is None else self._cache.reason,
-            "holder": self._lease["holder"], "lease_id": self._lease["lease_id"],
-            "incarnation": self._lease["incarnation"], "epoch": self._lease["epoch"],
+            "code": "ok" if cached or now_set else reason,
+            "holder": lease["holder"], "lease_id": lease["lease_id"],
+            "incarnation": lease["incarnation"], "epoch": lease["epoch"],
             "valid_for": None if not isinstance(answer, dict) else answer.get("valid_for"),
             "ready": ready, "remaining": remaining, "cached": cached,
             "renew_after": renew_after, "wait": None,
@@ -620,14 +680,19 @@ class MainRuntime:
             raise RuntimeRefusal("bad_request")
         if target is not None and not _ident_ok(target):
             raise RuntimeRefusal("bad_request")
-        if not self._started:
-            raise RuntimeRefusal("not_started")
-        if self._hold:
-            raise RuntimeRefusal(self._hold)
-        if self._block == "suspend" or self._block in ("legacy", "quarantined"):
-            raise RuntimeRefusal(self._block)
-        if self._block == "draining" and not self._drain_finished():
-            raise RuntimeRefusal(self._block)
+        with self._lock:
+            if not self._started:
+                raise RuntimeRefusal("not_started")
+            if self._hold:
+                raise RuntimeRefusal(self._hold)
+            if self._block == "suspend" or self._block in ("legacy", "quarantined"):
+                raise RuntimeRefusal(self._block)
+            draining = self._block == "draining"
+        if draining and not self._drain_finished():
+            raise RuntimeRefusal("draining")
+        # Every block below comes from this status read. If a block changed while
+        # the read was in flight, the newer one stays and the answer is a refusal.
+        gen = self._generation()
         try:
             status = self._port.status()
         except LinkError:
@@ -635,17 +700,17 @@ class MainRuntime:
             raise RuntimeRefusal("partition")
         self._last = status
         if status["mode"] in _LEGACY_MODES:
-            self._block = "legacy"
+            self._set_block("legacy", gen)
             raise RuntimeRefusal("legacy")
         if status["mode"] == "QUARANTINED":
-            self._block = "quarantined"
+            self._set_block("quarantined", gen)
             raise RuntimeRefusal("quarantined")
         if status.get("mode") != "V2_ACTIVE" or not status.get("lease_valid"):
-            self._block = "no_main"
+            self._set_block("no_main", gen)
             raise RuntimeRefusal("no_main")
         if status.get("main") != self.device_id:
             self._cache.invalidate("not_holder")
-            self._block = "not_holder"
+            self._set_block("not_holder", gen)
             raise RuntimeRefusal("not_holder")
         if not status.get("main_ready"):
             raise RuntimeRefusal("not_ready")
@@ -663,10 +728,16 @@ class MainRuntime:
             seen = self._cache.seen
             if seen != (status["incarnation"], status["epoch"]):
                 self._cache.invalidate("newer_tuple")
-                self._block = "stale"
+                self._set_block("stale", gen)
                 raise RuntimeRefusal("stale")
-        if self._block == "partition":
-            raise RuntimeRefusal("partition")
+        with self._lock:
+            if self._block == "partition":
+                raise RuntimeRefusal("partition")
+            # A drain, suspend or hold that landed while this call ran closes it.
+            if self._hold:
+                raise RuntimeRefusal(self._hold)
+            if self._gen != gen and self._block is not None:
+                raise RuntimeRefusal(self._block)
         return {
             "effect_class": effect_class, "target": target, "holder": self.device_id,
             "incarnation": status["incarnation"], "epoch": status["epoch"],
@@ -689,32 +760,41 @@ class MainRuntime:
         except LinkError:
             self._lose_link()
             raise RuntimeRefusal("partition")
-        self._last = status
         current = status.get("transition") or {}
         if current.get("transition_id") != transition_id:
+            with self._lock:
+                self._last = status
             raise RuntimeRefusal("unknown_transition")
-        self._block = "draining"
-        self._cache.invalidate("draining")
+        with self._lock:
+            self._last = status
+            # The generation moves here. A renew that began earlier cannot cache
+            # its grant again or clear this block from an older status read.
+            self._set_block("draining")
+            self._cache.invalidate("draining")
         return {"transition_id": transition_id, "admission_stopped": True,
                 "renewals_stopped": True, "authority_drain": False,
                 "state": current.get("state"), "code": "draining"}
 
     def release_before_suspend(self):
         """Best-effort ``release`` plus a local stop. A missed ack does not elect a successor."""
-        self._block = "suspend"
-        self._cache.invalidate("suspend")
-        self._releasing = True
+        with self._lock:
+            self._set_block("suspend")
+            self._cache.invalidate("suspend")
+            self._releasing = True
+            lease = self._lease
         released = False
         code = "no_lease"
-        if self._lease is not None:
+        if lease is not None:
             try:
-                self._port.release(self._lease)
+                self._port.release(lease)
                 released = True
                 code = "released"
-                self._lease = None
+                with self._lock:
+                    if self._lease is lease:
+                        self._lease = None
             except LinkError:
                 self._lose_link()
-                self._block = "suspend"
+                self._set_block("suspend")
                 code = "partition"
             except AuthorityError as err:
                 code = err.code
@@ -727,8 +807,9 @@ class MainRuntime:
                 acked = True
             except (RuntimeRefusal, AuthorityError, LinkError):
                 acked = False
-        self._releasing = False
-        self._block = "suspend"
+        with self._lock:
+            self._releasing = False
+            self._set_block("suspend")
         return {"released": released, "admission_stopped": True, "invalidated": True,
                 "acked": acked, "code": code}
 
@@ -753,34 +834,43 @@ class MainRuntime:
 
     def invalidate_after_resume(self):
         """Drop every cached grant. Does not reclaim MAIN and does not renew."""
-        self._cache.invalidate("resumed")
-        if self._block == "partition":
-            self._stale = None
-        if self._block != "legacy":
-            self._block = "resumed"
+        with self._lock:
+            self._cache.invalidate("resumed")
+            if self._block == "partition":
+                self._stale = None
+            if self._block != "legacy":
+                self._set_block("resumed")
 
     def stop_new_admission(self, reason):
         """Sticky for this process. A later renew cannot clear an explicit hold."""
-        self._hold = _reason(reason)
-        self._cache.invalidate("stopped")
+        with self._lock:
+            self._hold = _reason(reason)
+            self._gen += 1
+            self._cache.invalidate("stopped")
 
     def _drain_finished(self):
         """A local drain latch lasts only while the authority transition is still open."""
+        gen = self._generation()
         try:
             status = self._port.status()
         except LinkError:
             self._lose_link()
             return False
-        self._last = status
-        if status.get("transition"):
-            return False
-        self._block = None
-        return True
+        with self._lock:
+            self._last = status
+            if status.get("transition"):
+                return False
+            # A block set after this read began (a new drain) is not cleared by it.
+            if self._gen != gen:
+                return False
+            self._block = None
+            return True
 
     def _lose_link(self):
-        self._stale = self._view(self._last, stale=True)
-        self._cache.invalidate("link_loss")
-        self._block = "partition"
+        with self._lock:
+            self._stale = self._view(self._last, stale=True)
+            self._cache.invalidate("link_loss")
+            self._set_block("partition")
 
     def _view(self, status, stale):
         status = status or {}
@@ -1175,6 +1265,9 @@ class _HandoffJournal:
     def __init__(self, path):
         self.path = None if path is None else Path(path)
         self.corrupt = False
+        # True when the last update could not be written. Memory was not changed,
+        # so nothing was recorded and nothing has run: the caller may retry.
+        self.write_failed = False
         self.doc = {"schema": 1, "steps": {}}
         if self.path is not None and self.path.exists():
             loaded = _journal_load_text(self.path)
@@ -1272,14 +1365,16 @@ class _HandoffJournal:
             return None
 
         if not self._update(merge):
-            return "corrupt", None
+            return ("unwritable" if self.write_failed else "corrupt"), None
         return box["phase"], box["ok"]
 
     def _update(self, merge):
+        """Apply ``merge`` to a copy. Memory adopts it only after the write lands."""
+        self.write_failed = False
         if self.corrupt:
             return False
         if self.path is None:
-            updated = merge(self.doc)
+            updated = merge(copy.deepcopy(self.doc))
             if updated is None:
                 self.corrupt = True
                 return False
@@ -1295,7 +1390,7 @@ class _HandoffJournal:
             handle = os.fdopen(os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0), 0o600),
                                "r+b", buffering=0)
             _acquire_os_lock(handle)
-            current = self.doc
+            current = copy.deepcopy(self.doc)
             if self.path.exists():
                 loaded = _journal_load_text(self.path)
                 if loaded is None:
@@ -1309,21 +1404,40 @@ class _HandoffJournal:
             _journal_write(self.path, updated)
             self.doc = updated
             return True
-        except (OSError, RuntimeRefusal):
+        except OSError:
+            self.write_failed = True
+            return False
+        except RuntimeRefusal:
             return False
         finally:
             if handle is not None:
                 handle.close()
 
 
+def _snapshot_transport(err):
+    """True when a snapshot failure is the link, not an authority decision."""
+    if isinstance(err, (LinkError, OSError)):
+        return True
+    if isinstance(err, (RuntimeRefusal, AuthorityError)):
+        code = getattr(err, "code", None)
+        return code in _LINK_CODES or code == "partition"
+    return False
+
+
 def _public_snapshot(runtime):
-    """Holder's copied tuple. Never reads a private lease attribute."""
+    """Holder's copied tuple. Never reads a private lease attribute.
+
+    ``_SNAPSHOT_DOWN`` is a transport failure. None is an empty or malformed
+    snapshot, or a refusal that is not a link error.
+    """
     method = getattr(runtime, "lease_snapshot", None)
     if not callable(method):
         return None
     try:
         snap = method()
-    except (RuntimeRefusal, AuthorityError, LinkError, OSError):
+    except (RuntimeRefusal, AuthorityError, LinkError, OSError) as err:
+        if _snapshot_transport(err):
+            return _SNAPSHOT_DOWN
         return None
     return _lease_view(snap)
 
@@ -1345,7 +1459,9 @@ class SafeHandoff:
     the old lease is fenced, ``jarvis.brainsync.handoff(old, new, config, base)``
     is imported and must return ``ok`` True. ``config`` and ``base`` are local
     hook arguments, not authority requests. A failure after the fence cancels
-    only when authenticated status shows no holder. Fence waits come back as
+    only when authenticated status shows no holder. A transport failure reading
+    the candidate snapshot is ``partition``: the transition stays open and the
+    next call resumes it. Fence waits come back as
     ``pending`` with ``retry_after``. The same call resumes one transition for
     the same candidate and refuses a different one. The result never includes a
     lease id.
@@ -1613,6 +1729,8 @@ class SafeHandoff:
         if status.get("lease_holder") != self._candidate.device_id or status.get("main_ready") is True:
             return None, "stale"
         snap = _public_snapshot(self._candidate)
+        if snap is _SNAPSHOT_DOWN:
+            return None, "partition"
         if not _grant_ok(snap, self._candidate.device_id, transition.get("expected_epoch")):
             return None, "lease_unavailable"
         if (snap.get("incarnation") != status.get("incarnation")
@@ -1620,6 +1738,33 @@ class SafeHandoff:
                 or snap.get("holder") != status.get("lease_holder")):
             return None, "stale"
         return snap, None
+
+    def _acquire_grant(self, transition):
+        """Status plus the public snapshot. A link blip is not a cancel.
+
+        Returns ``(status, snap, problem, status_err, partitioned)``.
+        ``partitioned`` means this call must return ``partition`` without
+        aborting or marking the journal. The read is tried up to three times.
+        A later clean grant problem (expired, stale, unavailable) is returned
+        as that problem. A clean snapshot after a blip still ends this call as
+        ``partition``; the next call resumes the same transition. ``status_err``
+        is a failed status read and keeps the caller's existing error result.
+        """
+        last_status = None
+        saw_partition = False
+        for _attempt in range(_GRANT_READS):
+            status, err = self._read_status()
+            if err is not None:
+                return status, None, None, err, False
+            last_status = status
+            snap, problem = self._grant_current(status, transition)
+            if problem == "partition":
+                saw_partition = True
+                continue
+            if saw_partition and problem is None:
+                return status, None, "partition", None, True
+            return status, snap, problem, None, False
+        return last_status, None, "partition", None, True
 
     def _lost_grant(self, transition_id, transition, old_main, new_main, config, base):
         """The grant answer was lost. Do not invent a lease id."""
@@ -1630,23 +1775,31 @@ class SafeHandoff:
         if (current.get("transition_id") != transition_id
                 or current.get("state") != "GRANTED_NOT_READY"):
             return _handoff_result(False, "partition", "partition", status=status, transition=transition)
-        _snap, problem = self._grant_current(status, current)
+        status, _snap, problem, status_err, partitioned = self._acquire_grant(current)
+        if status_err is not None:
+            return _handoff_from_error(status_err, transition=transition)
+        if partitioned:
+            return _handoff_result(False, "partition", "partition", status=status, transition=current)
         if problem is not None:
-            if problem == "lease_unavailable":
-                return self._abort(transition_id, "lease_unavailable", current)
-            journal = self._journal()
-            if journal.corrupt or journal.any_recorded():
-                return self._uncertain(current, "reconcile")
+            # An empty snapshot still cancels. A lapsed lease cancels even when
+            # the journal has records: nothing can be admitted on it.
+            if problem != "lease_unavailable" and problem != "expired":
+                journal = self._journal()
+                if journal.corrupt or journal.any_recorded():
+                    return self._uncertain(current, "reconcile")
             return self._abort(transition_id, problem, current)
         return self._promote(current, old_main, new_main, config, base)
 
     def _promote(self, transition, old_main, new_main, config, base):
         self._journal_base = base
-        status, err = self._read_status()
-        if err is not None:
-            return _handoff_from_error(err, transition=transition)
-        snap, problem = self._grant_current(status, transition)
+        status, snap, problem, status_err, partitioned = self._acquire_grant(transition)
+        if status_err is not None:
+            return _handoff_from_error(status_err, transition=transition)
+        if partitioned:
+            return _handoff_result(False, "partition", "partition", status=status, transition=transition)
         journal = self._journal()
+        if problem == "expired":
+            return self._abort(transition.get("transition_id"), problem, transition)
         if journal.corrupt:
             return self._uncertain(transition, "reconcile")
         if problem is not None:
@@ -1674,14 +1827,32 @@ class SafeHandoff:
         return self._complete(transition)
 
     def _callback(self, transition, name, call, accept, refuse_code):
-        """One winner claims the step under the journal lock and runs the hook."""
+        """One winner claims the step under the journal lock and runs the hook.
+
+        A grant problem on a step that has no record yet does not claim it, so
+        a failed check cannot stick the journal at ``started``. A hook that
+        raises, or a step someone else already started, is not replayed and
+        does not cancel; renewal is paused so the not-ready lease can lapse.
+        """
         journal = self._journal()
-        status, err = self._read_status()
-        if err is not None:
-            return _handoff_from_error(err, transition=transition)
-        snap, problem = self._grant_current(status, transition)
+        phase_now = journal.step(name).get("phase")
+        status, snap, problem, status_err, partitioned = self._acquire_grant(transition)
+        if status_err is not None:
+            return _handoff_from_error(status_err, transition=transition)
+        if partitioned:
+            return _handoff_result(False, "partition", "partition", status=status, transition=transition)
+        if problem == "expired":
+            return self._abort(transition.get("transition_id"), problem, transition)
+        if phase_now is None and problem is not None and not journal.corrupt:
+            return self._abort(transition.get("transition_id"), problem, transition)
         phase, ok_flag = journal.claim(name)
+        if phase == "unwritable":
+            # Nothing was recorded and the hook has not run. The same call resumes.
+            return _handoff_result(
+                False, "pending", "journal_unwritable", status=status,
+                transition=transition, retry_after=_JOURNAL_RETRY)
         if phase == "started":
+            self._pause_candidate_renewal()
             return self._uncertain(transition, "reconcile")
         if phase == "finished":
             if ok_flag is True:
@@ -1694,6 +1865,7 @@ class SafeHandoff:
         try:
             result = call(snap)
         except Exception:
+            self._pause_candidate_renewal()
             return self._uncertain(transition, "reconcile")
         if not accept(result):
             journal.mark(name, "finished", ok=False)
@@ -1718,19 +1890,25 @@ class SafeHandoff:
             if proved is not None:
                 journal.mark("complete", "finished", ok=True)
                 return proved
-            status, err = self._read_status()
-            if err is not None:
+            status, _snap, problem, status_err, partitioned = self._acquire_grant(transition)
+            if status_err is not None:
                 return self._uncertain(transition, "reconcile")
-            _snap, problem = self._grant_current(status, transition)
+            if partitioned:
+                return _handoff_result(
+                    False, "partition", "partition", status=status, transition=transition)
+            if problem == "expired":
+                return self._abort(tid, problem, transition)
             if problem is not None:
                 return self._uncertain(transition, "reconcile")
         else:
-            status, err = self._read_status()
-            if err is not None:
-                return _handoff_from_error(err, transition=transition)
-            _snap, problem = self._grant_current(status, transition)
+            status, _snap, problem, status_err, partitioned = self._acquire_grant(transition)
+            if status_err is not None:
+                return _handoff_from_error(status_err, transition=transition)
+            if partitioned:
+                return _handoff_result(
+                    False, "partition", "partition", status=status, transition=transition)
             if problem is not None:
-                if journal.any_recorded():
+                if problem != "expired" and journal.any_recorded():
                     return self._uncertain(transition, "reconcile")
                 return self._abort(tid, problem, transition)
             if not journal.mark("complete", "started"):
@@ -1798,6 +1976,16 @@ class SafeHandoff:
             transition={"transition_id": transition.get("transition_id"), "state": "SUCCEEDED",
                         "action": transition.get("action")},
             action=transition.get("action"))
+
+    def _pause_candidate_renewal(self):
+        """Stop the candidate extending a not-ready lease. Failure is ignored."""
+        method = getattr(self._candidate, "pause_renewal", None)
+        if not callable(method):
+            return
+        try:
+            method()
+        except Exception:
+            return
 
     def _uncertain(self, transition, code):
         """The effect may have happened. Do not cancel, replay, or open another transition."""

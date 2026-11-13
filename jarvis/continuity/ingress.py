@@ -88,6 +88,7 @@ SCHEMA_VERSION = 1
 PHONE_COOKIE = "__Host-jarvis_phone"
 PHONE_HEADER = "X-JARVIS-Phone"
 CSRF_HEADER = "X-CSRF-Token"
+SESSION_HEADER = "X-JARVIS-Session"
 COOKIE_AGE = 90 * 24 * 3600
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 CODE_LEN = 8
@@ -453,6 +454,21 @@ def _origin_of(value):
     if parts.port and parts.port != 443:
         return f"https://{host}:{parts.port}", frozenset({f"{host}:{parts.port}"})
     return f"https://{host}", frozenset({host, f"{host}:443"})
+
+
+def _session_header_count(headers):
+    """How many X-JARVIS-Session values arrived. Zero means the client sent none."""
+    if headers is None:
+        return 0
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        return len(list(get_all(SESSION_HEADER) or []))
+    count = 0
+    items = headers.items() if hasattr(headers, "items") else ()
+    for key, _value in items:
+        if str(key).lower() == SESSION_HEADER.lower():
+            count += 1
+    return count
 
 
 def _header(headers, name):
@@ -2656,7 +2672,7 @@ class PhoneProtocolAdapter:
             found = self.ingress.read(principal, "fleet")
             return HttpResult(200, found.get("body") or {})
         if method == "GET" and path == "/phone/api/session/frame":
-            return self._frame(principal, parts.query)
+            return self._frame(principal, parts.query, headers)
         job = _JOB_PATH.match(path)
         if method == "GET" and job:
             return self._ask_poll(principal, job.group(1), parts.query)
@@ -2732,10 +2748,17 @@ class PhoneProtocolAdapter:
             raise IngressError("bad_request", 400, "Send a JSON object.")
         return payload
 
-    def _frame(self, principal, query):
+    def _frame(self, principal, query, headers=None):
         from urllib.parse import parse_qs
         parsed = parse_qs(query, keep_blank_values=False)
-        session = (parsed.get("session") or [""])[0]
+        count = _session_header_count(headers)
+        if count:
+            session = _header(headers, SESSION_HEADER)
+            if count != 1 or not _SESSION.fullmatch(session or ""):
+                raise IngressError("not_found", 404, "No such session.")
+        else:
+            # legacy: remove after 2026-12-31
+            session = (parsed.get("session") or [""])[0]
         try:
             after = int((parsed.get("after") or ["0"])[0] or 0)
         except ValueError:

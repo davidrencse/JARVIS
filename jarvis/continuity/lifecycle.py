@@ -81,11 +81,8 @@ class RoleLifecycle:
             cluster_tunnel.stop(self.state)
             if cluster_tunnel.status(self.state)['running']:
                 raise RuntimeRefusal('tunnel_busy')
-        cluster_tunnel.autostart(self.config_path, self.state, body['link'] is not None)
-        if body['link'] is not None:
-            cluster_tunnel.start(self.config_path, self.state)
-            if not cluster_tunnel.status(self.state)['running']:
-                raise RuntimeRefusal('partition')
+        from jarvis.linkfinder import activate_tunnel
+        activate_tunnel(self.config_path, self.state, body['link'])
         cluster_setup.role_autostart(self.config_path, self.state, True)
         return result
 

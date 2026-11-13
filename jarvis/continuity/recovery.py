@@ -51,8 +51,14 @@ class ManualRecovery:
             phase = transition['state']
         if phase == 'FENCING':
             lease = self.port.transition_step(tid, 'grant')
-            # Lost grant/accept answers are never reconstructed from status.
-            self.candidate.accept_lease(lease)
+            # Lost grant/accept answers are never reconstructed from status. The
+            # grant is already committed as GRANTED_NOT_READY, so a lease the
+            # candidate cannot take is cancelled here; a retry then starts clean.
+            try:
+                self.candidate.accept_lease(lease)
+            except Exception:
+                self._cancel(tid)
+                raise
             phase = 'GRANTED_NOT_READY'
         if phase != 'GRANTED_NOT_READY':
             raise RuntimeRefusal('bad_state')
@@ -63,6 +69,10 @@ class ManualRecovery:
                 snapshot.get('epoch') != fresh.get('epoch') or
                 (fresh.get('transition') or {}).get('transition_id') != tid or
                 fresh.get('lease_valid') is not True or fresh.get('main_ready') is not False):
+            # A not-ready grant this candidate does not hold (for example after
+            # a retry whose accept never happened) must not sit until something
+            # else cancels it.
+            self._cancel(tid)
             raise RuntimeRefusal('lease_unavailable')
         # A failed or unverifiable canary explicitly clears the not-ready grant.
         try:
@@ -78,3 +88,10 @@ class ManualRecovery:
         return {'ok': ready, 'status': 'ready' if ready else 'no_main',
                 'transition_id': tid, 'main': final.get('main'),
                 'incarnation': final.get('incarnation'), 'epoch': final.get('epoch')}
+
+    def _cancel(self, tid):
+        """Best-effort clear of this transition. The caller's error stays the answer."""
+        try:
+            self.port.transition_step(tid, 'cancel')
+        except Exception:
+            pass

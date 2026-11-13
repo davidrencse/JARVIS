@@ -34,6 +34,7 @@ journals, executor guards. Callers pass identities they already authenticated.
 from ..locking import transaction
 import hashlib
 import json
+import math
 import re
 import secrets
 import sqlite3
@@ -143,6 +144,22 @@ def _num(value, name):
     return float(value)
 
 
+def _finite_non_negative(value, name):
+    """Reject bools, non-numbers, NaN, infinities, and negatives before any write."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise AuthorityError("bad_request", f"{name} must be a finite non-negative number")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise AuthorityError("bad_request", f"{name} must be a finite non-negative number")
+    return number
+
+
+def _bool(value, name):
+    if not isinstance(value, bool):
+        raise AuthorityError("bad_request", f"{name} must be true or false")
+    return value
+
+
 def _writer_lock(path):
     """Exclusive, nonblocking lock held for the store's lifetime: one writer per file."""
     handle = open(path, "a+b")
@@ -170,9 +187,10 @@ class AuthorityStore:
         self.authority_id = _ident(authority_id, "authority_id")
         self._mono, self._wall = monotonic, wall
         self.lease_seconds = float(lease_seconds)
-        self.margin = float(margin)
         if not 0 < self.lease_seconds <= 300:
             raise AuthorityError("bad_request", "lease_seconds out of range")
+        # Before the writer lock and the database, so a bad margin cannot hold the file.
+        self.margin = _finite_non_negative(margin, "margin")
         self._lock = threading.RLock()
         self._writer = _writer_lock(str(self.path) + ".writer")
         try:
@@ -212,6 +230,12 @@ class AuthorityStore:
                 if row is not None:
                     db.execute("UPDATE authority SET mode='QUARANTINED', holder=NULL, lease_id=NULL,"
                                " lease_ready=0, updated_at=? WHERE fleet_id=?", (now_w, self.fleet_id))
+                self._quarantined = True
+                self._barrier_until = float("inf")
+                return
+            if row["mode"] == "QUARANTINED":
+                # Stored quarantine is a latch. The new-incarnation path must not
+                # clear it, bump the epoch, or rewrite membership evidence.
                 self._quarantined = True
                 self._barrier_until = float("inf")
                 return
@@ -280,6 +304,9 @@ class AuthorityStore:
         """RoleStatus: safe to show on any authenticated surface (no credentials, no bodies)."""
         with self._lock:
             row = self._row(self._db)
+            if row is None:
+                raise AuthorityError("quarantined",
+                                     "authority state is unrecognized; restore by an operator")
             now = self._mono()
             valid = self._lease_valid(row, now)
             tr = None
@@ -339,6 +366,8 @@ class AuthorityStore:
           Pass ``reenable=True`` together with ``eligible=True`` to mark that same
           installation eligible again without moving the fence highwater. ``reenable``
           is refused for the current holder and for an open transition endpoint.
+          ``eligible`` must be a boolean. A non-boolean is ``bad_request`` and
+          writes nothing.
         """
         self._guard()
         _ident(device_id, "device_id"), _ident(installation_id, "installation_id")
@@ -346,30 +375,50 @@ class AuthorityStore:
             raise AuthorityError("bad_request", "kind must be pc or server")
         if not isinstance(reenable, bool):
             raise AuthorityError("bad_request", "reenable must be true or false")
+        if not isinstance(eligible, bool):
+            raise AuthorityError("bad_request", "eligible must be true or false")
         if reenable and not eligible:
             raise AuthorityError("bad_request", "reenable requires eligible=True")
-        want = 1 if eligible else 0
         with self._tx() as db:
-            old = self._participant(db, device_id)
-            if old is None:
-                self._refuse_live_member(db, device_id)
-                db.execute("INSERT INTO participants(device_id, installation_id, kind, eligible)"
-                           " VALUES(?,?,?,?)", (device_id, installation_id, kind, want))
-                return
-            if old["installation_id"] != installation_id:
-                self._refuse_live_member(db, device_id)
-                db.execute("INSERT OR REPLACE INTO participants(device_id, installation_id, kind, eligible)"
-                           " VALUES(?,?,?,?)", (device_id, installation_id, kind, want))
-                return
             if reenable:
-                self._refuse_live_member(db, device_id)
-                db.execute("UPDATE participants SET kind=?, eligible=1 WHERE device_id=? AND installation_id=?",
-                           (kind, device_id, installation_id))
-                return
-            if old["kind"] != kind:
-                self._refuse_live_member(db, device_id)
-            db.execute("UPDATE participants SET kind=? WHERE device_id=? AND installation_id=?",
-                       (kind, device_id, installation_id))
+                old = self._participant(db, device_id)
+                if old is not None and old["installation_id"] == installation_id:
+                    self._refuse_live_member(db, device_id)
+                    db.execute("UPDATE participants SET kind=?, eligible=1 WHERE device_id=? AND installation_id=?",
+                               (kind, device_id, installation_id))
+                    return
+            self.apply_participant_registration(db, device_id, installation_id, kind, eligible)
+
+    def apply_participant_registration(self, db, device_id, installation_id, kind, eligible=True):
+        """Participant write on the caller's already-open transaction.
+
+        Does not BEGIN, COMMIT, or reenable. `register_participant` runs this
+        inside its own transaction. Gateway enrollment runs it on the same
+        transaction as the directory row. Calling `register_participant` from
+        that transaction would commit the participant first.
+        """
+        _ident(device_id, "device_id")
+        _ident(installation_id, "installation_id")
+        if kind not in ("pc", "server"):
+            raise AuthorityError("bad_request", "kind must be pc or server")
+        _bool(eligible, "eligible")
+        self._guard()
+        want = 1 if eligible else 0
+        old = self._participant(db, device_id)
+        if old is None:
+            self._refuse_live_member(db, device_id)
+            db.execute("INSERT INTO participants(device_id, installation_id, kind, eligible)"
+                       " VALUES(?,?,?,?)", (device_id, installation_id, kind, want))
+            return
+        if old["installation_id"] != installation_id:
+            self._refuse_live_member(db, device_id)
+            db.execute("INSERT OR REPLACE INTO participants(device_id, installation_id, kind, eligible)"
+                       " VALUES(?,?,?,?)", (device_id, installation_id, kind, want))
+            return
+        if old["kind"] != kind:
+            self._refuse_live_member(db, device_id)
+        db.execute("UPDATE participants SET kind=? WHERE device_id=? AND installation_id=?",
+                   (kind, device_id, installation_id))
 
     def disable_participant(self, device_id, installation_id):
         """Durably revoke one enrolled installation. Idempotent for that pair.
@@ -482,6 +531,7 @@ class AuthorityStore:
         revived; a fenced or draining one is refused. Returns seconds of validity granted
         from the authority's receipt of this call (caller anchors at its request start)."""
         self._guard()
+        incarnation, epoch = _int(incarnation, "incarnation"), _int(epoch, "epoch")
         with self._tx() as db:
             row, now = self._row(db), self._mono()
             self._match(row, holder, lease_id, incarnation, epoch)
@@ -503,6 +553,7 @@ class AuthorityStore:
         the old validity margin stay so the fence cannot succeed early.
         """
         self._guard()
+        incarnation, epoch = _int(incarnation, "incarnation"), _int(epoch, "epoch")
         with self._tx() as db:
             row = self._row(db)
             self._match(row, holder, lease_id, incarnation, epoch)
@@ -595,13 +646,14 @@ class AuthorityStore:
     def readiness(self, transition_id, control_ready, ai_ready, checkpoint=None):
         """Candidate-reported readiness (booleans + opaque cursor id, never state contents)."""
         self._guard()
+        control_ready, ai_ready = _bool(control_ready, "control_ready"), _bool(ai_ready, "ai_ready")
         if checkpoint is not None:
             _ident(checkpoint, "checkpoint")
         with self._tx() as db:
             self._open(db, transition_id, ("REQUESTED", "VALIDATING"))
             db.execute("UPDATE transitions SET state='VALIDATING', control_ready=?, ai_ready=?, checkpoint=?,"
                        " updated_at=? WHERE transition_id=?",
-                       (int(bool(control_ready)), int(bool(ai_ready)), checkpoint, self._wall(), transition_id))
+                       (1 if control_ready else 0, 1 if ai_ready else 0, checkpoint, self._wall(), transition_id))
             return _transition_view(self._get(db, transition_id))
 
     def drain(self, transition_id):
@@ -669,6 +721,7 @@ class AuthorityStore:
     def complete(self, transition_id, canary_ok):
         """Verified canary activates admission; a failed one leaves no MAIN at a fresh epoch."""
         self._guard()
+        _bool(canary_ok, "canary_ok")
         with self._tx() as db:
             t = self._open(db, transition_id, ("GRANTED_NOT_READY",))
             row, now, w = self._row(db), self._mono(), self._wall()
@@ -689,10 +742,27 @@ class AuthorityStore:
             t = self._open(db, transition_id, OPEN_STATES)
             w = self._wall()
             row = self._row(db)
-            fenced_by_acks = t["state"] == "DRAINING" and db.execute(
-                "SELECT COUNT(*) FROM participants WHERE fenced_epoch>=?", (row["epoch"],)).fetchone()[0]
+            # DRAINING is fenced-by-acks only on fence()'s quorum: every eligible
+            # participant and the previous holder (source, else holder, else
+            # last_holder) have acked this epoch, and at least one eligible ack
+            # exists. The extra ack check rejects vacuous _acked (no eligible
+            # participants and no prior). A partial set leaves the old MAIN in
+            # place; targets that already acked refuse its tickets in consume
+            # ("target already fenced this epoch"), so admission stays fail-closed.
+            # Ineligible or disabled acks do not count. FENCING and
+            # GRANTED_NOT_READY still fail unconditionally: fence() already
+            # advanced the epoch and cleared the old lease, so there is nothing
+            # to restore.
+            fenced_by_acks = False
+            if t["state"] == "DRAINING":
+                prior = t["source"] or row["holder"] or row["last_holder"]
+                eligible_acks = db.execute(
+                    "SELECT COUNT(*) FROM participants WHERE eligible=1 AND fenced_epoch>=?",
+                    (row["epoch"],)).fetchone()[0]
+                fenced_by_acks = self._acked(db, row, (prior,)) and eligible_acks > 0
             if t["state"] in FENCED_STATES or fenced_by_acks:
-                # Targets already refuse this epoch: keeping the old MAIN would be a MAIN nobody obeys.
+                # Full quorum, or fence() already ran: keeping the old MAIN would
+                # be a MAIN nobody obeys.
                 self._fail_after_fence(db, transition_id,
                                        "cancelled_after_fence" if t["state"] in FENCED_STATES else "cancelled_after_acks")
             elif t["state"] == "DRAINING" and row["holder"] is None:
@@ -791,9 +861,15 @@ class AuthorityStore:
             return dict(rec, already=False)
 
     def prune(self, keep_seconds=DEDUP_SECONDS):
-        """Drop admission records whose ticket window closed more than `keep_seconds` ago."""
+        """Drop admission records whose ticket window closed more than `keep_seconds` ago.
+
+        Refuses while quarantined. A non-finite or negative window refuses before
+        any delete. The gateway does not call this.
+        """
+        self._guard()
+        keep = _finite_non_negative(keep_seconds, "keep_seconds")
         with self._tx() as db:
-            cur = db.execute("DELETE FROM admissions WHERE admit_until < ?", (self._wall() - keep_seconds,))
+            cur = db.execute("DELETE FROM admissions WHERE admit_until < ?", (self._wall() - keep,))
             return cur.rowcount
 
 

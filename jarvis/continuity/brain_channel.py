@@ -7,17 +7,24 @@ admission still applies; this module does not bypass a drained runtime's fence.
 import base64
 import hashlib
 import io
+import os
 import re
+import stat
+import time
 import uuid
 from pathlib import Path
 
-ACTIONS = frozenset({'brain_receive', 'brain_export', 'brain_freeze', 'brain_stage'})
+ACTIONS = frozenset({'brain_receive', 'brain_export', 'brain_freeze', 'brain_stage', 'brain_discard'})
+BUNDLE_NAME = re.compile(r'brain-[a-f0-9]{32}\.bundle')
+# Staged bundles left by a crashed or abandoned transfer are removed after this.
+STALE_BUNDLE_SECONDS = 24 * 3600
 
 
 def validate(payload):
     action = payload.get('action')
     required = ({'action', 'path'} if action == 'brain_stage' else
                 {'action', 'path', 'sha256'} if action == 'brain_receive' else
+                {'action', 'path'} if action == 'brain_discard' else
                 {'action', 'path', 'request'} if action == 'brain_export' else
                 {'action', 'request'})
     if action not in ACTIONS or set(payload) != required:
@@ -38,6 +45,34 @@ def _outside_git(path):
         raise ValueError('Brain staging must be outside Git checkouts.')
 
 
+def _drop(path):
+    """Remove one staged bundle. Only our own file names; never raises."""
+    if not BUNDLE_NAME.fullmatch(path.name):
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _sweep(folder, now=None):
+    """Remove staged bundles older than STALE_BUNDLE_SECONDS from the staging folder."""
+    cutoff = (time.time() if now is None else now) - STALE_BUNDLE_SECONDS
+    try:
+        children = list(folder.iterdir())
+    except OSError:
+        return
+    for child in children:
+        if not BUNDLE_NAME.fullmatch(child.name):
+            continue
+        try:
+            info = child.lstat()
+            if stat.S_ISREG(info.st_mode) and info.st_mtime < cutoff:
+                child.unlink()
+        except OSError:
+            continue
+
+
 def run_here(payload, state, config):
     from jarvis import brainsync, transfer
     validate(payload)
@@ -47,19 +82,37 @@ def run_here(payload, state, config):
     where = transfer._within(config, payload['path'])
     path = Path(where['path'])
     _outside_git(path)
-    if payload['action'] == 'brain_receive':
-        if where['dir'] or path.stat().st_size > brainsync.MAX_BUNDLE_BYTES:
+    if payload['action'] == 'brain_discard':
+        if where['dir'] or not BUNDLE_NAME.fullmatch(path.name):
             raise ValueError('Invalid brain bundle.')
-        blob = path.read_bytes()
-        if hashlib.sha256(blob).hexdigest() != payload['sha256']:
-            raise ValueError('Brain bundle digest mismatch.')
-        from .return_brain import receive
-        result = receive(config, state, blob)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return {'ok': True}
+    if payload['action'] == 'brain_receive':
+        if where['dir']:
+            raise ValueError('Invalid brain bundle.')
+        # An upload that cannot be imported must not stay in the staging folder.
+        try:
+            if path.stat().st_size > brainsync.MAX_BUNDLE_BYTES:
+                raise ValueError('Invalid brain bundle.')
+            blob = path.read_bytes()
+            if hashlib.sha256(blob).hexdigest() != payload['sha256']:
+                raise ValueError('Brain bundle digest mismatch.')
+            from .return_brain import receive
+            result = receive(config, state, blob)
+        except BaseException:
+            _drop(path)
+            raise
         if result.get('ok') is True:
             path.unlink()
+        else:
+            _drop(path)
         return result
     if not where['dir']:
         raise ValueError('Brain staging must be a directory.')
+    _sweep(path)
     if payload['action'] == 'brain_stage':
         return {'ok': True}
     result = brainsync.export_result(config, base, payload['request'].encode('utf-8'))
@@ -138,17 +191,33 @@ class ClusterBundleTransport:
         size = result.get('size')
         if type(size) is not int or not 0 <= size <= brainsync.MAX_BUNDLE_BYTES:
             raise ValueError('Invalid brain bundle size.')
-        blob = bytearray()
-        while len(blob) < size:
-            chunk = self._call(node, {'action': 'get', 'path': folder,
-                'rel': [result['name']], 'offset': len(blob)})
-            data = base64.b64decode(chunk['data'], validate=True)
-            if not data or len(blob) + len(data) > size or chunk['size'] != size:
-                raise ValueError('Brain bundle changed during transfer.')
-            blob.extend(data)
-        if hashlib.sha256(blob).hexdigest() != result['sha256']:
-            raise ValueError('Brain bundle digest mismatch.')
-        return {'ok': True, 'bundle': bytes(blob)}
+        name = result.get('name')
+        if not isinstance(name, str) or not BUNDLE_NAME.fullmatch(name):
+            raise ValueError('Invalid brain bundle name.')
+        try:
+            blob = bytearray()
+            while len(blob) < size:
+                chunk = self._call(node, {'action': 'get', 'path': folder,
+                    'rel': [name], 'offset': len(blob)})
+                data = base64.b64decode(chunk['data'], validate=True)
+                if not data or len(blob) + len(data) > size or chunk['size'] != size:
+                    raise ValueError('Brain bundle changed during transfer.')
+                blob.extend(data)
+            if hashlib.sha256(blob).hexdigest() != result['sha256']:
+                raise ValueError('Brain bundle digest mismatch.')
+            return {'ok': True, 'bundle': bytes(blob)}
+        finally:
+            # The export is a private staging copy. Verified or not, it is done.
+            self._discard(node, folder, name)
+
+    def _discard(self, node, folder, name):
+        """Best effort. A peer that cannot discard still sweeps stale bundles itself."""
+        import ntpath, posixpath
+        join = ntpath.join if '\\' in folder else posixpath.join
+        try:
+            self._call(node, {'action': 'brain_discard', 'path': join(folder, name)})
+        except Exception:
+            pass
 
 
 

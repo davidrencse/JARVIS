@@ -62,6 +62,7 @@ from jarvis.continuity.authority import (
     AuthorityStore,
     _writer_lock,
 )
+from jarvis.remote_view import FRAME_HOLD
 
 DEVICE_NS = "jarvis-continuity-device-v1"
 OWNER_NS = "jarvis-continuity-owner-v1"
@@ -83,6 +84,9 @@ MAX_READ_RESPONSE = 4 * 1024 * 1024
 MAX_RAW = 2_500_000
 EFFECT_KINDS = frozenset({"ask", "session_start", "session_input", "session_stop", "logout_end"})
 READ_KINDS = frozenset({"overview", "fleet", "ask_poll", "session_frame", "effect_status"})
+# The hub holds an unchanged frame for FRAME_HOLD. A relay read shorter than that
+# raises no_relay on every quiet screen and the phone drops the session.
+READ_RELAY_TIMEOUT = FRAME_HOLD + 3
 
 CAPABILITIES = frozenset({
     "status", "lease", "fence", "candidate", "consume", "reconcile", "client",
@@ -944,14 +948,46 @@ class ContinuityGateway:
         if principal.device_id != fields["target"]:
             raise GatewayError("forbidden")
         main = self._devices.get(fields["main"])
-        if main is None or not verify_message(TICKET_NS, _message(TICKET_NS, signed), signature, main.public_key):
+        if main is None or main.kind != "pc":
             raise GatewayError("unauthorized")
-        record = self._store(lambda: self.store.consume(
-            admission_id=fields["admission_id"], target=fields["target"], operation_id=fields["operation_id"],
-            attempt_id=fields["attempt_id"], digest=fields["digest"], main=fields["main"],
-            incarnation=fields["incarnation"], epoch=fields["epoch"], issued_at=fields["issued_at"],
-            admit_until=fields["admit_until"], issuer_incarnation=fields["issuer_incarnation"]))
+        if not verify_message(TICKET_NS, _message(TICKET_NS, signed), signature, main.public_key):
+            raise GatewayError("unauthorized")
+        verified = (main.installation_id, main.kind, main.public_key)
+        with self._lock:
+            current = self._devices.get(fields["main"])
+            if current is None or (current.installation_id, current.kind, current.public_key) != verified:
+                raise GatewayError("unauthorized")
+            record = self._consume_bound(current, fields)
         return _project_admission(record)
+
+    def _consume_bound(self, main, fields):
+        """Consume only when the signed directory row is that PC's installation.
+
+        The store lock covers the directory read and `consume`. `consume`
+        takes that same re-entrant lock for its transaction. Enrollment takes
+        the gateway lock first, then the store lock, so it cannot change the
+        row between the check and the admission insert.
+        """
+        store = self.store
+        with store._lock:
+            directory = store._db.execute(
+                "SELECT installation_id, kind, public_key FROM gateway_directory WHERE device_id=?",
+                (main.device_id,)).fetchone()
+            participant = store._db.execute(
+                "SELECT installation_id, kind FROM participants WHERE device_id=?",
+                (main.device_id,)).fetchone()
+            if (directory is None or participant is None or directory["kind"] != "pc"
+                    or participant["kind"] != "pc"
+                    or directory["installation_id"] != participant["installation_id"]
+                    or directory["installation_id"] != main.installation_id
+                    or directory["public_key"] != main.public_key):
+                raise GatewayError("unauthorized")
+            return self._store(lambda: store.consume(
+                admission_id=fields["admission_id"], target=fields["target"],
+                operation_id=fields["operation_id"], attempt_id=fields["attempt_id"],
+                digest=fields["digest"], main=fields["main"], incarnation=fields["incarnation"],
+                epoch=fields["epoch"], issued_at=fields["issued_at"], admit_until=fields["admit_until"],
+                issuer_incarnation=fields["issuer_incarnation"]))
 
     def admission(self, principal, payload):
         """Read a consumed admission. A device that is neither target nor MAIN gets the same not_found."""
@@ -1077,8 +1113,11 @@ class ContinuityGateway:
             "envelope_b64": base64.b64encode(envelope).decode("ascii"),
         }, sort_keys=True, separators=(",", ":")).encode("ascii")
         limit = MAX_RELAY_RESPONSE if effect else MAX_READ_RESPONSE
+        # Effects and short reads keep the 2s relay deadline. session_frame must
+        # outlast the hub's unchanged-frame hold.
+        timeout = READ_RELAY_TIMEOUT if kind == "session_frame" else 2
         try:
-            upstream = _post_json(origin + RELAY_PATH, body, limit)
+            upstream = _post_json(origin + RELAY_PATH, body, limit, timeout=timeout)
             result = self._transient_result(effect, operation_id, upstream)
         except GatewayError:
             if effect:
@@ -1125,10 +1164,11 @@ class ContinuityGateway:
         a fresh owner proof.
 
         The participant row and the directory row commit in one transaction,
-        or neither does. RAM is updated only after that commit. A restart
-        loads the directory back. Stored columns are the device id, installation
-        id, kind, public key, capability list, and optional loopback relay
-        origin. The owner signature and the request body are not stored.
+        or neither does. RAM is updated only after that commit. A client id
+        and a participant id cannot replace each other. A restart loads the
+        directory back. Stored columns are the device id, installation id,
+        kind, public key, capability list, and optional loopback relay origin.
+        The owner signature and the request body are not stored.
         """
         self._accept_owner(owner_proof, "enroll", _exact(payload, (
             "device_id", "installation_id", "kind", "public_key", "capabilities"), ("relay_origin",)))
@@ -1257,37 +1297,33 @@ class ContinuityGateway:
     def _save_enrollment(self, record):
         """Commit participant membership and the directory row together.
 
-        Dependency: `AuthorityStore.register_participant` in `authority.py` is
-        the owned statement of this invariant (WS1). Calling it would commit
-        the participant before this directory insert, so a directory failure
-        left a durable member with no directory row. The same SQL runs here,
-        inside this transaction, under the store lock `_store_tx` already
-        holds. `_apply_participant_registration` is that copy.
+        `AuthorityStore.apply_participant_registration` writes on this open
+        transaction. `register_participant` would commit the participant
+        before the directory insert. The same installation updates kind only,
+        so acknowledgements stay and a revoked installation is not made
+        eligible again. A new installation resets ack columns through the
+        store helper. The current holder and an open transition endpoint are
+        refused with no write.
 
-        Gateway enroll calls `register_participant(device_id, installation_id,
-        kind, True)` and does not pass `reenable`. A missing row inserts that
-        installation with `eligible` 1. A changed installation id is
-        `INSERT OR REPLACE` of device_id, installation_id, kind, and eligible.
-        Ack columns are omitted on purpose: they take the schema defaults,
-        which is the installation-change reset (`mode_version` 0,
-        `fenced_epoch` -1, `boot_id` and `acked_at` null). The same
-        installation updates kind only, so acknowledgements stay and a
-        revoked installation is not made eligible again. Kind must be `pc`
-        or `server`. The current holder and an open transition endpoint are
-        refused by `store._refuse_live_member` with no write.
-        `store._guard()` is the quarantine check `register_participant` runs
-        before its write. Clients are directory entries only: they do not
-        write `participants` and do not call `_guard()`.
-
-        RAM is updated by the caller only after this returns.
+        A client is a directory row only and does not call `_guard`, so a
+        fresh client id can still enroll while quarantined. A client write
+        is refused when a participant row exists, or when the directory row
+        is not already that client installation. A PC or server write is
+        refused when the directory id is client-only. RAM is updated by the
+        caller only after this returns.
         """
         caps = _caps_json(record.capabilities)
         try:
             with self._store_tx() as db:
                 _ensure_gateway_schema(db)
-                if record.kind != "client":
+                if record.kind == "client":
+                    _refuse_client_namespace(db, record)
+                else:
+                    self.store._guard()
+                    _refuse_client_only_id(db, record)
                     _apply_participant_registration(
                         self.store, db, record.device_id, record.installation_id, record.kind)
+                    _require_participant_binding(db, record)
                 db.execute(
                     "INSERT INTO gateway_directory(device_id, installation_id, kind, public_key,"
                     " capabilities, relay_origin) VALUES(?,?,?,?,?,?)"
@@ -1562,12 +1598,12 @@ def _project_admission(record):
     return view
 
 
-def _post_json(url, data, limit):
+def _post_json(url, data, limit, timeout=2):
     request = urllib.request.Request(url, data=data, method="POST")
     request.add_header("Content-Type", "application/json")
     request.add_header("Accept", "application/json")
     try:
-        with _opener().open(request, timeout=2) as response:
+        with _opener().open(request, timeout=timeout) as response:
             status = getattr(response, "status", response.getcode())
             if status != 200:
                 raise GatewayError("no_relay")
@@ -1918,38 +1954,58 @@ _NONCE_DDL = (
 
 
 def _apply_participant_registration(store, db, device_id, installation_id, kind):
-    """Same writes as `register_participant(..., eligible=True)` without `reenable`.
+    """Participant half of an enrollment transaction. Does not commit.
 
-    Dependency: authority.py `register_participant` and `_refuse_live_member`.
-    Kept here so enrollment can commit membership and the directory row in
-    one transaction. Do not add the ack columns to the INSERT: omitting them
-    is the installation-change reset. The same installation updates kind
-    only, so this replay cannot undo `disable_participant`. `_guard` runs
-    only on this path. A client directory row does not call it.
+    `store.apply_participant_registration` is the store's no-reenable write.
+    Calling `register_participant` here would commit before the directory row.
     """
     if kind not in ("pc", "server"):
         raise GatewayError("bad_request")
-    store._guard()
-    old = db.execute("SELECT * FROM participants WHERE device_id=?", (device_id,)).fetchone()
-    if old is None:
-        store._refuse_live_member(db, device_id)
-        db.execute(
-            "INSERT INTO participants(device_id, installation_id, kind, eligible)"
-            " VALUES(?,?,?,1)",
-            (device_id, installation_id, kind))
+    store.apply_participant_registration(db, device_id, installation_id, kind, True)
+
+
+def _directory_identity(db, device_id):
+    return db.execute(
+        "SELECT installation_id, kind FROM gateway_directory WHERE device_id=?",
+        (device_id,)).fetchone()
+
+
+def _refuse_client_namespace(db, record):
+    """A client cannot take a participant id or retarget an existing directory row.
+
+    A missing directory row is a new client id. The same client installation
+    may replace its key. Any other client write is `conflict` and writes nothing.
+    """
+    participant = db.execute(
+        "SELECT 1 FROM participants WHERE device_id=?", (record.device_id,)).fetchone()
+    if participant is not None:
+        raise GatewayError("conflict")
+    directory = _directory_identity(db, record.device_id)
+    if directory is None:
         return
-    if old["installation_id"] != installation_id:
-        store._refuse_live_member(db, device_id)
-        db.execute(
-            "INSERT OR REPLACE INTO participants(device_id, installation_id, kind, eligible)"
-            " VALUES(?,?,?,1)",
-            (device_id, installation_id, kind))
+    if directory["kind"] != "client" or directory["installation_id"] != record.installation_id:
+        raise GatewayError("conflict")
+
+
+def _refuse_client_only_id(db, record):
+    """A PC or server cannot take an id that is only a client directory row."""
+    directory = _directory_identity(db, record.device_id)
+    if directory is None or directory["kind"] != "client":
         return
-    if old["kind"] != kind:
-        store._refuse_live_member(db, device_id)
-    db.execute(
-        "UPDATE participants SET kind=? WHERE device_id=? AND installation_id=?",
-        (kind, device_id, installation_id))
+    participant = db.execute(
+        "SELECT 1 FROM participants WHERE device_id=?", (record.device_id,)).fetchone()
+    if participant is None:
+        raise GatewayError("conflict")
+
+
+def _require_participant_binding(db, record):
+    """The directory upsert may record only the participant row this transaction wrote."""
+    bound = db.execute(
+        "SELECT installation_id, kind FROM participants WHERE device_id=?",
+        (record.device_id,)).fetchone()
+    if (bound is None or bound["installation_id"] != record.installation_id
+            or bound["kind"] != record.kind):
+        raise GatewayError("conflict")
 
 
 def _ensure_gateway_schema(db):
