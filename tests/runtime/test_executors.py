@@ -2,6 +2,7 @@
 Nothing real runs: _run, subprocess, shutil.which, time.sleep and os.name are patched."""
 
 import json
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -16,9 +17,14 @@ def done(code=0, err=""):
 class SpotifyDeepLinkTests(unittest.TestCase):
     def go(self, url, os_name, run_result=None):
         tools = actions.DesktopTools()
+        # Replace actions' own `time` name, not time.sleep itself: a patch on the shared module
+        # also records (and turns into a hot loop) any other thread's sleep, e.g. a leaked poller's.
+        sleep = mock.Mock()
+        clock = mock.MagicMock(wraps=time)
+        clock.sleep = sleep
         with mock.patch.object(actions.os, "name", os_name), \
                 mock.patch.object(actions, "_run", return_value=run_result or done()) as run, \
-                mock.patch.object(actions.time, "sleep") as sleep, \
+                mock.patch.object(actions, "time", clock), \
                 mock.patch.object(actions.subprocess, "Popen") as popen, \
                 mock.patch.object(actions, "_spotify_ready", return_value=True):
             result = tools.open_url(url)
