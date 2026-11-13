@@ -85,24 +85,31 @@ class ControllerPauseTests(unittest.TestCase):
         pause.set(False, wait=True)
 
     def test_quick_open_close_still_restores(self):
-        # Connect, then an instant failure: set(False) lands while apply() is mid-stop
+        # Connect, then an instant failure: set(False) lands while apply() is inside
+        # status(), so that same turn stops Lan Mouse and then restores it.
+        # start() is appended before applied flips (sharedinput.ControllerPause._apply_once),
+        # so the call list alone is not the settled state.
         import threading
-        gate = threading.Event()
+        import time
+        entered = threading.Event()
+        release = threading.Event()
         lm = self.lm
 
         def slow_status():
-            gate.wait(2)
+            entered.set()
+            release.wait()
             return lm.status()
+
         pause = sharedinput.ControllerPause(self.state, slow_status, lm.start, lm.stop)
         pause.set(True)
-        import time
-        time.sleep(0.05)
+        self.assertTrue(entered.wait(2), "apply thread never reached status")
         pause.set(False)
-        gate.set()
-        for _ in range(100):
-            if lm.calls == ["stop", "start"]:
+        release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if lm.calls == ["stop", "start"] and pause.applied is False:
                 break
-            time.sleep(0.02)
+            time.sleep(0.01)
         self.assertEqual(lm.calls, ["stop", "start"])
         self.assertFalse(pause.applied)
 

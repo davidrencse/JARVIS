@@ -12,6 +12,26 @@ from jarvis.confirm import ConfirmQueue
 
 CONFIG = {"devices": {"dell": {}, "zenbook": {}}, "cluster": {"enabled": False}}
 
+# These tests run real sandboxed commands. WRITABLE names /tmp and ~/projects, and every command walks
+# those trees for git dirs to guard: ~25k folders (seconds on a loaded box, inside the timed spans
+# below), and a repo another process deletes between the walk and bwrap's mount fails the command
+# with "bwrap: Can't find source path ..." (code 1). A private writable root has neither problem.
+_ROOT = None
+_SAVED = None
+
+
+def setUpModule():
+    global _ROOT, _SAVED
+    _ROOT = tempfile.TemporaryDirectory(prefix="jarvis-terminal-test-")
+    _SAVED = (terminal.WRITABLE, tempfile.tempdir)
+    terminal.WRITABLE = (_ROOT.name,)
+    tempfile.tempdir = _ROOT.name
+
+
+def tearDownModule():
+    terminal.WRITABLE, tempfile.tempdir = _SAVED
+    _ROOT.cleanup()
+
 
 @unittest.skipIf(os.name == "nt", "POSIX process groups")
 class TimeoutTests(unittest.TestCase):
@@ -19,15 +39,18 @@ class TimeoutTests(unittest.TestCase):
         import time
         tmp = tempfile.mkdtemp()
         marker = Path(tmp) / "alive"
-        command = f"(sleep 1.5; touch {marker}) & sleep 30"
-        with mock.patch.object(terminal, "TIMEOUT", 1):
+        command = f"(sleep 0.35; touch {marker}) & sleep 30"
+        # Building the sandbox argv walks ~25k directories (git-dir and socket guards): seconds on a
+        # loaded box. Build it first so the bound below times the kill, not the setup.
+        argv = terminal._argv(command, str(Path(tmp).resolve()))
+        with mock.patch.object(terminal, "TIMEOUT", 0.15), mock.patch.object(terminal, "_argv", return_value=argv):
             start = time.time()
             ok, text = terminal.run(json.dumps({"command": command, "cwd": tmp}))
         self.assertFalse(ok)
         self.assertLess(time.time() - start, 8)
-        self.assertIn("stopped after 1 s", text)
+        self.assertIn("stopped after 0.15 s", text)
         self.assertIn("builds, servers", text)
-        time.sleep(1.2)
+        time.sleep(0.3)  # past the grandchild's own sleep, so a survivor would have touched
         self.assertFalse(marker.exists())  # the backgrounded grandchild died too
 
 
@@ -38,9 +61,10 @@ class OutputBoundTests(unittest.TestCase):
     def test_endless_output_is_bounded_and_only_the_timeout_kills(self):
         import time
         tmp = tempfile.mkdtemp()
-        with mock.patch.object(terminal, "OUTPUT_CAP", 200_000), mock.patch.object(terminal, "TIMEOUT", 2):
+        argv = terminal._argv("yes", tmp)  # sandbox setup walks ~25k dirs; keep it out of the timed span
+        with mock.patch.object(terminal, "OUTPUT_CAP", 200_000), mock.patch.object(terminal, "TIMEOUT", 0.3):
             start = time.time()
-            code, out, err, timed_out = terminal._run_shell(terminal._argv("yes", tmp), tmp)
+            code, out, err, timed_out = terminal._run_shell(argv, tmp)
         self.assertLess(time.time() - start, 10)
         self.assertTrue(timed_out)
         self.assertLess(len(out), 3 * terminal.MAX_OUTPUT + terminal.KEEP_TAIL)

@@ -177,12 +177,14 @@ class CheckTests(unittest.TestCase):
         lister.assert_not_called()
 
 
-def fake_windows(**kw):
+def fake_windows(clock=None, **kw):
     """observe.run() reaches the lister through check()'s default argument, which is bound
     at import time, so patching observe.windows alone does not stop a real desktop listing
     (suspected source bug). Patch the name and the default so nothing real is listed."""
     fake = mock.Mock(**kw)
     defaults = (fake,) + observe.check.__defaults__[1:]
+    if clock is not None:  # check()'s clock is bound at import too: pin it so a loaded box can't tick
+        defaults = (fake, clock) + defaults[2:]
     stack = mock.patch.object(observe, "windows", fake)
     return fake, stack, mock.patch.object(observe.check, "__defaults__", defaults)
 
@@ -190,7 +192,7 @@ def fake_windows(**kw):
 class RunTests(unittest.TestCase):
     def test_valid(self):
         arg = json.dumps({"predicate": {"kind": "window", "app": "spotify"}, "settle": 2})
-        fake, a, b = fake_windows(return_value=[win("Spotify")])
+        fake, a, b = fake_windows(clock=lambda: 0.0, return_value=[win("Spotify")])
         with a, b:
             ok, text = observe.run(arg)
         self.assertTrue(ok)

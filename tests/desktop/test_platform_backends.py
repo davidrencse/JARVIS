@@ -5,6 +5,7 @@ os.name is patched where the code under test branches on it."""
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,17 @@ def detect(desktop, os_name=None):
 
 def which(*present):
     return mock.patch("shutil.which", side_effect=lambda n, *a, **k: f"/usr/bin/{n}" if n in present else None)
+
+
+def instant_focus_readback():
+    """The Hyprland focus read-back waits 0.4 s per attempt. These fakes answer on the
+    first read, so the wait is not what the test is checking."""
+    real = actions._focused_now
+
+    def fast(window, wait=0, clock=time.monotonic, sleep=lambda _seconds: None):
+        return real(window, wait=0, clock=clock, sleep=sleep)
+
+    return mock.patch.object(actions, "_focused_now", fast)
 
 
 def posix():
@@ -254,7 +266,8 @@ class ActionsWindowTests(unittest.TestCase):
                 return done(json.dumps({"address": "0xabc" if moved else "0xdef"}))
             return done("ok")
         fake = Fake(handler)
-        with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake):
+        with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake), \
+                instant_focus_readback():
             self.assertEqual(actions.focus_window("dolphin"), (True, "Switched to Files."))
         self.assertEqual(moved, ["hl.dsp.cursor.move({ x = 300, y = 200 })"])
 
@@ -274,7 +287,7 @@ class ActionsWindowTests(unittest.TestCase):
                 return done(json.dumps({"address": "0xdef"}))
             return done("ok")
         with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", Fake(handler)), \
-                mock.patch.object(actions, "FOCUS_WAIT", 0):
+                instant_focus_readback():
             self.assertFalse(actions.focus_window("dolphin")[0])
         self.assertEqual(moved[-1], "hl.dsp.cursor.move({ x = 900, y = 700 })")  # put back
 
@@ -286,7 +299,7 @@ class ActionsWindowTests(unittest.TestCase):
                     done(json.dumps({"address": "0xdef"})) if a[:2] == ["hyprctl", "activewindow"]
                     else done("ok"))
         with posix(), detect("hyprland"), which("hyprctl"), mock.patch.object(actions, "_run", fake), \
-                mock.patch.object(actions, "FOCUS_WAIT", 0):
+                instant_focus_readback():
             ok, text = actions.focus_window("kitty")
         self.assertFalse(ok)
         self.assertIn("didn't come to the front", text)

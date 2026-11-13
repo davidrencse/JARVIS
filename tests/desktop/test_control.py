@@ -12,11 +12,17 @@ from PIL import Image
 from jarvis import control
 from jarvis.assistant import STOP_CONTROL
 
+_PNG_CACHE = {}
+
 
 def png(w=2560, h=1440):
-    out = io.BytesIO()
-    Image.new("RGB", (w, h), (10, 20, 30)).save(out, "PNG")
-    return out.getvalue()
+    key = (w, h)
+    cached = _PNG_CACHE.get(key)
+    if cached is None:
+        out = io.BytesIO()
+        Image.new("RGB", (w, h), (10, 20, 30)).save(out, "PNG")
+        cached = _PNG_CACHE[key] = out.getvalue()
+    return cached
 
 
 class Fake:
@@ -61,6 +67,10 @@ class Fake:
 
 
 class ControlTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        png()  # one full-desktop encode, outside each test's clock
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -220,6 +230,7 @@ class ControlTest(unittest.TestCase):
         self.assertEqual(control._STATE["typed"], "")
 
     def test_cursor_keys_then_ctrl_u_stay_unknown(self):
+        self.fake = Fake(w=320, h=180)  # the checks are the key gate, not a full-desktop shot
         for key in ("home", "left", "ctrl+a", "ctrl+e", "end"):
             control._STATE["typed"] = ""
             res = self._typing(("type", "x"), ("key", key), ("key", "ctrl+u"), ("type", "ls"))
