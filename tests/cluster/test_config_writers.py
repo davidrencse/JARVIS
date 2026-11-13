@@ -126,6 +126,37 @@ class Base(unittest.TestCase):
 
 
 class PatchConfigTests(Base):
+    def test_return_uses_authenticated_local_main_when_raw_role_names_target(self):
+        doc = self.disk()
+        doc["cluster"]["local_device"] = "dell"
+        self.path.write_text(json.dumps(doc), encoding="utf-8")
+        state = self.state
+        calls = []
+
+        class Handoff:
+            phase = "before"
+            def candidate_readiness(self, device):
+                return {"control_ready": True, "ai_ready": False}
+            def authority_status(self):
+                main = "dell" if self.phase == "before" else "zenbook"
+                return {"mode": "V2_ACTIVE", "lease_valid": True, "main_ready": True,
+                        "main": main, "epoch": 2, "incarnation": 1,
+                        "transition": None if self.phase == "before" else {
+                            "state": "SUCCEEDED", "candidate": "zenbook",
+                            "transition_id": "t-return-role", "action": "set_preferred_main"}}
+            def __call__(self, old, new, config, base):
+                calls.append((old, new))
+                self.phase = "after"
+                return {"ok": True, "status": "ready", "main": new,
+                        "transition_id": "t-return-role", "epoch": 2,
+                        "action": "set_preferred_main"}
+
+        with mock.patch.object(cluster_cli, "_bound_handoff", return_value=Handoff()):
+            result = cluster_cli.set_main(doc, self.path, "zenbook", state=state)
+        self.assertEqual(calls, [("dell", "zenbook")])
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.disk()["cluster"]["main_device"], "zenbook")
+
     def test_only_the_change_is_written_and_unrelated_edits_survive(self):
         stale = json.loads(json.dumps(MAIN))
         self.edit_disk(lambda d: d.setdefault("rules", {}).update(confirm="never"))

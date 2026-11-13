@@ -497,10 +497,16 @@ class RunLoopTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch("jarvis.cluster._refresh_clipboard"):
             worker = NodeWorker.__new__(NodeWorker)
             worker.state, worker.restarting = Path(tmp), False
+            worker.config_path = Path(tmp) / "jarvis.config.json"
+            worker.config_path.write_text("{}", encoding="utf-8")
+            worker._process_registration = None
+            worker._cooperative_request = None
             worker._poll_loop = Mock(side_effect=ValueError("boom"))
             with patch("builtins.print") as out, self.assertRaises(ValueError):
                 worker.run()
             self.assertFalse(any("already running" in str(c) for c in out.call_args_list))
+            worker._poll_loop.assert_called_once_with()
+            self.assertFalse((worker.state / "cluster-process.json").exists())
 
     def test_held_lock_reports_already_running(self):
         from jarvis.locking import exclusive_lock
