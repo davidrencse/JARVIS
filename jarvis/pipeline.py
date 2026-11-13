@@ -384,7 +384,11 @@ def _record(turn, commands, result, started):
 
 
 def _blocked_reply(command, verdict):
-    what = f"{command['intent'].replace('_', ' ')} {next(iter(command['args'].values()))}"
+    # An empty map makes next() raise StopIteration; None and non-dicts have no value either.
+    args = command.get("args")
+    value = next(iter(args.values()), None) if isinstance(args, dict) and args else None
+    intent = command["intent"].replace("_", " ")
+    what = intent if value in (None, "") else f"{intent} {value}"
     if verdict["risk"] == "confirm":
         return (f"I need your OK to {what} on {command['device']}, and I can't ask for "
                 "confirmations yet, so I didn't do it.")

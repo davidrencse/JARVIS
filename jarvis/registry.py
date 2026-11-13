@@ -52,8 +52,20 @@ def _url(value):
         (value.startswith(("http://", "https://")) or value.split(":", 1)[0] in DEEP_LINKS)
 
 
+def _public(value):
+    """_url, and an http(s) page must not point at this PC or the home network (loopback, the
+    console on :7777, private/CGNAT/link-local, decimal/hex/octal forms: actions._local_address
+    resolves them). Deep links pass."""
+    if not _url(value):
+        return False
+    if value.startswith(("http://", "https://")):
+        from .actions import _local_address
+        return _local_address(value) is None
+    return True
+
+
 def _http(value):
-    return _url(value) and value.startswith(("http://", "https://"))
+    return _url(value) and value.startswith(("http://", "https://")) and _public(value)
 
 
 def _level(value):
@@ -92,7 +104,7 @@ INTENTS = {i.name: i for i in (
     Intent("open_app", "direct", "allow", {"name": (_name, True)},
            "a window of the app appears", 8),
     Intent("open_url", "direct", "allow",
-           {"url": (_url, True), "browser": (_name, False)},
+           {"url": (_public, True), "browser": (_name, False)},
            "a browser window's title names the site", 6),
     Intent("focus_window", "direct", "allow", {"name": (_name, True)},
            "the focused window is the app", 2),

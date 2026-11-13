@@ -40,8 +40,10 @@ import re
 import sqlite3
 import stat
 import tempfile
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from itertools import groupby
 from pathlib import Path
@@ -71,17 +73,48 @@ CHUNK_RE = re.compile(r"^jrc-(?P<rid>[0-9a-f]{12})-r(?P<rev>\d{4,})-(?P<idx>\d{4
 PLAN_RE = re.compile(r"plan-[0-9a-f]{8}\.json")
 SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}")
 RUN_SUFFIXES = (".md", ".json", ".jsonl", ".txt")
-SECRET_RES = [re.compile(p) for p in (
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-    r"\bsk-[A-Za-z0-9_-]{20,}",
-    r"\bgh[pousr]_[A-Za-z0-9]{30,}",
-    r"\bxox[baprs]-[A-Za-z0-9-]{10,}",
-    r"\bAKIA[0-9A-Z]{16}\b",
-    r"\bAIza[0-9A-Za-z_-]{35}\b",
-    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
-    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}",
-    r"(?i)(?:api[_-]?key|secret|token|passw(?:or)?d)[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_\-/+=]{16,}",
-)]
+# (pattern, literals a match must start with, ASCII case-fold). The literals are a necessary
+# prefix of every match, so a miss never skips a secret. `(?i)` needles are lowercase.
+_SECRET_RULES = (
+    (r"-----BEGIN [A-Z ]*PRIVATE KEY-----", ("-----BEGIN ",), False),
+    (r"\bsk-[A-Za-z0-9_-]{20,}", ("sk-",), False),
+    (r"\bgh[pousr]_[A-Za-z0-9]{30,}", ("ghp_", "gho_", "ghu_", "ghs_", "ghr_"), False),
+    (r"\bxox[baprs]-[A-Za-z0-9-]{10,}", ("xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-"), False),
+    (r"\bAKIA[0-9A-Z]{16}\b", ("AKIA",), False),
+    (r"\bAIza[0-9A-Za-z_-]{35}\b", ("AIza",), False),
+    (r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", ("eyJ",), False),
+    (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{24,}", ("bearer",), True),
+    # Assignment: key/secret/token = 16+ non-space chars. Punctuation is allowed in the value;
+    # placeholders (`${X}`, `<x>`, `[hidden]`, `***`) are not secrets.
+    (r"(?i)(?:api[_-]?key|secret|token)[\"']?\s*[:=]\s*[\"']?(?![$<{\[(*])[^\s\"',;]{16,}",
+     ("apikey", "api_key", "api-key", "secret", "token"), True),
+    # aws_secret_access_key / secret_key: the "secret" needle starts the match mid-name.
+    (r"(?i)secret[_-]?(?:access[_-]?)?key[\"']?\s*[:=]\s*[\"']?(?![$<{\[(*])[^\s\"',;]{16,}",
+     ("secret",), True),
+    # Passwords are short and have punctuation: 4-200 chars, quoted (spaces allowed) or bare.
+    # Type words and placeholders after the separator (`password: str`, `password=required`) pass.
+    (r"(?i)pass(?:w(?:or)?d|phrase)[\"']?\s*[:=]\s*"
+     r"(?![$<{\[(*]|(?:true|false|none|null|nil|required|optional|string|str|int|bool|bytes|hidden"
+     r"|redacted|empty|unset|undefined|password|your[-_ ]?password)\b)"
+     r"(?:\"[^\"\n]{4,200}\"|'[^'\n]{4,200}'|[^\s\"',;]{4,200})",
+     ("password", "passwd", "passphrase"), True),
+    (r"\bgithub_pat_[A-Za-z0-9_]{20,}", ("github_pat_",), False),
+    (r"\bASIA[0-9A-Z]{16}\b", ("ASIA",), False),
+    (r"\bya29\.[A-Za-z0-9_-]{20,}", ("ya29.",), False),
+    (r"\b[pr]k-[A-Za-z0-9_-]{20,}", ("pk-", "rk-"), False),
+    (r"\b[prs]k_(?:live|test)_[A-Za-z0-9]{16,}", ("pk_", "rk_", "sk_"), False),
+    # Header/cookie lines: `Authorization: Bearer x`, `Cookie: sid=...`.
+    (r"(?i)\bauthorization[\"']?\s*[:=]\s*[\"']?"
+     r"(?:(?:bearer|basic|digest|token|negotiate)\s+[^\s\"']{6,}|[^\s\"']{12,})",
+     ("authorization",), True),
+    (r"(?i)\bcookie[\"']?\s*[:=]\s*[\"']?(?:[^\s\"';=]+=[^\s\"';]{4,}|[^\s\"']{12,})",
+     ("cookie",), True),
+    # user:password@host in any URL (starts at "://" so the literal is the match's prefix).
+    (r"://[^\s/@:]{1,256}:[^\s/@]{1,256}@", ("://",), False),
+)
+_SECRET_CHECKS = tuple((re.compile(pattern), needles, casefold)
+                       for pattern, needles, casefold in _SECRET_RULES)
+SECRET_RES = [rx for rx, _, _ in _SECRET_CHECKS]
 
 # Every top-level state entry, classified. First match wins. `captured` entries are exported
 # (with the per-table/per-file policy noted); everything else is deliberately not.
@@ -193,8 +226,102 @@ def _strings(obj):
             yield from _strings(value)
 
 
+# The eyJ rule's class cannot hold '.', so each start has one parse. '-' is outside
+# \w and inside the class: '-eyJ' repeated is a boundary at every needle, and a match
+# attempt then reads the whole suffix. Doing that at every needle is quadratic
+# (SECRET_RES.search is too). A failed parse covers a span where every later eyJ fails
+# the same way, so the scan resumes at the end of the span.
+_JWT_RUN = re.compile(r"[A-Za-z0-9_-]*")
+_JWT_WORD = re.compile(r"\w")
+
+
+def _word_char(text, index):
+    """``\\w`` at one index. ASCII uses isalnum so a boundary check skips the engine."""
+    ch = text[index]
+    if ch.isascii():
+        return ch.isalnum() or ch == "_"
+    return _JWT_WORD.match(text, index) is not None
+
+
+def _jwt_span(text, j):
+    """-1 if the eyJ rule matches at ``j``. Otherwise where to resume the scan."""
+    n = len(text)
+    b = _JWT_RUN.match(text, j + 3).end()
+    if b - (j + 3) < 10 or b >= n or text[b] != ".":
+        return b
+    d = _JWT_RUN.match(text, b + 1).end()
+    if d - (b + 1) < 10 or d >= n or text[d] != ".":
+        return d
+    f = _JWT_RUN.match(text, d + 1).end()
+    if f - (d + 1) < 10:
+        return f
+    return -1
+
+
+def _jwt_hit(text):
+    """The ``eyJ`` rule in one pass. See ``_JWT_RUN``."""
+    n = len(text)
+    i = 0
+    while i < n:
+        j = text.find("eyJ", i)
+        if j < 0:
+            return False
+        if j > 0 and _word_char(text, j - 1):
+            i = j + 1
+            continue
+        end = _jwt_span(text, j)
+        if end < 0:
+            return True
+        i = end if end > j else j + 1
+    return False
+
+
+def _hits_at(rx, text, hay, needle):
+    """True when `rx` matches `text` at an occurrence of `needle` in `hay` (same indexes)."""
+    start = 0
+    while True:
+        found = hay.find(needle, start)
+        if found < 0:
+            return False
+        if rx.match(text, found):
+            return True
+        start = found + 1
+
+
+def _text_secret(text):
+    """SECRET_RES.search, without running every pattern across a miss.
+
+    On ASCII, `(?i)` folds with ``str.lower``, which matches those patterns. Other text
+    still runs the `(?i)` patterns with ``search``: a fold such as Kelvin ``K`` matches
+    ``(?i)`` without spelling the ASCII needle. The ``eyJ`` rule is ``_jwt_hit``: the
+    same matches, without a match attempt per needle.
+    """
+    if not text:
+        return False
+    ascii_text = text.isascii()
+    folded = None
+    for rx, needles, casefold in _SECRET_CHECKS:
+        if casefold and not ascii_text:
+            if rx.search(text):
+                return True
+            continue
+        if not casefold and needles == ("eyJ",):
+            if _jwt_hit(text):
+                return True
+            continue
+        hay = text
+        if casefold:
+            if folded is None:
+                folded = text.lower()
+            hay = folded
+        for needle in needles:
+            if _hits_at(rx, text, hay, needle):
+                return True
+    return False
+
+
 def looks_secret(obj):
-    return any(rx.search(text) for text in _strings(obj) for rx in SECRET_RES)
+    return any(_text_secret(text) for text in _strings(obj))
 
 
 def excluded(obj):
@@ -246,6 +373,224 @@ def inventory(state_dir):
     return {"entries": entries,
             "unclassified": [e["name"] for e in entries if e["class"] == "unclassified"],
             "complete": all(e["class"] != "unclassified" for e in entries)}
+
+
+# In-memory only. Status stays read-only: nothing here is written to disk.
+# A note is re-read only when its mtime_ns or size changes. Chunk bytes are part of
+# the read, so a chunked note also remembers each chunk's mtime_ns and size and is
+# re-read when one of those changes (the note file itself often does not).
+_NOTE_READ_MAX = 512
+_NOTE_READ_MAX_BYTES = 8 * 1024 * 1024
+_NOTE_READ_CACHE = OrderedDict()   # path -> (st_mtime_ns, st_size, result)
+_NOTE_READ_CHUNKS = {}             # path -> tuple of chunk stat signatures
+_NOTE_READ_WEIGHT = {}
+_NOTE_READ_BYTES = [0]
+_NOTE_READ_LOCK = threading.Lock()
+_DIR_LIST_MAX = 256
+_DIR_LIST_CACHE = OrderedDict()    # dir -> ((mtime_ns, count, max_child_mtime_ns), {stem: [info]})
+_DIR_LIST_LOCK = threading.Lock()
+
+
+def _clear_archive_read_cache():
+    """Drop the in-memory note and directory caches. Tests use this; status never needs it."""
+    with _NOTE_READ_LOCK:
+        _NOTE_READ_CACHE.clear()
+        _NOTE_READ_CHUNKS.clear()
+        _NOTE_READ_WEIGHT.clear()
+        _NOTE_READ_BYTES[0] = 0
+    with _DIR_LIST_LOCK:
+        _DIR_LIST_CACHE.clear()
+
+
+def _note_cache_pop_locked(key):
+    _NOTE_READ_CACHE.pop(key, None)
+    _NOTE_READ_CHUNKS.pop(key, None)
+    _NOTE_READ_BYTES[0] -= _NOTE_READ_WEIGHT.pop(key, 0)
+    if _NOTE_READ_BYTES[0] < 0:
+        _NOTE_READ_BYTES[0] = 0
+
+
+def _note_cache_drop(key):
+    with _NOTE_READ_LOCK:
+        _note_cache_pop_locked(key)
+
+
+def _note_cache_drop_under(folder):
+    prefix = os.fspath(folder)
+    if not prefix.endswith(os.sep):
+        prefix += os.sep
+    with _NOTE_READ_LOCK:
+        for key in [k for k in _NOTE_READ_CACHE if k == prefix[:-1] or k.startswith(prefix)]:
+            _note_cache_pop_locked(key)
+
+
+def _note_cache_drop_absent(folder, names):
+    """Forget cached notes in `folder` whose filename is no longer in the directory."""
+    prefix = os.fspath(folder)
+    if not prefix.endswith(os.sep):
+        prefix += os.sep
+    with _NOTE_READ_LOCK:
+        for key in list(_NOTE_READ_CACHE):
+            if not key.startswith(prefix):
+                continue
+            rest = key[len(prefix):]
+            if os.sep not in rest and rest not in names:
+                _note_cache_pop_locked(key)
+
+
+def _forget_dir(folder):
+    prefix = os.fspath(folder)
+    child = prefix + os.sep
+    with _DIR_LIST_LOCK:
+        for key in [k for k in _DIR_LIST_CACHE if k == prefix or k.startswith(child)]:
+            _DIR_LIST_CACHE.pop(key, None)
+    _note_cache_drop_under(folder)
+
+
+def _chunk_deps(folder, manifest):
+    """Stat signature of a chunked note's chunk files. No opens. () when there are none."""
+    items = manifest.get("chunks") if isinstance(manifest, dict) else None
+    if not isinstance(items, list):
+        return ()
+    sig = []
+    for item in items:
+        name = item.get("name") if isinstance(item, dict) else None
+        if not isinstance(name, str) or name != Path(name).name or name in ("", ".", ".."):
+            sig.append(("bad", None))
+            continue
+        path = os.fspath(Path(folder) / name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            sig.append((path, None, None))
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            sig.append((path, None, None))
+            continue
+        sig.append((path, st.st_mtime_ns, st.st_size))
+    return tuple(sig)
+
+
+def _chunk_sig_now(spec):
+    live = []
+    for item in spec:
+        if not item or item[0] == "bad":
+            live.append(("bad", None))
+            continue
+        path = item[0]
+        try:
+            st = os.lstat(path)
+        except OSError:
+            live.append((path, None, None))
+            continue
+        if not stat.S_ISREG(st.st_mode):
+            live.append((path, None, None))
+            continue
+        live.append((path, st.st_mtime_ns, st.st_size))
+    return tuple(live)
+
+
+def _note_cache_get(key, mtime_ns, size):
+    with _NOTE_READ_LOCK:
+        row = _NOTE_READ_CACHE.get(key)
+        if row is None or row[0] != mtime_ns or row[1] != size:
+            return None
+        spec = _NOTE_READ_CHUNKS.get(key, ())
+        result = row[2]
+        if not spec:
+            _NOTE_READ_CACHE.move_to_end(key)
+            return result
+    if _chunk_sig_now(spec) != spec:
+        _note_cache_drop(key)
+        return None
+    with _NOTE_READ_LOCK:
+        row = _NOTE_READ_CACHE.get(key)
+        if row is not None and row[2] is result:
+            _NOTE_READ_CACHE.move_to_end(key)
+    return result
+
+
+def _note_cache_put(key, mtime_ns, size, result, chunk_sig, weight):
+    if not isinstance(result, BaseException) and weight > _NOTE_READ_MAX_BYTES:
+        return
+    with _NOTE_READ_LOCK:
+        for dead in [k for k in _NOTE_READ_CACHE if k != key and not os.path.lexists(k)]:
+            _note_cache_pop_locked(dead)
+        _note_cache_pop_locked(key)
+        _NOTE_READ_CACHE[key] = (mtime_ns, size, result)
+        _NOTE_READ_CHUNKS[key] = chunk_sig
+        _NOTE_READ_WEIGHT[key] = weight
+        _NOTE_READ_BYTES[0] += weight
+        while _NOTE_READ_CACHE and (
+                len(_NOTE_READ_CACHE) > _NOTE_READ_MAX or _NOTE_READ_BYTES[0] > _NOTE_READ_MAX_BYTES):
+            if len(_NOTE_READ_CACHE) == 1 and next(iter(_NOTE_READ_CACHE)) == key:
+                break
+            victim = next(k for k in _NOTE_READ_CACHE if k != key)
+            _note_cache_pop_locked(victim)
+
+
+def _cacheable_error(exc):
+    """A new exception with the same type and args, and no traceback pinning the read."""
+    try:
+        return exc.__class__(*exc.args)
+    except Exception:
+        return ValueError(str(exc))
+
+
+def _stat_unchanged(path, st):
+    try:
+        now = os.lstat(path)
+    except OSError:
+        return False
+    return (stat.S_ISREG(now.st_mode) and now.st_mtime_ns == st.st_mtime_ns
+            and now.st_size == st.st_size)
+
+
+def _shard_listing(folder):
+    """Notes in one shard directory, keyed by stem. Signature is directory mtime_ns plus
+    the child count and max child mtime from scandir stat. No file is opened.
+
+    A matching signature returns the previous listing object. A vanished directory
+    drops that listing and any note reads cached under it."""
+    key = os.fspath(folder)
+    found = []
+    count = 0
+    max_ns = 0
+    try:
+        dir_ns = os.lstat(folder).st_mtime_ns
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                count += 1
+                try:
+                    max_ns = max(max_ns, entry.stat(follow_symlinks=False).st_mtime_ns)
+                except OSError:
+                    pass
+                match = NOTE_RE.match(entry.name)
+                if match and not entry.is_symlink():
+                    found.append((match["stem"], int(match["rev"]), match["payload"],
+                                  bool(match["tomb"]), entry.name))
+    except FileNotFoundError:
+        _forget_dir(folder)
+        return {}
+    sig = (dir_ns, count, max_ns)
+    with _DIR_LIST_LOCK:
+        slot = _DIR_LIST_CACHE.get(key)
+        if slot is not None and slot[0] == sig:
+            _DIR_LIST_CACHE.move_to_end(key)
+            return slot[1]
+        by_stem = {}
+        names = set()
+        for stem, rev, payload, tomb, name in found:
+            names.add(name)
+            by_stem.setdefault(stem, []).append({
+                "stem": stem, "rev": rev, "payload": payload,
+                "tomb": tomb, "name": name, "dir": folder})
+        _DIR_LIST_CACHE[key] = (sig, by_stem)
+        _DIR_LIST_CACHE.move_to_end(key)
+        while len(_DIR_LIST_CACHE) > _DIR_LIST_MAX:
+            _DIR_LIST_CACHE.popitem(last=False)
+    _note_cache_drop_absent(folder, names)
+    return by_stem
 
 
 class SecondBrain:
@@ -587,12 +932,58 @@ class SecondBrain:
 
     def _load(self, path):
         """THE note reader: parse_note plus, for a chunked note, every chunk read back, bounded and
-        verified against the manifest and the frontmatter. Raises ValueError on any doubt."""
+        verified against the manifest and the frontmatter. Raises ValueError on any doubt.
+
+        The parsed result is cached in memory by this path's mtime_ns and size. A chunked note
+        is also keyed by its chunk stats, so a rewritten chunk is not served from the old parse.
+        The cache is not a file."""
         path = Path(path)
-        parsed = self.parse_note(self._read_note(path))
-        if parsed.get("chunked"):
-            text = self._assemble(path, parsed)
-            parsed.update(payload_text=text, obj=json.loads(text), payload_ok=True)
+        key = os.fspath(path)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            _note_cache_drop(key)
+            raise
+        if not stat.S_ISREG(st.st_mode):
+            raise SecondBrainError("not a regular file")
+        if st.st_size > self.max_record_bytes * 4 + 65536:
+            raise SecondBrainError("note larger than the record bound")
+        hit = _note_cache_get(key, st.st_mtime_ns, st.st_size)
+        if hit is not None:
+            if isinstance(hit, BaseException):
+                raise hit
+            return hit
+        try:
+            raw = self._read_note(path)
+        except FileNotFoundError:
+            _note_cache_drop(key)
+            raise
+        try:
+            parsed = self.parse_note(raw)
+        except ValueError as exc:
+            if _stat_unchanged(path, st):
+                _note_cache_put(key, st.st_mtime_ns, st.st_size, _cacheable_error(exc), (), 0)
+            raise
+        chunk_sig = ()
+        try:
+            if parsed.get("chunked"):
+                before = _chunk_deps(path.parent, parsed.get("manifest"))
+                text = self._assemble(path, parsed)
+                after = _chunk_deps(path.parent, parsed.get("manifest"))
+                parsed.update(payload_text=text, obj=json.loads(text), payload_ok=True)
+                if before != after or not _stat_unchanged(path, st):
+                    return parsed
+                chunk_sig = after
+        except ValueError as exc:
+            if parsed.get("chunked"):
+                chunk_sig = _chunk_deps(path.parent, parsed.get("manifest"))
+            if _stat_unchanged(path, st):
+                _note_cache_put(key, st.st_mtime_ns, st.st_size, _cacheable_error(exc), chunk_sig, 0)
+            raise
+        if not _stat_unchanged(path, st):
+            return parsed
+        weight = len(parsed.get("payload_text") or "")
+        _note_cache_put(key, st.st_mtime_ns, st.st_size, parsed, chunk_sig, weight)
         return parsed
 
     def _assemble(self, path, parsed):
@@ -703,15 +1094,22 @@ class SecondBrain:
         return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
 
     def _memory_records(self, db, counts):
+        keep_out = set()   # ids of items the owner marked PC-only: their links stay PC-only too
         if self._has(db, "items"):
             for r in self._stream(db, "SELECT * FROM items ORDER BY rowid"):
                 counts["items"] = counts.get("items", 0) + 1
-                yield "memory-item", r["id"], self._payload("memory", "memory-item", r["id"],
-                                                            "memory.sqlite3#items", _row(r))
+                payload = self._payload("memory", "memory-item", r["id"],
+                                        "memory.sqlite3#items", _row(r))
+                if excluded(payload):
+                    keep_out.add(r["id"])
+                yield "memory-item", r["id"], payload
         if self._has(db, "links"):
             rows = self._stream(db, "SELECT src,dst,rel,created_at FROM links ORDER BY src,dst,rel")
             for src, group in groupby(rows, key=lambda r: r["src"]):
                 links = [_row(r) for r in group]
+                if src in keep_out:
+                    counts["links_excluded"] = counts.get("links_excluded", 0) + len(links)
+                    continue
                 counts["links"] = counts.get("links", 0) + len(links)
                 yield "memory-links", src, self._payload("memory", "memory-links", src,
                                                          "memory.sqlite3#links", {"src": src, "links": links})
@@ -1133,24 +1531,23 @@ class SecondBrain:
     # -- per-record publish (write-through queue) ---------------------------------------------
     def _record_state(self, stem, store, kind, digest12):
         """{stem: info} for ONE record's newest revision, scanning only its folder and creating
-        nothing. Same conflict rule as _scan (gaps/duplicates mean no safe 'latest')."""
+        nothing. Same conflict rule as _scan (gaps/duplicates mean no safe 'latest').
+
+        The shard listing is cached by directory mtime_ns, child count and max child mtime.
+        The returned info is a copy, so a caller can mark a conflict without pinning that
+        flag into the cache."""
         cur = self.root
         for part in AREA + (store, _slug(kind, 20), digest12[:2]):
             cur = cur / part
             try:
                 st = os.lstat(cur)
             except FileNotFoundError:
+                _forget_dir(cur)
                 return {}
             if stat.S_ISLNK(st.st_mode) or getattr(os.path, "isjunction", lambda p: False)(cur) \
                     or not stat.S_ISDIR(st.st_mode):
                 raise SecondBrainError(f"{cur.name} is a link or not a directory")
-        revs = []
-        with os.scandir(cur) as entries:
-            for entry in entries:
-                m = NOTE_RE.match(entry.name)
-                if m and m["stem"] == stem and not entry.is_symlink():
-                    revs.append({"stem": stem, "rev": int(m["rev"]), "payload": m["payload"],
-                                 "tomb": bool(m["tomb"]), "name": entry.name, "dir": cur})
+        revs = [dict(item) for item in _shard_listing(cur).get(stem, ())]
         if not revs:
             return {}
         info = max(revs, key=lambda r: r["rev"])
@@ -1248,6 +1645,17 @@ class SecondBrain:
             raise ValueError("source/fields missing")
         if "tombstone" in payload or set(payload) - {"schema", "store", "kind", "key", "source", "fields", "children"}:
             raise ValueError("unexpected keys")
+        if "children" in payload:   # restore reads these as shaped lists; refuse what it can't apply
+            children = payload["children"]
+            if not isinstance(children, dict):
+                raise ValueError("children must be an object")
+            for name in ("events", "hops"):
+                rows = children.get(name, [])
+                if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                    raise ValueError(f"children.{name} must be a list of objects")
+            for ev in children.get("events", []):
+                if isinstance(ev.get("seq"), bool) or not isinstance(ev.get("seq"), int):
+                    raise ValueError("children.events[].seq must be an integer")
         return payload
 
     @staticmethod
@@ -1570,28 +1978,55 @@ class SecondBrain:
         the original numbers are written to `archive-restore-map.json` next to the databases. The
         result is deterministic (sorted record stems) and nothing is silently merged: collisions are
         counted in report['seq_remapped_tasks']."""
-        used, top, remap = set(), 0, {}
-        for _, obj in tasks:
-            for ev in (obj.get("children") or {}).get("events", []):
-                top = max(top, int(ev["seq"]))
-        for _, obj in sorted(tasks, key=lambda t: t[0]):
-            events = sorted((obj.get("children") or {}).get("events", []), key=lambda e: int(e["seq"]))
+        used, top, remap, failed = set(), 0, {}, set()
+
+        def refuse(obj, exc):   # one malformed task never aborts the restore or leaves a half task
+            failed.add(obj["fields"].get("id"))
+            report["errors"].append({"path": self.record_id(obj["store"], obj["kind"], obj["key"]),
+                                     "problem": f"{type(exc).__name__}: {exc}"[:160]})
+
+        good = []
+        for stem, obj in tasks:
+            try:
+                events = (obj.get("children") or {}).get("events", [])
+                if not isinstance(events, list) or any(
+                        not isinstance(e, dict) or isinstance(e.get("seq"), bool)
+                        or not isinstance(e.get("seq"), int) for e in events):
+                    raise ValueError("task events need integer seq")
+            except (AttributeError, TypeError, ValueError) as exc:
+                refuse(obj, exc)
+                continue
+            good.append((stem, obj, sorted(events, key=lambda e: e["seq"])))
+            top = max([top] + [e["seq"] for e in events])
+        for _, obj, events in sorted(good, key=lambda t: t[0]):
             f = obj["fields"]
-            db.execute("INSERT INTO tasks(id,spec,state,created_at,updated_at) "
-                       "VALUES(:id,:spec,:state,:created_at,:updated_at)", f)
-            clash = any(int(e["seq"]) in used for e in events)
-            mapping = []
-            for e in events:
-                seq = int(e["seq"])
-                if clash:
-                    top += 1
-                    seq = top
-                used.add(seq)
-                mapping.append([int(e["seq"]), seq])
-                db.execute("INSERT INTO events(seq,task_id,at,kind,detail) VALUES(?,?,?,?,?)",
-                           (seq, e["task_id"], e["at"], e["kind"], e["detail"]))
+            db.execute("SAVEPOINT restore_task")
+            try:
+                db.execute("INSERT INTO tasks(id,spec,state,created_at,updated_at) "
+                           "VALUES(:id,:spec,:state,:created_at,:updated_at)", f)
+                clash = any(e["seq"] in used for e in events)
+                mapping, seqs, nxt = [], [], top
+                for e in events:
+                    seq = e["seq"]
+                    if clash:
+                        nxt += 1
+                        seq = nxt
+                    seqs.append(seq)
+                    mapping.append([e["seq"], seq])
+                    db.execute("INSERT INTO events(seq,task_id,at,kind,detail) VALUES(?,?,?,?,?)",
+                               (seq, e["task_id"], e["at"], e["kind"], e["detail"]))
+            except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+                db.execute("ROLLBACK TO restore_task")
+                db.execute("RELEASE restore_task")
+                refuse(obj, exc)
+                continue
+            db.execute("RELEASE restore_task")
+            top = nxt
+            used.update(seqs)
             if clash:
                 remap[f["id"]] = {"source": obj.get("source"), "events": mapping}
+        if failed:
+            nonterminal[:] = [n for n in nonterminal if n[0] not in failed]
         report["seq_remapped_tasks"] = len(remap)
         if remap:
             report.setdefault("warnings", []).append(

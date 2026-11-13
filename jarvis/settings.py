@@ -78,7 +78,7 @@ FIELDS = {
 # A change to one of these values weakens a safety net: the console must say so and the
 # save must carry confirmed: true (write() refuses it otherwise).
 LOOSENS = {"rules.confirm": "never", "terminal.sandbox": False, "lan_mouse.off_when_apart": False}
-DEFAULTS = {"rules.confirm": CONFIRM_DEFAULT, "actions.enabled": True, "actions.browser": True,
+DEFAULTS = {"cluster.link_discovery": True, "cluster.announce_port": 47781, "cluster.fleet_id": "jarvis", "rules.confirm": CONFIRM_DEFAULT, "actions.enabled": True, "actions.browser": True,
             "actions.grokbot": True, "terminal.sandbox": True, "lan_mouse.enabled": True,
             "lan_mouse.off_when_apart": True, "vault.write": False}
 # Restart-free in this process but built once in the voice listener's brain.

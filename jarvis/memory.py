@@ -119,6 +119,8 @@ _INDEXING = {}
 _INDEX_LOCK = threading.Lock()
 INDEX_EVERY = 2.0  # seconds between request-triggered background index passes
 _LAST_KICK = {}
+# path -> the jarvis-memory-index thread. release_background_index joins it.
+_INDEX_THREADS = {}
 
 
 class _Vectors:
@@ -233,6 +235,7 @@ class Memory:
         title = (title or body.strip().splitlines()[0])[:200]
         created = _now()
         with self.connect() as db:
+            archive_queue.enter(db)
             # INSERT OR IGNORE: another process (the voice daemon and the console share this
             # file) may add the same fact between our look-up and insert, or draw the same id.
             for _ in range(8):
@@ -272,6 +275,7 @@ class Memory:
 
     def link(self, src, dst, rel="related"):
         with self.connect() as db:
+            archive_queue.enter(db)
             if not db.execute("SELECT 1 FROM items WHERE id=?", (src,)).fetchone():
                 raise ValueError(f"Unknown memory item: {src}")
             self._link(db, src, dst, rel)
@@ -292,6 +296,7 @@ class Memory:
     def merge_meta(self, item_id, extra):
         """Add keys to an item's meta (e.g. a reply's usage, known only once the turn ends)."""
         with self.connect() as db:
+            archive_queue.enter(db)
             row = db.execute("SELECT meta FROM items WHERE id=?", (item_id,)).fetchone()
             if row is None:
                 return False
@@ -328,6 +333,7 @@ class Memory:
         if as_kind not in RETIRED_KINDS:
             raise ValueError(f"Retire as one of {', '.join(RETIRED_KINDS)}.")
         with self.connect() as db:
+            archive_queue.enter(db)
             row = db.execute("SELECT kind, meta FROM items WHERE id=?", (item_id,)).fetchone()
             if row is None or row["kind"] not in kinds:
                 return False
@@ -376,6 +382,7 @@ class Memory:
                 break
         if target is not None:
             with self.connect() as db:
+                archive_queue.enter(db)
                 for dst in sources:
                     self._link(db, target, dst, "from")
                 row = db.execute("SELECT meta, importance FROM items WHERE id=?", (target,)).fetchone()
@@ -549,13 +556,12 @@ class Memory:
 
     def _index_in_background(self):
         """Embed unindexed items off the request path. One worker per database file; a call
-        while it runs asks it for another pass instead of starting a second."""
+        while it runs asks it for another pass instead of starting a second.
+
+        Returns that ``jarvis-memory-index`` thread, already started. The handle is also
+        kept on the module so ``release_background_index`` can join it after ``_index_soon``.
+        """
         key = str(self.path)
-        with _INDEX_LOCK:
-            if key in _INDEXING:
-                _INDEXING[key] = True
-                return
-            _INDEXING[key] = False
 
         def run():
             try:
@@ -568,13 +574,63 @@ class Memory:
                     with _INDEX_LOCK:
                         if not _INDEXING.get(key):
                             _INDEXING.pop(key, None)
+                            _INDEX_THREADS.pop(key, None)
                             return
                         _INDEXING[key] = False
             except BaseException:
                 with _INDEX_LOCK:
                     _INDEXING.pop(key, None)
+                    _INDEX_THREADS.pop(key, None)
                 raise
-        threading.Thread(target=run, name="jarvis-memory-index", daemon=True).start()
+
+        with _INDEX_LOCK:
+            if key in _INDEXING:
+                _INDEXING[key] = True
+                return _INDEX_THREADS.get(key)
+            _INDEXING[key] = False
+            thread = threading.Thread(target=run, name="jarvis-memory-index", daemon=True)
+            # Published before start() returns so a release on another thread can join it.
+            # start() does not take _INDEX_LOCK, and the worker takes that lock only after
+            # a batch, so holding it across start does not deadlock.
+            _INDEX_THREADS[key] = thread
+            thread.start()
+        return thread
+
+    def background_index_thread(self):
+        """The ``jarvis-memory-index`` thread for this database, or None.
+
+        It may already have finished. ``release_background_index`` is what joins it
+        and drops this file's ``_VCACHE`` and ``_LAST_KICK`` entries.
+        """
+        with _INDEX_LOCK:
+            return _INDEX_THREADS.get(str(self.path))
+
+    def release_background_index(self, timeout=30):
+        """Join this database's indexer and drop the module caches that name its file.
+
+        The batch already in progress runs to completion; a further pass is not
+        started. ``_VCACHE`` and ``_LAST_KICK`` for this file are removed after the
+        join returns, so the caller can delete the directory without those caches
+        still pointing at it. ``timeout`` is the join bound in seconds. Returns the
+        thread, or None when this file has no worker. A returned thread that is
+        still alive did not finish inside ``timeout``.
+        """
+        key = str(self.path)
+        with _INDEX_LOCK:
+            if key in _INDEXING:
+                _INDEXING[key] = False  # finish this pass, do not loop
+            thread = _INDEX_THREADS.get(key)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+        with _INDEX_LOCK:
+            if _INDEX_THREADS.get(key) is thread and (thread is None or not thread.is_alive()):
+                _INDEX_THREADS.pop(key, None)
+                _INDEXING.pop(key, None)
+            _LAST_KICK.pop(key, None)
+        with _VCACHE_LOCK:
+            for cache_key in [k for k in _VCACHE if k[0] == key]:
+                _VCACHE.pop(cache_key, None)
+        return thread
 
     def _index_soon(self):
         """Request path: let the background indexer embed what's new, at most every

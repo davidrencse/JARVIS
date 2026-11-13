@@ -21,6 +21,9 @@ TAILSCALE = (
 _SSH_DEST = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*@[A-Za-z0-9][A-Za-z0-9.-]*")
 _COLLISION = re.compile(r" \(\d+\)")
 _RELEASE_KEY = re.compile(r"[A-Za-z0-9_]{1,64}")
+# Set on symlink, junction, and mount-point tags. Cloud placeholders (0x9000001A)
+# have FILE_ATTRIBUTE_REPARSE_POINT too, but this bit stays clear.
+_NAME_SURROGATE = 0x20000000
 
 
 def is_tailscale_ip(value):
@@ -89,13 +92,31 @@ def _nofollow():
 
 
 def _is_reparse(path):
+    """True for a symlink, junction, or mount point. A cloud placeholder is not one."""
     try:
         st = os.lstat(path)
     except OSError:
         return False
     if stat.S_ISLNK(st.st_mode):
         return True
-    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+    tag = getattr(st, "st_reparse_tag", None)
+    if tag:
+        return bool(tag & _NAME_SURROGATE)
+    attrs = getattr(st, "st_file_attributes", 0) or 0
+    return bool(attrs & 0x400 and not stat.S_ISREG(st.st_mode))
+
+
+def _same_file(fd, path):
+    """The opened handle is the file now named ``path``, and that name is no link.
+    Without O_NOFOLLOW (Windows) a name swapped for a junction between the
+    lexists check and the open is only caught here."""
+    try:
+        if _is_reparse(path):
+            return False
+        now, opened = os.lstat(path), os.fstat(fd)
+    except OSError:
+        return False
+    return (now.st_dev, now.st_ino) == (opened.st_dev, opened.st_ino)
 
 
 def _binary():
@@ -139,6 +160,9 @@ def open_leaf(folder, name, mode="rb"):
             if _is_reparse(folder_s) or (os.path.lexists(path) and _is_reparse(path)):
                 raise ValueError("Refusing to follow a link.")
             fd = os.open(path, flags, 0o600)
+            if not _same_file(fd, path) or _is_reparse(folder_s):  # swapped after the check
+                os.close(fd)
+                raise ValueError("Refusing to follow a link.")
         else:
             dirfd = os.open(folder_s, os.O_RDONLY | directory | _nofollow())
             fd = os.open(name, flags, 0o600, dir_fd=dirfd)
@@ -222,11 +246,14 @@ def publish_new(part, dest):
         raise ValueError("Refusing to publish a link.")
     fd = os.open(dest_s, os.O_CREAT | os.O_EXCL | os.O_WRONLY | _nofollow() | _binary(), 0o600)
     os.close(fd)
+    replaced = False
     try:
         if not stat.S_ISREG(os.lstat(part_s).st_mode):
             raise ValueError("Refusing to publish a link.")
         os.replace(part_s, dest_s)
+        replaced = True
     except Exception:
+        # The placeholder is empty. The part, if replace did not move it, is the copy.
         try:
             os.unlink(dest_s)
         except OSError:
@@ -234,11 +261,21 @@ def publish_new(part, dest):
         raise
     try:
         _fchmod_regular(dest_s)
-    except (OSError, ValueError):
+    except ValueError:
         try:
             os.unlink(dest_s)
         except OSError:
             pass
+        raise
+    except OSError:
+        # WinError 5 after a successful replace: Defender, the indexer, or
+        # OneDrive still has the new file open. The part name is already
+        # gone, so deleting dest would drop the only copy.
+        if not replaced or os.path.lexists(part_s):
+            try:
+                os.unlink(dest_s)
+            except OSError:
+                pass
         raise
 
 

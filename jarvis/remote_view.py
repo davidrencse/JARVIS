@@ -464,11 +464,13 @@ class Sessions:
             self._end(self._node_session(node, sid), why)
             return {"stop": True}
 
-    def take_input(self, node, sid, after=0, hold=INPUT_HOLD, stop_event=None):
+    def take_input(self, node, sid, after=0, hold=None, stop_event=None):
         """Events numbered past `after` (the last one the node pressed), held up to `hold` s.
         Events stay queued until a later poll's `after` says they were pressed, so a reply
         lost on the way (a dropped link) is sent again, never lost: a key-up always lands.
-        {"events": [[n, event]...], "stop"}."""
+        {"events": [[n, event]...], "stop"}. `hold` None reads INPUT_HOLD at call time."""
+        if hold is None:
+            hold = INPUT_HOLD
         if isinstance(after, bool) or not isinstance(after, int) or after < 0:
             raise ValueError("after must be the last event number pressed.")
         deadline = self.clock() + hold
@@ -1014,7 +1016,9 @@ class NodeSession:
         screen, secure desktop). Keep sending only those ups, backing off, until they go
         through; the marker keeps the list meanwhile, so recover() pays it if this process
         dies first. A newer session here takes the list over (and this stops sending at
-        once); the control stop file or LATE_RELEASE_FOR ends the retry, marker kept."""
+        once); only LATE_RELEASE_FOR ends the retry, marker kept. The control stop file is NOT a
+        reason to give up: a stop is exactly when David wants the key up, and these ups go
+        through release(), which never consults it."""
         began = time.monotonic()
         delay, due, outcome = 0.5, began + 0.5, "free"
         while True:
@@ -1027,7 +1031,7 @@ class NodeSession:
                     outcome = "handed over"
                     break
                 continue
-            if self._stopped_here() or time.monotonic() - began > self.LATE_RELEASE_FOR:
+            if time.monotonic() - began > self.LATE_RELEASE_FOR:
                 outcome = "gave up"  # the marker stays: recover() at the next start lets go
                 break
             if time.monotonic() < due:
@@ -1126,18 +1130,27 @@ class NodeSession:
         else:
             self._drop_marker()
             self._restore_lan_mouse()
-        newer = _ACTIVE.get(self.sid)
-        superseded = newer is not None and newer is not self and not newer._done
-        # tell the console why at once, not after NODE_IDLE of silence; but never for an id a
-        # redelivered start now drives: that end would kill the live session on the hub
-        if not self.hub_ended and not superseded:
-            try:
-                self.client.request("/v1/remote/frame", {"session": self.sid, "end": self.why}, timeout=5)
-            except Exception:
-                pass
+        # tell the console why at once, not after NODE_IDLE of silence
+        self._tell_hub()
         _log(self.state, {"action": "remote_end", "session": self.sid[:8], "why": self.why})
         if self.announce:
             notify_here("Your phone stopped controlling this screen.")
+
+    def _tell_hub(self):
+        """Post this session's end. The hub's input hold (take_input's INPUT_HOLD)
+        returns as soon as the session ends, so a local stop is not stuck behind whatever
+        is left of that hold. Nothing is posted when the hub already ended it, or when a
+        redelivered start now owns this id (that post would kill the live session)."""
+        if self.hub_ended:
+            return
+        newer = _ACTIVE.get(self.sid)
+        if newer is not None and newer is not self and not newer._done:
+            return
+        try:
+            self.client.request("/v1/remote/frame", {"session": self.sid, "end": self.why}, timeout=5)
+        except Exception:
+            return
+        self.hub_ended = True
 
     def _drop_marker(self):
         if _ACTIVE.get(self.sid, self) is not self:
@@ -1196,6 +1209,10 @@ class NodeSession:
             began = time.monotonic()
             if self._stopped_here():
                 self.end("Control was stopped on this computer.")
+                # Keys and buttons are already up. The input thread is inside the hub's
+                # hold; this post ends the session there instead of leaving the console
+                # waiting out the rest of INPUT_HOLD (2 s).
+                self._tell_hub()
                 break
             try:
                 image, area = self.capture()
@@ -1310,6 +1327,31 @@ _ACTIVE = {}  # session id -> NodeSession, on the node
 _LATE = {}    # session id -> ended NodeSession whose refused ups are still being retried
 _LAN_LOCK = threading.RLock()  # Lan Mouse stop/start around sessions, and its handoff
 _LAN = {"owed": False, "starting": 0}  # owed: stopped by a session that ended mid-replace
+
+
+def release_held(wait=2.0):
+    """Let go of everything any session here still holds (live ones and ended ones whose refused
+    ups are being retried): `jarvis control stop` / the computer-stop job call this, so a key
+    whose up failed earlier comes up now instead of waiting for the retry's next back-off or a
+    restart. Only the session's own ups (backend=False; control.stop sweeps the backend itself).
+    Each runs on its own thread, bounded by `wait` s in all, so a press stuck in ydotool can't
+    hold the stop up. Never raises."""
+    try:
+        sessions = list(_ACTIVE.values()) + [s for s in list(_LATE.values()) if s not in _ACTIVE.values()]
+    except Exception:
+        return
+
+    def one(session):
+        try:
+            session.injector.release(backend=False)
+        except Exception:
+            pass
+    threads = [threading.Thread(target=one, args=(s,), name="remote-stop-release", daemon=True) for s in sessions]
+    for t in threads:
+        t.start()
+    deadline = time.monotonic() + wait
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
 
 
 def end_all(why="JARVIS on this computer is restarting.", wait=3):

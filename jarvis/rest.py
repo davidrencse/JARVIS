@@ -118,12 +118,19 @@ def pause(state):
               "blockers": [{"unit": u, "who": w, "why": y} for u, w, y in blockers]}
     path = _record_path(state)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Keep the units of an earlier pause that was never undone: wake must restart them too.
+    # Keep what an earlier pause that was never undone stopped: wake must restart exactly the
+    # union. Its blockers too: wake only starts OWN_UNITS plus the blockers in the record, so a
+    # unit the first pause stopped (Instabox, already down for the second) would stay down.
     try:
-        old = json.loads(path.read_text(encoding="utf-8")).get("stopped") or []
-    except (OSError, ValueError):
-        old = []
-    record["stopped"] = [*[u for u in old if u not in stopped], *stopped]
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        old = previous.get("stopped") or []
+        old_blockers = previous.get("blockers") or []
+    except (OSError, ValueError, AttributeError):
+        old, old_blockers = [], []
+    record["stopped"] = [*[u for u in old if isinstance(u, str) and u not in stopped], *stopped]
+    seen = {b["unit"] for b in record["blockers"]}
+    record["blockers"] = [*[b for b in old_blockers if isinstance(b, dict) and isinstance(b.get("unit"), str)
+                            and b["unit"] not in seen], *record["blockers"]]
     path.write_text(json.dumps(record, indent=2), encoding="utf-8")
     return {"paused": True, "stopped": record["stopped"], "failed": failed,
             "blockers": record["blockers"]}

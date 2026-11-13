@@ -8,19 +8,24 @@ Public API (typed reports, see each docstring; callers must not treat a missing 
     status(state_dir)                  -> report     read-only counts, no bodies, no vault access
     drain(state_dir, vault_root, limit=100, ...)     bounded, cross-process locked publish
     release_held(state_dir, record_id=None, reason=None) -> int
+    acknowledge_absent(state_dir, record_id) -> int   clear one missing-source key; no tombstone
 
 How capture works
 - Per database (memory.sqlite3, history.sqlite3, tasks.sqlite3) `configure` adds `archive_*` tables
   and AFTER INSERT/UPDATE/DELETE triggers that note which record a statement touched
-  (`archive_guard`). Hooks in memory.py/history.py/store.py call `capture(db)` last inside their
-  transaction: it builds the full payload from the rows as committed by that transaction and
-  INSERTs it into `archive_outbox`. If that insert fails the exception propagates, the
-  transaction rolls back and the personal mutation never happened (callers see the error).
+  (`archive_guard`). Hooks in memory.py/history.py/store.py call `enter(db)` before those writes
+  and `capture(db)` last inside their transaction. `enter` marks guards that already existed.
+  Capture builds the full payload from the rows of this transaction and INSERTs it into
+  `archive_outbox`. If that insert fails the exception propagates, the transaction rolls back
+  and the personal mutation never happened (callers see the error). A pre-existing guard is
+  reconciled instead, so it cannot roll an unrelated write back.
 - A writer that does not know about the hook (an older process, a raw sqlite client) still fires
-  the triggers: its guard rows survive the commit and the next `drain()` reconciles them into
-  outbox events from the then-current rows (intermediate states of that write are lost; the
-  event is marked origin 'reconcile' and counted). Exact per-mutation capture therefore needs
-  every long-lived JARVIS process restarted after activation.
+  the triggers: its guard rows survive the commit and the next `drain()` or hooked `capture()`
+  reconciles them into outbox events from the then-current rows (intermediate states of that
+  write are lost; the event is marked origin 'reconcile' and counted). A missing row that already
+  has a published head or a spool revision becomes one `archive_absent` key. A scratch row with
+  neither is dropped and does not latch. Exact per-mutation capture therefore needs every
+  long-lived JARVIS process restarted after activation.
 - `configure(enabled=True)` also writes a marker (`archive-capture.json`) in the state dir. A
   store database created later (first command ever, restored state) is adopted by the store
   constructor (`adopt`), so a store first created after activation has no capture gap.
@@ -33,7 +38,8 @@ captured stores is suspended while capture is enabled so no pending record can d
 (see history/store). A held `oversize` row stops blocking once a later pending revision of
 the same record fits: the row stays, state `superseded`, reason `superseded-oversize`,
 payload unchanged. Secret and conflict holds are not superseded. A transaction that is
-itself over the cap still raises ArchiveCaptureError.
+itself over the cap still raises ArchiveCaptureError. A guard left by an earlier raw write
+of a different key does not: it is reconciled, and an over-cap payload of that key is held.
 """
 
 import json
@@ -70,7 +76,11 @@ _DDL = (
     "state TEXT NOT NULL DEFAULT 'pending', held_reason TEXT, last_error TEXT)",
     "CREATE INDEX IF NOT EXISTS archive_outbox_rec ON archive_outbox(store, kind, key, seq)",
     "CREATE TABLE IF NOT EXISTS archive_guard(store TEXT NOT NULL, kind TEXT NOT NULL, "
-    "key TEXT NOT NULL, PRIMARY KEY(store, kind, key))",
+    "key TEXT NOT NULL, touched INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(store, kind, key))",
+    # One row per source key that disappeared after a published head or a spool revision.
+    # Scratch deletes (neither of those) are not inserted. The vault note is not removed here.
+    "CREATE TABLE IF NOT EXISTS archive_absent(store TEXT NOT NULL, kind TEXT NOT NULL, "
+    "key TEXT NOT NULL, since TEXT NOT NULL, PRIMARY KEY(store, kind, key))",
     "CREATE TABLE IF NOT EXISTS archive_head(store TEXT NOT NULL, kind TEXT NOT NULL, "
     "key TEXT NOT NULL, payload_sha TEXT NOT NULL, published_at TEXT NOT NULL, "
     "PRIMARY KEY(store, kind, key))",
@@ -107,8 +117,10 @@ def _triggers(store):
     out = []
     for table, col, kind in _WATCH[store]:
         for op, refs in (("INSERT", ("NEW",)), ("UPDATE", ("NEW", "OLD")), ("DELETE", ("OLD",))):
-            body = " ".join(f"INSERT OR IGNORE INTO archive_guard VALUES('{store}','{kind}',{r}.{col});"
-                            for r in refs)
+            body = " ".join(
+                f"INSERT INTO archive_guard(store,kind,key,touched) VALUES('{store}','{kind}',{r}.{col},1) "
+                f"ON CONFLICT(store,kind,key) DO UPDATE SET touched=1;"
+                for r in refs)
             out.append(f"CREATE TRIGGER IF NOT EXISTS archive_{table}_{op.lower()} AFTER {op} ON {table} "
                        f"WHEN (SELECT value FROM archive_meta WHERE key='enabled')='1' BEGIN {body} END")
     return out
@@ -160,7 +172,32 @@ def _install(db, store):
         _seed_baseline(db, store)
     db.execute("INSERT OR REPLACE INTO archive_meta VALUES('schema', ?)", (SCHEMA_VERSION,))
     db.execute("INSERT OR REPLACE INTO archive_meta VALUES('store', ?)", (store,))
+    _ensure_capture_schema(db)
     db.execute("INSERT OR REPLACE INTO archive_meta VALUES('enabled', '1')")   # last: triggers go live
+
+
+def _ensure_capture_schema(db):
+    """Add transaction-entry provenance and per-key absence. Idempotent.
+
+    Existing ledgers keep their rows. Triggers are replaced once so a watched write sets
+    `touched`; `enter` clears that flag on guards that were already committed. Absence rows
+    are created here and never by a read-only status call."""
+    if not _has_table(db, "archive_guard"):
+        return
+    columns = {row[1] for row in db.execute("PRAGMA table_info(archive_guard)")}
+    if "touched" not in columns:
+        db.execute("ALTER TABLE archive_guard ADD COLUMN touched INTEGER NOT NULL DEFAULT 0")
+    db.execute("CREATE TABLE IF NOT EXISTS archive_absent(store TEXT NOT NULL, kind TEXT NOT NULL, "
+               "key TEXT NOT NULL, since TEXT NOT NULL, PRIMARY KEY(store, kind, key))")
+    store = _meta(db, "store")
+    if store not in _WATCH or _meta(db, "guard_provenance") == "1":
+        return
+    for table, _, _ in _WATCH[store]:
+        for op in ("insert", "update", "delete"):
+            db.execute(f"DROP TRIGGER IF EXISTS archive_{table}_{op}")
+    for stmt in _triggers(store):
+        db.execute(stmt)
+    db.execute("INSERT OR REPLACE INTO archive_meta VALUES('guard_provenance', '1')")
 
 
 def _sibling_overflow(directory, store):
@@ -246,6 +283,26 @@ def _build(db, store, kind, key):
     raise ArchiveCaptureError(f"unknown record kind {kind!r}")
 
 
+def _last_digest(db, store, kind, key):
+    """Sha of the newest queued/held revision of a key, else of its published head, else None."""
+    last = db.execute("SELECT payload_sha FROM archive_outbox WHERE store=? AND kind=? AND key=? "
+                      "AND state IN ('pending', 'held') ORDER BY seq DESC LIMIT 1",
+                      (store, kind, key)).fetchone()
+    if last is None:
+        last = db.execute("SELECT payload_sha FROM archive_head WHERE store=? AND kind=? AND key=?",
+                          (store, kind, key)).fetchone()
+    return last[0] if last is not None else None
+
+
+def _link_source_excluded(db, src):
+    """True when the memory item a link record hangs off is flagged PC-only (`no-archive`)."""
+    try:
+        item = _build(db, "memory", "memory-item", src)
+    except (ValueError, TypeError):
+        return False
+    return bool(item) and sb.excluded(item)
+
+
 def _enqueue(db, store, kind, key, origin, verify=None, hold_unverified=False, withhold=None):
     """Queue the record's current revision unless it equals the newest queued/published one.
     Returns 1 if an event was added, 0 if nothing changed, -1 if a matching head could not be
@@ -256,24 +313,20 @@ def _enqueue(db, store, kind, key, origin, verify=None, hold_unverified=False, w
         text = sb._canonical(obj) if obj else None
     except (ValueError, TypeError):   # NaN/inf/unserialisable value: held, never dropped
         obj, text, state, reason = True, '{"unserializable":true}', "held", "unserializable"
-    if obj is not True and obj and sb.excluded(obj):   # owner flagged it PC-only: counted, never queued
+    if (obj is not True and obj and sb.excluded(obj)) or \
+            (kind == "memory-links" and _link_source_excluded(db, key)):
+        # owner flagged it PC-only (a link follows its source item): counted, never queued
         db.execute("INSERT INTO archive_meta VALUES('excluded','1') ON CONFLICT(key) DO UPDATE "
                    "SET value=CAST(value AS INTEGER)+1")
         return 0
     if not obj:
-        db.execute("INSERT INTO archive_meta VALUES('source_gone','1') ON CONFLICT(key) DO UPDATE "
-                   "SET value=CAST(value AS INTEGER)+1")
+        _note_missing_source(db, store, kind, key)
         return 0
     digest = sb._sha(text)
     size = len(text.encode("utf-8"))
     # A superseded oversize row still holds the old bytes. It is not the current revision.
-    last = db.execute("SELECT payload_sha FROM archive_outbox WHERE store=? AND kind=? AND key=? "
-                      "AND state IN ('pending', 'held') ORDER BY seq DESC LIMIT 1",
-                      (store, kind, key)).fetchone()
-    if last is None:
-        last = db.execute("SELECT payload_sha FROM archive_head WHERE store=? AND kind=? AND key=?",
-                          (store, kind, key)).fetchone()
-    if last is not None and last[0] == digest:
+    last = _last_digest(db, store, kind, key)
+    if last is not None and last == digest:
         if _same_payload_queued(db, store, kind, key, digest):
             return 0
         if verify is not None:
@@ -305,12 +358,131 @@ def _enqueue(db, store, kind, key, origin, verify=None, hold_unverified=False, w
     return 1
 
 
+def _capture_origin(origin, touched):
+    """Rollback applies only to a key this transaction changed.
+
+    `enter` sets `touched` to 0 on guards that were already committed. A raw guard from
+    another key stays 0 and is reconciled, including an over-cap payload, which is held.
+    Guessing the set from rows written later is not provenance: the flag is the entry mark."""
+    if origin == "txn" and not touched:
+        return "reconcile"
+    return origin
+
+
 def _capture_guard(db, origin):
-    guards = db.execute("SELECT store,kind,key FROM archive_guard ORDER BY rowid").fetchall()
-    added = sum(_enqueue(db, g[0], g[1], g[2], origin) for g in guards)
+    _ensure_capture_schema(db)
+    guards = db.execute("SELECT store,kind,key,touched FROM archive_guard ORDER BY rowid").fetchall()
+    added = 0
+    for guard in guards:
+        added += _enqueue(db, guard["store"], guard["kind"], guard["key"],
+                          _capture_origin(origin, guard["touched"]))
     if guards:
         db.execute("DELETE FROM archive_guard")
     return added
+
+
+def _has_revision(db, store, kind, key):
+    """True when this key was published or a spool revision was committed. A baseline
+    key that was never queued is not evidence, and neither is a scratch insert."""
+    if db.execute("SELECT 1 FROM archive_head WHERE store=? AND kind=? AND key=?",
+                  (store, kind, key)).fetchone():
+        return True
+    return db.execute("SELECT 1 FROM archive_outbox WHERE store=? AND kind=? AND key=?",
+                      (store, kind, key)).fetchone() is not None
+
+
+def _note_missing_source(db, store, kind, key):
+    """Inventory policy for a source row that is gone.
+
+    Scratch (no head, no spool): leave no latch. Otherwise one identifiable absent row.
+    Does not delete spool bytes, write a tombstone, or remove a vault note."""
+    if not _has_revision(db, store, kind, key):
+        return
+    _ensure_capture_schema(db)
+    db.execute("INSERT INTO archive_absent(store,kind,key,since) VALUES(?,?,?,?) "
+               "ON CONFLICT(store,kind,key) DO NOTHING",
+               (store, kind, key, _stamp()))
+
+
+def _current_digest(db, store, kind, key):
+    """Sha of the source row as it is now, or None when the row is gone or unreadable."""
+    try:
+        obj = _build(db, store, kind, key)
+        text = sb._canonical(obj) if obj else None
+    except (ValueError, TypeError):
+        return None
+    return sb._sha(text) if text else None
+
+
+def _clear_absent_if_current(db, store, kind, key, digest):
+    """Drop the absence only when the source row is back and equals this verified payload."""
+    if not _has_table(db, "archive_absent"):
+        return False
+    if _current_digest(db, store, kind, key) != digest:
+        return False
+    return db.execute("DELETE FROM archive_absent WHERE store=? AND kind=? AND key=?",
+                      (store, kind, key)).rowcount > 0
+
+
+def _heal_absent(db, verify):
+    """Clear absences whose source matches a published head `verify` can read back.
+
+    A recreated row with different bytes stays absent until that revision is acknowledged.
+    `verify` is None, or false, when the vault cannot be checked: nothing is cleared."""
+    if verify is None or not _has_table(db, "archive_absent"):
+        return 0
+    cleared = 0
+    rows = db.execute("SELECT store,kind,key FROM archive_absent").fetchall()
+    for store, kind, key in rows:
+        digest = _current_digest(db, store, kind, key)
+        if digest is None:
+            continue
+        head = db.execute("SELECT payload_sha FROM archive_head WHERE store=? AND kind=? AND key=?",
+                          (store, kind, key)).fetchone()
+        if head is None or head[0] != digest:
+            continue
+        # A committed spool revision still has to publish. Matching the old head is not
+        # the end of that key, and ack decides once the new payload is the one read back.
+        if db.execute("SELECT 1 FROM archive_outbox WHERE store=? AND kind=? AND key=? "
+                      "AND state IN ('pending','held')", (store, kind, key)).fetchone():
+            continue
+        try:
+            sound = verify(store, kind, key, digest)
+        except (OSError, sb.SecondBrainError):
+            sound = False
+        if sound and _clear_absent_if_current(db, store, kind, key, digest):
+            cleared += 1
+    return cleared
+
+
+def _source_gone(conn):
+    """Unresolved absent keys, plus a legacy anonymous counter if an older process left one.
+
+    New absences are not added to that counter. The counter has no keys, so heal and
+    acknowledge do not clear it."""
+    keys = 0
+    if _has_table(conn, "archive_absent"):
+        keys = conn.execute("SELECT COUNT(*) FROM archive_absent").fetchone()[0]
+    legacy = 0
+    try:
+        legacy = int(_meta(conn, "source_gone", "0") or 0)
+    except (TypeError, ValueError):
+        legacy = 0
+    return keys + max(0, legacy)
+
+
+def _absent_ids(conn, limit=20):
+    if not _has_table(conn, "archive_absent"):
+        return []
+    return [f"{row[0]}/{row[1]}/{row[2]}" for row in conn.execute(
+        "SELECT store,kind,key FROM archive_absent ORDER BY store,kind,key LIMIT ?", (limit,))]
+
+
+def _split_record_id(record_id):
+    parts = str(record_id).split("/", 2)
+    if len(parts) != 3 or parts[0] not in STORE_FILES or not parts[1] or not parts[2]:
+        raise ValueError("record id must be store/kind/key")
+    return parts
 
 
 def _head_matches(db, store, kind, key, digest):
@@ -348,10 +520,71 @@ def _backfill(db, limit=BACKFILL_BATCH, verify=None, withhold=None):
     return added, consumed
 
 
+def _memo(check, cache):
+    """`check` with answers already read (no vault access); a miss falls back to the real call."""
+    if check is None:
+        return None
+
+    def run(store, kind, key, digest):
+        hit = cache.get((store, kind, key, digest))
+        return hit if hit is not None else check(store, kind, key, digest)
+    return run
+
+
+def _guard(check, *args):
+    try:
+        return bool(check(*args))
+    except (OSError, sb.SecondBrainError):
+        return False
+
+
+def prefetch_backfill(db, limit, verify, withhold):
+    """Read the vault for the next backfill batch BEFORE the write transaction opens, so a slow
+    note read never holds BEGIN IMMEDIATE (which blocks memory/history writers up to the sqlite
+    timeout). Returns (verify, withhold) to pass to `_backfill` inside the transaction."""
+    sound_by, held_by = {}, {}
+    if verify is not None:
+        rows = db.execute("SELECT store,kind,key FROM archive_backfill ORDER BY rowid LIMIT ?",
+                          (limit,)).fetchall()
+        for store, kind, key in rows:
+            digest = _current_digest(db, store, kind, key)
+            if digest is None or _last_digest(db, store, kind, key) != digest:
+                continue   # _enqueue will not ask about this one
+            ident = (store, kind, key, digest)
+            sound_by[ident] = _guard(verify, *ident)
+            if not sound_by[ident] and withhold is not None:
+                held_by[ident] = _guard(withhold, *ident)
+    return _memo(verify, sound_by), _memo(withhold, held_by)
+
+
+def prefetch_heal(db, verify):
+    """The vault reads `_heal_absent` will make, done before its write transaction opens."""
+    sound_by = {}
+    if verify is not None and _has_table(db, "archive_absent"):
+        for store, kind, key in db.execute("SELECT store,kind,key FROM archive_absent").fetchall():
+            digest = _current_digest(db, store, kind, key)
+            if digest is not None and _last_digest(db, store, kind, key) == digest:
+                sound_by[(store, kind, key, digest)] = _guard(verify, store, kind, key, digest)
+    return _memo(verify, sound_by)
+
+
+def enter(db):
+    """Call once at the start of a hooked transaction, before any watched write.
+
+    Guards already in the table are pre-existing raw evidence (`touched` 0). Triggers then
+    set `touched` on keys this transaction changes. No-op when capture is off. Clearing the
+    flag after the writes would hide that distinction, so this cannot run from `capture`."""
+    if not enabled(db):
+        return
+    _ensure_capture_schema(db)
+    db.execute("UPDATE archive_guard SET touched=0")
+
+
 def capture(db):
     """Queue the revisions touched by this transaction. Call as the LAST statement inside the
-    `with connect() as db:` block of a personal mutation. No-op when capture is off. Any failure
-    raises ArchiveCaptureError so the surrounding transaction rolls back. Returns events added."""
+    `with connect() as db:` block of a personal mutation, after `enter`. No-op when capture is
+    off. Any failure raises ArchiveCaptureError so the surrounding transaction rolls back.
+    Returns events added. A pre-existing guard is reconciled and does not raise for size."""
     if not enabled(db):
         return 0
     try:
@@ -453,7 +686,7 @@ def _age(stamp):
 def _store_status(path):
     info = {"exists": path.exists(), "configured": False, "enabled": False, "pending": 0, "held": 0,
             "superseded": 0, "errors": 0, "unreconciled": 0, "bytes": 0, "oldest_age_s": None,
-            "last_success": None, "source_gone": 0, "held_reasons": {}, "error_samples": [],
+            "last_success": None, "source_gone": 0, "source_gone_ids": [], "held_reasons": {}, "error_samples": [],
             "baseline_seeded": False, "baseline_pending": 0, "rows": 0, "heads": 0, "last_drain": None,
             "excluded": 0, "overflow_max_bytes": 0, "held_oversize_bytes": 0}
     if not info["exists"]:
@@ -464,8 +697,9 @@ def _store_status(path):
             return info
         meta = {r[0]: r[1] for r in conn.execute("SELECT key,value FROM archive_meta")}
         info.update(configured=True, enabled=meta.get("enabled") == "1",
-                    last_success=meta.get("last_success_at"), source_gone=int(meta.get("source_gone", 0)),
-                    excluded=int(meta.get("excluded", 0)))
+                    last_success=meta.get("last_success_at"), excluded=int(meta.get("excluded", 0)))
+        info["source_gone"] = _source_gone(conn)
+        info["source_gone_ids"] = _absent_ids(conn)
         row = conn.execute("SELECT SUM(state='pending'), SUM(state='held'), SUM(state='superseded'), "
                            "SUM(last_error IS NOT NULL), COALESCE(SUM(bytes),0), MIN(captured_at) "
                            "FROM archive_outbox").fetchone()
@@ -501,7 +735,9 @@ def status(state_dir):
     "pending", "held", "superseded" (oversize rows kept, not blocking), "errors", "unreconciled",
     "bytes", "oldest_age_s" (int|None),
     "last_success" (ISO|None: last acknowledged publish), "last_drain" (ISO|None: last drain that
-    reached the vault and finished without error, even if the queue was empty), "source_gone",
+    reached the vault and finished without error, even if the queue was empty), "source_gone"
+    (absent keys, plus a legacy anonymous counter), "source_gone_ids" (up to 20 store/kind/key ids,
+    no bodies),
     "baseline_seeded" (every enabled store had its pre-existing rows queued), "baseline_pending"
     (rows still waiting to be queued), "rows" (records the sources hold: coverage), "heads"
     (records with a verified published revision: NOT parity, see SecondBrain.parity),
@@ -512,6 +748,7 @@ def status(state_dir):
            "marker": (state / MARKER).exists(), "pending": 0, "held": 0, "superseded": 0,
            "errors": 0, "unreconciled": 0,
            "bytes": 0, "oldest_age_s": None, "last_success": None, "last_drain": None, "source_gone": 0,
+           "source_gone_ids": [],
            "baseline_seeded": False, "baseline_pending": 0, "rows": 0, "heads": 0,
            "excluded": 0, "held_reasons": {}, "error_samples": [], "stores": {},
            "overflow_max_bytes": 0, "held_oversize_bytes": 0}
@@ -530,6 +767,7 @@ def status(state_dir):
         for reason, n in info["held_reasons"].items():
             out["held_reasons"][reason] = out["held_reasons"].get(reason, 0) + n
         out["error_samples"] += info["error_samples"][:2]
+        out["source_gone_ids"].extend(info.get("source_gone_ids") or [])
         ages = [a for a in (out["oldest_age_s"], info["oldest_age_s"]) if a is not None]
         out["oldest_age_s"] = max(ages) if ages else None
         out["last_success"] = max(filter(None, (out["last_success"], info["last_success"])), default=None)
@@ -539,6 +777,7 @@ def status(state_dir):
     out["enabled"] = any(s.get("enabled") for s in stores)
     out["configured"] = all(s.get("configured") for s in stores)
     out["capture_complete"] = all(s.get("configured") and s.get("enabled") for s in stores)
+    out["source_gone_ids"] = out["source_gone_ids"][:20]
     return out
 
 
@@ -678,6 +917,27 @@ def release_held(state_dir, record_id=None, reason=None):
     return total
 
 
+def acknowledge_absent(state_dir, record_id):
+    """Clear one missing-source key after the owner accepts that the source is gone.
+
+    Does not write a tombstone, delete a vault note, or drop spool bytes. Returns how
+    many rows were removed (0 or 1). A recreated source is not cleared here: drain
+    clears it only after the published head reads back."""
+    store, kind, key = _split_record_id(record_id)
+    path = Path(state_dir).expanduser() / STORE_FILES[store]
+    if not path.exists():
+        return 0
+    conn = _open(path)
+    try:
+        if not _has_table(conn, "archive_absent"):
+            return 0
+        with _tx(conn):
+            return conn.execute("DELETE FROM archive_absent WHERE store=? AND kind=? AND key=?",
+                                (store, kind, key)).rowcount
+    finally:
+        conn.close()
+
+
 def _supersede_oversize(conn, cap):
     """A held oversize row stops being the head once a later pending revision of the same
     record fits under `cap`. The row and its payload stay, as state superseded. Secret,
@@ -703,6 +963,10 @@ def _ack(conn, row, result):
         conn.execute("INSERT OR REPLACE INTO archive_head VALUES(?,?,?,?,?)",
                      (row["store"], row["kind"], row["key"], row["payload_sha"], _stamp()))
         conn.execute("INSERT OR REPLACE INTO archive_meta VALUES('last_success_at', ?)", (_stamp(),))
+        # The note just read back. Clear the absence only if the source row is that payload.
+        # A delete whose spool was already committed stays absent: the body reached the vault
+        # and the source is still gone.
+        _clear_absent_if_current(conn, row["store"], row["kind"], row["key"], row["payload_sha"])
 
 
 def _retry(conn, seq, why):
@@ -789,8 +1053,9 @@ def drain(state_dir, vault_root, limit=100, *, allow_secret_like=(), dry_run=Fal
 
     Returns {"ok": bool, "busy": bool, "vault_ok": bool, "dry_run": bool, "acked": int,
     "published": int, "unchanged": int, "held": int, "failed": int, "reconciled": int,
-    "superseded": int (oversize rows marked this call), "remaining": int (pending+held left
-    in enabled stores; superseded is not remaining), "held_ids": [<=20 ids],
+    "superseded": int (oversize rows marked this call), "source_gone": int (absent keys left
+    in enabled stores), "remaining": int (pending+held+baseline+unreconciled+source_gone in
+    enabled stores; superseded is not remaining), "held_ids": [<=20 ids],
     "error_samples": [<=5 short strings], "error"?: str, "elapsed_ms": int, "stores": {...}}.
     ok means: vault reachable, not busy, no database error. It does NOT mean the queue is empty:
     check remaining/held/failed."""
@@ -798,7 +1063,8 @@ def drain(state_dir, vault_root, limit=100, *, allow_secret_like=(), dry_run=Fal
     rep = {"ok": True, "busy": False, "vault_ok": False, "dry_run": bool(dry_run), "acked": 0,
            "published": 0, "unchanged": 0, "held": 0, "failed": 0, "reconciled": 0, "baselined": 0,
            "released_oversize": 0, "superseded": 0, "chunked": 0, "repaired": 0,
-           "baseline_pending": 0, "remaining": 0, "held_ids": [], "error_samples": [], "stores": {}, "elapsed_ms": 0}
+           "baseline_pending": 0, "source_gone": 0, "remaining": 0, "held_ids": [], "error_samples": [],
+           "stores": {}, "elapsed_ms": 0}
     state = Path(state_dir).expanduser()
     try:
         limit = max(1, min(int(limit), MAX_LIMIT))
@@ -859,14 +1125,17 @@ def _drain_locked(state, vault_root, limit, allow_secret_like, dry_run, max_reco
                         verify = brains[store].publication_sound
                         withhold = brains[store].repair_withheld
                         while batches * BACKFILL_BATCH < limit:   # bounded and resumable per drain
+                            n = min(BACKFILL_BATCH, limit - batches * BACKFILL_BATCH)
+                            v, w = prefetch_backfill(conn, n, verify, withhold)   # vault reads: no lock held
                             with _tx(conn):
-                                added, seen = _backfill(
-                                    conn, min(BACKFILL_BATCH, limit - batches * BACKFILL_BATCH),
-                                    verify=verify, withhold=withhold)
+                                added, seen = _backfill(conn, n, verify=v, withhold=w)
                             rep["baselined"] += seen
                             batches += 1
                             if seen == 0:
                                 break
+                        healer = prefetch_heal(conn, verify)
+                        with _tx(conn):
+                            _heal_absent(conn, healer)
                     # recovery: held only for size, now fits the bound or the owner's overflow policy.
                     # What still does not fit stops blocking only when a later pending revision does.
                     if (cap := max(brain.max_record_bytes, brains[store].max_overflow_bytes)):
@@ -904,12 +1173,15 @@ def _drain_locked(state, vault_root, limit, allow_secret_like, dry_run, max_reco
                 info["pending"], info["held"] = row[0] or 0, row[1] or 0
                 info["baseline_pending"] = conn.execute("SELECT COUNT(*) FROM archive_backfill").fetchone()[0]
                 info["unreconciled"] = conn.execute("SELECT COUNT(*) FROM archive_guard").fetchone()[0]
+                info["source_gone"] = _source_gone(conn)
             except sqlite3.Error as exc:
                 rep.update(ok=False)
                 info["error"] = _short(exc)
             if info["enabled"]:
                 rep["baseline_pending"] += info["baseline_pending"]
-                rep["remaining"] += info["pending"] + info["held"] + info["baseline_pending"] + info["unreconciled"]
+                rep["source_gone"] += info.get("source_gone", 0)
+                rep["remaining"] += (info["pending"] + info["held"] + info["baseline_pending"]
+                                     + info["unreconciled"] + info.get("source_gone", 0))
         if not dry_run and rep["ok"] and vault["ok"]:   # a finished drain that reached the vault
             for store, conn in conns.items():
                 if rep["stores"][store]["enabled"] and "error" not in rep["stores"][store]:

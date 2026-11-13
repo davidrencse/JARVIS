@@ -786,6 +786,19 @@ def check(predicate, settle, lister=None, clock=time.monotonic, sleep=time.sleep
 
 
 FOCUSED_TITLE = 80  # characters of the focused window's title the brain is shown
+FOCUSED_APP = 40
+# Control, format and bidi characters (NUL, ESC, line separators, RTL overrides) never belong
+# in a title the brain reads.
+_UNSAFE_TITLE = re.compile("[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2064\u2066-\u206f\ufeff]")
+
+
+def _shown(text, limit):
+    """Window text for the brain's recall: a page controls it, and situation.py quotes it as
+    `focused app "title"`. Control characters and newlines go, double quotes and backslashes
+    become harmless ones (a title can't close the quote), and the length is capped."""
+    text = " ".join(_UNSAFE_TITLE.sub(" ", str(text or "")).split())
+    text = text.replace('"', "'").replace("\\", "/")
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def now():
@@ -800,13 +813,11 @@ def now():
             raise LookupError("window list unreadable")
         for w in listed:
             words = list(dict.fromkeys(str(w.get("app") or "").split()))  # "kitty kitty" -> kitty
-            app = " ".join(words)
+            app = _shown(" ".join(words), FOCUSED_APP)
             if app and app not in apps:
                 apps.append(app)
             if w.get("focused"):
-                title = " ".join(str(w.get("title") or "").split())
-                focused = {"app": app, "title": title[:FOCUSED_TITLE] +
-                           ("…" if len(title) > FOCUSED_TITLE else "")}
+                focused = {"app": app, "title": _shown(w.get("title"), FOCUSED_TITLE)}
     except (LookupError, OSError, ValueError, subprocess.SubprocessError):
         apps = None  # can't list windows on this desktop: say nothing rather than "no apps"
     try:

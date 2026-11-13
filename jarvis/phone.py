@@ -13,8 +13,11 @@ funnel). Every request must prove, failing closed at each step:
   5. no other site sent it (Sec-Fetch-Site);
   6. a POST carries X-JARVIS-Phone and one JSON object;
   7. /phone/api/* carries the cookie of a phone paired at the main's own terminal, from the
-     same tailnet device and login it paired from. A phone paired after the CSRF token
-     existed also sends that token on POST. A phone paired before it keeps working.
+     same tailnet device and login it paired from. That cookie rotates every 7 days; the
+     previous token still works for 10 minutes, and a frame poll does not rotate it. A phone
+     paired after the CSRF token existed also sends that token on POST. A phone paired before
+     it keeps working. A frame sends its session id in X-JARVIS-Session (32 hex); the old
+     ?session= query is still accepted until 2026-12-31.
 It serves a fixed list of shell files and a typed allowlist of routes, and never falls
 through to console routes.
 
@@ -49,6 +52,9 @@ STORE = "phone.json"
 LOCK = "phone.lock"
 COOKIE = "__Host-jarvis_phone"
 COOKIE_AGE = 90 * 24 * 3600
+ROTATE_AFTER = 7 * 24 * 3600  # current token age before a new one is minted
+ROTATE_GRACE = 600            # s the previous token still authenticates
+_SESSION_HEADER = "X-JARVIS-Session"
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # base32 without 0/O and 1/I
 CODE_LEN = 8
 CODE_TTL = 300        # s a pairing code lives
@@ -125,6 +131,48 @@ def _log(text):
 
 def _digest(text):
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def _hash_eq(stored, digest):
+    """Constant-time match of a stored sha256 hex digest. A different length is not a match."""
+    text = str(stored or "")
+    if len(text) != len(digest):
+        return False
+    return hmac.compare_digest(text, digest)
+
+
+def _rotation_base(phone):
+    """When the current token was minted. A phone paired before rotation stores only created."""
+    try:
+        base = phone.get("rotated") or phone["created"]
+    except KeyError:
+        return None
+    if isinstance(base, bool) or not isinstance(base, (int, float)):
+        return None
+    return float(base)
+
+
+def _prev_until(phone):
+    until = phone.get("prev_until")
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return None
+    return float(until)
+
+
+def _prev_expired(phone, now):
+    prev = phone.get("prev_token_sha256")
+    if not isinstance(prev, str) or not prev:
+        return False
+    until = _prev_until(phone)
+    return until is None or now >= until
+
+
+def _prev_matches(phone, digest, now):
+    """The previous token, and only while its grace window is still open."""
+    until = _prev_until(phone)
+    if until is None or now >= until:
+        return False
+    return _hash_eq(phone.get("prev_token_sha256"), digest)
 
 
 def clean_text(value, limit):
@@ -312,7 +360,8 @@ def _pair_step(data, code, who, name, ua, mobile, claim, now):
     phone = {"id": phone_id, "name": request.get("name") or "Phone", "token_sha256": _digest(token),
              "csrf_sha256": _digest(csrf),
              "stable_id": who["stable_id"], "node": request.get("node"), "os": request.get("os"),
-             "login": request.get("login"), "ua": request.get("ua"), "created": now, "last_seen": now}
+             "login": request.get("login"), "ua": request.get("ua"), "created": now,
+             "last_seen": now, "rotated": now}
     data["phones"].append(phone)
     data["codes"] = [c for c in data["codes"] if c is not entry]
     return "paired", (phone, token, csrf)
@@ -545,6 +594,21 @@ def set_cookie(token, age=COOKIE_AGE):
     return f"{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={age}"
 
 
+_pending_cookie = threading.local()
+
+
+def _clear_pending_cookie():
+    if getattr(_pending_cookie, "token", None) is not None:
+        _pending_cookie.token = None
+
+
+def _take_pending_cookie():
+    """The new cookie for this request, if the current token was just rotated. Not logged."""
+    token = getattr(_pending_cookie, "token", None)
+    _clear_pending_cookie()
+    return token
+
+
 # ---- rate limits -------------------------------------------------------------------------
 
 class Limiter:
@@ -639,6 +703,18 @@ def _hub_error(exc):
     if isinstance(exc, (ValueError, RuntimeError, OSError, LookupError)) or status != 502:
         return _refuse(status, clean_text(exc, 300) or "The computer refused that.")
     return _refuse(502, "Something went wrong on the PC.")
+
+
+def _frame_session(headers, query):
+    """Remote-view session id. The header wins; a missing header still accepts the old query."""
+    if headers is not None:
+        values = _header_values(headers, _SESSION_HEADER)
+        if values:
+            if len(values) != 1 or not _SESSION_RE.fullmatch(values[0]):
+                raise _refuse(404, "No such session.")
+            return values[0]
+    # legacy: remove after 2026-12-31
+    return (query.get("session") or [""])[0]
 
 
 class PhoneHTTPServer(ThreadingHTTPServer):
@@ -1012,21 +1088,99 @@ class PhoneServer:
             raise _refuse(403, "That Tailscale login doesn't match this device.")
         return who
 
-    def phone_for(self, headers, who):
-        """The paired phone this request's cookie belongs to (check 6), or a 401 {pair:true}."""
+    def phone_for(self, headers, who, rotate=True):
+        """The paired phone this request's cookie belongs to (check 6), or a 401 {pair:true}.
+
+        A current token older than ROTATE_AFTER is replaced once inside the store lock.
+        The previous token is accepted until prev_until and never starts a rotation.
+        The frame poll passes rotate false. The new plaintext is only a Set-Cookie, never
+        a field on the phone and never logged.
+        """
         tokens = cookie_values(headers)
         if not tokens:
             raise _refuse(401, "This phone isn't paired with JARVIS.", pair=True)
         phones = self.store.load()["phones"]
+        now = self.clock()
         for token in tokens[:4]:
             digest = _digest(token)
             for phone in phones:
-                if hmac.compare_digest(str(phone.get("token_sha256", "")), digest) and \
-                        phone.get("stable_id") == who["stable_id"] and \
-                        str(phone.get("login", "")).casefold() == who["login"].casefold():
+                device = phone.get("stable_id") == who["stable_id"] and \
+                    str(phone.get("login", "")).casefold() == who["login"].casefold()
+                if _hash_eq(phone.get("token_sha256"), digest) and device:
                     self._seen(phone)
+                    rotated_now = self._rotate_if_due(phone, now) if rotate else False
+                    if not rotated_now and _prev_expired(phone, now):
+                        self._forget_prev(phone)
+                    phone.pop("_set_cookie", None)
                     return phone
+                if device and _prev_matches(phone, digest, now):
+                    self._seen(phone)
+                    phone.pop("_set_cookie", None)
+                    return phone
+                if device and _prev_expired(phone, now):
+                    self._forget_prev(phone)
         raise _refuse(401, "This phone isn't paired with JARVIS (or was removed).", pair=True)
+
+    def _rotate_if_due(self, phone, now):
+        """Mint one new token when the current one is old enough. Concurrent callers rotate once."""
+        base = _rotation_base(phone)
+        if base is None or now - base < ROTATE_AFTER:
+            return False
+
+        def change(data):
+            locked_now = self.clock()
+            for row in data["phones"]:
+                if row.get("id") != phone["id"]:
+                    continue
+                locked_base = _rotation_base(row)
+                if locked_base is None or locked_now - locked_base < ROTATE_AFTER:
+                    return None
+                token = secrets.token_urlsafe(32)
+                if not _TOKEN.fullmatch(token):
+                    return None
+                old = str(row.get("token_sha256") or "")
+                row["prev_token_sha256"] = old
+                row["prev_until"] = locked_now + ROTATE_GRACE
+                row["token_sha256"] = _digest(token)
+                row["rotated"] = locked_now
+                phone["prev_token_sha256"] = old
+                phone["prev_until"] = row["prev_until"]
+                phone["token_sha256"] = row["token_sha256"]
+                phone["rotated"] = locked_now
+                return token
+            return None
+
+        try:
+            minted = self.store.update(change)
+        except (OSError, ValueError):
+            return False
+        if not minted:
+            return False
+        _pending_cookie.token = minted
+        return True
+
+    def _forget_prev(self, phone):
+        """Drop an expired previous token. Re-check under the lock so a fresh rotation is kept."""
+        phone_id = phone.get("id")
+        phone.pop("prev_token_sha256", None)
+        phone.pop("prev_until", None)
+
+        def change(data):
+            locked_now = self.clock()
+            for row in data["phones"]:
+                if row.get("id") != phone_id:
+                    continue
+                if not _prev_expired(row, locked_now):
+                    return None
+                row.pop("prev_token_sha256", None)
+                row.pop("prev_until", None)
+                return None
+            return None
+
+        try:
+            self.store.update(change)
+        except (OSError, ValueError):
+            pass
 
     def _seen(self, phone):
         now = self.clock()
@@ -1296,9 +1450,9 @@ class PhoneServer:
             self.publish("camera.on", {"device": device, "by": phone.get("name")})
         return view
 
-    def frame(self, phone, query):
+    def frame(self, phone, query, headers=None):
         """(seq, jpeg, width, height), None (unchanged: 204), or a Reply. One per phone."""
-        sid = (query.get("session") or [""])[0]
+        sid = _frame_session(headers, query)
         try:
             after = int((query.get("after") or ["0"])[0] or 0)
         except ValueError:
@@ -1614,6 +1768,11 @@ class PhoneHandler(BaseHTTPRequestHandler):
             pass
 
     def _send(self, status, data, ctype, cache="no-store", headers=None):
+        extra = dict(headers or {})
+        token = _take_pending_cookie()
+        # A rotation's new cookie. Logout's clear and pairing's own Set-Cookie win.
+        if token and "Set-Cookie" not in extra:
+            extra["Set-Cookie"] = set_cookie(token)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -1624,7 +1783,7 @@ class PhoneHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", cache)
         if ctype.startswith("text/html"):
             self.send_header("Content-Security-Policy", CSP)
-        for name, value in (headers or {}).items():
+        for name, value in extra.items():
             self.send_header(name, str(value))
         if self.close_connection:
             self.send_header("Connection", "close")
@@ -1651,6 +1810,7 @@ class PhoneHandler(BaseHTTPRequestHandler):
     do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = do_TRACE = do_CONNECT = _not_allowed
 
     def _handle(self, method):
+        _clear_pending_cookie()
         try:
             try:
                 from .continuity.integration import phone_listener_open
@@ -1737,10 +1897,10 @@ class PhoneHandler(BaseHTTPRequestHandler):
             ua = clean_text(self.headers.get("User-Agent"), UA_MAX)
             raise srv.pair(body, who, ip, ua, claim=path == "/phone/pair")
         who = srv.identify(self.headers, ip)
-        phone = srv.phone_for(self.headers, who)
-        return self._api(method, path, url.query, body, phone)
+        phone = srv.phone_for(self.headers, who, rotate=path != "/phone/api/session/frame")
+        return self._api(method, path, url.query, body, phone, self.headers)
 
-    def _api(self, method, path, query, body, phone):
+    def _api(self, method, path, query, body, phone, headers=None):
         srv = self.phone
         if method == "POST" and not srv.csrf_ok(self.headers, phone):
             raise _refuse(403, "This phone needs to pair again.", code="csrf")
@@ -1752,9 +1912,10 @@ class PhoneHandler(BaseHTTPRequestHandler):
             if path == "/phone/api/fleet":
                 return self._json(200, srv.fleet(phone))
             if path == "/phone/api/session/frame":
-                frame = srv.frame(phone, parse_qs(query))
+                parsed = parse_qs(query)
+                frame = srv.frame(phone, parsed, headers)
                 if frame is None:
-                    ago = srv.node_ago(phone, (parse_qs(query).get("session") or [""])[0])
+                    ago = srv.node_ago(phone, _frame_session(headers, parsed))
                     return self._send(204, b"", "text/plain",
                                       headers={"X-Node-Ago": f"{ago:.1f}"} if ago is not None else None)
                 seq, jpeg, width, height = frame
