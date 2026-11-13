@@ -477,26 +477,93 @@ def _node_code(state, node):
     return status, (status or {}).get("code")
 
 
-def _pull(state, node, how, cut=None):
+PULL_WAIT = 240   # seconds a pull node gets to poll (~30 s), install, restart and check in
+HEARTBEAT = 30    # seconds between "still testing" lines during a release cut
+SEEN_FRESH = 90   # a node that checked in this recently counts as online
+
+
+def _fresh(status):
+    return bool(status and status.get("seen") and time.time() - status["seen"] < SEEN_FRESH)
+
+
+def _say(text):
+    """Progress goes to stderr: stdout stays the JSON report."""
+    import sys
+    print(f"jarvis update: {text}", file=sys.stderr, flush=True)
+
+
+def _heartbeat(label, every=None, say=None):
+    """Context manager: says `label (Ns)` every `every` seconds while a long step runs, so a
+    release cut (the full test suite, ~9 min) never looks like a hang."""
+    import contextlib
+    import threading
+    say, every = say or _say, every or HEARTBEAT
+
+    @contextlib.contextmanager
+    def beat():
+        stop, began = threading.Event(), time.monotonic()
+
+        def tick():
+            while not stop.wait(every):
+                say(f"{label} ({round(time.monotonic() - began)} s)")
+        thread = threading.Thread(target=tick, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+    return beat()
+
+
+def _pull(state, node, how, cut=None, say=None, wait=None):
     """A pull node takes the main's *release*, never the live tree. Cut one now (the full
-    suite runs first) so the update means what David asked for, and say plainly when the
-    tests hold it back: before, a failed release left the node on old code with no hint."""
-    from .release import cut as cut_release
-    report = (cut or cut_release)(state, quiet=0)
-    out = {"node": node, "updated": False, "pull": True, "release": report}
+    suite runs first, minutes: progress is printed meanwhile) so the update means what David
+    asked for, say plainly when the tests hold it back, then wait (bounded) until the node
+    reports the release's fingerprint. An offline node is reported and left alone."""
+    from .release import cut as cut_release, served_code
+    say = say or _say
+    wait = PULL_WAIT if wait is None else wait
+    started = time.monotonic()
+    _, before = _node_code(state, node)
+    say(f"cutting a release for {node}: the full test suite runs on a copy of the code first "
+        "(about 9 minutes); a tested release is what nodes get")
+    with _heartbeat("release tests still running", say=say):
+        report = (cut or cut_release)(state, quiet=0)
+    out = {"node": node, "updated": False, "pull": True, "release": report, "before": before}
     if report.get("released") or "already get" in str(report.get("note", "")):
-        out["note"] = (f"{how} on its next poll (within ~30 s while its node agent runs) "
-                       "and restarts.")
+        want = served_code(state)
+        out["expected"] = want
+        say(f"release {want} ready; waiting for {node} to pull it")
+        status, now = _node_code(state, node)
+        online = _fresh(status)
+        deadline = time.monotonic() + (wait if online else 0)
+        while not (now == want and online):
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(2)
+            status, now = _node_code(state, node)
+            online = _fresh(status)
+        out["after"] = now
+        if now == want and online:
+            out.update(updated=True, note=f"{node} runs {want}.")
+        elif not online:
+            out["note"] = (f"{how}; {node} is offline right now, so it will pull release {want} "
+                           "when it reconnects. Not retrying.")
+        else:
+            out["note"] = (f"Release {want} is cut but {node} still reports {now} after {wait} s. "
+                           f"{how}; check its node agent (jarvis cluster doctor).")
     elif report.get("tests"):
         out["note"] = (f"Not sent: the release tests failed, so {node} keeps its last release. "
-                       f"Fix the failing test, then run this again. ({str(report['tests'])[-800:]})")
+                       f"Fix the failing test, then run this again. ({str(report['tests'])[:900]})")
     else:
         out["note"] = f"Not sent yet: {report.get('note') or 'no release could be cut'}"
+    out["seconds"] = round(time.monotonic() - started, 1)
     return out
 
 
-def update(config, state, node, rollback=False):
-    """Bring `node` to this main's code (or back to its previous code). Returns a report."""
+def update(config, state, node, rollback=False, cut=None):
+    """Bring `node` to this main's code (or back to its previous code). Returns a report.
+    `cut` replaces release.cut for pull nodes (one cut shared by a whole fleet update)."""
     from .topology import identity
     local, main = identity(config)
     if local != main:
@@ -507,14 +574,14 @@ def update(config, state, node, rollback=False):
     if not is_ssh_node(config, node):
         if rollback:
             raise ValueError(f"{node} has no SSH link, so it can't be rolled back remotely.")
-        return _pull(state, node, f"{node} has no SSH link: it pulls the main's code itself")
+        return _pull(state, node, f"{node} has no SSH link: it pulls the main's code itself", cut=cut)
     _, _, folder = _ssh(config, state, node)
     kernel = _node_os(config, state, node)
     if kernel is None:
         # The scripts below need a POSIX shell, tar and a known service manager.
         if rollback:
             raise ValueError(f"{node} isn't a Linux or macOS node, so it can't be rolled back remotely.")
-        return _pull(state, node, f"{node} isn't a Linux or macOS node: it pulls the main's code itself")
+        return _pull(state, node, f"{node} isn't a Linux or macOS node: it pulls the main's code itself", cut=cut)
     started = time.monotonic()
     _, before = _node_code(state, node)
     from .release import served_code, source

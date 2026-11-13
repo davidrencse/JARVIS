@@ -1204,9 +1204,18 @@ def run(args, config, base):
         if not nodes:
             raise ValueError("No enrolled nodes to update.")
         reports = []
+        from .release import cut as cut_release
+        shared = {}
+
+        def cut_once(*a, **k):
+            # One release cut per run: a failed or blocked cut (the suite takes ~9 min) is
+            # not repeated for every remaining node.
+            if "report" not in shared or shared["report"].get("released"):
+                shared["report"] = cut_release(*a, **k)
+            return shared["report"]
         for node in nodes:  # one failing node must not stop the rest
             try:
-                reports.append(update(config, state, node, rollback=args.rollback))
+                reports.append(update(config, state, node, rollback=args.rollback, cut=cut_once))
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 if args.value:
                     raise

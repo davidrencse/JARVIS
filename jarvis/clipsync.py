@@ -920,7 +920,8 @@ def connect(device, board, log, target=None, state=None):
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, creationflags=flags)
     try:
-        source = open(__file__, "rb").read()
+        with open(__file__, "rb") as handle:
+            source = handle.read()
         proc.stdin.write(b"%d\n" % len(source) + source)
         proc.stdin.flush()
         hello = proc.stdout.readline()

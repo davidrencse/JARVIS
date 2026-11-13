@@ -1177,7 +1177,7 @@ class Hub:
             if not _under_tests():
                 threading.Thread(target=self._linkfinder, name="main-linkfinder", daemon=True).start()
             from .continuity.renewal import start_bound
-            self._continuity_renewer = start_bound(self.state)
+            self._continuity_renewer = start_bound(self.state, self.config, self.base)
             if settings.get("auto_update", True):
                 threading.Thread(target=self._keep_up, name="jarvis-auto-update",
                                  daemon=True).start()
@@ -1918,7 +1918,9 @@ class NodeWorker:
                     except Exception as exc:
                         print(f"JARVIS node: remote-control recovery: {exc}", flush=True)
                 from .continuity.renewal import start_bound
-                renewer = start_bound(self.state)
+                renewer = start_bound(self.state, getattr(self, "config", None),
+                                      Path(self.config_path).resolve().parent
+                                      if getattr(self, "config_path", None) else None)
                 try:
                     self._poll_loop()
                 finally:

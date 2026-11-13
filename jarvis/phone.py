@@ -1040,7 +1040,26 @@ class PhoneServer:
         name = self.tailnet.dns_name()
         if name:
             allowed |= {name, f"{name}:443"}
+        front = self._front_origin()
+        if front:
+            allowed.add(urlsplit(front).netloc)
         return host in allowed
+
+    def _front_origin(self):
+        """`phone.front_origin`: the stable https origin of the phone front on the
+        Oracle server, which relays to whichever PC holds MAIN. Absent: no front."""
+        value = (self.config.get("phone") or {}).get("front_origin")
+        if not isinstance(value, str):
+            return None
+        try:
+            parts = urlsplit(value)
+            parts.port
+        except ValueError:
+            return None
+        if parts.scheme != "https" or not parts.hostname or parts.path or parts.query \
+                or parts.fragment or parts.username is not None:
+            return None
+        return value.lower()
 
     def origin_ok(self, headers):
         """A missing Origin is allowed (the app's own urllib tests, and a top-level
@@ -1055,6 +1074,9 @@ class PhoneServer:
         name = self.tailnet.dns_name()
         if name:
             allowed |= {f"https://{name}", f"https://{name}:443"}
+        front = self._front_origin()
+        if front:
+            allowed.add(front)
         return values[0] in allowed
 
     def csrf_ok(self, headers, phone):
