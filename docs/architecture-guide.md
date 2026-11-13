@@ -1,16 +1,16 @@
-# JARVIS architecture guide (complete reference)
+# JARVIS architecture guide
 
-This is the entry point for anyone working on JARVIS, human or Claude, on any machine. It
-covers what each part does, where it lives, which settings drive it and the rules it must
-keep. Deeper design history is in `jarvis-os-architecture.md`; the move to a new main is in
-`migration.md`; David's rules, machines and decisions are in the `jarvis-memory/` vault.
+*What each part does, where it lives, which settings drive it, and the rules it must keep.*
+
+Design decisions are in [jarvis-os-architecture.md](jarvis-os-architecture.md). Commands are in [reference.md](reference.md). Moving the main is in [migration.md](migration.md). Runbooks are under `docs/handbook/`: browser, cluster, continuity, drag-drop-design, fleet-ui, lan-mouse, operations, perf, phone, release, remote-control, voice. David's rules and machines are in the `jarvis-memory/` vault.
 
 Contents: [1 What JARVIS is](#1-what-jarvis-is) · [2 Request flow](#2-request-flow) ·
 [3 Modules](#3-modules-by-station) · [4 Main and nodes](#main-and-nodes) ·
 [5 OS support](#5-os-support) · [6 Voice](#6-voice) · [7 Models and cost](#7-models-and-cost) ·
 [8 Memory](#8-memory-and-the-two-vaults) · [9 Safety](#9-safety-and-checks) ·
 [10 Configuration](#10-configuration-reference) · [11 State on disk](#11-state-on-disk) ·
-[12 Commands](#12-commands) · [13 Tests](#13-tests) · [14 Known limits](#14-known-limits-and-open-work)
+[12 Commands](#12-commands) · [13 Tests](#13-tests) · [14 Known limits](#14-known-limits-and-open-work) ·
+[15 Pipeline invariants](#15-pipeline-invariants)
 
 ## 1 What JARVIS is
 
@@ -61,7 +61,20 @@ voice (daemon.py) / text (ask, chat, console)
   the route, logs it next to what actually happened, and does not decide anything until
   calibrated (temperature scaling, ≥ 98% precision on ≥ 50 labels).
 - `router.py` picks tiers for free-form work: simple → one CLI run (Codex/Claude); web →
-  browser agents; complex → `orchestrator.py`.
+  browser agents; complex → `orchestrator.py`. `routing.auto_escalate: false` keeps
+  conversation on the brain; web and orchestration run only with an explicit `--tier`.
+  `routing.brain: "claude"` selects the Claude lane. `models` maps `low` / `mid` / `high`
+  to Haiku or low effort, Sonnet or medium, Opus or high. Codex tiers change reasoning
+  effort; set `model` there to pin a Codex model.
+- ChatGPT runs through the Codex CLI `app-server` on the ChatGPT subscription. API-key
+  environment variables are stripped from that child. Driving chatgpt.com is not the path.
+- `adapters.apis` entries are `{name, url, sites, token_env}`. The contract is POST
+  `{"query", "context"}` → JSON `answer`, https or localhost only. A listed browser agent
+  stays unused until `personal_agents.<name>.integration` is set.
+- Specialists are `.claude/agents/*.md`. Reviewer, security, researcher, architect, and
+  scout are read-only. Writers declare non-overlapping `owned_paths`. A plan is saved and
+  does nothing until `jarvis orchestrate run PLAN_ID`. Steps follow dependencies and stop
+  at the first failure. Grokbot handoff checks are in [handbook/browser.md](handbook/browser.md).
 
 ## 3 Modules by station
 
@@ -132,8 +145,8 @@ Key files in plain words:
   when nothing is pending, held or failing, a drain has succeeded, every published head was
   opened through the archive loader, and no published record has a revision gap or duplicate.
 - `brainsync.py`: a private git snapshot (`<base>/.jarvis/brain-git`, not the Obsidian vault)
-  and a SQLite memory handoff. Off unless `brainsync.enabled` is true; this config has no
-  `brainsync` key. Safe vault files are copied in with exclusive create. The same path with
+  and a SQLite memory handoff. Off unless `brainsync.enabled` is true; this config sets it
+  true. Safe vault files are copied in with exclusive create. The same path with
   different bytes becomes a side-by-side `conflict-<sha256>` copy. Nothing is overwritten
   or deleted. Secret-shaped names and `state/memory.sqlite3` are not pushed unless that
   exact path is on `remote_allowlist` (empty by default).
@@ -409,19 +422,20 @@ workers are started through `explorer.exe` (see `cluster_tunnel.start`, `daemon.
 
 1. `listen.record_utterance`: 16 kHz mono; Silero VAD gate (or a loudness gate fitted to
    the room). On Linux it reads through PipeWire/Pulse, not raw ALSA.
-2. Speaker check (`listen.VoicePrint`, sherpa-onnx ERes2Net, CPU) runs **in parallel**
-   with speech-to-text: Parakeet v3 (Handy's model, `onnx-asr`, `voice.stt_engine`, default) first, kept only when it hears the wake word; otherwise Whisper (`faster-whisper`, CUDA if present, else CPU int8; `hotwords="Jarvis"`).
-   - score ≥ threshold (≈ 0.36, `voiceprint.json`): David.
-   - 0.24 ≤ score < threshold: a near miss (far from the mic, quieter, music behind him).
-     Accepted only if the transcript starts with the wake word; never used for adaptation.
-   - below 0.24: another voice. The transcript is cancelled, never read or logged.
-3. Wake word (`assistant.wake_word`): the text must start with Jarvis (or a Whisper
-   mishearing of it: Jervis, Jarvas, Javis). "Travis" and "Jarvis's …" don't count. This is
-   David's hard rule: no always-on path acts without it.
+2. Speaker check (`listen.VoicePrint`, sherpa-onnx ERes2Net, CPU). On CUDA it runs beside
+   speech-to-text; on CPU it runs first so a stranger's clip never queues ahead of David.
+   Parakeet (`voice.stt_engine`, default) first; Whisper (`faster-whisper`, CUDA if present,
+   else CPU int8, `hotwords="Jarvis"`) when Parakeet is unsure. The learned threshold is
+   clamped to 0.30–0.36. `near_miss` defaults to 0.25 and `stranger_floor` to 0.08.
+   Bands, wake variants, and learning rules are in [handbook/voice.md](handbook/voice.md).
+3. Wake word: an always-on request must start with Jarvis (or an accepted mishearing).
+   "Travis" and "Jarvis's …" do not count. Push-to-talk with the speaker check off does
+   not apply that rule; that difference is still David's to close.
 4. Confident matches with the wake word adapt the voiceprint (enrollment clips stay pinned,
    learned ones rotate, 40 max).
-5. Replies are spoken by Kokoro (local, voice `bm_lewis`), streamed sentence by sentence;
-   "On it." plays while the brain thinks.
+5. Replies use `voice.engine` (ElevenLabs in this config, Kokoro when that cannot speak),
+   streamed sentence by sentence. "On it." plays while the brain thinks. Kokoro's voice
+   here is `bm_lewis`.
 
 Debugging: `.jarvis/logs/voice.log` shows each utterance's score; "no wake word (score):
 N words, not kept" means your voice was accepted but the transcript didn't start with Jarvis
@@ -478,8 +492,10 @@ Add new model calls through it, never as a bare `ChatGPTLane`/`FastLane`:
 
 ## 8 Memory and the two vaults
 
-- **Memory heap** (`memory.py`, `.jarvis/memory.sqlite3`): every message and result. Search is
-  BM25 plus vectors fused with reciprocal-rank fusion when `memory.semantic` is true
+- **Memory heap** (`memory.py`, `.jarvis/memory.sqlite3`): every message and result. Ids are
+  `kind:YYYYMMDD:hex6`. Search is FTS5 (porter stemming, prefix match, title weighted 4×)
+  blended with importance and 30-day recency; identical content within a kind is stored once.
+  BM25 plus vectors are fused with reciprocal-rank fusion when `memory.semantic` is true
   (`JARVIS_SEMANTIC=0` turns it off). Vectors come from `embed.py` (all-MiniLM-L6-v2 ONNX,
   downloaded once to the Hugging Face cache, unloaded after 600 s idle).
   Every brain call gets the last 20 min of conversation plus relevant heap lines as recall.
@@ -524,8 +540,14 @@ Add new model calls through it, never as a bare `ChatGPTLane`/`FastLane`:
   endpoints separated (`cluster._read_only`), code-mismatch refusal.
 - Paths, SSH destinations and Lan Mouse peer addresses that arrive from another machine
   go through `pathsafe.py`: no symlink follow, no publish over an existing name, no
-  Tailscale address as a peer.
+  Tailscale address as a peer (100.64.0.0/10, fd7a:115c:a1e0::/48, or any text that
+  starts with `100.`).
+- Shell and desktop startup files (shell, X, fish, hypr, uwsm, environment.d, PowerShell
+  profile) may be read. Writes are refused: "JARVIS doesn't write shell or desktop startup files".
 - No system-wide input or cursor changes without a tested fail-safe.
+- `rules.confirm: never` still parks money and messages (`rules.always_ask`). A terminal
+  command runs at most 30 s (`terminal.TIMEOUT`) and, on Linux, inside bubblewrap unless
+  `terminal.sandbox` is false.
 
 ## 10 Configuration reference
 
@@ -568,10 +590,13 @@ Cluster actions: `configure`, `main`, `roles`, `status`, `run` (main), `node`, `
 
 ## 13 Tests
 
-`python -m unittest discover -s tests` with an interpreter that has the voice extras
-(the project `.venv`: `.venv/bin/python` on Linux, `.venv\Scripts\python.exe` on Windows). About 4,000 tests, all mocked: none touch the real
-desktop, microphone or accounts. Test configs turn off semantic recall, shadow mode and the
-interpreter. Live checks are `jarvis selftest keyboard` and `jarvis doctor`.
+`python -m unittest discover -s tests` with the project `.venv`
+(`.venv/bin/python` on Linux, `.venv\Scripts\python.exe` on Windows). Set
+`JARVIS_NO_MODELS=1` and unset `CODEX_*`. The suite is mocked: it does not touch the real
+desktop, microphone, or accounts, and an audit hook refuses to start `codex` or `claude`.
+Test configs turn off semantic recall, shadow mode, and the interpreter. Live checks are
+`jarvis selftest keyboard` (Windows only; it skips elsewhere) and `jarvis doctor`.
+`jarvis eval` is free; `jarvis eval --brain` spends subscription quota.
 
 ## 14 Known limits and open work
 
@@ -579,4 +604,49 @@ interpreter. Live checks are `jarvis selftest keyboard` and `jarvis doctor`.
 - The interpreter has not yet been tested live end to end.
 - Lan Mouse is in service (`lan_mouse.enabled` is true). `sharedinput.guard` stops it after two apart readings, and the captured-input fail-safe is the daemon `release_bind` written by `desktop.lan_mouse_config` (with `authorized_fingerprints`).
 - Instant greetings ("hi", "thanks" with no model) were offered, not built.
-- The decider stays in shadow mode until it has enough labels to calibrate.
+- The decider stays in shadow (`decisions.shadow` is true) until a job's measured precision
+  reaches 0.98 on at least 20 picks (`decide.TARGET`). A deadline falls back to rules, never a guess.
+- Node offline mode (allow-risk actions on that node only, journal replayed as records and
+  never re-executed) is a design, not a running mode.
+- Parallel plan writers stay off. Owned paths are collision checks, not filesystem permissions.
+
+## 15 Pipeline invariants
+
+Plans, the task ledger, and the memory database are separate stores.
+
+- `jarvis/locking.py` takes a nonblocking OS file lock before loading a plan and holds it
+  through execution or recovery. A second process gets a busy message. Exit releases the
+  lock; the file stays. The lock covers one local filesystem, not separate state directories.
+- `python -m jarvis orchestrate recover PLAN_ID` reports recorded task states and launches
+  nothing. `--apply` adopts terminal artifacts, keeps failed work blocked, and marks the
+  original queued task ids for a later `orchestrate run`. It never creates a replacement
+  task for an uncertain dispatch. A running or missing task stops recovery for inspection.
+- The result checkpoint is written before memory indexing. Indexing can be repaired from
+  the artifact. `finished` means the process exited 0, not that acceptance criteria passed.
+  A crash after dispatch and before the checkpoint is uncertain: do not clear the task
+  mapping to make Run succeed.
+- Plan validation rejects absolute paths, traversal, and empty or ambiguous Windows names,
+  and compares case, separators, dot segments, and nested directories the same way.
+  Immediately before dispatch, owned paths are resolved inside the plan workspace, which
+  catches symlink aliases that leave it, including links added after the plan was saved.
+  A workspace writer with no owned paths cannot run. A link can still change between that
+  check and the edit. Do not enable parallel writers until overlap detection, whole-plan
+  claims, separate workspaces, and acceptance checks exist.
+- Warm provider lanes use monotonic deadlines. An abandoned turn discards its process and
+  output queue so the next request cannot receive the previous answer. Cleanup waits on
+  the direct child; descendant MCP and browser processes are not covered by that helper.
+- `Store.overview()` reads totals and fourteen recent task projections on one connection.
+- A full subscriber queue closes that SSE connection. The browser's EventSource retry
+  receives a fresh `hello` and reloads history and overview. The watcher compares the
+  feed file's identity, so a replaced `events.jsonl` is read from the start even when the
+  new size is at least the old offset. The feed is a bounded transient stream.
+- File copies check the exact candidate path. Directories and broken symlinks count as
+  taken. A permission error fails closed. Names are normalized before the collision check,
+  including Windows reserved names, and stay inside the inbox parser's 200-character limit.
+  Picking a free name and performing the copy are separate steps; two writers can still race.
+- A failed microphone startup releases the tracks, nodes, and audio context it acquired.
+  Concurrent starts share one request. Escape, the microphone button, or releasing a held
+  Space cancels a pending start. A quick Space tap keeps its previous behavior.
+- Restart the console, listener, or overlay to load Python. The task timestamp index is
+  created on the next store open and can stay if code is rolled back. Do not restore or
+  delete `.jarvis` to undo a code change.
