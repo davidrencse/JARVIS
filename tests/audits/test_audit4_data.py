@@ -51,6 +51,7 @@ class MemoryAbsorb(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.memory = Memory(tmp.name)
+        self.addCleanup(self.memory.release_background_index, 30)  # before rmtree
 
     def active(self):
         return [k["text"] for k in self.memory.knowledge(("fact",))]
@@ -74,11 +75,54 @@ class MemoryAbsorb(unittest.TestCase):
         self.assertEqual((again, state), (first, "merged"))
 
 
+class _Vec:
+    """Stand-in for one embedding. index_vectors stores tobytes()."""
+
+    def tobytes(self):
+        return b"\x00" * 16
+
+
+def _fake_embed(texts):
+    return [_Vec() for _ in texts]
+
+
 class MemoryVectors(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
+        self._tmp_name = tmp.name
+        # LIFO: directory-gone runs last, after rmtree. rmtree runs after the
+        # embed patch stops, which runs after release_background_index has
+        # joined the worker and dropped _VCACHE and _LAST_KICK. The worker
+        # writes memory.sqlite3 (and its rollback journal) after embed()
+        # returns; deleting the directory first made Python 3.14 raise
+        # "Directory not empty".
+        self.addCleanup(self._assert_temp_dir_removed)
         self.addCleanup(tmp.cleanup)
         self.memory = Memory(tmp.name)
+        # Real embed() loads the MiniLM ONNX session. Under a busy machine that
+        # load outlives the 30s join and the temp directory. The indexer still
+        # opens, writes and closes the database; only the model call is faked.
+        embed_patch = mock.patch("jarvis.embed.embed", _fake_embed)
+        embed_patch.start()
+        self.addCleanup(embed_patch.stop)
+        self.addCleanup(self._finish_indexer)
+
+    def _assert_temp_dir_removed(self):
+        self.assertFalse(os.path.exists(self._tmp_name), self._tmp_name)
+
+    def _finish_indexer(self):
+        from jarvis import memory as memory_module
+        key = str(self.memory.path)
+        thread = self.memory.release_background_index(timeout=30)
+        self.assertTrue(thread is None or not thread.is_alive())
+        self.assertFalse([t for t in threading.enumerate()
+                          if t.name == "jarvis-memory-index" and t.is_alive()])
+        with memory_module._INDEX_LOCK:
+            self.assertNotIn(key, memory_module._INDEXING)
+            self.assertNotIn(key, memory_module._LAST_KICK)
+            self.assertNotIn(key, memory_module._INDEX_THREADS)
+        with memory_module._VCACHE_LOCK:
+            self.assertFalse(any(cache_key[0] == key for cache_key in memory_module._VCACHE))
 
     def test_prune_drops_stale_model_retired_and_orphan_vectors_only(self):
         keep = self.memory.add("fact", "keep me")["id"]
@@ -102,6 +146,15 @@ class MemoryVectors(unittest.TestCase):
             out = self.memory._fuse("thesis", keyword, (), (), 5)
         if out is not None:
             self.assertNotIn("ghost", [i["id"] for i in out])
+        # _index_soon records this temp database and starts the daemon.
+        # A still-registered indexer has to be the handle release joins; a
+        # finished pass has already dropped _INDEXING and closed the file.
+        from jarvis import memory as memory_module
+        key = str(self.memory.path)
+        with memory_module._INDEX_LOCK:
+            self.assertIn(key, memory_module._LAST_KICK)
+            still_indexing = key in memory_module._INDEXING
+        self.assertTrue(self.memory.background_index_thread() is not None or not still_indexing)
 
 
 class EventsRoll(unittest.TestCase):
@@ -264,6 +317,20 @@ class StorePrune(unittest.TestCase):
                 os.utime(stamp, (time.time() - 90000,) * 2)
                 Store(tmp)
                 prune.assert_called_once()
+
+
+def tearDownModule():
+    """No indexer left, and no cache entry still names a directory this module removed."""
+    from jarvis import memory as memory_module
+    alive = [t for t in threading.enumerate() if "jarvis-memory-index" in (t.name or "")]
+    if alive:
+        raise AssertionError("jarvis-memory-index still running: " + ", ".join(t.name for t in alive))
+    with memory_module._VCACHE_LOCK:
+        stale_cache = [key for key in memory_module._VCACHE if not os.path.exists(key[0])]
+    with memory_module._INDEX_LOCK:
+        stale_kick = [key for key in memory_module._LAST_KICK if not os.path.exists(key)]
+    if stale_cache or stale_kick:
+        raise AssertionError(f"index caches point at removed files: {stale_cache} {stale_kick}")
 
 
 if __name__ == "__main__":
