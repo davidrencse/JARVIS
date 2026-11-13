@@ -19,7 +19,7 @@ from .platforms import NO_WINDOW, on_windows
 from .cluster import save_json
 from .locking import exclusive_lock
 from .topology import DEFAULT_PORT, identity
-from .transfer import _check_target, _ssh_args, ssh_device
+from .transfer import _check_target, _ssh_args, ssh_device, ssh_host
 
 NAME = "cluster-tunnel"
 # While on a fallback target (e.g. Tailscale), how often to look for an earlier one (the
@@ -122,7 +122,7 @@ def command(config, state, target):
     return [*_ssh_args(binary, machine.get("identity_file")), *extra, *pinned_host(machine, state),
             "-N", "-T", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=2", "-L" if mode(config) == "forward" else "-R",
-            f"127.0.0.1:{port}:127.0.0.1:{port}", target]
+            f"127.0.0.1:{port}:127.0.0.1:{port}", *ssh_host(target)]
 
 
 def status(state):
@@ -138,6 +138,8 @@ def status(state):
 
 
 def run(config, state):
+    from .continuity.repoint import effective_config
+    config = effective_config(config, state)
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True)
     machine = peer(config, state)

@@ -112,7 +112,7 @@ def package(root=PACKAGE):
     """The tar stream a node unpacks: jarvis/ plus pyproject.toml, from `root` (the tested
     release, release.source(); the live package by default)."""
     buffer = io.BytesIO()
-    with tarfile.open(fileobj=buffer, mode="w") as tar:
+    with tarfile.open(fileobj=buffer, mode="w", dereference=True) as tar:
         for path in _files(root):
             tar.add(path, arcname="jarvis/" + path.relative_to(root).as_posix(), recursive=False)
         pyproject = root.parent / "pyproject.toml"
@@ -252,7 +252,14 @@ def code_bundle(state):
             "version": version, "vsig": sign(_bundle_bytes(raw, version, code), state)}
 
 
+def _zip_symlink(info):
+    """Unix symlink entry. The DOS attribute word is not a Unix mode, so create_system 0 is left."""
+    return info.create_system == 3 and (info.external_attr >> 16) & 0o170000 == 0o120000
+
+
 def _safe_name(name):
+    if not isinstance(name, str) or any(c in name for c in "\x00\n\r"):
+        raise ValueError(f"Unsafe path in code package: {name!r}")
     parts = name.split("/")
     if (not name or name.startswith("/") or "\\" in name or ":" in name or
             any(p in ("", ".", "..") for p in parts) or (parts[0] != "jarvis" and name != "pyproject.toml")):
@@ -289,7 +296,13 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
     elif not verify(raw, bundle.get("signature"), key):
         raise ValueError("The code bundle isn't signed by the main PC's pinned key; not installed.")
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-        entries = [(i.filename, _safe_name(i.filename)) for i in archive.infolist() if not i.is_dir()]
+        entries = []
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            if _zip_symlink(info):
+                raise ValueError(f"Unsafe path in code package: {info.filename!r}")
+            entries.append((info.filename, _safe_name(info.filename)))
         with tempfile.TemporaryDirectory(prefix="jarvis-update-") as stage:
             stage = Path(stage)
             for name, parts in entries:
@@ -395,9 +408,9 @@ def _remote(config, state, node, command, stdin=b"", timeout=120):
     """Run `command` on the node (stdin piped in) over the first target that answers."""
     argv, targets, _ = _ssh(config, state, node)
     last = ""
-    for target in targets:
+    for target in targets:  # _ssh already refused a target that is not user@host
         try:
-            out = subprocess.run([*argv, target, command], input=stdin, capture_output=True,
+            out = subprocess.run([*argv, "--", target, command], input=stdin, capture_output=True,
                                  timeout=timeout, creationflags=NO_WINDOW)
         except subprocess.SubprocessError as exc:
             raise RuntimeError(f"ssh to {node} failed: {exc}") from None

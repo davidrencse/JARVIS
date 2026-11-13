@@ -75,6 +75,8 @@ def parse_uri_list(data, log=lambda _: None):
             path = unquote(uri.path, errors="strict")
             if not path.startswith("/") or path.startswith("//") or "\0" in path:
                 raise ValueError("not a local absolute path")
+            if any(part == ".." for part in path.split("/")):
+                raise ValueError("parent segment")
             paths.append(path)
         except ValueError as exc:
             log(f"skipped file URI {line!r}: {exc}")
@@ -111,6 +113,7 @@ def select_files(paths, max_bytes=FILES_MAX_BYTES, log=lambda _: None):
         try:
             drive, tail = ntpath.splitdrive(raw)
             if ("\0" in raw or not path.is_absolute() or raw.startswith(("//", "\\\\"))
+                    or any(part == ".." for part in str(raw).replace("\\", "/").split("/"))
                     or (sys.platform == "win32" and (not drive or ":" in tail))):
                 raise ValueError("not a local absolute path")
             for part in (path, *path.parents):
@@ -160,6 +163,18 @@ def png_encode(width, height, rows, alpha):
             + _png_chunk(b"IDAT", zlib.compress(raw, 6)) + _png_chunk(b"IEND", b""))
 
 
+def _inflate(data, limit):
+    """Decompress at most ``limit`` bytes. A clipboard PNG must not expand without bound."""
+    dec = zlib.decompressobj()
+    out = dec.decompress(data, limit + 1)
+    if len(out) > limit or dec.unconsumed_tail:
+        raise ValueError("image data expands too far")
+    tail = dec.flush()
+    if tail or not dec.eof:
+        raise ValueError("image data expands too far")
+    return out
+
+
 def png_decode(data):
     """(width, height, top-down RGBA rows) for 8-bit RGB/RGBA/grey, non-interlaced PNGs."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
@@ -179,7 +194,8 @@ def png_decode(data):
     channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color)
     if depth != 8 or interlace or not channels:
         raise ValueError("unsupported PNG layout")
-    raw, stride, bpp = zlib.decompress(b"".join(idat)), width * channels, channels
+    raw = _inflate(b"".join(idat), MAX_PURE_PIXELS * 5 + 1024 * 1024)
+    stride, bpp = width * channels, channels
     rows, prev = [], bytearray(stride)
     for y in range(height):
         start = y * (stride + 1)
@@ -645,12 +661,18 @@ def apply(state, kind, data):
         return False
     key_data = data
     if kind == "files":
+        from .pathsafe import open_leaf
         from .transfer import drop_folder
         names = file_names(data)
-        root = drop_folder().resolve()
-        paths = [root / name for name in names]
-        if any(p.is_symlink() or p.resolve().parent != root or not p.is_file() for p in paths):
-            raise ValueError("Clipboard file is missing or outside the drop folder.")
+        root = Path(drop_folder())
+        paths = []
+        for name in names:
+            try:
+                with open_leaf(root, name, "rb"):
+                    pass
+            except (OSError, ValueError):
+                raise ValueError("Clipboard file is missing or outside the drop folder.") from None
+            paths.append(root / name)
         key_data, data = names, paths
     if state:  # first, so this machine's watcher sees it as ours, not a new copy
         path = os.path.join(os.path.abspath(state), APPLIED)
@@ -692,6 +714,9 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
     import io
     from .transfer import peer, peers, push, drop_folder
     targets = [peer(config, device_name)] if device_name else peers(config)
+    devices = config.get("devices", {})
+    # Servers have no desktop clipboard; sending there only logs a refusal on each copy.
+    targets = [t for t in targets if (devices.get(t) or {}).get("profile") not in ("cloud", "server")]
     board = board or local_clipboard()
     log = log or _log_line(os.path.join(state, "logs", "clipboard.log"))
     if isinstance(board, (Wayland, Windows)):
@@ -855,14 +880,20 @@ def _pinned_host(device, state):
     """ssh options that check the peer against its pinned host key, whatever its address.
 
     The peer's IP changes with DHCP and networks; keying known_hosts by a fixed alias
-    keeps StrictHostKeyChecking on without a fresh "unknown host" after every move."""
+    keeps StrictHostKeyChecking on without a fresh "unknown host" after every move.
+    The alias and the key are the only bytes written, so a saved key cannot add a line."""
     key = device.get("host_key")
     if not key or not state:
         return []
-    alias = "jarvis-" + device.get("hostname", "peer")
+    alias = "jarvis-" + str(device.get("hostname") or "peer")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", alias):
+        raise ValueError("Invalid SSH host key alias.")
+    if not re.fullmatch(
+            r"(?:ssh-ed25519|ssh-rsa|ecdsa-sha2-[A-Za-z0-9-]+) [A-Za-z0-9+/=]+", str(key).strip()):
+        raise ValueError("Invalid pinned SSH host key.")
     path = os.path.join(state, "known_hosts")
-    with open(path, "w", encoding="utf-8") as out:
-        out.write(f"{alias} {key.strip()}\n")
+    with open(path, "w", encoding="ascii") as out:
+        out.write(f"{alias} {str(key).strip()}\n")
     return ["-o", f"HostKeyAlias={alias}", "-o", f"UserKnownHostsFile={path}"]
 
 
@@ -877,15 +908,14 @@ def _targets(device):
 
 def connect(device, board, log, target=None, state=None):
     """One SSH session to the peer; returns when it drops."""
-    from .transfer import _check_target, _ssh_args
+    from .transfer import _ssh_args, ssh_host
     target = target or device.get("target")
-    _check_target(target)
     ssh = shutil.which("ssh")
     if not ssh:
         raise RuntimeError("The OpenSSH client isn't installed.")
     args = [*_ssh_args(ssh, device.get("identity_file")), *_pinned_host(device, state), "-T",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2",
-            target, BOOTSTRAP]
+            *ssh_host(target), BOOTSTRAP]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, creationflags=flags)

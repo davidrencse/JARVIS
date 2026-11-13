@@ -682,6 +682,10 @@ def set_main(config, path, device, state=None):
     barrier is clear. A later retry that already matches the stored receipt finishes the
     config write and does not call the handoff again.
     """
+    from .continuity.hub_control import operator_configured, request_main
+    if (configured_handoff(state or Path(path).resolve().parent / ".jarvis") is None
+            and operator_configured(config, Path(path).resolve().parent)):
+        return request_main(config, state or Path(path).resolve().parent / ".jarvis", device)
     del config
     try:
         from .continuity.integration import refuse_unfenced
@@ -1353,11 +1357,12 @@ def run(args, config, base):
     return None
 
 
-def autostart(config_path, state, turn_on):
+def autostart(config_path, state, turn_on, *, restart=False):
     """Run this PC's role (main or node) at login: Windows, macOS or Linux."""
     from .autostart import install
     argv = [sys.executable, "-m", "jarvis", "--config", str(config_path), "--state", str(state), "cluster", "run"]
-    return install("jarvis-cluster", "JARVIS Cluster", argv, turn_on)
+    return install("jarvis-cluster", "JARVIS Cluster", argv, turn_on,
+                   **({"restart": True} if restart else {}))
 
 
 def proxy_cognition(args, config):

@@ -141,7 +141,7 @@ def _raise_cleanup(*errors):
         raise subprocess.SubprocessError(text)
 
 
-def install(name, title, argv, enable=True):
+def install(name, title, argv, enable=True, *, restart=False):
     """Turn login startup on or off for argv. Returns {"autostart", "path"}.
 
     Turning off removes the Startup entry, LaunchAgent, or user unit even when the
@@ -180,7 +180,7 @@ def install(name, title, argv, enable=True):
             subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=15)
             subprocess.run(["systemctl", "--user", "enable", "--now", target.name],
                            check=True, timeout=15)
-            if existed and changed:  # already running on the old ExecStart
+            if existed and (changed or restart):  # explicit role switch or changed ExecStart
                 subprocess.run(["systemctl", "--user", "restart", target.name],
                                check=True, timeout=15)
         elif existed:  # never turned on: nothing to disable

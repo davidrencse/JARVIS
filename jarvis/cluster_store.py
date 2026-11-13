@@ -24,7 +24,7 @@ TERMINAL = {"done", "failed", "expired", "uncertain"}
 # larger than control messages. Their payload and result live only in the Broker's memory
 # (the jobs row keeps state and deadline, with '{}' as the body), so a 2 GB transfer isn't
 # rewritten through SQLite several times over. Dropped once the requester has the result.
-BULK = frozenset({"transfer"})
+BULK = frozenset({"transfer", "continuity"})
 MAX_PAYLOAD, MAX_BULK_PAYLOAD = 65536, 3_000_000
 # A node checks in once per held poll (cluster.POLL_WAIT, 25 s) and not at all while it
 # runs an action (up to 45 s), so "online" must outlast both, or a busy node looks gone.
@@ -68,6 +68,13 @@ class Broker:
 
     @contextmanager
     def db(self):
+        if os.name != "nt":  # token hashes; the journal beside it still follows the process umask
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+                os.close(fd)
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
         db = sqlite3.connect(self.path, timeout=15)
         db.row_factory = sqlite3.Row
         try:

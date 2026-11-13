@@ -19,7 +19,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit
 
 from .fsio import read_json
 from .platforms import NO_WINDOW, on_windows
@@ -265,6 +265,9 @@ class Client:
         if os.environ.get("JARVIS_NO_MODELS") == "1" and \
                 self.state.resolve() == (Path(__file__).resolve().parent.parent / ".jarvis").resolve():
             raise PermissionError("Tests may not use this PC's real cluster credentials (JARVIS_NO_MODELS).")
+        from .continuity.repoint import effective_config
+        config = effective_config(config, self.state)
+        self.config = config
         self.local, self.main = identity(config)
         self.url = endpoint(config)
         if owner:
@@ -419,6 +422,9 @@ def validate_action(kind, payload):
     elif kind == "storage":
         if payload.get("action") not in ("list", "resolve", "exists", "thumbnail") or not isinstance(payload.get("path"), str):
             raise ValueError("Invalid node storage query.")
+    elif kind == "continuity":
+        from .continuity.participant import validate
+        validate(payload)
     elif kind == "transfer":
         from .transfer import validate
         validate(payload)
@@ -436,6 +442,8 @@ def validate_action(kind, payload):
 
 
 def _execute_local_body(kind, payload, config, state):
+    if kind == "continuity":
+        raise ValueError("Continuity RPCs require the private coordinator channel.")
     if kind == "desktop":
         from .remote import run_here
         extras = {}
@@ -539,7 +547,9 @@ class Hub:
             raise PermissionError("This endpoint is not the configured main PC; update cluster config.")
         auth = headers.get("Authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
-        if token and hmac.compare_digest(token.encode(), self.owner.encode()):
+        presented, owner = token.encode(), self.owner.encode()
+        if (token and len(presented) == len(owner) and 20 <= len(token) <= 256
+                and hmac.compare_digest(presented, owner)):
             return self.main, CAPABILITIES | {"owner"}
         found = self.broker.authenticate(token)
         if not found or (capability and capability not in found[1]):
@@ -628,6 +638,8 @@ class Hub:
         return False
 
     def dispatch(self, node, kind, payload, timeout=45):
+        if kind == "continuity":
+            raise ValueError("Continuity RPCs use the private coordinator channel.")
         validate_action(kind, payload)
         try:
             from .continuity.integration import refuse_unfenced, require_production_authority
@@ -996,6 +1008,8 @@ class Hub:
             self.thread.start()
             self.worker.start()
             self.started = True
+            from .continuity.renewal import start_bound
+            self._continuity_renewer = start_bound(self.state)
             if settings.get("auto_update", True):
                 threading.Thread(target=self._keep_up, name="jarvis-auto-update",
                                  daemon=True).start()
@@ -1011,6 +1025,9 @@ class Hub:
         if getattr(self, "_here", None):  # first: the main's own sessions let go while the hub answers
             self._end_here("JARVIS on the main stopped.")
         self.stop_event.set()
+        renewer = getattr(self, "_continuity_renewer", None)
+        if renewer is not None:
+            renewer.close()
         self.remote.close_all("JARVIS on the main stopped.")  # nodes let go on their next poll
         with self._condition:
             self._condition.notify_all()
@@ -1027,6 +1044,20 @@ class Hub:
         if self._lock:
             self._lock.__exit__(None, None, None)
             self._lock = None
+
+
+def hub_hosts(bound, config):
+    """Names the hub will answer as Host. Loopback, the bind address, and the hostname
+    in cluster.main_url. Binding 0.0.0.0 does not allow every Host header."""
+    allowed = {"127.0.0.1", "localhost", "::1"}
+    if isinstance(bound, str) and bound.strip():
+        allowed.add(bound.strip().lower())
+    url = str(((config or {}).get("cluster") or {}).get("main_url") or "")
+    if url:
+        name = urlsplit(url).hostname
+        if name:
+            allowed.add(name.lower())
+    return tuple(sorted(allowed))
 
 
 def make_server(hub, host, port):
@@ -1059,6 +1090,12 @@ def make_server(hub, host, port):
         def _request(self, post):
             try:
                 self._node_path = None  # one handler serves a whole keep-alive connection
+                if not Handler._allowed(self):  # this class's _allowed is the console credential
+                    site = self.headers.get("Sec-Fetch-Site")
+                    detail = ("Unexpected Host header."
+                              if site in (None, "same-origin", "none")
+                              else "Requests from other sites are refused.")
+                    return self._send(403, {"error": detail})
                 if self.path.startswith("/api/"):
                     self.node_id, caps = hub.authenticate(self.headers, "console")
                     if "owner" not in caps:
@@ -1095,15 +1132,40 @@ def make_server(hub, host, port):
                             hub._condition.wait(min(1, remaining))
                 if not post:
                     return self._send(404, {"error": "Unknown cluster endpoint."})
-                length = int(self.headers.get("Content-Length", "0"))
+                length = self._content_length()
                 # Results, and file chunks on their way to a node (BULK jobs), may be large.
                 bulk = ("/v1/result", "/v1/action", "/v1/control", "/v1/remote/frame")
-                if not 0 < length <= (MAX_RESULT if self.path in bulk else MAX_PROTOCOL):
+                if length is None or not 0 < length <= (MAX_RESULT if self.path in bulk else MAX_PROTOCOL):
                     raise ValueError("Invalid cluster request length.")
                 self.connection.settimeout(15)
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("Cluster body must be an object.")
+                if self.path in ("/v1/action", "/v1/control") and data.get("kind") == "transfer":
+                    from .continuity.brain_channel import ACTIONS as brain_actions
+                    payload = data.get("payload")
+                    if (isinstance(payload, dict) and payload.get("action") in brain_actions
+                            and "owner" not in caps):
+                        raise PermissionError("Brain transfer operations require the owner credential.")
+                if self.path == "/v1/continuity/endpoint":
+                    if "files" not in caps or "owner" in caps or set(data) != {"nonce"}:
+                        raise PermissionError("An enrolled target credential is required.")
+                    from .continuity.repoint import endpoint_receipt
+                    from .continuity.runtime import RuntimeRefusal
+                    try:
+                        return self._send(200, endpoint_receipt(hub, node, data['nonce']))
+                    except RuntimeRefusal as exc:
+                        return self._send(409, {'error': exc.code})
+                if self.path == "/v1/continuity/recover":
+                    if "owner" not in caps:
+                        raise PermissionError("Recovery requires the local owner credential.")
+                    from .continuity.hub_control import run_recover
+                    return self._send(200, run_recover(hub, data, self.client_address[0]))
+                if self.path == "/v1/continuity/main":
+                    if "owner" not in caps:
+                        raise PermissionError("MAIN transitions require the local owner credential.")
+                    from .continuity.hub_control import run_main
+                    return self._send(200, run_main(hub, data, self.client_address[0]))
                 if self.path == "/v1/redeem" and "owner" not in caps:
                     return self._send(200, hub.redeem(node, data.get("public_key"), data.get("token")))
                 if self.path == "/v1/poll" and "owner" not in caps:
@@ -1112,7 +1174,7 @@ def make_server(hub, host, port):
                     if "desktop" in caps:
                         kinds |= {"remote"}
                     if "files" in caps:
-                        kinds |= {"storage", "transfer"}
+                        kinds |= {"storage", "transfer", "continuity"}
                     deadline = time.monotonic() + POLL_WAIT
                     with hub._condition:
                         hub._polling.setdefault(node, set()).add(self.connection)
@@ -1210,8 +1272,12 @@ def make_server(hub, host, port):
                 self._send(403, {"error": str(exc)})
             except LookupError as exc:
                 self._send(404, {"error": str(exc)})
-            except (ValueError, TypeError, OSError, RuntimeError) as exc:
+            except OSError:
+                self._send(400, {"error": "Cluster request failed."})
+            except (ValueError, TypeError, RuntimeError) as exc:
                 self._send(400, {"error": str(exc)})
+
+    MainHandler.hosts = hub_hosts(host, hub.config)
 
     class HubServer(ConsoleServer):
         def finish_request(self, request, client_address):
@@ -1442,7 +1508,18 @@ class NodeWorker:
             if managed_node_disposition is not None:
                 # After the code-key check above. A payload boolean cannot admit this job.
                 disposition = managed_node_disposition(self.state, job)
-            if disposition == "refuse":
+            if job['kind'] == 'continuity':
+                # _untrusted already checked the pinned code-key signature. RPCs
+                # check their own live transition instead of an ordinary ticket.
+                self._mark_seen(job['id'])
+                try:
+                    from .continuity.participant import execute_job
+                    result = execute_job(self.state, job['payload'], job['requester'])
+                    message = {'id': job['id'], 'failed': False, 'result': result}
+                except Exception as exc:
+                    message = {'id': job['id'], 'failed': True, 'result': {
+                        'error': 'Continuity callback refused', 'code': getattr(exc, 'code', 'callback_failed')}}
+            elif disposition == "refuse":
                 message = {"id": job["id"], "failed": True, "result": {
                     "error": "Not run: managed continuity admission is missing."}}
             elif disposition == "admit":
@@ -1603,9 +1680,13 @@ class NodeWorker:
                         recover(self.state)
                     except Exception as exc:
                         print(f"JARVIS node: remote-control recovery: {exc}", flush=True)
+                from .continuity.renewal import start_bound
+                renewer = start_bound(self.state)
                 try:
                     self._poll_loop()
                 finally:
+                    if renewer is not None:
+                        renewer.close()
                     from .remote_view import end_all
                     try:
                         end_all()  # a restart or stop never leaves David's keys held down

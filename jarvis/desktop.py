@@ -52,15 +52,12 @@ def local_fingerprint():
 
 
 def remote_fingerprint(target, identity_file=None):
+    from .transfer import _ssh_args, ssh_host
     binary = shutil.which("ssh")
     if not binary:
         raise ValueError("OpenSSH client is not installed.")
-    identity_args = []
-    if identity_file:
-        identity_args = ["-i", str(Path(identity_file).expanduser()), "-o", "IdentitiesOnly=yes"]
     result = subprocess.run(
-        [binary, "-T", *identity_args, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-         "-o", "ConnectTimeout=8", target, "python3 -"],
+        [*_ssh_args(binary, identity_file), "-T", *ssh_host(target), "python3 -"],
         input=REMOTE_FINGERPRINT, capture_output=True, text=True, timeout=30, shell=False)
     if result.returncode:
         raise RuntimeError("Remote fingerprint failed: " + (result.stderr or result.stdout)[-500:])
@@ -78,10 +75,23 @@ def lan_mouse_config(peer_name, peer_ips, position, peer_fingerprint,
         raise ValueError(f"position must be one of {', '.join(POSITIONS)}.")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", peer_name):
         raise ValueError("Peer name must be a plain hostname.")
+    from .pathsafe import is_tailscale_ip, release_key
+    kept = []
     for ip in peer_ips:
         if (not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip)
                 or any(int(octet) > 255 for octet in ip.split("."))):
             raise ValueError(f"Not an IPv4 address: {ip}")
+        if is_tailscale_ip(ip):
+            continue
+        kept.append(ip)
+    if list(peer_ips) and not kept:
+        raise ValueError("Lan Mouse does not use Tailscale addresses (100.64.0.0/10).")
+    peer_ips = kept
+    if isinstance(port, float) and port.is_integer():
+        port = int(port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("port must be an integer from 1 to 65535.")
+    release_bind = [release_key(key) for key in release_bind]
     if not re.fullmatch(r"(?:[0-9a-f]{2}:){31}[0-9a-f]{2}", peer_fingerprint):
         raise ValueError("Fingerprint must be 32 colon-separated lowercase hex bytes.")
     if capture_backend not in (None, "input-capture-portal", "layer-shell", "windows"):

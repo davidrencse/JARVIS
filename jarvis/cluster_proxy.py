@@ -118,7 +118,7 @@ def proxy_handler(client, overlay=None, setup=None, local=None):
             return self._static(self.path.split("?", 1)[0])
 
         def do_POST(self):
-            if not self._allowed() or self.headers.get("X-JARVIS") != "1":
+            if not self._allowed() or not self._post_ok():
                 return self._refuse()
             if self.path == "/api/overlay":
                 if overlay is None:
@@ -191,11 +191,12 @@ def proxy_handler(client, overlay=None, setup=None, local=None):
                             response = again
                 self.send_response(response.status)
                 for name in ("Content-Type", "Content-Length", "Cache-Control",
-                             "Content-Disposition", "X-Content-Type-Options",
+                             "Content-Disposition",
                              "X-Frame-Seq", "X-Frame-Width", "X-Frame-Height", "X-Node-Ago"):
                     if response.headers.get(name):
                         self.send_header(name, response.headers[name])
-                self.send_header("Referrer-Policy", "no-referrer")
+                # Stamped here, not copied: the main's reply must not choose framing or CORS.
+                self._stamp_security(response.headers.get("Content-Type") or "")
                 self.end_headers()
                 sent = True
                 while True:

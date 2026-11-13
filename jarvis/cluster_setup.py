@@ -27,6 +27,7 @@ import re
 import shutil
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -247,10 +248,71 @@ def _key_lines(path):
         return []
 
 
+_NODE_KINDS = {"ssh-ed25519", "sk-ed25519@openssh.com", "ssh-rsa"}
+_KEY_BLOB = re.compile(r"[A-Za-z0-9+/=]+\Z")
+_KEY_COMMENT = re.compile(r"[A-Za-z0-9_.:@+-]+\Z")
+
+
+def _rsa_bits(blob):
+    """Bit length of an OpenSSH ssh-rsa modulus, or 0 when the blob is not that key."""
+    try:
+        raw = base64.b64decode(blob, validate=True)
+
+        def take():
+            nonlocal raw
+            if len(raw) < 4:
+                raise ValueError
+            size = struct.unpack(">I", raw[:4])[0]
+            raw = raw[4:]
+            if size > len(raw):
+                raise ValueError
+            chunk, raw = raw[:size], raw[size:]
+            return chunk
+
+        if take() != b"ssh-rsa":
+            return 0
+        take()  # exponent
+        modulus = take()
+        if modulus[:1] == b"\x00":
+            modulus = modulus[1:]
+        return int.from_bytes(modulus or b"\x00", "big").bit_length()
+    except (ValueError, struct.error):
+        return 0
+
+
+def _public_key_parts(public_key):
+    """Type and blob of one node public key. Options, newlines, and weak types are refused.
+
+    The comment, when present, is checked and then dropped: the line JARVIS writes uses
+    its own ``jarvis-node:`` mark, never text from the key."""
+    if not isinstance(public_key, str) or any(c in public_key for c in "\r\n\x00"):
+        raise ValueError("ssh-keygen made an unexpected public key.")
+    parts = public_key.split(" ")
+    if len(parts) not in (2, 3):
+        raise ValueError("ssh-keygen made an unexpected public key.")
+    kind, blob = parts[0], parts[1]
+    if (kind not in _NODE_KINDS or kind.startswith("-") or any(c in kind for c in ",=\"")
+            or blob.startswith("-") or any(c in blob for c in ",\"") or not _KEY_BLOB.fullmatch(blob)):
+        raise ValueError("ssh-keygen made an unexpected public key.")
+    if len(parts) == 3 and not _KEY_COMMENT.fullmatch(parts[2]):
+        raise ValueError("ssh-keygen made an unexpected public key.")
+    if kind == "ssh-rsa" and _rsa_bits(blob) < 3072:
+        raise ValueError("ssh-rsa node keys must be at least 3072 bits.")
+    return kind, blob
+
+
 def authorized(node, path=None, public_key=None):
     """This node has a JARVIS key line (holding exactly `public_key`, when given)."""
+    if not isinstance(node, str) or not DEVICE_ID.fullmatch(node):
+        return False
     path = path or _authorized_keys()
-    key = " ".join(str(public_key).split()[:2]) if public_key else ""
+    key = ""
+    if public_key:
+        try:
+            kind, blob = _public_key_parts(public_key)
+        except ValueError:
+            return False
+        key = f"{kind} {blob}"
     return any(line.rstrip().endswith(" " + MARK + node) and (not key or f" {key} " in line)
                for line in _key_lines(path))
 
@@ -265,18 +327,22 @@ def _write_keys(path, lines):
 
 def authorize(node, public_key, port, path=None):
     """Replace this node's JARVIS key line (only that one) with a fresh restricted one."""
+    if not isinstance(node, str) or not DEVICE_ID.fullmatch(node):
+        raise ValueError("Invalid node ID.")
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("Invalid cluster listen port.")
+    kind, blob = _public_key_parts(public_key)
     path = path or _authorized_keys()
-    parts = public_key.split()
-    if len(parts) < 2 or not HOST_KEY.fullmatch(" ".join(parts[:2])):
-        raise ValueError("ssh-keygen made an unexpected public key.")
     with _keys_locked(path):
         lines = [line for line in _key_lines(path) if not line.rstrip().endswith(" " + MARK + node)]
-        lines.append(f"{restrictions(port)} {parts[0]} {parts[1]} {MARK}{node}")
+        lines.append(f"{restrictions(port)} {kind} {blob} {MARK}{node}")
         _write_keys(path, lines)
     return str(path)
 
 
 def unauthorize(node, path=None):
+    if not isinstance(node, str) or not DEVICE_ID.fullmatch(node):
+        raise ValueError("Invalid node ID.")
     path = path or _authorized_keys()
     with _keys_locked(path):
         lines = _key_lines(path)
@@ -1355,7 +1421,7 @@ def _link_hint(error, forward, main):
 def _doctor_node(config, state, local, main, forward, checks, code):
     """Append node checks. Return the /v1/status object when that call succeeded."""
     from . import cluster_tunnel
-    from .transfer import _ssh_args
+    from .transfer import _ssh_args, ssh_host
     status = None
     try:
         Client(config, state)
@@ -1385,12 +1451,13 @@ def _doctor_node(config, state, local, main, forward, checks, code):
                       f"Is {main} awake and on this network (or Tailscale)? If its address "
                       f"changed: on {main}, jarvis cluster invite {local}, then join again"):
             return None
-        argv = [*_ssh_args(binary, key), *cluster_tunnel.pinned_host(machine, state), "-T", reachable[0]]
         try:
+            argv = [*_ssh_args(binary, key), *cluster_tunnel.pinned_host(machine, state), "-T",
+                    *ssh_host(reachable[0])]
             out = subprocess.run(argv, capture_output=True, text=True, timeout=20, creationflags=FLAGS)
             ok = out.returncode == 0 and "jarvis-node-link" in out.stdout
             detail = reachable[0] if ok else (out.stderr.strip()[-200:] or f"ssh exited {out.returncode}")
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
             ok, detail = False, str(exc)
         if "REMOTE HOST IDENTIFICATION" in detail or "Host key verification" in detail:
             fix = f"{main}'s SSH host key changed; make a new invite there and join again"
@@ -1432,3 +1499,9 @@ def _doctor_node(config, state, local, main, forward, checks, code):
                f"{code} vs main {status['code']}",
                "Leave the node agent running; it installs the main's code and restarts itself")
     return status
+
+
+def role_autostart(config_path, state, enable, *, restart=False):
+    """Existing cluster unit/Startup helper, with explicit role-switch activation."""
+    from .cluster_cli import autostart
+    return autostart(config_path, state, enable, **({'restart': True} if restart else {}))

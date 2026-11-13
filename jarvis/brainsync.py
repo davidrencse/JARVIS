@@ -1702,6 +1702,10 @@ def _peer_brain_command(config, node, command):
 
 
 def _default_transport(config, base):
+    if any(isinstance(row, dict) and row.get("brain_transfer_dir")
+           for row in config.get("devices", {}).values()):
+        from .continuity.brain_channel import ClusterBundleTransport
+        return ClusterBundleTransport(config, base)
     return SshBundleTransport(config, base)
 
 

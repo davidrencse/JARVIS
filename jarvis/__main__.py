@@ -251,6 +251,9 @@ def main():
         config_path = Path(args.config).resolve()
         base = config_path.parent
         config = json.loads(config_path.read_text(encoding="utf-8"))
+        if args.command != "continuity":
+            from .continuity.repoint import effective_config
+            config = effective_config(config, args.state)
         from .topology import enabled, identity, is_node
         if args.command == "cluster":
             from .cluster_cli import run as cluster_command
@@ -377,7 +380,7 @@ def main():
             elif args.action in ("elevate", "unelevate"):  # this computer only, from an admin terminal
                 emit(getattr(sharedinput, args.action)(args.state))
             elif args.action == "nearby":  # read-only: are the laptops together?
-                emit(sharedinput.peer_nearby())
+                emit({**sharedinput.peer_nearby(), "guard": sharedinput.sharing_availability(args.state)})
             elif args.action == "guard":  # one reading; the IP watcher runs it every 30 s
                 if not (config.get("lan_mouse") or {}).get("off_when_apart", True):
                     emit({"action": None, "note": "lan_mouse.off_when_apart is false in jarvis.config.json."})
