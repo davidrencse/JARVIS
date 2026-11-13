@@ -174,6 +174,44 @@
     if (!csrfUnsaved && csrfHold) csrfHold.hidden = true;
   }
   function clearCsrf() { csrfToken = ""; csrfUnsaved = false; if (csrfHold) csrfHold.hidden = true; store.del(CSRF_KEY); }
+  // Behind the phone front (one origin for whichever PC is MAIN) every PC pairs on its own.
+  // The front names the answering PC in X-Jarvis-Main; its token is kept under that name and
+  // sent as X-Jarvis-Csrf-<pc>. The front hands each PC only its own token.
+  const CSRF_BY_MAIN_KEY = "jarvis.phone.csrf.by-main";
+  const MAIN_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+  let csrfByMain = {};
+  function readCsrfByMain() {
+    csrfByMain = {};
+    let raw = store.get(CSRF_BY_MAIN_KEY, "");
+    try { raw = raw ? JSON.parse(raw) : {}; } catch (e) { raw = {}; }
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      for (const k of Object.keys(raw)) if (MAIN_RE.test(k) && CSRF_RE.test(raw[k])) csrfByMain[k] = raw[k];
+    }
+  }
+  function writeCsrfByMain() {
+    const keys = Object.keys(csrfByMain);
+    if (!keys.length) { store.del(CSRF_BY_MAIN_KEY); return true; }
+    const text = JSON.stringify(csrfByMain);
+    return !!store.set(CSRF_BY_MAIN_KEY, text) && store.get(CSRF_BY_MAIN_KEY, "") === text;
+  }
+  function answeringMain(res) {
+    let v = "";
+    try { v = res && res.headers && typeof res.headers.get === "function" ? res.headers.get("X-Jarvis-Main") : ""; } catch (e) { v = ""; }
+    return MAIN_RE.test(String(v || "")) ? String(v) : "";
+  }
+  function saveCsrfFor(main, token) {
+    if (!main) { saveCsrf(token); return; }
+    if (!CSRF_RE.test(token)) return;
+    csrfByMain[main] = token;
+    csrfUnsaved = !writeCsrfByMain();
+    if (!csrfUnsaved && csrfHold) csrfHold.hidden = true;
+  }
+  function clearCsrfFor(main) {
+    if (!main) { clearCsrf(); return; }
+    delete csrfByMain[main];
+    writeCsrfByMain();
+  }
+  readCsrfByMain();
   function isCsrf(e) {
     return !!(e && e.kind === "http" && e.status === 403 && e.data && e.data.code === "csrf");
   }
@@ -217,6 +255,7 @@
     const headers = { "X-JARVIS-Phone": "1" };
     if (json) headers["Content-Type"] = "application/json";
     if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+    for (const k of Object.keys(csrfByMain)) headers["X-Jarvis-Csrf-" + k] = csrfByMain[k];
     if (session) headers["X-JARVIS-Session"] = String(session);
     return headers;
   }
@@ -328,11 +367,12 @@
       throw new Fail(ctl.signal.aborted ? "JARVIS took too long to answer. Check Tailscale, then try again." : UNREACHABLE, "net");
     } finally { clearTimeout(timer); }
     if (!data || typeof data !== "object" || Array.isArray(data)) data = {};
+    const main = answeringMain(res);
     if (res.status === 401 && data.pair) {
-      clearCsrf();
+      clearCsrfFor(main);
       throw new Fail(str(data.error) || "This phone isn't paired.", "auth", 401, data);
     }
-    if (res.ok && (path === "/phone/pair" || path === "/phone/pair/status") && CSRF_RE.test(data.csrf_token)) saveCsrf(data.csrf_token);
+    if (res.ok && (path === "/phone/pair" || path === "/phone/pair/status") && CSRF_RE.test(data.csrf_token)) saveCsrfFor(main, data.csrf_token);
     if (!res.ok) throw new Fail(errorMessage(res.status, data), "http", res.status, data);
     return { status: res.status, data };
   }
