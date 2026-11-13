@@ -188,7 +188,13 @@ class WiringTests(unittest.TestCase):
     def test_a_daemon_older_than_its_binary_is_stale(self):
         import subprocess, sys, time
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-        self.addCleanup(child.kill)
+
+        def _reap():
+            if child.poll() is None:
+                child.kill()
+            child.wait(5)
+
+        self.addCleanup(_reap)
         time.sleep(0.2)
         exe = str(Path(f"/proc/{child.pid}/exe").resolve())
         with mock.patch.object(Path, "stat", lambda self, **k: type("S", (), {"st_mtime": time.time() + 10})()):
