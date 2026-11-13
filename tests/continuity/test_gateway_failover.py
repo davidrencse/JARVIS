@@ -46,3 +46,43 @@ class GatewayFailoverTests(unittest.TestCase):
             with self.assertRaisesRegex(GatewayError, 'no_relay'):
                 ContinuityGateway.forward_transient(
                     gateway, _principal(gateway._token, payload), payload, envelope)
+
+    def test_effect_during_takeover_is_not_replayed_to_the_new_main(self):
+        gateway = _Gateway('http://127.0.0.1:9001')
+        view = {'main': 'zenbook', 'authority_id': 'oracle-auth', 'incarnation': 1,
+                'epoch': 1, 'mode_version': 1}
+        gateway._relay_status = lambda: dict(view)
+        gateway._devices['dell'] = _Record(
+            'dell', 'dell-inst', 'pc', 'ssh-ed25519 AAAA', frozenset({'client'}),
+            'http://127.0.0.1:9002')
+        envelope = b'{"ask":1}'
+
+        def payload(operation_id, target):
+            return {'operation_id': operation_id, 'target': target, 'attempt_id': 'attempt01',
+                    'digest': 'sha256:' + hashlib.sha256(envelope).hexdigest(),
+                    'capability': 'client', 'kind': 'ask'}
+
+        def post(url, data, limit, timeout=2):
+            view.update(main='dell', epoch=2)
+            return {'operation_id': 'ask000001', 'accepted': True}
+
+        first = payload('ask000001', 'zenbook')
+        with patch('jarvis.continuity.gateway._post_json', side_effect=post) as posted:
+            with self.assertRaisesRegex(GatewayError, 'no_relay'):
+                ContinuityGateway.forward_transient(
+                    gateway, _principal(gateway._token, first), first, envelope)
+        self.assertEqual(posted.call_args.args[0], 'http://127.0.0.1:9001' + RELAY_PATH)
+        self.assertEqual(gateway._effects['ask000001']['state'], 'error')
+        with patch('jarvis.continuity.gateway._post_json') as again:
+            with self.assertRaisesRegex(GatewayError, 'no_relay'):
+                ContinuityGateway.forward_transient(
+                    gateway, _principal(gateway._token, first), first, envelope)
+        again.assert_not_called()
+        second = payload('ask000002', 'dell')
+        with patch('jarvis.continuity.gateway._post_json', return_value={
+                'operation_id': 'ask000002', 'accepted': True}) as moved:
+            result = ContinuityGateway.forward_transient(
+                gateway, _principal(gateway._token, second), second, envelope)
+        self.assertTrue(result['relayed'])
+        self.assertFalse(result['effect_authorized'])
+        self.assertEqual(moved.call_args.args[0], 'http://127.0.0.1:9002' + RELAY_PATH)

@@ -10,7 +10,8 @@ import unittest
 from pathlib import Path
 
 from jarvis.continuity.authority import LEASE_SECONDS
-from jarvis.continuity.runtime import LinkError, MainRuntime, SafeHandoff
+from jarvis.continuity.recovery import ManualRecovery
+from jarvis.continuity.runtime import LinkError, MainRuntime, RuntimeRefusal, SafeHandoff
 from tests.continuity._fleet import Clock, ack, cutover, open_store, promote
 from tests.continuity.test_safe_handoff import TOKEN, BASE, AckingRuntime, _facts
 
@@ -305,3 +306,258 @@ class HandoffRecoveryTests(unittest.TestCase):
         self.assertEqual(renewed["code"], "ok")
         self.assertGreater(self.port.renews, renews)
         self.assertGreaterEqual(self.store._lease["expires"], expires)
+
+
+class _StepPort:
+    """Counts owner steps and can fail complete before or after the store commits."""
+
+    def __init__(self, inner, complete_at=None):
+        self.inner = inner
+        self.complete_at = complete_at
+        self.steps = []
+        self.completes = 0
+
+    def transition_step(self, transition_id, step, canary_ok=None):
+        self.steps.append(step)
+        if step != "complete":
+            return self.inner.transition_step(transition_id, step, canary_ok)
+        self.completes += 1
+        if self.complete_at == "before" and self.completes == 1:
+            raise LinkError("partition")
+        result = self.inner.transition_step(transition_id, step, canary_ok)
+        if self.complete_at == "after" and self.completes == 1:
+            raise LinkError("partition")
+        return result
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+class _Crash(BaseException):
+    """Stands in for a process death after the canary has been marked started."""
+
+
+class ManualRecoveryReceiptTests(unittest.TestCase):
+    """Same client key replays the authority outcome. Canary and complete do not run twice."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.clock = Clock()
+        self.store = open_store(Path(self.tmp.name) / "authority.sqlite", self.clock)
+        self.addCleanup(self.store.close)
+        from jarvis.continuity.runtime import StoreAdapter
+        self.port = _StepPort(StoreAdapter(self.store))
+        cutover(self.store)
+        self.receipts = Path(self.tmp.name) / "receipts.json"
+        self.canary_calls = 0
+        self.runtime = MainRuntime(
+            self.port, "dell", "dell-inst",
+            lambda: {"control_ready": True, "checkpoint": "cp-1"},
+            clock=self.clock.mono, boot=lambda: "boot-a")
+
+    def canary(self, device):
+        self.canary_calls += 1
+        return True
+
+    def recover(self, canary=None, port=None):
+        return ManualRecovery(
+            port or self.port, self.runtime, canary or self.canary, receipts=self.receipts)
+
+    def assert_no_lease(self, result=None):
+        if result is not None:
+            encoded = json.dumps(result)
+            self.assertNotIn("lease_id", encoded)
+            self.assertNotIn("ls-", encoded)
+        if self.receipts.exists():
+            text = self.receipts.read_text(encoding="utf-8")
+            self.assertNotIn("lease_id", text)
+            self.assertNotIn("ls-", text)
+            self.assertEqual(self.receipts.stat().st_mode & 0o777, 0o600)
+
+    def test_same_key_replays_ready_without_a_second_canary(self):
+        first = self.recover()("dell", "req-ready")
+        self.assert_no_lease(first)
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["status"], "ready")
+        self.assertNotIn("already", first)
+        self.assertEqual(self.canary_calls, 1)
+        self.assertEqual(self.store.status()["mode"], "V2_ACTIVE")
+        epoch = self.store.status()["epoch"]
+        second = self.recover(lambda device: self.fail("canary replayed"))("dell", "req-ready")
+        self.assert_no_lease(second)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(second["status"], "ready")
+        self.assertTrue(second["already"])
+        self.assertEqual(second["transition_id"], first["transition_id"])
+        self.assertEqual(second["epoch"], first["epoch"])
+        self.assertEqual(self.store.status()["epoch"], epoch)
+        self.assertEqual(self.canary_calls, 1)
+        self.assertEqual(self.port.completes, 1)
+
+    def test_failed_canary_rollback_is_replayed_not_retried(self):
+        def fail(device):
+            self.canary_calls += 1
+            return False
+
+        first = self.recover(fail)("dell", "req-rollback")
+        self.assert_no_lease(first)
+        self.assertFalse(first["ok"])
+        self.assertEqual(first["status"], "no_main")
+        self.assertEqual(self.store.status()["mode"], "V2_ONLY_NO_MAIN")
+        self.assertFalse(self.store.status()["lease_valid"])
+        epoch = self.store.status()["epoch"]
+        second = self.recover(lambda device: self.fail("canary replayed"))("dell", "req-rollback")
+        self.assert_no_lease(second)
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["status"], "no_main")
+        self.assertTrue(second["already"])
+        self.assertEqual(second["transition_id"], first["transition_id"])
+        self.assertEqual(self.store.status()["epoch"], epoch)
+        self.assertEqual(self.canary_calls, 1)
+        self.assertEqual(self.port.completes, 1)
+        self.assertIsNone(self.store.status()["transition"])
+
+    def test_new_key_can_recover_after_rollback(self):
+        self.recover(lambda device: False)("dell", "req-fail")
+        ack(self.store)
+        fresh = self.recover()("dell", "req-again")
+        self.assert_no_lease(fresh)
+        self.assertTrue(fresh["ok"], fresh)
+        self.assertEqual(fresh["status"], "ready")
+        self.assertEqual(self.store.status()["main"], "dell")
+        self.assertEqual(self.canary_calls, 1)
+
+    def test_complete_lost_after_commit_returns_the_ready_receipt(self):
+        port = _StepPort(self.port.inner, complete_at="after")
+        self.runtime._port = port
+        result = self.recover(port=port)("dell", "req-lost-after")
+        self.assert_no_lease(result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "ready")
+        self.assertNotIn("already", result)
+        self.assertEqual(self.canary_calls, 1)
+        self.assertEqual(port.completes, 1)
+        self.assertEqual(self.store.status()["mode"], "V2_ACTIVE")
+        again = self.recover(lambda device: self.fail("canary replayed"), port=port)(
+            "dell", "req-lost-after")
+        self.assertTrue(again["already"])
+        self.assertTrue(again["ok"], again)
+        self.assertEqual(port.completes, 1)
+        self.assertEqual(self.canary_calls, 1)
+
+    def test_complete_lost_before_commit_is_not_a_rollback(self):
+        port = _StepPort(self.port.inner, complete_at="before")
+        self.runtime._port = port
+        with self.assertRaises(LinkError) as caught:
+            self.recover(port=port)("dell", "req-lost-before")
+        self.assertEqual(caught.exception.code, "partition")
+        self.assertEqual(self.canary_calls, 1)
+        self.assertEqual(port.completes, 1)
+        held = self.store.status()
+        self.assertEqual(held["transition"]["state"], "GRANTED_NOT_READY")
+        self.assertTrue(held["lease_valid"])
+        self.assertFalse(held["main_ready"])
+        self.assertNotIn("cancel", port.steps)
+        port.complete_at = None
+        result = self.recover(lambda device: self.fail("canary replayed"), port=port)(
+            "dell", "req-lost-before")
+        self.assert_no_lease(result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(self.canary_calls, 1)
+        self.assertEqual(port.completes, 2)
+        self.assertEqual(self.store.status()["mode"], "V2_ACTIVE")
+
+    def test_canary_that_does_not_return_stays_uncertain(self):
+        def crash(device):
+            self.canary_calls += 1
+            raise _Crash()
+
+        with self.assertRaises(_Crash):
+            self.recover(crash)("dell", "req-uncertain")
+        self.assertEqual(self.canary_calls, 1)
+        held = self.store.status()
+        self.assertEqual(held["transition"]["state"], "GRANTED_NOT_READY")
+        self.assertTrue(held["lease_valid"])
+        self.assertNotIn("cancel", self.port.steps)
+        self.assert_no_lease()
+        result = self.recover(lambda device: self.fail("canary replayed"))("dell", "req-uncertain")
+        self.assert_no_lease(result)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "uncertain")
+        self.assertNotIn("already", result)
+        self.assertEqual(self.store.status()["transition"]["state"], "GRANTED_NOT_READY")
+        self.assertEqual(self.canary_calls, 1)
+        self.assertNotIn("complete", self.port.steps)
+        self.assertNotIn("cancel", self.port.steps)
+
+    def test_accept_that_lands_is_not_cancelled(self):
+        def accept(lease):
+            MainRuntime.accept_lease(self.runtime, lease)
+            raise RuntimeRefusal("partition")
+
+        self.runtime.accept_lease = accept
+        with self.assertRaises(RuntimeRefusal) as caught:
+            self.recover()("dell", "req-accept")
+        self.assertEqual(caught.exception.code, "partition")
+        self.assertEqual(self.store.status()["transition"]["state"], "GRANTED_NOT_READY")
+        self.assertNotIn("cancel", self.port.steps)
+        self.assertEqual(self.port.steps.count("grant"), 1)
+        self.runtime.accept_lease = lambda lease: self.fail("accept replayed")
+        result = self.recover()("dell", "req-accept")
+        self.assert_no_lease(result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.port.steps.count("grant"), 1)
+        self.assertEqual(self.canary_calls, 1)
+        self.assertEqual(self.store.status()["mode"], "V2_ACTIVE")
+
+    def test_failed_accept_replays_no_main_on_the_real_store(self):
+        def miss(lease):
+            raise RuntimeRefusal("partition")
+
+        self.runtime.accept_lease = miss
+        with self.assertRaises(RuntimeRefusal) as caught:
+            self.recover()("dell", "req-missed")
+        self.assertEqual(caught.exception.code, "partition")
+        self.assertIn("cancel", self.port.steps)
+        self.assertIsNone(self.store.status()["transition"])
+        self.assertFalse(self.store.status()["lease_valid"])
+        epoch = self.store.status()["epoch"]
+        result = self.recover(lambda device: self.fail("canary after missed accept"))(
+            "dell", "req-missed")
+        self.assert_no_lease(result)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "no_main")
+        self.assertTrue(result["already"])
+        self.assertEqual(self.store.status()["epoch"], epoch)
+        self.assertEqual(self.canary_calls, 0)
+        self.assertEqual(self.port.completes, 0)
+
+    def test_spent_key_without_the_receipt_file_does_not_open_another_effect(self):
+        ManualRecovery(self.port, self.runtime, self.canary)("dell", "req-untracked")
+        self.assertEqual(self.canary_calls, 1)
+        epoch = self.store.status()["epoch"]
+        fresh = MainRuntime(
+            self.port, "dell", "dell-inst",
+            lambda: {"control_ready": True, "checkpoint": "cp-1"},
+            clock=self.clock.mono, boot=lambda: "boot-a")
+        with self.assertRaises(RuntimeRefusal) as caught:
+            ManualRecovery(self.port, fresh, lambda device: self.fail("second effect"))(
+                "dell", "req-untracked")
+        self.assertEqual(caught.exception.code, "key_reused")
+        self.assertEqual(self.store.status()["epoch"], epoch)
+        self.assertEqual(self.store.status()["mode"], "V2_ACTIVE")
+        self.assertEqual(self.canary_calls, 1)
+        self.assertIsNone(self.store.status()["transition"])
+
+    def test_receipt_carrying_a_lease_id_is_ignored(self):
+        self.receipts.write_text(json.dumps({"req-leak": {
+            "schema": 1, "client_key": "req-leak", "candidate": "dell",
+            "expected_incarnation": 1, "expected_epoch": 0, "expected_policy": 1,
+            "canary_started": True, "canary": True, "lease_id": "ls-secret"}}), encoding="utf-8")
+        result = self.recover()("dell", "req-leak")
+        self.assert_no_lease(result)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.canary_calls, 1)
+        self.assertNotIn("ls-secret", self.receipts.read_text(encoding="utf-8"))

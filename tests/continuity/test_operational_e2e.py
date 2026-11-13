@@ -4,21 +4,29 @@ Everything here is the real module: `AuthorityStore` behind `ContinuityGateway`,
 `AuthorityClient` with installation-key signatures, `MainRuntime`, `ExecutorGuard`,
 `ContinuityGatewaySession` and `MobileIngress`. The stand-ins are a loopback MAIN
 relay sink per PC and a fake `Clock`. A passing run is not a live failover: no Oracle
-gateway, Tailscale or Dell has been exercised.
+gateway, Tailscale, Dell, or the phone listener on 127.0.0.1:7787 has been exercised.
+
+`deployment_facts` is only called with a temp config. The repo `jarvis.config.json`
+is not opened by these tests. `ContinuityIntegration.blockers` still reads that
+file inside the production refuse path; a missing `gateway_host_unverified` there
+is a device id named oracle, not an enrolled host.
 """
 
 import json
 import re
+import socket
 import threading
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 from urllib.request import Request, urlopen
 
 from jarvis.continuity.authority import LEASE_SECONDS, SAFETY_MARGIN, AuthorityError, AuthorityStore
 from jarvis.continuity.executor import ExecutorGuard
-from jarvis.continuity.gateway import AuthorityClient, GatewayError
+from jarvis.continuity.gateway import AuthorityClient, ContinuityGateway, GatewayError
 from jarvis.continuity.integration import (
     AUTHORITY_ID,
     CONTRACT_HTTP,
@@ -27,6 +35,7 @@ from jarvis.continuity.integration import (
     HTTP_STATUS,
     INCOMPATIBILITIES,
     ORIGIN,
+    SELF_RECOVERY,
     ContinuityIntegration,
     IntegrationError,
     IsolatedFleet,
@@ -42,7 +51,12 @@ from jarvis.continuity.integration import (
     refuse_unfenced,
     set_node_seen_mode,
 )
-from jarvis.continuity.ingress import PHONE_COOKIE, IngressError, PhoneProtocolAdapter
+from jarvis.continuity.ingress import (
+    PHONE_COOKIE,
+    ContinuityGatewaySession,
+    IngressError,
+    PhoneProtocolAdapter,
+)
 from jarvis.continuity.runtime import RuntimeRefusal
 from jarvis.continuity.participant import Participant
 from jarvis.continuity.renewal import LeaseRenewer
@@ -76,8 +90,63 @@ def hdr(cookie=None, csrf=None):
     return out
 
 
+_STABLE_BLOCKERS = (
+    "phone_origin_arch_loopback",
+    "dell_provider_unverified",
+    "luna_grok_unverified",
+    "safety_margin_unmeasured",
+    "windows_clock_untested",
+    "legacy_paths_unfenced",
+    "passkey_verifier_absent",
+    "signature_verifier_absent",
+    "automatic_failover_disabled",
+)
+_QUIET_PEERS = {"gateway": {"compatible": True}}
+
+
+def _temp_config(case, document):
+    """A config that is not the repo file. `deployment_facts` reads only this path."""
+    folder = TemporaryDirectory()
+    case.addCleanup(folder.cleanup)
+    path = Path(folder.name) / "jarvis.config.json"
+    repo = Path(__file__).resolve().parents[2] / "jarvis.config.json"
+    case.assertNotEqual(path.resolve(), repo.resolve())
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+# Production posts a relay with a 2s urllib timeout (gateway._post_json) and the authority
+# client uses 10s. Those are wall-clock deadlines on a loopback hop: on a machine under load
+# (load >30 during a release run) the node's handler thread is not scheduled inside 2s, the
+# gateway answers `no_relay` (503) and the request fails although nothing is wrong. This
+# fixture keeps the real transport, the at-most-once rules and every assertion, and only
+# raises those two deadlines for the duration of one test. Nothing here sleeps or retries.
+_LOOPBACK_DEADLINES = {2: 60, 10: 90}
+
+
+def widen_loopback_deadlines(case):
+    real = urllib.request.OpenerDirector.open
+
+    def open(self, fullurl, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+        return real(self, fullurl, data, _LOOPBACK_DEADLINES.get(timeout, timeout))
+
+    patcher = mock.patch.object(urllib.request.OpenerDirector, "open", open)
+    patcher.start()
+    case.addCleanup(patcher.stop)
+
+
+def _blocker_ids(facts, peers=_QUIET_PEERS):
+    return {row["id"] for row in _blockers(facts, peers)}
+
+
 class ProductionBlocked(unittest.TestCase):
     def test_default_mode_refuses_cutover(self):
+        """Refuse stays on. This does not read the repo config and does not prove a host.
+
+        `activate_v2` still calls the production blocker list, which reads
+        `jarvis.config.json` on its own. `gateway_host_unverified` and
+        `hub_loopback` follow that file, so they are not asserted here.
+        """
         integration = ContinuityIntegration()
         mode = integration.mode()
         self.assertEqual(mode["mode"], "LEGACY_ACTIVE")
@@ -88,14 +157,10 @@ class ProductionBlocked(unittest.TestCase):
         self.assertFalse(report["activated"])
         self.assertTrue(report["ignored_tuple"])
         ids = {row["id"] for row in report["blockers"]}
-        # The gateway-host blocker tracks whether the real config names an oracle device.
-        self.assertEqual("gateway_host_unverified" in ids, not deployment_facts()["oracle_device"])
-        for blocker in ("hub_loopback", "phone_origin_arch_loopback",
-                        "dell_provider_unverified", "luna_grok_unverified", "safety_margin_unmeasured",
-                        "windows_clock_untested", "legacy_paths_unfenced", "passkey_verifier_absent",
-                        "signature_verifier_absent", "automatic_failover_disabled"):
+        for blocker in _STABLE_BLOCKERS:
             self.assertIn(blocker, ids)
         self.assertFalse(any(name.startswith("peer_") for name in ids))
+        self.assertNotIn("no_oracle_device", ids)
         self.assertFalse(integration.v2_request({"role": "phone"}, "op-1", {"target": "dell"})["ok"])
         legacy = integration.legacy_request({"target": "dell", "effect_class": "control"})
         self.assertFalse(legacy["acted"])
@@ -107,28 +172,97 @@ class ProductionBlocked(unittest.TestCase):
         self.assertFalse(integration.quiesce_legacy(1)["applied"])
         self.assertFalse(integration.rollback_quiesced("drill", 1)["applied"])
 
-    def test_peers_behave_and_oracle_gateway_is_recorded(self):
+    def test_peer_probe_and_temp_config_are_not_a_live_gateway(self):
+        """Runtime and executor run a temp fixture. Gateway and ingress do not.
+
+        `peer_report` marks gateway and ingress compatible when
+        `forward_transient` and `relay_transient` are callable. That is not a
+        served relay and not an Oracle process. `phone_bind` is the constant
+        `127.0.0.1:7787`; the temp document's listener is ignored.
+        """
         peers = peer_report()
-        for name in ("gateway", "ingress", "runtime", "executor"):
+        for name in ("runtime", "executor"):
             self.assertTrue(peers[name]["present"], name)
             self.assertTrue(peers[name]["compatible"], (name, peers[name]))
-        facts = deployment_facts()
-        self.assertTrue(facts["config_read"])
-        self.assertEqual(facts["oracle_device"], "oracle" in facts["device_ids"])
-        self.assertIn("gateway_host_unverified",
-                      {row["id"] for row in _blockers(dict(facts, oracle_device=False), peers)})
-        self.assertNotIn("gateway_host_unverified",
-                         {row["id"] for row in _blockers(dict(facts, oracle_device=True), peers)})
-        self.assertEqual(facts["phone_bind"], "127.0.0.1:7787")
-        self.assertFalse(facts["provider_verified"])
-        self.assertFalse(facts["windows_clock_tested"])
-        ids = {row["id"] for row in INCOMPATIBILITIES}
-        for kept in ("no_signatures", "store_states", "no_passkey"):
-            self.assertIn(kept, ids)
-        self.assertNotIn("peers_absent", ids)
-        self.assertNotIn("inprocess_auth_double", ids)
+            self.assertNotIn("behavior", peers[name]["missing"], peers[name])
+        self.assertTrue(callable(getattr(ContinuityGateway, "forward_transient", None)))
+        self.assertTrue(callable(getattr(ContinuityGatewaySession, "relay_transient", None)))
+        for name in ("gateway", "ingress"):
+            self.assertTrue(peers[name]["present"], name)
+            self.assertEqual(peers[name]["missing"], [], peers[name])
+            self.assertTrue(peers[name]["compatible"], (name, peers[name]))
+            self.assertNotIn("origin", peers[name])
+            self.assertNotIn("pid", peers[name])
+
+        missing_dir = TemporaryDirectory()
+        self.addCleanup(missing_dir.cleanup)
+        absent = deployment_facts(Path(missing_dir.name) / "missing.json")
+        self.assertFalse(absent["config_read"])
+        self.assertFalse(absent["oracle_device"])
+        self.assertEqual(absent["phone_bind"], "127.0.0.1:7787")
+        self.assertIn("gateway_host_unverified", _blocker_ids(absent))
+
+        no_oracle = deployment_facts(_temp_config(self, {
+            "devices": {"zenbook": {"hostname": "arch"}, "dell": {"hostname": "dell"}},
+            "cluster": {"listen_host": "127.0.0.1", "listen_port": 7700,
+                        "phone_bind": "0.0.0.0:9999"},
+        }))
+        self.assertTrue(no_oracle["config_read"])
+        self.assertEqual(no_oracle["device_ids"], ["dell", "zenbook"])
+        self.assertFalse(no_oracle["oracle_device"])
+        self.assertEqual(no_oracle["phone_bind"], "127.0.0.1:7787")
+        self.assertFalse(no_oracle["provider_verified"])
+        self.assertFalse(no_oracle["windows_clock_tested"])
+        no_oracle_ids = _blocker_ids(no_oracle)
+        self.assertIn("gateway_host_unverified", no_oracle_ids)
+        self.assertIn("hub_loopback", no_oracle_ids)
+
+        for host in (None, "127.0.0.1", "localhost"):
+            loop = dict(no_oracle, listen_host=host)
+            self.assertIn("hub_loopback", _blocker_ids(loop), host)
+
+        tailnet = deployment_facts(_temp_config(self, {
+            "devices": {"zenbook": {"hostname": "arch"}},
+            "cluster": {"listen_host": "100.64.0.8"},
+        }))
+        self.assertNotIn("hub_loopback", _blocker_ids(tailnet))
+        self.assertIn("gateway_host_unverified", _blocker_ids(tailnet))
+
+        # A devices key named oracle, with no origin, key, or enrollment, sets
+        # oracle_device. _blockers then drops gateway_host_unverified. The fact
+        # dict has no enrollment field, so that drop is not a verified host.
+        name_only_record = {
+            "hostname": "oracle-vm", "label": "oracle", "os": "linux", "profile": "cloud",
+        }
+        self.assertEqual(set(name_only_record), {"hostname", "label", "os", "profile"})
+        named = deployment_facts(_temp_config(self, {
+            "devices": {"oracle": name_only_record},
+            "cluster": {"listen_host": "100.64.0.8", "main_device": "zenbook"},
+        }))
+        self.assertEqual(named["oracle_device"], "oracle" in named["device_ids"])
+        self.assertTrue(named["oracle_device"])
+        self.assertEqual(named["phone_bind"], "127.0.0.1:7787")
+        for absent_key in ("enrolled", "origin", "public_key", "relay_origin"):
+            self.assertNotIn(absent_key, named)
+        named_ids = _blocker_ids(named)
+        self.assertNotIn("gateway_host_unverified", named_ids)
+        self.assertNotIn("hub_loopback", named_ids)
+        self.assertEqual(
+            "gateway_host_unverified" in _blocker_ids(dict(named, oracle_device=False)),
+            True)
+        self.assertNotIn("gateway_host_unverified", _blocker_ids(dict(named, oracle_device=True)))
+
+        static_ids = {row["id"] for row in INCOMPATIBILITIES}
+        for kept in ("no_signatures", "store_states", "no_passkey", "no_oracle_device"):
+            self.assertIn(kept, static_ids)
+        self.assertNotIn("peers_absent", static_ids)
+        self.assertNotIn("inprocess_auth_double", static_ids)
+        self.assertNotIn("gateway_host_unverified", static_ids)
+        self.assertNotIn("no_oracle_device", named_ids)
+        self.assertNotEqual(static_ids, named_ids)
 
     def test_store_codes_fail_closed(self):
+        """Literal AuthorityError("code") tokens in authority.py. A dynamic code string is invisible."""
         source = Path("jarvis/continuity/authority.py").read_text(encoding="utf-8")
         codes = set(re.findall(r'AuthorityError\("([a-z_]+)"', source))
         self.assertTrue(codes)
@@ -148,9 +282,10 @@ class ProductionBlocked(unittest.TestCase):
 
 
 class Composed(unittest.TestCase):
-    """A real fleet with Arch (`zenbook`) as MAIN and the phone paired through real ingress."""
+    """Temp fleet. Arch is MAIN. The phone session is the in-process ingress, not :7787."""
 
     def setUp(self):
+        widen_loopback_deadlines(self)
         self.tmp = TemporaryDirectory()
         self.clock = Clock()
         self.fleet = IsolatedFleet(self.tmp.name, self.clock)
@@ -161,6 +296,12 @@ class Composed(unittest.TestCase):
         self.relay_events = []
         for node in (self.arch, self.dell):
             self.record_relay(node)
+        live = Path(__file__).resolve().parents[2] / ".jarvis"
+        root = self.fleet.root.resolve()
+        live_root = live.resolve()
+        self.assertTrue(self.fleet.origin.startswith("http://127.0.0.1:"), self.fleet.origin)
+        self.assertFalse(self.fleet.gateway.policy.auto_failover)
+        self.assertFalse(root == live_root or live_root in root.parents)
         self.fleet.cutover()
         _, self.arch_lease = self.fleet.promote("zenbook")
         self.arch.runtime.start()
@@ -296,7 +437,7 @@ class Composed(unittest.TestCase):
         the socket so the return test can bring the same endpoint back online.
         """
         self.arch.server.shutdown()
-        self.arch.thread.join(timeout=5)
+        self.arch.thread.join(timeout=60)
         self.assertFalse(self.arch.thread.is_alive())
         self.assertTrue(self.dell.client.status()["lease_valid"])
 
@@ -306,15 +447,39 @@ class Composed(unittest.TestCase):
         Hub.start and Agent.run currently start LeaseRenewer, not the optional
         RecoveryOrchestrator. Do not substitute owner.promote here: that would
         hide the missing automatic recovery that caused the incident. No owner
-        private key is given to a node, and no canary is fabricated.
+        private key is given to a node. Each candidate's canary checks the
+        actual loopback listener, open executor and local control readiness.
         """
-        workers = [LeaseRenewer(Participant(node.client, node.runtime, guard=node.executor))
+        workers = [LeaseRenewer(Participant(node.client, node.runtime, guard=node.executor,
+                                            canary=lambda node=node: self.node_canary(node)))
                    for node in nodes]
         results = []
         for _ in range(seconds):
             self.clock.tick(1)
             results.append([worker.tick() for worker in workers])
         return results
+
+    @staticmethod
+    def node_canary(node):
+        # These are the real loopback services of this isolated fixture, not
+        # production Dell/Oracle readiness. A stopped serving thread must fail
+        # even when shutdown() has left its listening socket open for failback.
+        if not node.thread.is_alive() or not node.runtime.lease_snapshot():
+            return False
+        view = node.executor.local_view()
+        if (view.get('journal') is not True or view.get('quarantined')
+                or node.runtime.readiness('control').get('meets') is not True):
+            return False
+        try:
+            with socket.create_connection(node.server.server_address, timeout=0.5):
+                return True
+        except OSError:
+            return False
+
+    def test_recovery_canary_refuses_a_stopped_candidate_listener(self):
+        self.assertTrue(self.node_canary(self.arch))
+        self.crash_arch()
+        self.assertFalse(self.node_canary(self.arch))
 
     def assert_phone_served_by(self, device, key):
         # Separate checks expose both the authority/routing failure and its
@@ -397,12 +562,15 @@ class Composed(unittest.TestCase):
         self.assertIn("partition", self.dell.refusals)
         self.dell.client.up = True
 
+        # restart_gateway also re-enrols from its RAM list. That loop is not
+        # what keeps the directory; the next test reopens the temp sqlite with
+        # no enroll call. Neither restart is an Oracle process.
         restarted = self.fleet.restart_gateway()
         self.assertIsNone(restarted["main"])
         self.assertGreater(restarted["incarnation"], old["incarnation"])
         self.assertGreater(restarted["grant_barrier"], 0)
         me = self.call("GET", "/phone/api/me")
-        self.assertEqual(me.status, 200, "the paired phone session must survive a gateway restart")
+        self.assertEqual(me.status, 200, "in-process phone adapter, not the live :7787 listener")
         self.assertFalse(me.body["relay"])
         refused = self.ask("op-after-restart")
         self.assertEqual(refused.status, 503)
@@ -421,6 +589,47 @@ class Composed(unittest.TestCase):
             self.dell.client.consume(ticket, signature)
         self.assertIn(stale.exception.code, ("stale", "no_admission"))
         self.assertEqual(self.dell.effects, ["op-after-001", "op-after-002"])
+
+    def test_directory_survives_reopen_without_reenroll(self):
+        """Temp sqlite reload. Not restart_gateway's re-enrol loop and not Oracle.
+
+        The gateway process is the same interpreter. `open` loads
+        `gateway_directory`. Status from the already-enrolled keys must work
+        with no further `enroll` call. MAIN is cleared because a new store
+        incarnation voids the old lease.
+        """
+        before = self.arch.client.status()
+        self.assertEqual(before["main"], "zenbook")
+        enrolled = len(self.fleet._enrolled)
+        self.assertGreaterEqual(enrolled, 4)
+        previous = self.fleet.origin
+        self.fleet.gateway.close()
+        gateway = ContinuityGateway.open(
+            self.fleet.root / "authority.sqlite", FLEET_ID, AUTHORITY_ID,
+            [self.fleet.public("owner")],
+            monotonic=self.clock.mono, wall=self.clock.wall,
+            self_recovery=SELF_RECOVERY)
+        self.fleet.gateway = gateway
+        origin = gateway.serve()
+        self.assertTrue(origin.startswith("http://127.0.0.1:"), origin)
+        self.assertNotEqual(origin, previous)
+        self.assertFalse(gateway.policy.auto_failover)
+        self.fleet.origin = origin
+        clients = [self.fleet.owner, self.fleet.oracle, self.fleet.phone_client]
+        clients.extend(node.client for node in self.fleet.nodes.values())
+        for client in clients:
+            client.origin = origin
+        self.assertEqual(len(self.fleet._enrolled), enrolled)
+        for client, name in (
+                (self.arch.client, "zenbook"),
+                (self.dell.client, "dell"),
+                (self.fleet.oracle, "oracle"),
+                (self.fleet.phone_client, "ingress")):
+            status = client.status()
+            self.assertEqual(status["authority_id"], AUTHORITY_ID, name)
+            self.assertIsNone(status["main"], name)
+            self.assertGreater(status["incarnation"], before["incarnation"], name)
+        self.assertEqual(len(self.fleet._enrolled), enrolled)
 
     def test_ambiguous_effect_is_never_sent_again(self):
         self.arch.server.shutdown()  # the relay target dies after the gateway picked it
@@ -589,6 +798,12 @@ class Composed(unittest.TestCase):
     # --- opt-in launch contract -------------------------------------------------
 
     def test_launch_contract_is_off_until_explicitly_closed(self):
+        """RAM flags and `apply_node_seen`. This does not construct `NodeWorker`.
+
+        The helper records after `run` returns, so an exception skips the
+        record. `jarvis.cluster.NodeWorker` is the production mark and is not
+        called here.
+        """
         self.assertTrue(phone_listener_open())
         self.assertEqual(node_seen_mode(), "before")
         refuse_unfenced("remote")  # default: legacy keeps working, nothing raised

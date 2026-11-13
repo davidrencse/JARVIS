@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -1008,6 +1009,67 @@ class HandoffSurfaces(unittest.TestCase):
         self.assertEqual(out["ok"], True)
         self.assertEqual(out["main"], "dell")
         self.assertEqual(self.disk()["cluster"]["main_device"], "dell")
+
+
+class ConsoleSingleFlightTests(unittest.TestCase):
+    def setUp(self):
+        from jarvis.continuity import console
+        self.console = console
+        console._CACHE.clear()
+        console._INFLIGHT.clear()
+        self.addCleanup(console._CACHE.clear)
+        self.addCleanup(console._INFLIGHT.clear)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "operator.json"
+        self.path.write_text("{}", encoding="utf-8")
+        self.cfg = {"continuity": {"operator_config": str(self.path)}}
+
+    def test_overlapping_calls_share_one_status_and_a_timeout_cannot_replace_it(self):
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        class Client:
+            def status(self):
+                calls.append(1)
+                started.set()
+                self_release = release.wait(2)
+                if not self_release:
+                    raise TimeoutError("held")
+                return {"mode": "V2_ACTIVE", "epoch": 3, "main": "dell", "lease_valid": True,
+                        "private_key_path": "/secret/key"}
+
+        def factory(_path):
+            return Client(), {"origin": "https://oracle-vm:443/x", "private_key_path": "/secret/key"}
+
+        owner = {}
+        waiter = {}
+
+        def run(box, timeout):
+            box["value"] = self.console.gateway_status(self.cfg, factory=factory, now=50, timeout=timeout)
+
+        first = threading.Thread(target=run, args=(owner, 2))
+        first.start()
+        self.assertTrue(started.wait(2))
+        second = threading.Thread(target=run, args=(waiter, 0.05))
+        second.start()
+        second.join(1)
+        self.assertFalse(second.is_alive())
+        self.assertEqual(waiter["value"], {"state": "unreachable", "error": "Timeout"})
+        self.assertNotIn(str(self.path), self.console._CACHE)
+        release.set()
+        first.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertEqual(owner["value"]["state"], "ok")
+        self.assertEqual(owner["value"]["main"], "dell")
+        self.assertNotIn("secret", json.dumps(owner["value"]))
+        self.assertEqual(calls, [1])
+        cached = self.console.gateway_status(self.cfg, factory=factory, now=60)
+        self.assertEqual(cached["state"], "ok")
+        self.assertEqual(cached["main"], "dell")
+        self.assertEqual(calls, [1])
 
 
 if __name__ == "__main__":

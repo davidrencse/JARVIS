@@ -336,6 +336,35 @@ class ProductionFences(unittest.TestCase):
             issue("zenbook", "op-1", "at-1", "sha256:" + "ab" * 32, "ordinary")
         self.assertEqual(caught.exception.code, "stale")
 
+    def test_issuer_refuses_a_stale_main_and_signs_for_the_holder(self):
+        class Client:
+            def __init__(self, device_id):
+                self.device_id = device_id
+
+            def status(self):
+                return {"mode": "V2_ACTIVE", "lease_valid": True, "main_ready": True,
+                        "main": "dell", "lease_holder": "dell",
+                        "authority_id": "oracle-auth", "fleet_id": "home",
+                        "incarnation": 2, "epoch": 4, "mode_version": 3, "policy_version": 1}
+
+        digest = "sha256:" + "ab" * 32
+        stale = production_issuer(self.state / "zenbook-key", Client("zenbook"), wall=lambda: 1800000000)
+        with patch("jarvis.continuity.integration.sign_message") as sign:
+            with self.assertRaises(IntegrationError) as caught:
+                stale("dell", "op-1", "at-1", digest, "ordinary")
+        self.assertEqual(caught.exception.code, "stale")
+        self.assertEqual(sign.call_count, 0)
+
+        holder = production_issuer(self.state / "dell-key", Client("dell"), wall=lambda: 1800000000)
+        with patch("jarvis.continuity.integration.sign_message", return_value="signed-by-dell") as sign:
+            signed, ticket = holder("zenbook", "op-1", "at-1", digest, "ordinary")
+        self.assertEqual(sign.call_count, 1)
+        self.assertEqual(signed["main"], "dell")
+        self.assertEqual(ticket["main"], "dell")
+        self.assertEqual(ticket["target"], "zenbook")
+        self.assertEqual(signed["signature"], "signed-by-dell")
+        self.assertEqual(signed["epoch"], 4)
+
     def test_closed_surface_still_refuses_before_the_runtime(self):
         configure_production(self.state, self.runtime)
         close_unfenced("cluster_local")

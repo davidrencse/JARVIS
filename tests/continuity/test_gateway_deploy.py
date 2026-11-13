@@ -106,12 +106,15 @@ class DryRunTests(DeployBase):
             "STAGE=/opt/jarvis.new",
             "-u jarvis-gateway env PYTHONPATH=\"$STAGE\" JARVIS_NO_MODELS=1 /usr/bin/python3 "
             '-c "import jarvis.continuity.gateway"',
-            'sudo -n rm -rf "$OPT" && sudo -n mv "$STAGE" "$OPT"',
+            'sudo -n mv "$OPT" "$OPT.outgoing-$TS"',
+            'sudo -n mv "$STAGE" "$OPT"',
+            'sudo -n mv "$OPT.outgoing-$TS" "$OPT"',
             "chown -R jarvis-gateway:jarvis-gateway",
             'chmod 0750 "$OPT"',
         ):
             self.assertIn(needle, script)
         self.assertNotIn("restart_and_wait; then", script)
+        self.assertNotIn('sudo -n rm -rf "$OPT" && sudo -n mv "$STAGE" "$OPT"', script)
         self.assertIn("service NOT restarted", script)
         # import check comes before swap, backup before staging
         self.assertLess(script.index("cp -a"), script.index("tar -xzf"))
@@ -136,6 +139,9 @@ class RestartTests(DeployBase):
         self.assertIn("exit 3", script)
         self.assertIn("is-active", script)
         self.assertIn("seq 1 15", script)
+        self.assertIn("sleep 1", script)
+        self.assertNotIn("sleep 2", script)
+        self.assertIn('mv "$OPT.outgoing-$TS" "$OPT"', script)
 
     def test_real_run_uses_scp_then_single_ssh(self):
         code = self.run_deploy(restart=True)

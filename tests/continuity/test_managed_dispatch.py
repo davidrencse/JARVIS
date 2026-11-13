@@ -260,8 +260,44 @@ class ManagedDispatch(unittest.TestCase):
             self.assertEqual(json.loads(effects.read_text(encoding="utf-8")),
                              [{"kind": "inventory", "payload": {}}])
 
+            # Transfer is bulk. The jobs row stays "{}", and the admission envelope
+            # lives only in broker memory until the requester reads the result.
+            node_row = next(row for row in hub.broker.nodes() if row["id"] == "dell")
+            hub.broker.heartbeat("dell", {
+                "hostname": "dell", "code": node_row.get("code") or ""})
+            with patch("jarvis.transfer.send", side_effect=AssertionError("ssh send")), \
+                    patch("jarvis.deploy._remote", side_effect=AssertionError("ssh remote")):
+                transfer_box = self.call_transfer(config, main, {"action": "inbox"})
+                transfer_row = self.pending(hub, transfer_box)
+                self.assertEqual(transfer_row["kind"], "transfer")
+                self.assertEqual(transfer_row["payload"], "{}")
+                held = hub.broker._bulk[transfer_row["id"]]["payload"]
+                body = {"action": "inbox"}
+                self.assertEqual(
+                    {key: value for key, value in held.items() if key != ENVELOPE_KEY}, body)
+                transfer_envelope = held[ENVELOPE_KEY]
+                transfer_digest = effect_digest("transfer", body)
+                self.assertEqual(transfer_envelope["kind"], "transfer")
+                self.assertEqual(transfer_envelope["schema"], 1)
+                self.assertEqual(transfer_envelope["admission_ticket"]["digest"], transfer_digest)
+                self.assertEqual(transfer_envelope["signed_operation"]["digest"], transfer_digest)
+                self.assertEqual(transfer_envelope["admission_ticket"]["target"], "dell")
+                self.assertIn(
+                    "BEGIN SSH SIGNATURE", transfer_envelope["signed_operation"]["signature"])
+                self.assertEqual(runtime.order[-1], ("authority", "ordinary", "dell"))
+                self.assertEqual(len(json.loads(effects.read_text(encoding="utf-8"))), 1)
+                sealed_transfer = json.loads(json.dumps(held))
+                self.child(spec_path)
+                self.finish(transfer_box)
+            self.assertEqual(transfer_box["value"], {"ok": True, "text": "once"})
+            self.assertEqual(json.loads(effects.read_text(encoding="utf-8")), [
+                {"kind": "inventory", "payload": {}},
+                {"kind": "transfer", "payload": {"action": "inbox"}},
+            ])
+            self.assertNotIn(transfer_row["id"], hub.broker._bulk)
+
             self.child(spec_path)
-            self.assertEqual(len(json.loads(effects.read_text(encoding="utf-8"))), 1)
+            self.assertEqual(len(json.loads(effects.read_text(encoding="utf-8"))), 2)
 
             (node / "cluster-jobs-seen.json").unlink()
             replayed = []
@@ -276,6 +312,20 @@ class ManagedDispatch(unittest.TestCase):
             self.assertEqual(replayed, [])
             self.assertEqual(worker.client.results, [{
                 "id": "job-replay", "failed": True,
+                "result": {"error": "Not run: not_run"},
+            }])
+            transfer_replayed = []
+            transfer_job = sign_job(
+                {"id": "job-transfer-replay", "kind": "transfer",
+                 "payload": sealed_transfer, "remaining": 30},
+                "dell", main)
+            transfer_worker = self.worker(
+                node, transfer_job, lambda kind, body: transfer_replayed.append((kind, body)))
+            with patch("jarvis.hostmeter.cached_sample", return_value=None):
+                self.assertTrue(transfer_worker.once())
+            self.assertEqual(transfer_replayed, [])
+            self.assertEqual(transfer_worker.client.results, [{
+                "id": "job-transfer-replay", "failed": True,
                 "result": {"error": "Not run: not_run"},
             }])
             self.assertFalse((node / "cluster-jobs-seen.json").exists())
@@ -331,12 +381,71 @@ class ManagedDispatch(unittest.TestCase):
             authority_id="oracle-auth", authority=authority, verifier=authority.verify,
             boot=lambda: BOOT, wall=lambda: wall)
 
+    def test_managed_transfer_refuses_before_ssh_or_enqueue(self):
+        # send_file falls back to SSH on ConnectionError. A managed refusal is not
+        # that error, and it happens before a job or an SSH send.
+        from jarvis.continuity.runtime import RuntimeRefusal
+        from jarvis.transfer import send_file
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        main = root / "main"
+        main.mkdir()
+        note = root / "note.txt"
+        note.write_bytes(b"hello")
+        config = fleet_config(9)
+        config["devices"]["dell"] = {
+            "hostname": "dell", "transport": "ssh", "target": "dell.example",
+            "identity_file": str(root / "missing-key"),
+        }
+
+        class Refusing(Runtime):
+            def require_authority(self, effect_class, target=None):
+                super().require_authority(effect_class, target)
+                raise RuntimeRefusal("stale")
+
+        runtime = Refusing()
+        configure_production(main, runtime)
+        hub = None
+        try:
+            hub = Hub(config, main, main)
+            hub.start(host="127.0.0.1", port=0)
+            with patch("jarvis.transfer.send", side_effect=AssertionError("ssh send")), \
+                    patch("jarvis.deploy._remote", side_effect=AssertionError("ssh remote")):
+                with self.assertRaises(RuntimeRefusal) as caught:
+                    send_file(config, main, note, device="dell")
+            self.assertEqual(caught.exception.code, "stale")
+            self.assertEqual(runtime.calls, [("ordinary", "dell")])
+            with hub.broker.db() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+        finally:
+            if hub is not None:
+                hub.close()
+            clear_production(main)
+
     def dispatch(self, hub, kind, payload):
         box = {}
 
         def run():
             try:
                 box["value"] = hub.dispatch("dell", kind, payload, timeout=60)
+            except Exception as exc:
+                box["error"] = exc
+
+        box["thread"] = threading.Thread(target=run)
+        self._dispatches.append(box["thread"])
+        box["thread"].start()
+        return box
+
+    def call_transfer(self, config, state, payload):
+        from jarvis.transfer import call
+
+        box = {}
+
+        def run():
+            try:
+                box["value"] = call(config, state, "dell", payload, timeout=60)
             except Exception as exc:
                 box["error"] = exc
 

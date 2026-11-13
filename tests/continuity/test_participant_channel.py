@@ -95,6 +95,20 @@ class ParticipantChannelTests(unittest.TestCase):
         self.assertIsNone(verify_job(job, node, code_key(self.states[self.requester])))
         return rpc.execute_job(self.states[node], job['payload'], job['requester'])
 
+    def ack_epochs(self, device, start):
+        epochs = []
+        for path, obj in self.clients[device].sent[start:]:
+            if path.endswith('/acknowledge'):
+                self.assertEqual(obj['device']['device_id'], device)
+                self.assertEqual(obj['device']['installation_id'], device + '-inst')
+                self.assertIn('BEGIN SSH SIGNATURE', obj['device']['signature'])
+                epochs.append(obj['payload']['fenced_epoch'])
+        return epochs
+
+    def stored_epoch(self, device):
+        return self.store._db.execute(
+            'SELECT fenced_epoch FROM participants WHERE device_id=?', (device,)).fetchone()[0]
+
     def open(self, candidate='zenbook', action='recover'):
         st = self.port.status()
         return self.clients['zenbook'].transition_request('test-'+str(st['epoch']), action, candidate,
@@ -129,6 +143,33 @@ class ParticipantChannelTests(unittest.TestCase):
         self.assertFalse(signed['payload']['ai_ready'])
         with self.assertRaises(g.GatewayError):
             self.clients['zenbook'].readiness(tid, True, False)
+
+    def test_uncertain_handoff_stops_remote_candidate_renewing_the_grant(self):
+        from jarvis.continuity.runtime import SafeHandoff
+        self.seat_zenbook()
+        remotes = {device: rpc.RemoteRuntime(device, self.port, self.call)
+                   for device in self.participants}
+        candidate = remotes['dell']
+        port = rpc.CandidatePort(self.port, candidate, remotes.values())
+
+        def failed_brain(*_args):
+            raise OSError('lost reply after starting transfer')
+
+        handoff = SafeHandoff(port, source_runtime=remotes['zenbook'], candidate_runtime=candidate,
+            readiness=lambda _: candidate.readiness(), repoint=lambda *_: self.fail('repoint after uncertainty'),
+            canary=lambda _: self.fail('canary after uncertainty'), brain=failed_brain,
+            journal_path=self.states['zenbook'] / 'uncertain-handoff.json')
+        result = handoff('zenbook', 'dell', {}, self.states['zenbook'].parent)
+        self.assertEqual(result['status'], 'uncertain', result)
+        self.assertFalse(self.port.status()['main_ready'])
+        before = len(self.clients['dell'].sent)
+        self.assertEqual(self.participants['dell'].runtime.renew_once()['code'], 'renewal_paused')
+        self.assertEqual(len(self.clients['dell'].sent), before)
+        self.requester = 'dell'
+        with self.assertRaisesRegex(RuntimeRefusal, 'forbidden'):
+            candidate.pause_renewal()
+        self.clock.tick(30)
+        self.assertFalse(self.port.status()['lease_valid'])
 
     def test_source_drain_release_fence_and_candidate_lease_acceptance(self):
         self.seat_zenbook()
@@ -367,6 +408,128 @@ class ParticipantChannelTests(unittest.TestCase):
             hub_control.run_recover(hub, {'device': 'zenbook', 'request_id': 'initial-main'}, '127.0.0.1')
         with self.assertRaises(PermissionError):
             hub_control.run_recover(hub, {'device': 'zenbook', 'request_id': 'initial-main'}, '192.0.2.1')
+
+    def test_signed_fence_ack_is_idempotent_and_does_not_cover_the_new_epoch(self):
+        self.seat_zenbook()
+        tid = self.open('dell', 'set_preferred_main')
+        remotes = {d: rpc.RemoteRuntime(d, self.port, self.call) for d in self.participants}
+        port = rpc.CandidatePort(self.port, remotes['dell'], tuple(remotes.values()))
+        port.transition_readiness(tid, remotes['dell'].readiness())
+        port.transition_step(tid, 'drain')
+        remotes['zenbook'].begin_drain(tid)
+        remotes['zenbook'].release_for_handoff(tid)
+        closed = self.port.status()['epoch']
+        start = {d: len(self.clients[d].sent) for d in self.participants}
+        first = {d: self.call(d, self.payload('fence')) for d in self.participants}
+        for device, signed in first.items():
+            self.assertEqual(self.ack_epochs(device, start[device]), [closed])
+            self.assertEqual(signed['fenced_epoch'], closed)
+            self.assertEqual(signed['receipt']['epoch'], closed)
+            self.assertEqual(signed['receipt']['transition_id'], tid)
+            self.assertTrue(g.verify_message(
+                g.RUNTIME_NS, g._message(g.RUNTIME_NS, signed['receipt']),
+                signed['signature'], _keys()[device][0]))
+            other = 'zenbook' if device == 'dell' else 'dell'
+            self.assertFalse(g.verify_message(
+                g.RUNTIME_NS, g._message(g.RUNTIME_NS, signed['receipt']),
+                signed['signature'], _keys()[other][0]))
+            again = self.call(device, self.payload('fence'))
+            self.assertEqual(again['signature'], signed['signature'])
+            self.assertEqual(again['receipt'], signed['receipt'])
+            self.assertEqual(self.ack_epochs(device, start[device]), [closed])
+        self.port.transition_step(tid, 'fence')
+        opened = self.port.status()['epoch']
+        self.assertEqual(opened, closed + 1)
+        self.assertEqual(self.port.status()['transition']['state'], 'FENCING')
+        for device in self.participants:
+            self.participants[device]._fence_acks.clear()
+            replay = self.call(device, self.payload('fence'))
+            self.assertEqual(replay['receipt']['epoch'], closed)
+            self.assertEqual(replay['fenced_epoch'], closed)
+            self.assertNotIn(opened, self.ack_epochs(device, start[device]))
+            self.assertEqual(self.stored_epoch(device), closed)
+            self.assertTrue(g.verify_message(
+                g.RUNTIME_NS, g._message(g.RUNTIME_NS, replay['receipt']),
+                replay['signature'], _keys()[device][0]))
+        # Authority fence replay is idempotent once FENCING is committed. The
+        # peer acknowledgements above remain bound to the closed epoch; replay
+        # returns the same transition without advancing either epoch or acks.
+        replayed_fence = port.transition_step(tid, 'fence')
+        self.assertEqual(replayed_fence['state'], 'FENCING')
+        self.assertEqual(self.port.status()['epoch'], opened)
+        for device in self.participants:
+            self.assertEqual(self.stored_epoch(device), closed)
+            self.assertNotIn(opened, self.ack_epochs(device, start[device]))
+
+    def test_fence_role_phase_and_guard_failure_do_not_acknowledge(self):
+        self.seat_zenbook()
+        tid = self.open('dell', 'set_preferred_main')
+        self.call('dell', self.payload('readiness'))
+        before = len(self.clients['dell'].sent)
+        with self.assertRaisesRegex(RuntimeRefusal, 'bad_state'):
+            self.call('dell', self.payload('fence'))
+        self.assertEqual(self.ack_epochs('dell', before), [])
+        self.port.transition_step(tid, 'drain')
+        before = len(self.clients['dell'].sent)
+        with self.assertRaisesRegex(RuntimeRefusal, 'candidacy_mismatch'):
+            self.call('dell', self.payload('release'))
+        with self.assertRaisesRegex(RuntimeRefusal, 'candidacy_mismatch'):
+            self.call('dell', self.payload('drain'))
+        with self.assertRaisesRegex(RuntimeRefusal, 'forbidden'):
+            self.participants['dell'].execute(self.payload('fence'), requester='dell')
+
+        def refuse_ack(*args, **kwargs):
+            raise AuthorityError('revoked', 'disabled installation cannot acknowledge')
+
+        original = self.participants['dell'].guard.fence
+        self.participants['dell'].guard.fence = refuse_ack
+        try:
+            with self.assertRaisesRegex(RuntimeRefusal, 'revoked'):
+                self.call('dell', self.payload('fence'))
+        finally:
+            self.participants['dell'].guard.fence = original
+        self.assertEqual(self.ack_epochs('dell', before), [])
+        closed = self.port.status()['epoch']
+        for device in self.participants:
+            self.call(device, self.payload('fence'))
+        self.port.transition_step(tid, 'fence')
+        lease = self.port.transition_step(tid, 'grant')
+        self.assertEqual(self.port.status()['epoch'], closed + 1)
+        marks = {d: len(self.clients[d].sent) for d in self.participants}
+        with self.assertRaisesRegex(RuntimeRefusal, 'candidacy_mismatch'):
+            self.call('zenbook', self.payload('accept', lease=lease))
+        with self.assertRaisesRegex(RuntimeRefusal, 'bad_state'):
+            self.call('dell', self.payload('fence'))
+        self.assertEqual(self.ack_epochs('dell', marks['dell']), [])
+        self.assertEqual(self.ack_epochs('zenbook', marks['zenbook']), [])
+        self.assertEqual(self.stored_epoch('dell'), closed)
+        self.assertNotEqual(self.stored_epoch('dell'), self.port.status()['epoch'])
+
+    def test_mismatched_fence_receipt_does_not_advance_the_epoch(self):
+        self.seat_zenbook()
+        tid = self.open('dell', 'set_preferred_main')
+        remotes = {d: rpc.RemoteRuntime(d, self.port, self.call) for d in self.participants}
+        port = rpc.CandidatePort(self.port, remotes['dell'], tuple(remotes.values()))
+        port.transition_readiness(tid, remotes['dell'].readiness())
+        port.transition_step(tid, 'drain')
+        remotes['zenbook'].begin_drain(tid)
+        remotes['zenbook'].release_for_handoff(tid)
+        epoch = self.port.status()['epoch']
+        real = remotes['dell']._request
+
+        def lie(action, **kwargs):
+            result = real(action, **kwargs)
+            if action == 'fence':
+                result = copy.deepcopy(result)
+                result['receipt']['epoch'] = epoch + 1
+            return result
+
+        remotes['dell']._request = lie
+        with self.assertRaisesRegex(RuntimeRefusal, 'stale'):
+            port.transition_step(tid, 'fence')
+        self.assertEqual(self.port.status()['epoch'], epoch)
+        self.assertEqual(self.port.status()['transition']['state'], 'DRAINING')
+        self.assertEqual(self.port.status()['transition']['transition_id'], tid)
 
     def test_fence_refuses_unbound_legacy_entry_points_before_ack(self):
         from jarvis.continuity.integration import clear_production

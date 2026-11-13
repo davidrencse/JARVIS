@@ -232,10 +232,26 @@ class ForwardingTests(FrontCase):
         for name in ("authorization", "x-forwarded-for", "x-evil"):
             self.assertNotIn(name, seen, name)
         self.assertNotEqual(seen.get("accept-encoding"), "gzip")
-        self.assertEqual(seen["host"], "front.example.ts.net:8443")
+        # Host is the upstream's own name: its `tailscale serve` routes by it.
+        self.assertNotEqual(seen["host"], "front.example.ts.net:8443")
         self.assertEqual(seen["x-forwarded-host"], "front.example.ts.net:8443")
         self.assertEqual(seen["x-jarvis-front"], "1")
         self.assertEqual(seen["x-jarvis-front-main"], "arch")
+
+    def test_phone_identity_comes_only_from_this_servers_serve(self):
+        self.request("GET", "/phone/x", headers={
+            "X-Forwarded-For": "100.64.0.14", "Tailscale-User-Login": "owner@example.com",
+            "X-Jarvis-Front-For": "100.1.1.1", "X-Jarvis-Front-Login": "spoof@example.com"})
+        seen = self.arch.seen[0]["headers"]
+        self.assertEqual(seen["x-jarvis-front-for"], "100.64.0.14")
+        self.assertEqual(seen["x-jarvis-front-login"], "owner@example.com")
+
+    def test_client_front_identity_never_passes_alone(self):
+        self.request("GET", "/phone/x", headers={
+            "X-Jarvis-Front-For": "100.1.1.1", "X-Jarvis-Front-Login": "spoof@example.com"})
+        seen = self.arch.seen[0]["headers"]
+        self.assertNotIn("x-jarvis-front-for", seen)
+        self.assertNotIn("x-jarvis-front-login", seen)
 
     def test_post_body_and_query_forwarded(self):
         self.request("POST", "/phone/api/ask?a=b", body=b'{"q":1}',
@@ -374,6 +390,48 @@ class GatewayWiringTests(unittest.TestCase):
     def test_gatewayconfig_default_is_none(self):
         self.assertIsNone(load_gateway_config(self.write()).phone_front)
         self.assertIn("phone_front", GatewayConfig.__init__.__code__.co_varnames)
+
+
+class PerMainSessionTests(FrontCase):
+    """One origin, one pairing store per PC: each PC gets its own cookie and CSRF token."""
+
+    def test_only_this_mains_cookie_and_csrf_reach_it(self):
+        self.request("GET", "/phone/x", headers={
+            "Cookie": "__Host-jarvis_phone.arch=A; __Host-jarvis_phone.dell=D; "
+                      "__Host-jarvis_phone=OLD; theme=dark",
+            "X-Jarvis-Csrf-arch": "csrf-arch", "X-Jarvis-Csrf-dell": "csrf-dell",
+            "X-CSRF-Token": "stale"})
+        seen = self.arch.seen[0]["headers"]
+        self.assertEqual(seen["cookie"], "__Host-jarvis_phone=A; theme=dark")
+        self.assertEqual(seen["x-csrf-token"], "csrf-arch")
+        self.assertNotIn("x-jarvis-csrf-dell", seen)
+        self.assertNotIn("x-jarvis-csrf-arch", seen)
+        self.status = {"main": "dell", "lease_valid": True, "main_ready": True}
+        self.request("GET", "/phone/x", headers={
+            "Cookie": "__Host-jarvis_phone.arch=A; __Host-jarvis_phone.dell=D",
+            "X-Jarvis-Csrf-arch": "csrf-arch", "X-Jarvis-Csrf-dell": "csrf-dell"})
+        seen = self.dell.seen[0]["headers"]
+        self.assertEqual(seen["cookie"], "__Host-jarvis_phone=D")
+        self.assertEqual(seen["x-csrf-token"], "csrf-dell")
+
+    def test_no_token_for_this_main_sends_none(self):
+        self.request("GET", "/phone/x", headers={
+            "Cookie": "__Host-jarvis_phone.dell=D", "X-Jarvis-Csrf-dell": "csrf-dell",
+            "X-CSRF-Token": "stale"})
+        seen = self.arch.seen[0]["headers"]
+        self.assertNotIn("cookie", seen)
+        self.assertNotIn("x-csrf-token", seen)
+
+    def test_plain_csrf_passes_when_app_has_no_per_main_tokens(self):
+        self.request("GET", "/phone/x", headers={"X-CSRF-Token": "plain"})
+        self.assertEqual(self.arch.seen[0]["headers"]["x-csrf-token"], "plain")
+
+    def test_set_cookie_is_renamed_for_the_answering_main(self):
+        from jarvis.continuity.phone_front import _rename_cookie
+        self.assertEqual(
+            _rename_cookie("__Host-jarvis_phone=T; Path=/; Secure; HttpOnly; SameSite=Strict", "dell"),
+            "__Host-jarvis_phone.dell=T; Path=/; Secure; HttpOnly; SameSite=Strict")
+        self.assertEqual(_rename_cookie("a=1; Path=/", "dell"), "a=1; Path=/")
 
 
 if __name__ == "__main__":

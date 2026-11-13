@@ -68,7 +68,13 @@ class Hooks(unittest.TestCase):
         self.assertTrue(phone_listener_open())
 
     def test_seen_mark_after_is_opt_in(self):
-        source = inspect.getsource(cluster.NodeWorker)
+        # Loaded class line offsets can become stale while another worker edits
+        # cluster.py. Locate the named class in the current file instead.
+        module_source = Path(inspect.getsourcefile(cluster)).read_text(encoding="utf-8")
+        classes = [node for node in ast.parse(module_source).body
+                   if isinstance(node, ast.ClassDef) and node.name == "NodeWorker"]
+        self.assertEqual(len(classes), 1)
+        source = ast.get_source_segment(module_source, classes[0])
         self.assertIn('node_seen_mode() == "after"', source)
         self.assertIn("_mark_seen", source)
 
