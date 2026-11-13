@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from jarvis.sysview import PATHS, STATIONS, design
+from jarvis.sysview import PATHS, STATIONS, _module_name, design
 from jarvis.ui import Console
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -41,6 +41,28 @@ class SystemDesignTests(unittest.TestCase):
     def test_every_module_belongs_to_a_station(self):
         loose = [m["name"] for m in self.data["modules"] if m["station"] == "other" and m["name"] != "__init__"]
         self.assertEqual(loose, [], "add new modules to a station in jarvis/sysview.py")
+        # system_graph() only globs jarvis/*.py. Subpackages have to be registered too,
+        # under their import path (continuity.authority, fleet.readiness, the package itself).
+        package = ROOT / "jarvis"
+        seen = {m["name"] for m in self.data["modules"]}
+        missing = []
+        for path in sorted(package.rglob("*.py")):
+            if len(path.relative_to(package).parts) == 1:
+                continue
+            name = _module_name(path, package)
+            if name not in seen:
+                missing.append(name)
+        self.assertEqual(missing, [], "add subpackage modules to a station in jarvis/sysview.py")
+        home = {m["name"]: m["station"] for m in self.data["modules"]}
+        self.assertEqual(home["pathsafe"], "log")
+        self.assertEqual(home["continuity"], "machines")
+        self.assertEqual(home["continuity.authority"], "machines")
+        self.assertEqual(home["fleet"], "machines")
+        self.assertEqual(home["fleet.readiness"], "machines")
+        executor = next(m for m in self.data["modules"] if m["name"] == "continuity.executor")
+        self.assertIn("continuity.authority", executor["imports"])
+        self.assertIn("locking", executor["imports"])
+        self.assertIn("continuity.integration", executor["used_by"])
 
     def test_paths_only_name_real_stations(self):
         ids = {s["id"] for s in STATIONS}
