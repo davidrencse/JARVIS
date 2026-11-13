@@ -243,6 +243,18 @@ the original freeze active, and authorizes only that incoming memory/source. No
 memory is committed to GitHub. Changed data or a busy role lock refuses. An
 interrupted archive leaves a review state and is not retried automatically.
 
+After reviewing an interrupted `archiving` or `needs_review` approval and its
+private archive, retire that approval with its same three recorded hashes:
+
+```text
+jarvis continuity --config <this-PC-operator.json> --yes return-retire --hub-config <local-jarvis.config.json> --state <local-.jarvis> --incoming-memory-sha256 <reviewed-incoming-memory-hash> --current-memory-sha256 <reviewed-current-backup-hash> --freeze-sha256 <reviewed-freeze-hash>
+```
+
+This parks only the approval beside its archive. It does not restore or move
+memory, remove the freeze, approve another bundle, or complete a handoff. Missing
+confirmation, changed hashes, a different local identity, and busy role locks
+refuse through the existing return-approval checks.
+
 The scoped return receive still invokes the original conflict checks. After it
 receives exactly the approved memory, only the newer matching fenced return grant
 can invoke `activate_return`; that callback archives the old freeze before the
