@@ -2,9 +2,11 @@
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,7 +19,72 @@ from jarvis.store import Store
 ROOT = Path(__file__).resolve().parents[2]
 
 
+_RECOVER_DRIVER = r'''
+import io, json, sys
+from contextlib import redirect_stderr, redirect_stdout
+from jarvis.__main__ import main
+real = sys.stdout
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    sys.argv = ["jarvis", *req["args"]]
+    sink, err = io.StringIO(), io.StringIO()
+    code = 0
+    try:
+        with redirect_stdout(sink), redirect_stderr(err):
+            try:
+                code = main() or 0
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+    except Exception as exc:
+        err.write("Traceback " + repr(exc))
+        code = 1
+    real.write(json.dumps({"code": int(code or 0), "stdout": sink.getvalue(),
+                           "stderr": err.getvalue()}) + "\n")
+    real.flush()
+'''
+
+
 class RecoveryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._cli = subprocess.Popen(
+            [sys.executable, "-u", "-c", _RECOVER_DRIVER], cwd=ROOT,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8")
+
+        cls._responses = queue.Queue()
+
+        def read_responses():
+            for line in cls._cli.stdout:
+                cls._responses.put(line)
+            cls._responses.put(None)
+
+        def drain_stderr():
+            for _line in cls._cli.stderr:
+                pass
+
+        cls._stdout_reader = threading.Thread(target=read_responses, daemon=True)
+        cls._stderr_reader = threading.Thread(target=drain_stderr, daemon=True)
+        cls._stdout_reader.start()
+        cls._stderr_reader.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        proc = cls._cli
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+        finally:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+            cls._stdout_reader.join(timeout=5)
+            cls._stderr_reader.join(timeout=5)
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -161,13 +228,21 @@ class RecoveryTests(unittest.TestCase):
 
     def test_recover_cli_inspects_and_applies_without_provider(self):
         self.dispatched("finished", "CLI recovery")
-        command = [sys.executable, "-m", "jarvis", "--state", str(self.base),
-                   "orchestrate", "recover", self.plan_id]
-        for suffix, applied in (([], False), (["--apply"], True)):
-            result = subprocess.run(command + suffix, cwd=ROOT, capture_output=True,
-                                    text=True, encoding="utf-8", timeout=20)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)["applied"], applied)
+        # Both CLI invocations share the class interpreter. Each still goes through main().
+        results = []
+        for extra in ([], ["--apply"]):
+            payload = ["--state", str(self.base), "orchestrate", "recover", self.plan_id, *extra]
+            self._cli.stdin.write(json.dumps({"args": payload}) + "\n")
+            self._cli.stdin.flush()
+            try:
+                line = self._responses.get(timeout=120)
+            except queue.Empty:
+                self.fail("recover driver response timed out")
+            self.assertTrue(line, "recover driver died")
+            results.append(json.loads(line))
+        for result, applied in zip(results, (False, True)):
+            self.assertEqual(result["code"], 0, result["stderr"])
+            self.assertEqual(json.loads(result["stdout"])["applied"], applied)
 
     def test_process_contention_and_crash_release(self):
         # Child runs the actual Orchestrator.run, holding ownership while its fake

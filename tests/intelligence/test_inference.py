@@ -200,7 +200,7 @@ class ClaudeBrainTests(unittest.TestCase):
         self.assertIn("mcp__jarvis", args[args.index("--allowedTools") + 1])
         servers = json.loads(args[args.index("--mcp-config") + 1])["mcpServers"]
         self.assertEqual(servers["jarvis"]["args"][-1], "brain-tools")
-        self.assertEqual(args[args.index("--tools") + 1], "WebSearch,WebFetch")
+        self.assertEqual(args[args.index("--tools") + 1], "")  # no ungated web fetch
         self.assertEqual(args[args.index("--permission-mode") + 1], "dontAsk")
         self.assertIn("standing in", args[args.index("--append-system-prompt") + 1])
 

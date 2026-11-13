@@ -244,6 +244,13 @@ class AuditThreeTests(DecideBase):
         with mock.patch.object(decide, "choose", side_effect=AssertionError("waited")):
             self.assertTrue(decide.wants_notes("hello there"))
 
+    def test_wants_notes_on_a_cache_miss_answers_true_and_warms_in_the_background(self):
+        decide._cache.pop("recall", None)
+        with mock.patch.object(decide, "choose", side_effect=AssertionError("embedded on the request")), \
+                mock.patch.object(decide, "warm") as warm:
+            self.assertTrue(decide.wants_notes("what's the capital of France"))
+        warm.assert_called_once_with("recall")
+
 
 def synth(winner_is_label=True, n=60, label_override=None):
     """n decisions whose sims favour a rotating option."""
@@ -398,10 +405,18 @@ class ShadowTests(unittest.TestCase):
             self.run_shadow(self.on, self.memory, "x", "act")
 
     def test_real_rows_end_to_end(self):
-        with mock.patch("jarvis.embed.embed", side_effect=fake_embed):
+        # The row's label is the one the caller passed. One fit step still writes it;
+        # the full 1500-iteration build is the scorecard's job, not this path.
+        fast_fit = {**decide.FIT, "iterations": 1}
+        with mock.patch("jarvis.embed.embed", side_effect=fake_embed), \
+                mock.patch.object(decide, "FIT", fast_fit):
             decide._cache.clear()
-            self.run_shadow(self.on, self.memory, "open spotify", "act")
-            decide._cache.clear()
+            decide._models.pop("mode", None)
+            try:
+                self.run_shadow(self.on, self.memory, "open spotify", "act")
+            finally:
+                decide._cache.clear()
+                decide._models.pop("mode", None)
         db = sqlite3.connect(self.state / "history.sqlite3")
         try:
             rows = db.execute("SELECT job, label, source FROM decisions").fetchall()
@@ -447,6 +462,8 @@ class StatementRecallTests(unittest.TestCase):
 
     def gate(self, text, none, notes):
         from unittest.mock import patch
+        decide._cache["recall"] = {"notes": None, "none": None}  # built: the gate may ask
+        self.addCleanup(decide._cache.pop, "recall", None)
         with patch.object(decide, "choose", return_value={"sims": {"none": none, "notes": notes}}):
             return decide.wants_notes(text)
 

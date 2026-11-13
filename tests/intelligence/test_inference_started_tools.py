@@ -8,6 +8,8 @@ Failover now records started tools per request and puts them on the exception
 Fakes only: no model, CLI, network or OS input. This is a conservative no-replay rule, not a
 lease or fence."""
 
+import json
+import queue
 import tempfile
 import threading
 import unittest
@@ -305,7 +307,7 @@ class AssistantNeverReplaysAnAmbiguousEffect(unittest.TestCase):
 
     def orchestrated(self, lane, orchestrate_error=RuntimeError("all steps failed")):
         """assistant._orchestrated with a planner that runs one tools step then fails."""
-        def fake(text, config, base, state, run_tools=None, step=None, recall=()):
+        def fake(text, config, base, state, run_tools=None, step=None, recall=(), level=None):
             try:
                 run_tools("open spotify")
             except Exception:
@@ -363,7 +365,7 @@ class AssistantNeverReplaysAnAmbiguousEffect(unittest.TestCase):
             real("other request")
             cleared.set()
 
-        def planner(text, config, base, state, run_tools=None, step=None, recall=()):
+        def planner(text, config, base, state, run_tools=None, step=None, recall=(), level=None):
             run_tools("open spotify")
             raise RuntimeError("planner failed after the tool step")
 
@@ -392,6 +394,356 @@ class AssistantNeverReplaysAnAmbiguousEffect(unittest.TestCase):
         self.assertIn("b started but I never saw it finish", text)
         self.assertNotIn("b failed", text)
         self.assertNotIn("started", assistant._partial_reply([("a", False, "")]))
+
+
+class _Proc:
+    """In-memory Claude stream. ask() must not spawn a provider process."""
+
+    def __init__(self):
+        self.stdin = self
+
+    def write(self, data):
+        pass
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+class _Immediate(queue.Queue):
+    """get() never blocks: an empty stream is the lane's timeout."""
+
+    def get(self, block=True, timeout=None):
+        if self.empty():
+            raise queue.Empty
+        return queue.Queue.get(self, block=False)
+
+
+def _tool_use(name, key="c1"):
+    return {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": key, "name": name}]}}
+
+
+def _tool_result(name, key="c1", text="opened"):
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": key, "content": text}]}}
+
+
+def _answer(text="done"):
+    return {"type": "result", "result": text}
+
+
+def _lane_error(subtype, detail=None):
+    event = {"type": "result", "is_error": True, "subtype": subtype}
+    if detail is not None:
+        event["result"] = detail
+    return event
+
+
+OPENED = [_tool_use("open_app"), _tool_result("open_app", text="opened"), _answer("done")]
+OPENED_BOOM = [_tool_use("open_app"), _tool_result("open_app", text="opened"), _lane_error("boom")]
+OPENED_LIMIT = [_tool_use("open_app"), _tool_result("open_app", text="opened"),
+                _lane_error("error", "You've hit your usage limit.")]
+VOLUME = [_tool_use("volume", key="v1"), _tool_result("volume", key="v1", text="set"), _answer("ok")]
+
+
+class FastLaneEvidenceSurvivesUnlock(unittest.TestCase):
+    """Real FastLane / Failover / assistant. The CLI is an in-memory event stream.
+    No provider process. A second thread mutates the shared log only after A's lock drops."""
+
+    def setUp(self):
+        from jarvis import fastlane
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.addCleanup(assistant._STANDIN.update, lane=None)
+        self.store = Store(self.base / "s", lanes=1)
+        self.mem = Memory(self.base / "s")
+        fastlane._CLAUDE_LIMIT.update(until=0.0, text="")
+        self.addCleanup(fastlane._CLAUDE_LIMIT.update, until=0.0, text="")
+
+    def config(self):
+        return {"workspace_roots": ["."], "brain": {"situation": False},
+                "routing": {"fast_path": False, "agent_fallback": False}}
+
+    def fast(self, events):
+        from jarvis.fastlane import FastLane
+        lane = FastLane({}, self.base, command=["jarvis-test-no-spawn"], timeout=5)
+        self.arm(lane, events)
+
+        def refuse():
+            raise AssertionError("FastLane tried to start a provider process")
+        lane._spawn = refuse
+        return lane
+
+    def arm(self, lane, events):
+        lane.proc = _Proc()
+        lane.lines = _Immediate()
+        lane._reader = None
+        lane.turns = 0
+        for event in events:
+            lane.lines.put(json.dumps(event))
+
+    def interleave(self, lane, watch, other, expect=None, unfinished=None):
+        """Pause on `watch` after ask() has left the lane lock. `other` runs then."""
+        released, cleared = threading.Event(), threading.Event()
+        box, seen = {}, []
+        real = lane.ask
+
+        def wrapped(text, recall=(), on_sentence=None):
+            seen.append(text)
+            try:
+                result = real(text, recall, on_sentence)
+            except BaseException as exc:
+                if text == watch:
+                    box["exc"] = exc
+                    if expect is not None:
+                        self.assertEqual(exc.tool_log, expect)
+                        self.assertEqual(lane.turn_log(), expect)
+                    if unfinished is False:
+                        self.assertFalse(hasattr(exc, "tool_unfinished"))
+                    released.set()
+                    self.assertTrue(cleared.wait(5), "other thread did not finish")
+                raise
+            else:
+                if text == watch:
+                    if expect is not None:
+                        self.assertEqual(lane.turn_log(), expect)
+                        self.assertEqual(list(lane.tool_log), expect)
+                    released.set()
+                    self.assertTrue(cleared.wait(5), "other thread did not finish")
+                return result
+
+        def side():
+            try:
+                self.assertTrue(released.wait(5), "the watched ask never unlocked")
+                other(real)
+            except BaseException as exc:  # surfaced after the main assert, not as a hang
+                box["side"] = exc
+            finally:
+                cleared.set()
+
+        lane.ask = wrapped
+        worker = threading.Thread(target=side)
+        worker.start()
+        return worker, box, seen
+
+    def finish(self, worker, box):
+        worker.join(5)
+        if worker.is_alive():
+            self.fail("interleave thread still running")
+        side = box.get("side")
+        if side is not None:
+            raise side
+
+    def second_ask(self, lane, real, events):
+        """B's ask, after A's lock is gone. Rebinds the shared log through FastLane.ask."""
+        def install():
+            self.arm(lane, events)
+        lane._spawn = install
+        if lane.proc is not None:  # success path: the process is still the scripted one
+            install()
+        real("other")
+
+    def ask_planned(self, fo, usage="until 11:34 PM"):
+        def planner(text, config, base, state, run_tools=None, step=None, recall=(), level=None):
+            try:
+                run_tools("open spotify")
+            except Exception:
+                pass  # brain.orchestrate keeps going, then the plan itself fails
+            raise RuntimeError("planner failed after the tool step")
+
+        with mock.patch("jarvis.assistant.run_task", side_effect=AssertionError("ledger")), \
+                mock.patch("jarvis.assistant._fastlane", side_effect=AssertionError("talk lane")), \
+                mock.patch("jarvis.assistant._standin_reply",
+                           side_effect=AssertionError("stand-in reply")), \
+                mock.patch("jarvis.chatgpt.usage_limit", return_value=usage), \
+                mock.patch("jarvis.brain.judge", return_value={"plan": True, "reasons": ["x"]}), \
+                mock.patch("jarvis.brain.orchestrate", side_effect=planner):
+            return assistant.ask("open spotify and play jazz", self.store, self.mem,
+                                 self.config(), self.base, lane=fo)
+
+    def test_cleared_log_keeps_the_finished_tool_and_skips_a_second_ask(self):
+        primary = Lane(error=AssertionError("primary was asked"))
+        lane = self.fast(OPENED)
+        fo = Failover(primary, lambda: lane)
+        worker, box, seen = self.interleave(
+            lane, "open spotify", lambda real: self.second_ask(lane, real, [_answer("other")]),
+            expect=[("open_app", True, "opened")])
+        try:
+            result = self.ask_planned(fo)
+        finally:
+            self.finish(worker, box)
+        self.assertEqual(primary.asked, [])
+        self.assertEqual(seen, ["open spotify"])  # not asked again with the original text
+        self.assertEqual(lane.tool_log, [])  # B's ask rebound the shared list
+        self.assertEqual(lane.turn_log(), [("open_app", True, "opened")])
+        self.assertEqual(fo.turn_log(), [("open_app", True, "opened")])
+        self.assertIn("open_app ran", result["reply"])
+        self.assertEqual(result.get("state"), "partial")
+        self.assertEqual(result.get("tools"), [["open_app", True]])
+
+    def test_other_threads_tool_is_not_attributed_to_the_first(self):
+        primary = Lane(error=AssertionError("primary was asked"))
+        lane = self.fast(OPENED)
+        fo = Failover(primary, lambda: lane)
+        worker, box, seen = self.interleave(
+            lane, "open spotify", lambda real: self.second_ask(lane, real, VOLUME),
+            expect=[("open_app", True, "opened")])
+        try:
+            result = self.ask_planned(fo)
+        finally:
+            self.finish(worker, box)
+        self.assertEqual(seen, ["open spotify"])
+        self.assertEqual(lane.tool_log, [("volume", True, "set")])
+        self.assertEqual(fo.turn_log(), [("open_app", True, "opened")])
+        self.assertIn("open_app ran", result["reply"])
+        self.assertNotIn("volume", result["reply"])
+        self.assertEqual(result.get("tools"), [["open_app", True]])
+
+    def test_error_after_a_finished_tool_keeps_a_copy_when_the_log_is_cleared(self):
+        # ChatGPT is already limited, so the tools lane is the FastLane stand-in.
+        # Once with a plain lane error, once with limit wording. Neither may replay.
+        from jarvis import fastlane
+        for events in (OPENED_BOOM, OPENED_LIMIT):
+            with self.subTest(kind=events[-1]["subtype"]):
+                fastlane._CLAUDE_LIMIT.update(until=0.0, text="")
+                primary = Lane(error=AssertionError("primary was asked"))
+                lane = self.fast(events)
+                fo = Failover(primary, lambda current=lane: current)
+                worker, box, seen = self.interleave(
+                    lane, "open spotify",
+                    lambda real, current=lane: self.second_ask(current, real, [_answer("other")]),
+                    expect=[("open_app", True, "opened")], unfinished=False)
+                try:
+                    result = self.ask_planned(fo)
+                finally:
+                    self.finish(worker, box)
+                self.assertEqual(primary.asked, [])
+                self.assertEqual(seen, ["open spotify"])
+                self.assertEqual(box["exc"].tool_log, [("open_app", True, "opened")])
+                self.assertFalse(hasattr(box["exc"], "tool_unfinished"))
+                self.assertEqual(lane.tool_log, [])
+                self.assertIn("open_app ran", result["reply"])
+                self.assertNotIn("can't tell", result["reply"])
+                self.assertEqual(result.get("state"), "partial")
+
+    def test_raw_start_timeout_blocks_the_ledger(self):
+        lane = self.fast([_tool_use("mcp__jarvis__open_app")])
+        box = {}
+        real = lane.ask
+
+        def wrapped(text, recall=(), on_sentence=None):
+            try:
+                return real(text, recall, on_sentence)
+            except BaseException as exc:
+                box["exc"] = exc
+                raise
+
+        lane.ask = wrapped
+        with mock.patch("jarvis.assistant.run_task", side_effect=AssertionError("ledger")), \
+                mock.patch("jarvis.assistant._fastlane", side_effect=AssertionError("talk lane")), \
+                mock.patch("jarvis.assistant._standin_reply",
+                           side_effect=AssertionError("stand-in reply")), \
+                mock.patch("jarvis.brain.judge", return_value={"plan": False, "reasons": []}):
+            result = assistant.ask("open spotify and play jazz", self.store, self.mem,
+                                   self.config(), self.base, lane=lane)
+        self.assertEqual(box["exc"].tool_unfinished, ["open_app"])
+        self.assertEqual(box["exc"].tool_log, [])
+        self.assertIn("open_app started", result["reply"])
+        self.assertIn("can't tell whether it happened", result["reply"])
+        self.assertNotIn("open_app ran", result["reply"])
+        self.assertEqual(result.get("tools"), [["open_app", None]])
+
+    def test_empty_limit_still_reaches_the_stand_in(self):
+        """An explicit empty tool_log is this turn. Another thread's tool must not block it."""
+        lane = self.fast([_lane_error("error", "You've hit your usage limit.")])
+        stand = Lane("Claude answered.")
+
+        def other(real):
+            lane.tool_log.append(("sneak", True, "in"))  # same list would show on the exception
+            lane.tool_log = [("volume", True, "set")]
+
+        worker, box, seen = self.interleave(lane, "what time is it", other, expect=[])
+        fo = Failover(lane, lambda: stand)
+        try:
+            with no_limit():
+                reply = fo.ask("what time is it")
+        finally:
+            self.finish(worker, box)
+        self.assertEqual(reply, "Claude answered.")
+        self.assertEqual(stand.asked, ["what time is it"])
+        self.assertEqual(seen, ["what time is it"])
+        self.assertEqual(box["exc"].tool_log, [])
+        self.assertFalse(hasattr(box["exc"], "tool_unfinished"))
+        self.assertEqual(lane.tool_log, [("volume", True, "set")])
+        self.assertEqual(lane.turn_log(), [])
+        self.assertEqual(assistant._request_tools(lane), [])
+
+    def test_empty_failure_still_reaches_the_ledger(self):
+        lane = self.fast([_lane_error("boom")])
+        calls = []
+
+        def other(real):
+            lane.tool_log.append(("sneak", True, "in"))
+            lane.tool_log = [("volume", True, "set")]
+
+        def ledger(store, task_id, config, base, timeout):
+            calls.append(task_id)
+            return {"answer": "LEDGER", "task_id": task_id, "state": "finished"}
+
+        worker, box, seen = self.interleave(lane, "what is the capital of Mongolia?", other, expect=[])
+        try:
+            with mock.patch("jarvis.assistant.run_task", side_effect=ledger), \
+                    mock.patch("jarvis.assistant._fastlane", side_effect=AssertionError("talk lane")), \
+                    mock.patch("jarvis.assistant._standin_reply",
+                               side_effect=AssertionError("stand-in reply")), \
+                    mock.patch("jarvis.brain.judge", return_value={"plan": False, "reasons": []}):
+                result = assistant.ask("what is the capital of Mongolia?", self.store, self.mem,
+                                       self.config(), self.base, lane=lane)
+        finally:
+            self.finish(worker, box)
+        self.assertEqual(seen, ["what is the capital of Mongolia?"])
+        self.assertEqual(calls, [result["task"]])
+        self.assertEqual(result["reply"], "LEDGER")
+        self.assertNotIn("volume", result["reply"])
+        self.assertEqual(box["exc"].tool_log, [])
+        self.assertFalse(hasattr(box["exc"], "tool_unfinished"))
+        self.assertEqual(lane.turn_log(), [])
+
+    def test_cooldown_before_any_tool_still_fails_over(self):
+        """Claude's own cooldown runs nothing. A stale shared log must not block the stand-in."""
+        from jarvis import fastlane
+        from jarvis.fastlane import FastLane
+        fastlane.note_claude_limit(RuntimeError("Claude usage limit reached"))
+        lane = FastLane({}, self.base)  # no command: refuse before a process exists
+        lane.tool_log = [("old", True, "stale")]
+
+        def refuse():
+            raise AssertionError("spawned")
+        lane._spawn = refuse
+        stand = Lane("Claude answered.")
+        fo = Failover(lane, lambda: stand)
+        with no_limit():
+            reply = fo.ask("what time is it")
+        self.assertEqual(reply, "Claude answered.")
+        self.assertEqual(stand.asked, ["what time is it"])
+        self.assertEqual(lane.tool_log, [("old", True, "stale")])
+        self.assertIsNone(lane.turn_log())
 
 
 if __name__ == "__main__":

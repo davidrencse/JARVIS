@@ -217,7 +217,8 @@ class HttpCase(Temp):
         handler = type("H", (Handler,), {"console": self.console,
                                           "hosts": ("127.0.0.1", "localhost")})
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01},
+                         daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.port = self.server.server_address[1]
@@ -299,6 +300,21 @@ class ConsoleHttpRobustnessTests(HttpCase):
 
 # ---------------------------------------------------------------- credits pipeline
 class CreditsResilienceTests(Temp):
+    def setUp(self):
+        super().setUp()
+        from jarvis import credits as credits_mod
+        # These tests check that one bad provider and a manual entry still produce a
+        # full panel. Live quota calls and the home log trees are not what they assert.
+        for patcher in (
+                patch.object(credits_mod, "TIMEOUT", 0.05),
+                patch.object(Credits, "_subscription", lambda self, provider: (None, None)),
+                patch.object(Credits, "key", lambda self, keys: None),
+                patch.object(Credits, "_codex_local", lambda self, reading, keys: None),
+                patch.object(Credits, "_claude_local_unlocked",
+                             lambda self, reading, keys: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_one_provider_with_a_strange_reply_does_not_blank_the_panel(self):
         credits = Credits(self.base, {})
         with patch.object(Credits, "_deepseek", side_effect=ValueError("could not convert")), \

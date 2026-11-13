@@ -155,6 +155,17 @@ class FailoverRaces(unittest.TestCase):
 
 
 class FastLaneClose(unittest.TestCase):
+    def setUp(self):
+        from jarvis import fastlane
+        real = fastlane.close_process
+
+        def quick(proc, reader, grace=0.05):
+            return real(proc, reader, grace=min(float(grace), 0.05))
+
+        patcher = mock.patch.object(fastlane, "close_process", quick)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_close_mid_ask_raises_runtime_error(self):  # bug 5
         with tempfile.TemporaryDirectory() as d:
             script = Path(d) / "cli.py"
@@ -174,9 +185,10 @@ class FastLaneClose(unittest.TestCase):
                     out["e"] = exc
             t = threading.Thread(target=run)
             t.start()
+            self.addCleanup(t.join)
             self.assertTrue(spoke.wait(5))
             lane.close()
-            t.join(10)
+            t.join(5)
             self.assertIsInstance(out.get("e"), RuntimeError, out)
 
 

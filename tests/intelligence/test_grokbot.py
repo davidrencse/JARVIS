@@ -121,6 +121,13 @@ class SendTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "needs bash")
     def test_linux_paste_restores_image_and_reports_wtype_failure(self):
         # Run only the clipboard/paste tail against fake commands in a temp bin dir.
+        # The script waits for the window to settle. This run uses fake tools, so those
+        # pauses are shortened on the module constant for this test only.
+        fast_script = (grokbot.LINUX_SCRIPT.replace("sleep 0.15", "sleep 0.01")
+                       .replace("sleep 0.3", "sleep 0.01"))
+        script_patch = patch.object(grokbot, "LINUX_SCRIPT", fast_script)
+        script_patch.start()
+        self.addCleanup(script_patch.stop)
         script = grokbot.LINUX_SCRIPT
         tail = script[script.index("PREV=$(active)"):]
         with tempfile.TemporaryDirectory() as tmp:
@@ -277,7 +284,8 @@ class TunnelTests(unittest.TestCase):
         fake.send.side_effect = lambda prompt: {"sent": prompt, "to": "grokbot", "device": "dell",
                                                 "workspace": None}
         server = grokbot.relay_server(fake, token, 0)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01},
+                         daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return fake, server.server_address[1]
@@ -564,7 +572,7 @@ class PasteLockTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             lock = Path(tmp, "grok-send.lock")
             code = ("import sys, time\nfrom jarvis.locking import exclusive_lock\n"
-                    f"with exclusive_lock({str(lock)!r}):\n print('held', flush=True); time.sleep(1.5)")
+                    f"with exclusive_lock({str(lock)!r}):\n print('held', flush=True); time.sleep(0.35)")
             child = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
             self.addCleanup(child.wait)
             self.assertEqual(child.stdout.readline().strip(), "held")
