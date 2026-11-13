@@ -264,3 +264,34 @@ routing for the return. The Dell's existing forward-only SSH credential expressl
 forbids reverse forwards; changing a lease or a pointer does not change that.
 No SSH restrictions were widened. Do not treat the status→mode→ack→recover→MAIN
 sequence above as operational until those remaining composition tests pass.
+
+## Deploying the gateway to Oracle
+
+`jarvis/continuity/gateway_deploy.py` ships the local `jarvis/` package to the
+Oracle gateway (`/opt/jarvis`, unit `jarvis-continuity-gateway.service`). It
+never commits, and `--dry-run` runs nothing remote.
+
+```text
+.venv/bin/python -m jarvis.continuity.gateway_deploy --dry-run          # tarball + script + commands only
+.venv/bin/python -m jarvis.continuity.gateway_deploy                    # deploy, do NOT restart
+.venv/bin/python -m jarvis.continuity.gateway_deploy --restart          # deploy + restart, auto-rollback on failure
+.venv/bin/python -m jarvis.continuity.gateway_deploy --config-patch patch.json
+.venv/bin/python -m jarvis.continuity.gateway_deploy --rollback [--restart]
+```
+
+Defaults: `--host ubuntu@203.0.113.77`, `--key ~/.ssh/oracle-vm.key`.
+
+- The tarball holds `jarvis/` minus `__pycache__`, `*.pyc`, `*.pre-*` backups,
+  `.jarvis` and `jarvis/web/` (except `jarvis/web/phone/`). It is `scp`'d to
+  `/tmp`, then one `ssh ... bash -s` runs the generated script.
+- Remote script: backs up `/opt/jarvis` and `gateway.json` as `*.pre-<UTC ts>`,
+  stages `/opt/jarvis.new`, import-checks it as `jarvis-gateway`, swaps, fixes
+  owner and mode (0750). Nothing changes on the live tree if a check fails.
+- `--config-patch FILE` merges the file's top-level keys into `gateway.json`
+  (stays 0600, owner `jarvis-gateway`) and validates the result with
+  `load_gateway_config` against the staged code before the swap.
+- Without `--restart` it prints the exact restart command for you to run. With
+  it, the unit is restarted and must stay active ~15 s; otherwise the tool
+  restores the backups, restarts again and exits nonzero.
+- `--rollback` restores the newest `/opt/jarvis.pre-*` and `gateway.json.pre-*`.
+- Old `*.pre-*` backups pile up on the VM; prune them by hand.
