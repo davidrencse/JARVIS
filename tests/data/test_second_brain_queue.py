@@ -3,6 +3,7 @@ ordered publish, crash/ack safety, holds, prune protection, disabled parity, ine
 
 Fake vault and fake state in temp folders only: no real vault, state, model or network."""
 
+import contextlib
 import json
 import os
 import sqlite3
@@ -374,7 +375,8 @@ class Publish(Base):
         with patch.object(q, "MAX_RECORD_BYTES", 1000):
             with self.assertRaises(q.ArchiveCaptureError):
                 mem.add("note", "x" * 5000)
-        self.assertEqual(sqlite3.connect(self.state / "memory.sqlite3").execute("SELECT COUNT(*) FROM items").fetchone()[0], 0)
+        with contextlib.closing(sqlite3.connect(self.state / "memory.sqlite3")) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM items").fetchone()[0], 0)
         self.assertEqual(self.outbox("memory"), [])
 
     def test_held_oversize_released_with_larger_bound(self):

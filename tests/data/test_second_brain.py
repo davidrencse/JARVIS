@@ -4,6 +4,7 @@ human edits, crash/race safety, hostile vault paths, secret holds, restore rehea
 Everything runs against a fake vault and a fake state directory in a temp folder; no real vault,
 state, model or network is touched."""
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -338,12 +339,14 @@ class CrashSafety(Base):
         """A second state dir holding only this item: unchanged copy of the row, or other content."""
         other = self.base / "other"
         Memory(other)
-        with sqlite3.connect(self.state / "memory.sqlite3") as src, sqlite3.connect(other / "memory.sqlite3") as db:
-            row = list(src.execute("SELECT * FROM items WHERE id=?", (alpha_id,)).fetchone())
-            if body is not None:
-                row[3] = body
-                row[8] = "d" * 64
-            db.execute("INSERT INTO items VALUES(?,?,?,?,?,?,?,?,?,?)", row)
+        with contextlib.closing(sqlite3.connect(self.state / "memory.sqlite3")) as src, \
+                contextlib.closing(sqlite3.connect(other / "memory.sqlite3")) as db:
+            with src, db:
+                row = list(src.execute("SELECT * FROM items WHERE id=?", (alpha_id,)).fetchone())
+                if body is not None:
+                    row[3] = body
+                    row[8] = "d" * 64
+                db.execute("INSERT INTO items VALUES(?,?,?,?,?,?,?,?,?,?)", row)
         return other
 
     def _race(self, theirs_body, raise_exists):
@@ -793,7 +796,7 @@ class Snapshots(Base):
 class Restore(Base):
     def test_full_rebuild_from_the_vault_alone(self):
         ids = make_state(self.state)
-        with sqlite3.connect(self.state / "memory.sqlite3") as db:   # derived data that must not travel
+        with contextlib.closing(sqlite3.connect(self.state / "memory.sqlite3")) as db, db:   # derived data that must not travel
             db.execute("INSERT INTO vectors VALUES('v1','m',?)", (b"VECTORMARK",))
         before, files = dump(self.state), {}
         for sub in ("plans", "runs", "knowledge"):
@@ -868,9 +871,9 @@ class Restore(Base):
         make_state(self.state)
         marks = {"vectors": "VECTORMARK", "audit": "AUDITMARK", "conf": "CONFMARK", "grant": "GRANTMARK",
                  "decision": "DECISIONMARK", "token": "TOKENMARK", "phone": "PHONEMARK"}
-        with sqlite3.connect(self.state / "memory.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.state / "memory.sqlite3")) as db, db:
             db.execute("INSERT INTO vectors VALUES('v1','m',?)", (marks["vectors"].encode(),))
-        with sqlite3.connect(self.state / "history.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.state / "history.sqlite3")) as db, db:
             db.execute("INSERT INTO confirmation_audit(confirmation,at,origin,action,hash) VALUES(?,?,?,?,?)",
                        (marks["audit"], 1.0, "o", "a", "h"))
             db.execute("CREATE TABLE confirmations(id TEXT, note TEXT)")
@@ -932,7 +935,7 @@ class Tombstones(Base):
     def test_deleted_source_rows_are_counted_but_not_propagated(self):
         ids = make_state(self.state)
         self.synced()
-        with sqlite3.connect(self.state / "memory.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.state / "memory.sqlite3")) as db, db:
             db.execute("DELETE FROM items WHERE id=?", (ids["beta"],))
         report = self.synced()
         self.assertEqual((report["absent_from_source"], report["written"]), (1, 0))

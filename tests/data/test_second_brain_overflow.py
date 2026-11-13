@@ -6,6 +6,7 @@ forever, blocking every later (small) revision. With the owner's explicit overfl
 note; without the policy it stays held and visible, never dropped. Temp fixtures only.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -426,8 +427,8 @@ class Recovery(Bound):
         self.assertNotEqual(again["state"], "current")
         self.assertEqual(again["archive_chunk_damaged"], 0)   # the new head reads back on its own
         self.assertGreaterEqual(again["archive_revision_conflict"], 1)
-        head_sha = sqlite3.connect(self.state / "tasks.sqlite3").execute(
-            "SELECT payload_sha FROM archive_head").fetchone()[0]
+        with contextlib.closing(sqlite3.connect(self.state / "tasks.sqlite3")) as db:
+            head_sha = db.execute("SELECT payload_sha FROM archive_head").fetchone()[0]
         self.assertFalse(self.brain.publication_sound("tasks", "task", task["id"], head_sha))
         q.rescan(self.state)
         second = self.drain_all()

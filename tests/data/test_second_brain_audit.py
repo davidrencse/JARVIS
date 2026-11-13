@@ -3,6 +3,7 @@ outside the write lock). Temp fixtures only: no real vault, state, model or netw
 
 import json
 import os
+import contextlib
 import sqlite3
 import tempfile
 import time
@@ -233,7 +234,7 @@ class VaultReadsOutsideTheWriteLock(Base):
 
     def test_backfill_reads_notes_before_it_takes_the_write_lock(self):
         item = self._published_item()
-        with sqlite3.connect(self.state / "memory.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.state / "memory.sqlite3")) as db, db:
             db.execute("INSERT OR IGNORE INTO archive_backfill VALUES('memory','memory-item',?)", (item["id"],))
         probes = self._drain_probing()
         self.assertTrue(probes, "the backfill never read the note")
@@ -242,7 +243,7 @@ class VaultReadsOutsideTheWriteLock(Base):
 
     def test_heal_absent_reads_notes_before_it_takes_the_write_lock(self):
         item = self._published_item()
-        with sqlite3.connect(self.state / "memory.sqlite3") as db:
+        with contextlib.closing(sqlite3.connect(self.state / "memory.sqlite3")) as db, db:
             db.execute("INSERT INTO archive_absent VALUES('memory','memory-item',?,'2026-01-01')", (item["id"],))
         probes = self._drain_probing()
         self.assertTrue(probes, "heal never read the note")
