@@ -99,11 +99,15 @@ def _run_sequence(rng, state, autostart, best, box, default_stop):
             trace.append("mstart")
             if not d.running:
                 d.running, manual_stopped = True, False
+                si.update_guard_memo(state, manual_stop_at=None)
             continue
         if tok == "mstop":
             trace.append("mstop")
             if d.running:
                 d.running, manual_stopped = False, True
+                si.update_guard_memo(state, manual_stop_at=d.boot + 1, stopped_by_guard=False)
+                flag = False
+                d.guard_stop_clock = None
             continue
         # a reading
         tick = rng.choice((30, 120))
@@ -232,7 +236,6 @@ class GuardSweep(unittest.TestCase):
     def test_manual_start_is_an_override_until_together_again(self):
         self.assertNoViolation("override_blocks_stop")
 
-    @unittest.expectedFailure
     def test_manual_stop_sticks_until_boot(self):
         # BUG (suspected): with autostart on, the first reading after a boot treats any stopped
         # daemon as the guard's (boot reset in guard()). A stop by hand made before that first

@@ -599,6 +599,17 @@ class DropZoneTests(unittest.TestCase):
             self.assertEqual(push.call_args.kwargs["dest"], "desktop")
             self.assertEqual(push.call_args.kwargs["name"], source.name)
 
+    def test_servers_get_no_clipboard(self):
+        logs = []
+        config = {"devices": {"dell": {}, "oracle": {"profile": "cloud"}}}
+        from jarvis import transfer
+        with mock.patch.object(transfer, "peers", return_value=["dell", "oracle"]), \
+                mock.patch.object(clipsync.time, "sleep", side_effect=StopIteration), \
+                mock.patch.object(clipsync, "_dropzone", return_value=None):
+            with self.assertRaises(StopIteration):
+                clipsync.run_cluster(config, tempfile.mkdtemp(), board=mock.Mock(), log=logs.append)
+        self.assertIn("linked with dell over the cluster", logs)
+
     def test_no_desktop_support_means_no_zone(self):
         shared, logs = self.run_zone([], command=None)
         self.assertEqual(shared, [])
