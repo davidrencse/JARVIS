@@ -7,13 +7,13 @@ import os
 import shutil
 import sqlite3
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from jarvis import brainsync
+from tests.data.test_brainsync_cli import _BrainDriver
 
 ROOT = Path(__file__).resolve().parents[2]
 SECRET = "sk-abcdefghijklmnopqrstuvwxyz"
@@ -57,6 +57,14 @@ def devices():
 
 
 class BrainSyncTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._driver = _BrainDriver()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._driver.close()
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -459,26 +467,19 @@ class BrainSyncTests(unittest.TestCase):
         config_path = base / "jarvis.config.json"
         config_path.write_text("{}\n")
         state = base / ".jarvis"
-        env = os.environ.copy()
-        env["JARVIS_NO_MODELS"] = "1"
-        help_proc = subprocess.run(
-            [sys.executable, "-m", "jarvis", "--config", str(config_path), "--state", str(state),
-             "brain", "-h"], cwd=ROOT, capture_output=True, env=env, text=True, check=False)
+        prefix = ["--config", str(config_path), "--state", str(state), "brain"]
+        help_proc = self._driver.run([*prefix, "-h"], ROOT, None, 30)
         self.assertEqual(help_proc.returncode, 0, help_proc.stderr)
-        self.assertNotIn("receive", help_proc.stdout)
-        self.assertNotIn("export", help_proc.stdout)
-        self.assertNotIn("freeze", help_proc.stdout)
-        status = subprocess.run(
-            [sys.executable, "-m", "jarvis", "--config", str(config_path), "--state", str(state),
-             "brain", "status"], cwd=ROOT, capture_output=True, env=env, text=True, check=False)
+        help_text = help_proc.stdout.decode()
+        self.assertNotIn("receive", help_text)
+        self.assertNotIn("export", help_text)
+        self.assertNotIn("freeze", help_text)
+        status = self._driver.run([*prefix, "status"], ROOT, None, 30)
         self.assertEqual(status.returncode, 0, status.stderr)
-        body = json.loads(status.stdout)
+        body = json.loads(status.stdout.decode())
         self.assertTrue(body["ok"])
         self.assertFalse(body["enabled"])
-        hidden = subprocess.run(
-            [sys.executable, "-m", "jarvis", "--config", str(config_path), "--state", str(state),
-             "brain", "receive"], cwd=ROOT, capture_output=True, env=env, input=b"not-a-bundle",
-            check=False)
+        hidden = self._driver.run([*prefix, "receive"], ROOT, b"not-a-bundle", 30)
         self.assertNotEqual(hidden.returncode, 0)
         self.assertFalse((base / ".jarvis" / "brain-git").exists())
 

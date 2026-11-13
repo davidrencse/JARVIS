@@ -11,15 +11,18 @@ stdin, export/freeze truncating a body over 4096 bytes, and the SSH adapter
 skipping the peer checkout's ``.venv``) are asserted as the contract.
 """
 
+import base64
 import hashlib
 import json
 import os
+import select
 import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -100,7 +103,111 @@ def _pad_over_limit(payload):
     return padded
 
 
+_BRAIN_DRIVER = r'''
+import base64, io, json, os, sys
+from contextlib import redirect_stderr, redirect_stdout
+from jarvis.__main__ import main
+
+class _Capture(io.TextIOBase):
+    def __init__(self):
+        self.buffer = io.BytesIO()
+    def write(self, text):
+        data = text.encode("utf-8", "surrogateescape") if isinstance(text, str) else text
+        self.buffer.write(data)
+        return len(text)
+    def flush(self):
+        return None
+
+real_in, real_out = sys.stdin.buffer, sys.stdout.buffer
+while True:
+    line = real_in.readline()
+    if not line:
+        break
+    req = json.loads(line)
+    os.chdir(req["cwd"])
+    sys.argv = ["jarvis", *req["args"]]
+    raw = base64.b64decode(req.get("stdin") or "")
+    sys.stdin = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8", errors="surrogateescape")
+    sink, err = _Capture(), _Capture()
+    code = 0
+    try:
+        with redirect_stdout(sink), redirect_stderr(err):
+            try:
+                code = main() or 0
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+    except Exception as exc:
+        err.write("Traceback " + repr(exc))
+        code = 1
+    reply = json.dumps({
+        "code": int(code or 0),
+        "stdout": base64.b64encode(sink.buffer.getvalue()).decode("ascii"),
+        "stderr": base64.b64encode(err.buffer.getvalue()).decode("ascii"),
+    }).encode()
+    real_out.write(reply + b"\n")
+    real_out.flush()
+'''
+
+
+class _BrainDriver:
+    """One interpreter for many `python -m jarvis` commands. Each call still goes through main()."""
+
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", _BRAIN_DRIVER], cwd=ROOT, env=_child_env(),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self._err = bytearray()
+
+        def drain():
+            while True:
+                chunk = self.proc.stderr.read(4096)
+                if not chunk:
+                    break
+                self._err.extend(chunk)
+
+        self._drain = threading.Thread(target=drain, daemon=True)
+        self._drain.start()
+
+    def run(self, args, cwd, data, timeout):
+        payload = json.dumps({
+            "cwd": str(cwd),
+            "args": list(args),
+            "stdin": base64.b64encode(data or b"").decode("ascii"),
+        }).encode() + b"\n"
+        self.proc.stdin.write(payload)
+        self.proc.stdin.flush()
+        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        if not ready:
+            detail = self._err.decode("utf-8", "replace")[-500:]
+            raise AssertionError(f"cli driver timed out: {detail}")
+        line = self.proc.stdout.readline()
+        if not line:
+            detail = self._err.decode("utf-8", "replace")[-800:]
+            raise AssertionError(f"cli driver died: {detail}")
+        done = json.loads(line)
+        return subprocess.CompletedProcess(
+            list(args), int(done["code"]),
+            base64.b64decode(done["stdout"]), base64.b64decode(done["stderr"]))
+
+    def close(self):
+        proc = self.proc
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+
+
 class BrainCliTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._driver = _BrainDriver()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._driver.close()
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -120,8 +227,8 @@ class BrainCliTests(unittest.TestCase):
                 "brain", action, *extra]
         self.assertTrue(Path(sys.executable).is_absolute(), sys.executable)
         self.assertEqual(argv[0], sys.executable)
-        return subprocess.run(argv, cwd=self.unrelated, env=_child_env(), input=input,
-                              capture_output=True, timeout=timeout, check=False)
+        # main() sees the same user arguments `python -m jarvis` would put in argv[1:].
+        return self._driver.run(argv[3:], self.unrelated, input, timeout)
 
     def write_config(self, base, local, main, vault, *, enabled=False, remote=None, devices=None,
                      filename="jarvis.config.json"):

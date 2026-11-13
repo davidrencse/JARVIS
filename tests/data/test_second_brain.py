@@ -8,12 +8,14 @@ import errno
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -31,6 +33,11 @@ ROOT = Path(__file__).resolve().parents[2]
 SK = "sk-" + "a" * 30
 GHP = "ghp_" + "a" * 36
 PEM = "-----BEGIN " + "RSA PRIVATE KEY-----"
+
+
+def raw_looks_secret(obj):
+    """What looks_secret meant before the literal fast path: every SECRET_RES on every string."""
+    return any(rx.search(text) for text in sbmod._strings(obj) for rx in sbmod.SECRET_RES)
 
 
 # -- fixtures --------------------------------------------------------------------------------
@@ -592,6 +599,145 @@ class Boundaries(Base):
         self.assertTrue(looks_secret({"a": [{"b": f"x {SK}"}]}))
         self.assertTrue(looks_secret(["password = hunter2hunter2hunter2"]))
         self.assertFalse(looks_secret({"a": "plain text", "n": 5}))
+
+    def test_looks_secret_matches_the_raw_patterns(self):
+        """Every pattern, the near misses, and a seeded fuzz agree with SECRET_RES.search."""
+        tail = "a" * 16
+        jwt = "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10
+        cases = {
+            "sk": (f"x {SK} y", True),
+            "sk-short": ("sk-" + "a" * 19, False),
+            "sk-boundary": ("ask-" + "a" * 30, False),
+            "sk-later": ("sk-" + "a" * 10 + " sk-" + "b" * 20, True),
+            "ghp": (f"token {GHP}", True),
+            "ghx": ("ghx_" + "a" * 36, False),
+            "gho": ("gho_" + "a" * 30, True),
+            "xox": ("xoxb-" + "a" * 10, True),
+            "xox-short": ("xoxb-" + "a" * 9, False),
+            "xoxc": ("xoxc-" + "a" * 12, False),
+            "akia": ("AKIA" + "A" * 16, True),
+            "akia-long": ("AKIA" + "A" * 17, False),
+            "akia-lower": ("akia" + "a" * 16, False),
+            "aiza": ("AIza" + "a" * 35, True),
+            "aiza-short": ("AIza" + "a" * 34, False),
+            "jwt": (jwt, True),
+            "jwt-later": ("eyJ" + "a" * 9 + "!" + jwt, True),
+            "jwt-short": ("eyJ" + "a" * 10 + "." + "b" * 10, False),
+            "pem": (PEM, True),
+            "pem-public": ("-----BEGIN PUBLIC KEY-----", False),
+            "pem-lower": ("-----begin rsa private key-----", False),
+            "bearer": ("Bearer " + "a" * 24, True),
+            "bearer-short": ("bearer " + "a" * 23, False),
+            "bearer-boundary": ("xbearer " + "a" * 24, False),
+            "password": ("password = hunter2hunter2hunter2", True),
+            "password-case": ("PassWord = " + tail, True),
+            "api_key": ("api_key = " + tail, True),
+            "api-key": ("API-KEY:" + tail, True),
+            "apikey": ('apikey="' + tail + '"', True),
+            "secret-quote": ("secret: '" + tail + "'", True),
+            "passwd": ("passwd=" + tail, True),
+            "token-inside": ("mytoken=" + tail, True),
+            "token-short": ("token = " + "a" * 15, False),
+            "token-word": ("the token is not assigned", False),
+            "ws": ("token" + " " * 40 + "=" + tail, True),
+            "kelvin": ("to\u212aen = " + tail, True),
+            "nbsp": ("token\u00a0=\u00a0" + tail, True),
+            "emoji-sk": ("héllo " + SK, True),
+            "empty": ("", False),
+            "plain": ("ordinary note", False),
+        }
+        for name, (text, want) in cases.items():
+            got = looks_secret(text)
+            self.assertEqual(got, want, name)
+            self.assertEqual(got, raw_looks_secret(text), name)
+        nested = {"a": [{"b": f"x {SK}"}], "n": 5, "t": ("password = " + tail,)}
+        self.assertTrue(looks_secret(nested))
+        self.assertEqual(looks_secret(nested), raw_looks_secret(nested))
+        self.assertFalse(looks_secret({"a": "plain", "n": 5, "b": None}))
+        blob = "z" * 50_000
+        late = blob + " " + SK
+        early = SK + blob
+        self.assertFalse(looks_secret(blob))
+        self.assertEqual(looks_secret(blob), raw_looks_secret(blob))
+        self.assertTrue(looks_secret(late) and looks_secret(early))
+        self.assertEqual(looks_secret(late), raw_looks_secret(late))
+        rng = random.Random(339420)
+        alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-=:.'\"/\n"
+        fragments = ["", "z", "sk-", "token", "password", "Bearer ", "eyJ", "AKIA", "-----BEGIN ",
+                     "ghp_", "xoxb-", "AIza", "=", ":", "secret", "api_key", "\u212a", "é", "\u00a0"]
+        for i in range(80):
+            parts = [rng.choice(fragments) if i % 2 else rng.choice(alphabet) for _ in range(rng.randint(1, 24))]
+            if i % 5 == 0:
+                parts.append(rng.choice((SK, GHP, PEM, jwt, "Bearer " + "c" * 24, "token = " + tail)))
+            text = "".join(parts)
+            self.assertEqual(looks_secret(text), raw_looks_secret(text), text[:80])
+            wrapped = {"k": [text, {"n": i}]}
+            self.assertEqual(looks_secret(wrapped), raw_looks_secret(wrapped), i)
+
+    def test_looks_secret_bulk_ascii_beats_the_raw_scan(self):
+        """Relative to SECRET_RES on the same run. A fixed clock budget flakes across machines."""
+        blob = "z" * (512 * 1024)
+        obj = {"spec": blob, "n": 1}
+        looks_secret(obj)
+        raw_looks_secret(obj)
+
+        def best(fn):
+            samples = []
+            for _ in range(3):
+                started = time.perf_counter()
+                self.assertFalse(fn())
+                samples.append(time.perf_counter() - started)
+            return min(samples)
+
+        fast, slow = best(lambda: looks_secret(obj)), best(lambda: raw_looks_secret(obj))
+        self.assertGreater(slow, fast * 5, f"fast={fast:.4f}s slow={slow:.4f}s")
+        planted = {"spec": blob + " " + SK}
+        self.assertTrue(looks_secret(planted))
+        self.assertTrue(raw_looks_secret(planted))
+
+    def test_looks_secret_jwt_needle_repeat_stays_linear(self):
+        """'-eyJ' is a word boundary at every needle, and the class then eats the rest.
+
+        A match at each hit backtracks over that suffix (quadratic, and SECRET_RES.search
+        does too). The scan agrees with the raw pattern and stays one pass.
+        """
+        body = "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10
+        tricky = (
+            "-eyJ" * 200,
+            "-eyJ" * 200 + body,
+            "-eyJ" * 40 + "!" + body,
+            "_" + body,
+            "x" + body,
+            "é" + body,
+            "\u212a" + body,
+            "\u00a0" + body,
+            "\n" + body,
+            "-" + body,
+            body,
+            "eyJ" + "a" * 9 + "." + "b" * 10 + "." + "c" * 10,
+            "eyJ" + "a" * 10 + "." + "b" * 9 + "." + "c" * 10,
+            "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 9,
+            "eyJaaa.eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10,
+            "eyJ" + "a" * 10 + "." + "bb!eyJ" + "c" * 10 + "." + "d" * 10 + "." + "e" * 10,
+        )
+        for text in tricky:
+            self.assertEqual(looks_secret(text), raw_looks_secret(text), text[:70])
+
+        # 16 KB of '-eyJ'. SECRET_RES.search backtracks over the suffix at every needle.
+        # Same-run ratio, same reason as the bulk test: a fixed cutoff flakes.
+        text = "-eyJ" * 4000
+
+        def best(fn):
+            fn(text)
+            samples = []
+            for _ in range(3):
+                started = time.perf_counter()
+                self.assertFalse(fn(text))
+                samples.append(time.perf_counter() - started)
+            return min(samples)
+
+        fast, slow = best(looks_secret), best(raw_looks_secret)
+        self.assertGreater(slow, fast * 20, f"fast={fast:.4f}s slow={slow:.4f}s")
 
 
 # -- 8. snapshot consistency -------------------------------------------------------------------

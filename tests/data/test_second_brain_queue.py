@@ -15,6 +15,7 @@ from unittest.mock import patch
 os.environ.setdefault("JARVIS_NO_MODELS", "1")
 
 from jarvis import second_brain_queue as q  # noqa: E402
+from jarvis import second_brain_runtime as rt  # noqa: E402
 from jarvis.history import History  # noqa: E402
 from jarvis.locking import exclusive_lock  # noqa: E402
 from jarvis.memory import Memory  # noqa: E402
@@ -470,6 +471,123 @@ class InertRestore(Base):
         self.assertFalse(q.status(target)["enabled"])
         self.assertTrue(self.brain.validate()["ok"])
         self.assertTrue(done)
+
+
+class RawGuardPolicy(Base):
+    """S16 and S17. Temp state and temp vault only."""
+
+    def _cfg(self):
+        (self.vault / ".obsidian").mkdir(exist_ok=True)
+        return {"second_brain": {"enabled": True, "canonical_read": True},
+                "vault": {"path": str(self.vault), "enabled": True, "recall": True}}
+
+    def _runtime(self):
+        return rt.status(self._cfg(), self.state)
+
+    def test_scratch_delete_does_not_latch_and_recreated_source_heals_only_when_verified(self):
+        self.on()
+        mem = Memory(self.state)
+        kept = mem.add("note", "keep me visible body")
+        stayed = mem.add("note", "second archived body stays")
+        self.assertEqual(self.drain()["failed"], 0)
+        self.assertEqual(self._runtime()["state"], "current")
+        self.assertEqual(q.status(self.state)["source_gone"], 0)
+        raw = sqlite3.connect(self.state / "memory.sqlite3")
+        raw.execute(
+            "INSERT INTO items VALUES(?,?,?,?,?,?,?,?,?,?)",
+            ("note:scratch", "note", "scratch", "scratch body", "", "test", 0.5, "{}",
+             "digest-scratch", "2026-01-01T00:00:00+00:00"))
+        raw.execute("DELETE FROM items WHERE id=?", ("note:scratch",))
+        raw.commit()
+        raw.close()
+        scratch = self.drain()
+        self.assertEqual(scratch["source_gone"], 0, scratch)
+        self.assertEqual(q.status(self.state)["source_gone"], 0)
+        self.assertEqual(self._runtime()["state"], "current")
+        self.assertNotIn("note:scratch", " ".join(q.status(self.state)["source_gone_ids"]))
+
+        raw = sqlite3.connect(self.state / "memory.sqlite3")
+        saved = tuple(raw.execute("SELECT * FROM items WHERE id=?", (kept["id"],)).fetchone())
+        raw.execute("DELETE FROM items WHERE id=?", (kept["id"],))
+        raw.execute("DELETE FROM items WHERE id=?", (stayed["id"],))
+        raw.commit()
+        raw.close()
+        other = mem.add("note", "unrelated normal note")
+        gone = q.status(self.state)
+        self.assertEqual(gone["source_gone"], 2, gone)
+        self.assertEqual(gone["unreconciled"], 0)
+        self.assertCountEqual(
+            gone["source_gone_ids"],
+            [f"memory/memory-item/{kept['id']}", f"memory/memory-item/{stayed['id']}"])
+        self.assertEqual(mem.get(other["id"])["body"], "unrelated normal note")
+        offline = q.drain(self.state, self.state / "missing-vault")
+        self.assertFalse(offline["vault_ok"])
+        self.assertFalse(offline["ok"])
+        self.assertEqual(offline["source_gone"], 2, offline)
+        self.assertGreaterEqual(offline["remaining"], 1)
+        self.assertEqual(self.brain.latest(f"memory/memory-item/{kept['id']}")["fields"]["body"],
+                         "keep me visible body")
+        self.assertEqual(self._runtime()["state"], "pending")
+
+        raw = sqlite3.connect(self.state / "memory.sqlite3")
+        raw.execute("INSERT INTO items VALUES(?,?,?,?,?,?,?,?,?,?)", saved)
+        raw.commit()
+        raw.close()
+        still = q.drain(self.state, self.state / "missing-vault")
+        self.assertFalse(still["vault_ok"])
+        self.assertIn(f"memory/memory-item/{kept['id']}", q.status(self.state)["source_gone_ids"])
+        self.assertEqual(self.brain.latest(f"memory/memory-item/{kept['id']}")["fields"]["body"],
+                         "keep me visible body")
+        self.assertEqual(q.acknowledge_absent(self.state, f"memory/memory-item/{stayed['id']}"), 1)
+        after_ack = q.status(self.state)
+        self.assertEqual(after_ack["source_gone_ids"], [f"memory/memory-item/{kept['id']}"])
+        self.assertEqual(self.brain.latest(f"memory/memory-item/{stayed['id']}")["fields"]["body"],
+                         "second archived body stays")
+        self.assertFalse(any(path.name.endswith("-t.md") for path in self.vault.rglob("*.md")))
+        healed = self.drain()
+        self.assertTrue(healed["ok"], healed)
+        self.assertEqual(healed["source_gone"], 0, healed)
+        self.assertEqual(healed["remaining"], 0, healed)
+        self.assertEqual(q.status(self.state)["source_gone"], 0)
+        self.assertEqual(self.brain.latest(f"memory/memory-item/{kept['id']}")["fields"]["body"],
+                         "keep me visible body")
+        self.assertEqual(self.brain.latest(f"memory/memory-item/{stayed['id']}")["fields"]["body"],
+                         "second archived body stays")
+        self.assertFalse(any(path.name.endswith("-t.md") for path in self.vault.rglob("*.md")))
+        self.assertTrue(self.brain.validate()["ok"])
+        self.assertEqual(self._runtime()["state"], "current")
+        self.assertEqual(self._runtime()["archive_source_gone"], 0)
+
+    def test_raw_legacy_update_does_not_roll_back_an_unrelated_mutation(self):
+        self.on()
+        store = Store(self.state, prune=False)
+        victim = store.add({"objective": "victim"})
+        other = store.add({"objective": "hold the lane"})
+        store.transition(other["id"], "queued", "running", {"pid": 1})
+        self.assertEqual(self.drain()["failed"], 0)
+        self.assertEqual(self.outbox("tasks"), [])
+        raw = sqlite3.connect(self.state / "tasks.sqlite3")
+        raw.execute("UPDATE tasks SET spec=? WHERE id=?",
+                    (json.dumps({"objective": "Z" * 4000}), victim["id"]))
+        raw.commit()
+        raw.close()
+        with patch.object(q, "MAX_RECORD_BYTES", 1500):
+            added = store.add({"objective": "small unrelated"})
+            with patch("jarvis.daemon._alive", return_value=False):
+                reaped = store.reap_stale()
+            present = {row["id"] for row in store.list()}
+            with self.assertRaises(q.ArchiveCaptureError):
+                store.add({"objective": "Y" * 4000})
+            self.assertEqual({row["id"] for row in store.list()}, present)
+        self.assertIn(added["id"], present)
+        self.assertIn(victim["id"], present)
+        self.assertEqual(reaped, [other["id"]])
+        self.assertEqual(store.get(other["id"])["state"], "failed")
+        self.assertEqual(store.get(victim["id"])["state"], "queued")
+        held = [row for row in self.outbox("tasks") if row[2] == victim["id"]]
+        self.assertEqual(len(held), 1, held)
+        self.assertEqual(held[0][3:6], ("held", "oversize", "reconcile"))
+        self.assertTrue(any(row[2] == added["id"] and row[3] == "pending" for row in self.outbox("tasks")))
 
 
 if __name__ == "__main__":

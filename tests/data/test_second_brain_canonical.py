@@ -21,6 +21,7 @@ os.environ.setdefault("JARVIS_NO_MODELS", "1")
 from jarvis import second_brain as sb  # noqa: E402
 from jarvis import second_brain_queue as q  # noqa: E402
 from jarvis import second_brain_runtime as rt  # noqa: E402
+from jarvis.history import History  # noqa: E402
 from jarvis.memory import Memory  # noqa: E402
 from jarvis.second_brain import SecondBrain  # noqa: E402
 from jarvis.store import Store  # noqa: E402
@@ -396,6 +397,77 @@ class CanonicalRead(Base):
             with self.assertRaises(sb.SecondBrainError) as raised:
                 self.brain.canonical_records(store="memory", kind=colliders[0])
             self.assertIn("record-identity-mismatch", str(raised.exception))
+
+
+    def test_retired_records_stay_out_of_recall_and_column_names_are_not_hits(self):
+        """S1/S2: opt-in recall hides forgotten, replaced, and closed bodies, and a
+        column name is not a hit. Body, history, and task text still match. Every
+        selected head is still loaded, including after the query matches nothing."""
+        q.configure(self.state, True)
+        mem = Memory(self.state)
+        forgotten = mem.add("profile", "jasminecanaryquietmornings")
+        replaced = mem.add("fact", "replacedfactcedarmoss")
+        closed = mem.add("loop", "closedloopharborlight")
+        active = mem.add("profile", "active cedar profile stays visible")
+        noted = mem.add("note", "uniquebodytoken in the note text", title="Unrelated heading")
+        History(self.state).record(
+            "historytoken west window",
+            {"device": "main", "intent": "open", "args": {"app": "x"}},
+            {"ok": True, "state": "verified", "text": "done"}, text="ran")
+        task = Store(self.state, prune=False).add({"objective": "taskbodytoken ship the ledger"})
+        self.drain_all()
+        self.assertTrue(mem.forget_profile(forgotten["id"]))
+        self.assertTrue(mem.retire(replaced["id"], "replaced"))
+        self.assertTrue(mem.retire(closed["id"], "closed"))
+        rep = self.drain_all()
+        self.assertEqual(rep["remaining"], 0, rep)
+        self.assertFalse(rep["failed"], rep)
+        status = rt.status(self.config(True), self.state)
+        self.assertEqual(status["state"], "current", status)
+        self.assertTrue(status["canonical"], status)
+        self.assertEqual([row["text"] for row in mem.profile()], ["active cedar profile stays visible"])
+        for item, kind in ((forgotten, "forgotten"), (replaced, "replaced"), (closed, "closed")):
+            latest = self.brain.latest(f"memory/memory-item/{item['id']}")
+            self.assertEqual(latest["fields"]["kind"], kind)
+            self.assertIn(item["body"], latest["fields"]["body"])
+        self.assertFalse(any(path.name.endswith("-t.md") for path in self.vault.rglob("*.md")))
+        self.assertTrue(self.brain.validate()["ok"])
+
+        def ask(text):
+            with patch.object(Vault, "context", side_effect=AssertionError("legacy recall")):
+                return recall(self.config(True), self.state, text)
+
+        self.assertEqual(ask("jasminecanaryquietmornings"), [])
+        self.assertEqual(ask("replacedfactcedarmoss"), [])
+        self.assertEqual(ask("closedloopharborlight"), [])
+        self.assertEqual(ask("check the importance value now"), [])
+        self.assertEqual(ask("created column is not content"), [])
+        active_lines = ask("active cedar profile stays visible")
+        self.assertTrue(any("active cedar profile stays visible" in line for line in active_lines), active_lines)
+        body_lines = ask("uniquebodytoken")
+        self.assertTrue(any("uniquebodytoken" in line for line in body_lines), body_lines)
+        self.assertTrue(any(noted["id"] in line for line in body_lines), body_lines)
+        self.assertTrue(any("historytoken" in line for line in ask("historytoken west window")))
+        task_lines = ask("taskbodytoken ship the ledger")
+        self.assertTrue(any("taskbodytoken" in line for line in task_lines), task_lines)
+        self.assertTrue(any(task["id"] in line for line in task_lines), task_lines)
+        latest, _, _, _ = self.brain._scan()
+        expect = sorted(
+            info["name"] for info in latest.values()
+            if self.brain._placed(info)[0] in ("memory", "history", "tasks")
+        )
+        self.assertGreaterEqual(len(expect), 6, expect)
+        loaded = []
+        real_load = SecondBrain._load
+
+        def spy(brain, path):
+            loaded.append(Path(path).name)
+            return real_load(brain, path)
+
+        with patch.object(SecondBrain, "_load", spy), \
+                patch.object(Vault, "context", side_effect=AssertionError("legacy recall")):
+            self.assertEqual(recall(self.config(True), self.state, "check the importance value now"), [])
+        self.assertTrue(set(expect).issubset(loaded), (loaded, expect))
 
 
 class KindSlugInvariant(unittest.TestCase):

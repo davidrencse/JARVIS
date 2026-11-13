@@ -2,6 +2,7 @@
 
 import http.client
 import json
+import stat
 import subprocess
 import tempfile
 import threading
@@ -396,7 +397,8 @@ class StorageHttpTests(Temp):
         handler = type("H", (Handler,), {"console": self.console,
                                           "hosts": ("127.0.0.1", "localhost")})
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01},
+                         daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.port = self.server.server_address[1]
@@ -423,6 +425,346 @@ class StorageHttpTests(Temp):
         self.assertEqual(self.call("GET", "/api/fs?device=nope")[0], 400)
         self.assertEqual(self.call("POST", "/api/fs/copy", {}, header=False)[0], 403)
         self.assertEqual(self.call("POST", "/api/fs/copy", {"src_device": "dell"})[0], 400)
+
+
+class WindowsLandTests(unittest.TestCase):
+    """A Windows Access Denied after mkdir must not throw away the upload.
+
+    Hard links and placeholder-replace return WinError 5 when the new file is
+    still open elsewhere, and publish_new then deletes the only copy. The
+    Windows land path renames onto a free name and leaves an existing file
+    or link alone.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name)
+        self.part = self.folder / ".jarvis-upload-abc.part"
+        self.part.write_bytes(b"main-to-dell")
+
+    def test_rename_lands_without_a_hard_link_or_placeholder(self):
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.pathsafe, "link_new", side_effect=AssertionError("link")), \
+                patch.object(transfer.pathsafe, "publish_new", side_effect=AssertionError("publish")), \
+                patch.object(transfer.time, "sleep"):
+            landed = transfer._land(self.part, self.folder, "jarvis-disposable-m2d.txt")
+        self.assertEqual(landed, "jarvis-disposable-m2d.txt")
+        self.assertEqual((self.folder / landed).read_bytes(), b"main-to-dell")
+        self.assertFalse(self.part.exists())
+
+    def test_existing_file_and_link_are_not_overwritten(self):
+        taken = self.folder / "jarvis-disposable-m2d.txt"
+        taken.write_bytes(b"KEEP")
+        other = self.folder / "other.txt"
+        other.write_bytes(b"OTHER")
+        link = self.folder / "jarvis-disposable-m2d (2).txt"
+        link.symlink_to(other)
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.pathsafe, "link_new", side_effect=AssertionError("link")), \
+                patch.object(transfer.pathsafe, "publish_new", side_effect=AssertionError("publish")), \
+                patch.object(transfer.time, "sleep"):
+            landed = transfer._land(self.part, self.folder, "jarvis-disposable-m2d.txt")
+        self.assertEqual(landed, "jarvis-disposable-m2d (3).txt")
+        self.assertEqual(taken.read_bytes(), b"KEEP")
+        self.assertEqual(other.read_bytes(), b"OTHER")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.read_bytes(), b"OTHER")
+        self.assertEqual((self.folder / landed).read_bytes(), b"main-to-dell")
+        self.assertFalse(self.part.exists())
+
+    def test_sharing_denial_retries_then_copies_without_replacing(self):
+        real = transfer.os.rename
+        calls = {"n": 0}
+
+        def once(src, dst):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(13, "Access is denied")
+            return real(src, dst)
+
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.os, "rename", once), \
+                patch.object(transfer.pathsafe, "publish_new", side_effect=AssertionError("publish")), \
+                patch.object(transfer.time, "sleep") as slept:
+            landed = transfer._land(self.part, self.folder, "notes.txt")
+        self.assertEqual(landed, "notes.txt")
+        self.assertEqual((self.folder / "notes.txt").read_bytes(), b"main-to-dell")
+        self.assertFalse(self.part.exists())
+        self.assertEqual(slept.call_count, 1)
+
+        # Rename stays denied (the part is open without share-delete). The bytes
+        # are still readable, so they land by an exclusive copy. publish_new is
+        # not used: its failure path deletes the destination.
+        blocked = self.folder / ".jarvis-upload-blocked.part"
+        blocked.write_bytes(b"still-here")
+
+        def always(src, dst):
+            raise PermissionError(13, "Access is denied")
+
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.os, "rename", always), \
+                patch.object(transfer.pathsafe, "link_new", side_effect=AssertionError("link")), \
+                patch.object(transfer.pathsafe, "publish_new", side_effect=AssertionError("publish")), \
+                patch.object(transfer.time, "sleep") as slept:
+            landed = transfer._land(blocked, self.folder, "blocked.txt")
+        self.assertEqual(landed, "blocked.txt")
+        self.assertEqual((self.folder / "blocked.txt").read_bytes(), b"still-here")
+        self.assertFalse(blocked.exists())
+        self.assertEqual(slept.call_count, transfer._WIN_SHARE_TRIES - 1)
+
+    def test_copy_falls_back_only_after_rename_stays_denied(self):
+        held = self.folder / ".jarvis-upload-held.part"
+        held.write_bytes(b"copied")
+
+        def always(src, dst):
+            raise PermissionError(13, "Access is denied")
+
+        real_unlink = transfer.os.unlink
+
+        def keep_part(path, *args, **kwargs):
+            if str(path).endswith(".part"):
+                raise PermissionError(13, "Access is denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.os, "rename", always), \
+                patch.object(transfer.os, "unlink", keep_part), \
+                patch.object(transfer.pathsafe, "publish_new", side_effect=AssertionError("publish")), \
+                patch.object(transfer.time, "sleep"):
+            landed = transfer._land(held, self.folder, "held.txt")
+        self.assertEqual(landed, "held.txt")
+        self.assertEqual((self.folder / "held.txt").read_bytes(), b"copied")
+        self.assertEqual(held.read_bytes(), b"copied")
+        self.assertEqual(stat.S_IMODE((self.folder / "held.txt").stat().st_mode) & 0o777, 0o600)
+
+    def test_create_denial_keeps_the_part_and_does_not_touch_an_existing_name(self):
+        blocked = self.folder / ".jarvis-upload-blocked.part"
+        blocked.write_bytes(b"still-here")
+        taken = self.folder / "blocked.txt"
+        taken.write_bytes(b"KEEP")
+
+        def always(src, dst):
+            raise PermissionError(13, "Access is denied")
+
+        real_open = transfer.pathsafe.open_leaf
+
+        def open_leaf(folder, name, mode="rb"):
+            if mode == "xb":
+                raise PermissionError(13, "Access is denied")
+            return real_open(folder, name, mode)
+
+        real_lstat = transfer.os.lstat
+
+        def lstat(path, *args, **kwargs):
+            # Windows lexists/lstat can hide an existing name behind WinError 5.
+            if str(path).endswith("blocked.txt"):
+                raise PermissionError(13, "Access is denied")
+            return real_lstat(path, *args, **kwargs)
+
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.os, "rename", always), \
+                patch.object(transfer.os, "lstat", lstat), \
+                patch.object(transfer.pathsafe, "open_leaf", open_leaf), \
+                patch.object(transfer.pathsafe, "publish_new", side_effect=AssertionError("publish")), \
+                patch.object(transfer.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                transfer._land(blocked, self.folder, "blocked.txt")
+        self.assertEqual(blocked.read_bytes(), b"still-here")
+        self.assertEqual(taken.read_bytes(), b"KEEP")
+        self.assertFalse((self.folder / "blocked (2).txt").exists())
+
+    def test_a_symlink_part_is_not_published(self):
+        secret = self.folder / "secret"
+        secret.write_bytes(b"SECRET")
+        self.part.unlink()
+        self.part.symlink_to(secret)
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.time, "sleep"):
+            with self.assertRaises(ValueError):
+                transfer._land(self.part, self.folder, "landed.txt")
+        self.assertFalse((self.folder / "landed.txt").exists())
+        self.assertEqual(secret.read_bytes(), b"SECRET")
+        self.assertTrue(self.part.is_symlink())
+
+    def test_windows_create_retries_access_denied_and_posix_does_not(self):
+        calls = {"n": 0}
+
+        def open_leaf(folder, name, mode="rb"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError(13, "Access is denied")
+            return "opened"
+
+        with patch.object(transfer.os, "name", "nt"), \
+                patch.object(transfer.pathsafe, "open_leaf", open_leaf), \
+                patch.object(transfer.time, "sleep"):
+            self.assertEqual(transfer._open_upload(self.folder, "x.part", "xb"), "opened")
+        self.assertEqual(calls["n"], 2)
+
+        calls["n"] = 0
+        with patch.object(transfer.os, "name", "posix"), \
+                patch.object(transfer.pathsafe, "open_leaf", open_leaf):
+            with self.assertRaises(PermissionError):
+                transfer._open_upload(self.folder, "x.part", "xb")
+        self.assertEqual(calls["n"], 1)
+
+
+class DownloadCleanupTests(unittest.TestCase):
+    """A sharing denial after the bytes are in must not delete the only copy.
+
+    ``pull_path`` and ``fetch_file`` unlinked the part in ``finally``, including
+    when landing raised ``PermissionError``. That is the cleanup that threw
+    away a finished upload. Patching ``os.name`` is avoided: on this interpreter
+    it makes ``Path()`` try to build a ``WindowsPath``.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name)
+
+    def test_pull_path_keeps_finished_bytes_when_rename_is_denied(self):
+        import base64
+        payload = base64.b64encode(b"main-to-dell").decode()
+
+        def fake_call(config, state, device, body, timeout=120):
+            self.assertEqual(body["offset"], 0)
+            return {"data": payload, "size": len(b"main-to-dell"), "eof": True}
+
+        with patch.object(transfer, "call", fake_call), \
+                patch.object(transfer, "_land", side_effect=PermissionError(13, "Access is denied")):
+            with self.assertRaises(PermissionError):
+                transfer.pull_path({}, None, "dell", "/src/notes.txt", self.folder, "notes.txt")
+        parts = list(self.folder.glob(".jarvis-upload-*.part"))
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0].read_bytes(), b"main-to-dell")
+        self.assertFalse((self.folder / "notes.txt").exists())
+
+    def test_fetch_file_keeps_finished_bytes_when_rename_is_denied(self):
+        import base64
+        payload = base64.b64encode(b"from-dell").decode()
+
+        def fake_call(config, state, device, body, timeout=120):
+            return {"data": payload, "size": len(b"from-dell"), "eof": True}
+
+        with patch.object(transfer, "peer", lambda config, name=None: "dell"), \
+                patch.object(transfer, "call", fake_call), \
+                patch.object(transfer, "_land", side_effect=PermissionError(13, "Access is denied")):
+            with self.assertRaises(PermissionError):
+                transfer.fetch_file({}, None, "notes.txt", dest=self.folder)
+        parts = list(self.folder.glob(".jarvis-upload-*.part"))
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0].read_bytes(), b"from-dell")
+        self.assertFalse((self.folder / "notes.txt").exists())
+
+    def test_pull_path_still_removes_a_partial_on_a_normal_failure(self):
+        def fake_call(config, state, device, body, timeout=120):
+            raise RuntimeError("link dropped")
+
+        with patch.object(transfer, "call", fake_call), \
+                self.assertRaises(RuntimeError):
+            transfer.pull_path({}, None, "dell", "/src/notes.txt", self.folder, "notes.txt")
+        self.assertEqual(list(self.folder.glob(".jarvis-upload-*.part")), [])
+
+
+class WindowsRemoteNameTests(Temp):
+    """SCP onto a Windows folder must use the name Windows will actually store.
+
+    ``CON.txt``, ``a:b.txt`` and ``notes.txt.`` are distinct Linux strings and one
+    Windows file (a device, an alternate stream, or ``notes.txt``). The collision
+    probe and the scp target have to use that stored name, joined with the
+    destination's own separator, and a shell metacharacter never reaches scp.
+    """
+
+    def _run(self, remote, calls):
+        for target in (
+            patch.object(Storage, "_remote", lambda s, d, p, a: remote(d, p, a)),
+            patch("jarvis.storage.subprocess.run",
+                  lambda args, **kw: calls.append(args) or subprocess.CompletedProcess(args, 0, "", "")),
+            patch("jarvis.storage.shutil.which", lambda n: n),
+        ):
+            target.start()
+            self.addCleanup(target.stop)
+
+    def test_windows_destination_normalizes_before_the_collision_probe_and_scp(self):
+        desktop = "C:\\Users\\jdoe\\Desktop"
+        existing = {"a_b.txt", "notes.txt"}
+        seen = []
+
+        def remote(device_id, path, action):
+            if action == "exists":
+                seen.append(path)
+                leaf = path.replace("/", "\\").split("\\")[-1]
+                return {"exists": leaf.casefold() in {name.casefold() for name in existing}}
+            return {"path": desktop, "dir": True, "size": 0, "sep": "\\",
+                    "roots": ["C:\\Users\\jdoe"]}
+
+        calls = []
+        self._run(remote, calls)
+        (self.local / "CON.txt").write_text("device")
+        (self.local / "a:b.txt").write_text("colon")
+        (self.local / "notes.txt.").write_text("dot")
+
+        reserved = self.fs.copy("dell", str(self.local / "CON.txt"), "zen", desktop)
+        colon = self.fs.copy("dell", str(self.local / "a:b.txt"), "zen", desktop)
+        dotted = self.fs.copy("dell", str(self.local / "notes.txt."), "zen", desktop)
+
+        self.assertEqual(reserved["as"], "_CON.txt")
+        self.assertEqual(colon["as"], "a_b (2).txt")
+        self.assertEqual(dotted["as"], "notes (2).txt")
+        self.assertEqual(
+            [path.replace("/", "\\").split("\\")[-1] for path in seen],
+            ["_CON.txt", "a_b.txt", "a_b (2).txt", "notes.txt", "notes (2).txt"])
+        for path in seen:
+            self.assertTrue(path.replace("\\", "/").startswith("C:/Users/jdoe/Desktop/"), path)
+        remote_args = [args[args.index("--") + 2] for args in calls]
+        self.assertTrue(all(arg.startswith("jdoe@10.0.0.2:C:/Users/jdoe/Desktop/") for arg in remote_args), remote_args)
+        self.assertTrue(remote_args[0].endswith("/_CON.txt"), remote_args[0])
+        self.assertTrue(remote_args[1].endswith("/a_b (2).txt"), remote_args[1])
+        self.assertTrue(remote_args[2].endswith("/notes (2).txt"), remote_args[2])
+        # The local scp argument stays the real filename, so a trailing-dot file is found.
+        self.assertEqual(calls[2][calls[2].index("--") + 1], "notes.txt.")
+
+    def test_case_only_difference_is_a_collision_on_a_windows_destination(self):
+        desktop = "C:\\Users\\jdoe\\Desktop"
+        existing = {"Notes.txt"}
+        seen = []
+
+        def remote(device_id, path, action):
+            if action == "exists":
+                seen.append(path)
+                leaf = path.replace("/", "\\").split("\\")[-1]
+                return {"exists": leaf.casefold() in {name.casefold() for name in existing}}
+            return {"path": desktop, "dir": True, "size": 0, "sep": "\\",
+                    "roots": ["C:\\Users\\jdoe"]}
+
+        calls = []
+        self._run(remote, calls)
+        (self.local / "notes.txt").write_text("alpha")
+        out = self.fs.copy("dell", str(self.local / "notes.txt"), "zen", desktop)
+        self.assertEqual(out["as"], "notes (2).txt")
+        self.assertTrue(calls[-1][calls[-1].index("--") + 2].endswith("/notes (2).txt"))
+        self.assertTrue(seen[0].replace("/", "\\").endswith("\\notes.txt"))
+
+
+class ScpMetacharTests(Temp):
+    def test_shell_metacharacters_never_reach_scp(self):
+        hostile = self.local / "a;id.txt"
+        hostile.write_text("nope")
+        fake = FakeRemote(self)
+        for target in (
+            patch.object(Storage, "_remote", lambda s, d, p, a: fake.remote(d, p, a)),
+            patch("jarvis.storage.subprocess.run", lambda args, **kw: fake.run(args, **kw)),
+            patch("jarvis.storage.shutil.which", lambda n: n),
+        ):
+            target.start()
+            self.addCleanup(target.stop)
+        with self.assertRaises(ValueError):
+            self.fs.copy("dell", str(hostile), "zen", str(self.remote))
+        self.assertEqual(fake.calls, [])
+        self.assertFalse((self.remote / "a;id.txt").exists())
+        self.assertEqual(hostile.read_text(), "nope")
 
 
 if __name__ == "__main__":
