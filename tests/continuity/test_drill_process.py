@@ -457,7 +457,11 @@ class WorkerProc:
 
 
 class LoopProxy:
-    """Userspace TCP forwarder. ``close`` drops the listener and live sockets."""
+    """HTTP test forwarder with backend Host; close drops all live sockets.
+
+    Signed request bodies are unchanged. The gateway now validates its bound
+    Host/port, so the transport proxy forwards that authority, not its own port.
+    """
 
     def __init__(self, host, port):
         self.upstream = (host, int(port))
@@ -506,7 +510,8 @@ class LoopProxy:
         with self._lock:
             self._live.extend((client, upstream))
 
-        def pump(src, dst):
+        def pump(src, dst, rewrite_host=False):
+            head = b""
             try:
                 while not self._stop.is_set():
                     try:
@@ -515,6 +520,22 @@ class LoopProxy:
                         continue
                     if not data:
                         break
+                    if rewrite_host:
+                        head += data
+                        if b"\r\n\r\n" not in head:
+                            if len(head) > 65536:
+                                return
+                            continue
+                        headers, body = head.split(b"\r\n\r\n", 1)
+                        host, port = self.upstream
+                        authority = ("[%s]:%d" if ":" in host else "%s:%d") % (host, port)
+                        lines = headers.split(b"\r\n")
+                        # Keep duplicate headers duplicate: the gateway must still
+                        # reject malformed framing/authentication normally.
+                        lines = [b"Host: " + authority.encode("ascii")
+                                 if line.lower().startswith(b"host:") else line for line in lines]
+                        data = b"\r\n".join(lines) + b"\r\n\r\n" + body
+                        rewrite_host = False
                     dst.sendall(data)
             except OSError:
                 return
@@ -524,7 +545,7 @@ class LoopProxy:
                 except OSError:
                     pass
 
-        left = threading.Thread(target=pump, args=(client, upstream), daemon=True)
+        left = threading.Thread(target=pump, args=(client, upstream, True), daemon=True)
         right = threading.Thread(target=pump, args=(upstream, client), daemon=True)
         left.start()
         right.start()
