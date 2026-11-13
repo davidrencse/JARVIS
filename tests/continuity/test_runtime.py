@@ -206,6 +206,48 @@ class ClientShape:
         raise AssertionError("enroll")
 
 
+class FenceAfterRenew:
+    """Renew succeeds, then the authority fences before the runtime reads status."""
+
+    def __init__(self, inner, after):
+        self.inner = inner
+        self.after = after
+        self.fired = False
+
+    def renew(self, lease_tuple):
+        answer = self.inner.renew(lease_tuple)
+        if not self.fired:
+            self.fired = True
+            self.after()
+        return answer
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+class ModeOverlay:
+    """Real store, with one status field replaced. Used for mode and counter lies."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.mode = None
+        self.epoch = None
+        self.incarnation = None
+
+    def status(self):
+        status = dict(self.inner.status())
+        if self.mode is not None:
+            status["mode"] = self.mode
+        if self.epoch is not None:
+            status["epoch"] = self.epoch
+        if self.incarnation is not None:
+            status["incarnation"] = self.incarnation
+        return status
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -565,6 +607,23 @@ class RuntimeTests(unittest.TestCase):
         self.clock.tick(LEASE_SECONDS + 1)
         self.assertIsNone(self.store.status()["main"])
 
+    def test_drain_does_not_replace_busy_suspend_latch(self):
+        arch, _lease = self.v2()
+        self.touch()
+        watcher = self.orch()
+        opened = watcher.open_manual("make_main_now", "dell", "k-suspend-drain")
+        self.assertEqual(opened["code"], "requested")
+        self.assertEqual(arch.release_before_suspend()["code"], "busy")
+        arch.begin_drain(opened["transition_id"])
+        watcher.cancel(opened["transition_id"])
+
+        recording = Recording(self.link)
+        arch._port = recording
+        recording.events.clear()
+        result = arch.renew_once()
+        self.assertEqual(result["code"], "suspend")
+        self.assertFalse(any(name == "renew" for name, _args, _kwargs in recording.events))
+
     def test_recover_while_the_lease_is_valid_is_refused(self):
         _arch, _lease = self.v2()
         self.touch()
@@ -914,6 +973,160 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(AuthorityError) as stale:
             port.renew(lease)
         self.assertEqual((stale.exception.code, stale.exception.wait), ("stale", 4.5))
+
+    def test_handover_drops_a_warm_cache_before_the_local_drain(self):
+        arch, old = self.v2()
+        self.assertEqual(arch.require_authority("control")["epoch"], old["epoch"])
+        self.assertGreater(arch.state()["cache_remaining"], 0)
+        self.touch()
+        watcher = self.orch()
+        opened = watcher.open_manual("make_main_now", "dell", "k-handover")
+        drained = watcher.step()
+        self.assertEqual(drained["code"], "draining")
+        self.assertEqual(self.store.status()["mode"], "HANDOVER")
+        # The PC has not called begin_drain. Status alone must stop admission.
+        self.refuse(lambda: arch.require_authority("ordinary"), "no_main")
+        self.assertEqual(arch.state()["cache_remaining"], 0)
+        self.assertFalse(arch.state()["admission_open"])
+        self.assertIsNone(arch.state().get("lease_id"))
+        cancelled = watcher.cancel(opened["transition_id"])
+        self.assertEqual(cancelled["code"], "old_main_kept")
+        self.assertEqual(arch.require_authority("control")["epoch"], old["epoch"])
+
+    def test_later_epoch_on_the_same_device_is_not_the_old_grant(self):
+        arch, old = self.v2()
+        windows = self.pc("zenbook", suspend_clock=False)
+        windows.accept_lease(dict(old))
+        windows.start()
+        self.assertEqual(arch.require_authority("control")["epoch"], old["epoch"])
+        ack(self.store)
+        promote(self.store, "make_main_now", "dell", "k-away")
+        ack(self.store)
+        _tid, new = promote(self.store, "make_main_now", "zenbook", "k-back")
+        self.assertGreater(new["epoch"], old["epoch"])
+        self.assertEqual(self.store.status()["main"], "zenbook")
+        self.refuse(lambda: arch.require_authority("control"), "stale")
+        self.refuse(lambda: windows.require_authority("ordinary"), "stale")
+        self.assertEqual(arch.state()["cache_remaining"], 0)
+        self.assertFalse(arch.state()["admission_open"])
+        self.assertFalse(windows.state()["admission_open"])
+        renewed = arch.renew_once()
+        self.assertEqual(set(renewed), {"code", "wait"})
+        self.assertEqual(renewed["code"], "stale")
+        body = ticket(self.store, old, self.clock, op="op-old-epoch", body=NEEDLE)
+        with self.assertRaises(AuthorityError) as caught:
+            self.link.consume(body)
+        self.assertEqual(caught.exception.code, "stale")
+        self.assertNotIn(NEEDLE.encode(), self.disk())
+        arch.accept_lease(new)
+        self.assertEqual(arch.require_authority("control")["epoch"], new["epoch"])
+        self.assertIsInstance(arch.require_authority("control")["epoch"], int)
+        windows.accept_lease(new)
+        self.assertEqual(windows.require_authority("ordinary")["epoch"], new["epoch"])
+        self.assertTrue(windows.state()["admission_open"])
+
+    def test_incarnation_bump_refuses_before_another_renew(self):
+        arch, old = self.v2()
+        self.assertGreater(arch.state()["cache_remaining"], 0)
+        self.reopen()
+        self.refuse(lambda: arch.require_authority("ordinary"), "no_main")
+        self.assertFalse(arch.state()["admission_open"])
+        self.assertEqual(arch.state()["cache_remaining"], 0)
+        renewed = arch.renew_once()
+        self.assertEqual(set(renewed), {"code", "wait"})
+        self.assertEqual(renewed["code"], "stale")
+        self.refuse(lambda: arch.accept_lease(old), "stale")
+        self.assertNotEqual(self.store.status()["incarnation"], old["incarnation"])
+
+    def test_reboot_admits_only_after_a_renew_and_a_fenced_reboot_does_not(self):
+        cutover(self.store)
+        _tid, lease = promote(self.store, "recover", "zenbook", "k-boot")
+        self.touch()
+        recorded = Recording(self.link)
+        arch = self.pc("zenbook", port=recorded)
+        arch.accept_lease(lease)
+        arch.start()
+        recorded.events.clear()
+        self.boot["id"] = "boot-b"
+        context = arch.require_authority("control")
+        self.assertEqual(context["epoch"], lease["epoch"])
+        self.assertTrue(any(name == "renew" for name, _args, _kwargs in recorded.events))
+        self.boot["id"] = "boot-c"
+        ack(self.store)
+        promote(self.store, "make_main_now", "dell", "k-reboot-fence")
+        self.refuse(lambda: arch.require_authority("control"), "not_holder")
+        self.assertEqual(arch.state()["cache_remaining"], 0)
+        self.assertFalse(arch.state()["admission_open"])
+        renewed = arch.renew_once()
+        self.assertEqual(set(renewed), {"code", "wait"})
+        self.assertEqual(renewed["code"], "stale")
+
+    def test_renew_that_loses_the_fence_is_not_a_success_view(self):
+        arch, old = self.v2()
+        self.assertEqual(arch.renew_once()["code"], "ok")
+
+        def fence():
+            ack(self.store)
+            promote(self.store, "make_main_now", "dell", "k-mid-renew")
+
+        arch._port = FenceAfterRenew(self.link, fence)
+        renewed = arch.renew_once()
+        self.assertEqual(set(renewed), {"code", "wait"})
+        self.assertEqual(renewed["code"], "stale")
+        self.assertNotIn("epoch", renewed)
+        self.assertEqual(arch.state()["cache_remaining"], 0)
+        self.assertNotEqual(self.store.status()["epoch"], old["epoch"])
+        self.assertEqual(self.store.status()["main"], "dell")
+        self.refuse(lambda: arch.require_authority("control"), "not_holder")
+
+    def test_mode_and_counter_lies_fail_closed(self):
+        overlay = ModeOverlay(self.link)
+        cutover(self.store)
+        _tid, lease = promote(self.store, "recover", "zenbook", "k-mode")
+        self.touch()
+        arch = self.pc("zenbook", port=overlay)
+        windows = self.pc("zenbook", suspend_clock=False, port=overlay)
+        arch.accept_lease(lease)
+        arch.start()
+        windows.accept_lease(dict(lease))
+        windows.start()
+        self.assertEqual(arch.require_authority("control")["mode"], "V2_ACTIVE")
+        for mode, code in (("QUARANTINED", "quarantined"), ("ROLLBACK_QUIESCED", "legacy"),
+                           ("PREPARING_V2", "legacy"), ("V2_ACTIVE_MAYBE", "no_main")):
+            overlay.mode = mode
+            self.refuse(lambda: arch.require_authority("ordinary"), code)
+            self.refuse(lambda: windows.require_authority("ordinary"), code)
+            self.assertFalse(arch.state()["admission_open"])
+            self.assertEqual(arch.state()["cache_remaining"], 0)
+            # legacy and quarantined stay latched until start() sees the store leave them.
+            overlay.mode = None
+            arch.start()
+            windows.start()
+        self.assertEqual(arch.require_authority("control")["epoch"], lease["epoch"])
+        overlay.epoch = True
+        self.refuse(lambda: arch.require_authority("control"), "stale")
+        self.refuse(lambda: windows.require_authority("ordinary"), "stale")
+        self.refuse(lambda: arch.accept_lease(dict(lease, epoch=1)), "stale")
+        overlay.epoch = 1.0
+        self.refuse(lambda: arch.require_authority("control"), "stale")
+        self.refuse(lambda: windows.require_authority("control"), "stale")
+        overlay.epoch = None
+        overlay.incarnation = True
+        self.refuse(lambda: arch.require_authority("ai"), "stale")
+        self.assertEqual(arch.state()["cache_remaining"], 0)
+        self.assertFalse(windows.state()["admission_open"])
+
+    def test_windows_status_without_a_lease_does_not_admit(self):
+        cutover(self.store)
+        promote(self.store, "recover", "zenbook", "k-nolease")
+        self.touch()
+        runtime = self.pc("zenbook", suspend_clock=False)
+        state = runtime.start()
+        self.assertEqual(state["main"], "zenbook")
+        self.assertFalse(state["admission_open"])
+        self.refuse(lambda: runtime.require_authority("ordinary"), "no_lease_id")
+        self.refuse(lambda: runtime.require_authority("control"), "no_lease_id")
+        self.assertIsNone(runtime.lease_snapshot())
 
     def drive(self, watcher):
         last = None

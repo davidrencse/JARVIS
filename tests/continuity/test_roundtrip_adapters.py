@@ -93,7 +93,15 @@ class RoundTripAdapters(unittest.TestCase):
             source_offer = issuer.issue(source, self.hubs[target].continuity_endpoint)
             source_role = lifecycle.RoleLifecycle(e.participants[source], e.states[source].parent/'jarvis.config.json',
                 e.states[source], self.pins, startup_ready=lambda: True, probe=lambda body, nonce: repoint.endpoint_receipt(self.hubs[target], body['target'], nonce))
+            deferred = []
+            source_role.after_response = deferred.append
             result = source_role.switch_node(source_offer)
+            self.assertEqual(len(deferred), 1)
+            phase = json.loads((e.states[source]/lifecycle.PHASE_FILE).read_text())
+            self.assertEqual(phase['phase'], 'published')
+            # The fake response boundary has returned the authenticated switch
+            # result; only now may the old MAIN start its node role.
+            deferred.pop()()
             self.switches.append((source, target))
             return result
         coordinator = SafeHandoff(port, source_runtime=peers[old], candidate_runtime=peers[new],
@@ -155,6 +163,47 @@ class RoundTripAdapters(unittest.TestCase):
         with self.assertRaises(RuntimeRefusal): e.participants['dell'].runtime.require_authority('ordinary')
         self.assertTrue(e.participants['zenbook'].runtime.require_authority('ordinary')['ready'])
 
+    def test_received_retry_is_a_receipt_and_does_not_reinstall(self):
+        e = self.e
+        self.assertTrue(self.handoff('zenbook', 'dell')['ok'])
+        path, _hashes = self.prepare_return()
+        blob = path.read_bytes()
+        state = e.states['zenbook']
+        first = return_brain.receive(self.configs['zenbook'], state, blob)
+        self.assertTrue(first['ok'], first)
+        self.assertEqual(self.approval('zenbook')['phase'], 'received')
+        self.assertEqual(self.approval('zenbook')['bundle_sha256'], hashlib.sha256(blob).hexdigest())
+        installed = (state/'memory.sqlite3').read_bytes()
+        calls = {'install': 0, 'parse': 0}
+        real_install = brainsync._receive_unlocked
+        real_parse = brainsync._unbundle
+
+        def count_install(*args, **kwargs):
+            calls['install'] += 1
+            return real_install(*args, **kwargs)
+
+        def count_parse(payload):
+            calls['parse'] += 1
+            return real_parse(payload)
+
+        with patch('jarvis.brainsync._receive_unlocked', side_effect=count_install), \
+                patch('jarvis.brainsync._unbundle', side_effect=count_parse):
+            second = return_brain.receive(self.configs['zenbook'], state, blob)
+        self.assertEqual(calls, {'install': 0, 'parse': 1})
+        self.assertEqual(second, {'ok': True, 'status': 'imported', 'error': None, 'already': True,
+                                  'memory_sha256': self.approval('zenbook')['incoming_memory_sha256']})
+        self.assertEqual((state/'memory.sqlite3').read_bytes(), installed)
+        self.assertTrue(brainsync._frozen(state.parent, 'zenbook'))
+        (state/'memory.sqlite3').unlink()
+        with patch('jarvis.brainsync._receive_unlocked', side_effect=count_install):
+            with self.assertRaises(RuntimeRefusal) as missing:
+                return_brain.receive(self.configs['zenbook'], state, blob)
+        self.assertEqual(missing.exception.code, 'memory_conflict')
+        self.assertEqual(calls['install'], 0)
+        self.assertEqual(self.approval('zenbook')['phase'], 'received')
+        (state/'memory.sqlite3').write_bytes(installed)
+        self.assertTrue(return_brain.receive(self.configs['zenbook'], state, blob)['already'])
+
     def test_return_without_operator_disposition_preserves_memory_conflict_and_freeze(self):
         e = self.e; self.assertTrue(self.handoff('zenbook', 'dell')['ok'])
         with contextlib.closing(sqlite3.connect(e.states['dell']/'memory.sqlite3')) as db, db: db.execute("insert into items values ('different')")
@@ -170,8 +219,37 @@ class RoundTripAdapters(unittest.TestCase):
         self.prepare_return(); self.bad_canary = 'zenbook'
         result = self.handoff('dell', 'zenbook'); self.assertFalse(result['ok'])
         self.assertFalse(e.store.status()['lease_valid'])
+        marker = brainsync._marker_path(e.states['zenbook'].parent)
+        memory = e.states['zenbook']/'memory.sqlite3'
+        raw = memory.read_bytes()
+        memory.unlink()
+        with self.assertRaises(RuntimeRefusal) as missing:
+            return_brain.refreeze(e.participants['zenbook'])
+        self.assertEqual(missing.exception.code, 'memory_conflict')
+        self.assertEqual(self.approval('zenbook')['phase'], 'activated')
+        self.assertFalse(marker.exists())
+        swapped = e.root/'swapped.sqlite3'
+        with contextlib.closing(sqlite3.connect(swapped)) as db, db:
+            db.execute('create table items(body text)')
+            db.execute("insert into items values ('swapped')")
+        memory.write_bytes(swapped.read_bytes())
+        with self.assertRaises(RuntimeRefusal) as changed:
+            return_brain.refreeze(e.participants['zenbook'])
+        self.assertEqual(changed.exception.code, 'memory_conflict')
+        self.assertEqual(self.approval('zenbook')['phase'], 'activated')
+        self.assertFalse(marker.exists())
+        memory.write_bytes(raw)
         self.assertTrue(return_brain.refreeze(e.participants['zenbook'])['memory_preserved'])
         self.assertTrue(brainsync._frozen(e.states['zenbook'].parent, 'zenbook'))
+        restored = marker.read_bytes()
+        memory.write_bytes(swapped.read_bytes())
+        with self.assertRaises(RuntimeRefusal) as later:
+            return_brain.refreeze(e.participants['zenbook'])
+        self.assertEqual(later.exception.code, 'memory_conflict')
+        self.assertEqual(self.approval('zenbook')['phase'], 'refrozen')
+        self.assertEqual(marker.read_bytes(), restored)
+        memory.write_bytes(raw)
+        self.assertTrue(return_brain.refreeze(e.participants['zenbook'])['memory_preserved'])
         with contextlib.closing(sqlite3.connect(e.states['zenbook']/'memory.sqlite3')) as db, db:
             self.assertEqual(db.execute('select count(*) from items').fetchone()[0], 2)
 

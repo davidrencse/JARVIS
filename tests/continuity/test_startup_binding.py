@@ -9,13 +9,14 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from jarvis.continuity import integration, participant as rpc
 from jarvis.continuity.authority import LEASE_SECONDS, SAFETY_MARGIN
 from jarvis.continuity.integration import IsolatedFleet
 from jarvis.continuity.renewal import LeaseRenewer, start_bound
 from jarvis.continuity.startup import (NodeMainServices, acting_main_config, bind_managed,
-                                       checkpoint_id)
+                                       checkpoint_id, startup_ready)
 from tests.continuity._fleet import Clock
 
 
@@ -52,21 +53,35 @@ class StartupBindingTest(unittest.TestCase):
             self.addCleanup(rpc.unbind, state)
             self.addCleanup(integration.clear_production, state)
 
-    def factory(self, device):
+    def factory(self, device, *, enrollment=True, fleet_id="home"):
         client = self.fleet.nodes[device].client
-        return lambda path: (client, {"private_key_path": f"{device}.key"})
+        data = {"private_key_path": str(self.fleet._keys[device][1])}
+        if fleet_id is not None:
+            data["fleet_id"] = fleet_id
+        if enrollment:
+            data["enrollment"] = {
+                name: {"kind": "pc", "installation_id": name + "-inst", "public_key": self.fleet.public(name)}
+                for name in ("zenbook", "dell")}
+        return lambda path: (client, data)
 
     def manage(self, device):
         integration._write_marker(self.states[device])
 
-    def bind(self, device, services=None):
+    def bind(self, device, services=None, **factory_args):
         participant = bind_managed(_config(device), self.states[device], self.root / device,
-                                   client_factory=self.factory(device), services=services)
+                                   client_factory=self.factory(device, **factory_args),
+                                   services=services)
+        if participant is not None and getattr(participant, "guard", None) is not None:
+            self.addCleanup(participant.guard.close)
         if participant is not None:
             deadline = time.monotonic() + 5
             while participant.runtime.state().get("mode") is None and time.monotonic() < deadline:
                 time.sleep(0.01)
         return participant
+
+    def issue(self, device, target):
+        issuer = integration.production_binding(self.states[device])["issuer"]
+        return issuer(target, "op-transfer", "at-transfer", "sha256:" + "ab" * 32, "ordinary")
 
     def test_unmanaged_state_is_untouched(self):
         self.assertIsNone(self.bind("dell"))
@@ -98,19 +113,47 @@ class StartupBindingTest(unittest.TestCase):
         self.assertIsNotNone(bound)
         binding = integration.production_binding(self.states["zenbook"])
         self.assertIs(binding["runtime"], bound.runtime)
+        self.assertIs(binding["executor"], bound.guard)
+        self.assertTrue(callable(bound.guard.accept))
         self.assertTrue(callable(binding["issuer"]))
-        # The configured main keeps its own console: no node services are wired there.
+        self.assertTrue(startup_ready(self.states["zenbook"]))
+        # A runtime object without a Hub listener is not a MAIN canary.
         self.assertIsNone(getattr(bound, "services", None))
+        self.assertIs(bound.canary(), False)
 
-    def test_node_takes_main_starts_services_and_stops_them_on_failback(self):
+    def test_missing_adapters_do_not_bind(self):
+        self.manage("dell")
+        self.assertIsNone(self.bind("dell", enrollment=False))
+        self.assertIsNone(rpc.lookup(self.states["dell"]))
+        self.assertIsNone(integration.production_binding(self.states["dell"]))
+        self.assertFalse(startup_ready(self.states["dell"]))
+        self.assertEqual(integration.continuity_state(self.states["dell"]), "managed")
+
+    def test_bad_successor_grant_does_not_bind(self):
+        self.manage("dell")
+        grant = self.states["dell"] / "continuity-successor-grant.json"
+        grant.write_text("{}", encoding="utf-8")
+        self.assertIsNone(self.bind("dell"))
+        self.assertIsNone(integration.production_binding(self.states["dell"]))
+        self.assertIsNone(rpc.lookup(self.states["dell"]))
+        self.assertTrue(grant.is_file())
+        self.assertFalse(startup_ready(self.states["dell"]))
+
+    def test_register_failure_clears_the_runtime(self):
+        self.manage("zenbook")
+        with patch("jarvis.continuity.participant.bind", side_effect=RuntimeError("register failed")):
+            result = bind_managed(_config("zenbook"), self.states["zenbook"], self.root / "zenbook",
+                                  client_factory=self.factory("zenbook"))
+        self.assertIsNone(result)
+        self.assertIsNone(integration.production_binding(self.states["zenbook"]))
+        self.assertIsNone(rpc.lookup(self.states["zenbook"]))
+        self.assertFalse(startup_ready(self.states["zenbook"]))
+
+    def test_node_without_successor_route_does_not_promote_or_start_services(self):
         started = []
-
-        def phone_start(view, state, console):
-            self.assertEqual(view["cluster"]["main_device"], "dell")
-            server = FakeServer()
-            started.append(server)
-            return server
-
+        def phone_start(*args):
+            started.append(FakeServer())
+            return started[-1]
         services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],
                                     console_factory=lambda *a: FakeServer(), phone_start=phone_start)
         for device in ("zenbook", "dell"):
@@ -118,26 +161,15 @@ class StartupBindingTest(unittest.TestCase):
         dell = self.bind("dell", services=services)
         self.assertIsNotNone(dell)
         renewers = {"dell": LeaseRenewer(dell)}
-        for _ in range(5):  # nobody is MAIN after cutover: the node may recover it
+        for _ in range(5):  # no provisioned candidate listener means recovery must fail closed
             self.clock.tick(1)
             renewers["dell"].tick()
-        self.assertEqual(self.fleet.status()["main"], "dell")
-        self.assertTrue(services.running())
-        self.assertEqual(len(started), 1)
-
-        arch = self.bind("zenbook")  # the preferred PC comes up
-        renewers["zenbook"] = LeaseRenewer(arch)
-        for _ in range(int(30 + LEASE_SECONDS + SAFETY_MARGIN + 8)):
-            self.clock.tick(1)
-            for renewer in renewers.values():
-                renewer.tick()
-            if self.fleet.status()["main"] == "zenbook" and not services.running():
-                break
-        self.assertEqual(self.fleet.status()["main"], "zenbook")
+        self.assertIsNone(self.fleet.status()["main"])
+        self.assertFalse(self.fleet.status()["main_ready"])
         self.assertFalse(services.running())
-        self.assertTrue(started[0].closed)
+        self.assertEqual(started, [])
 
-    def test_failed_phone_start_refuses_the_grant(self):
+    def test_missing_successor_route_refuses_before_phone_start(self):
         services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],
                                     console_factory=lambda *a: FakeServer(),
                                     phone_start=lambda *a: None)
@@ -148,13 +180,37 @@ class StartupBindingTest(unittest.TestCase):
             self.clock.tick(1)
             renewer.tick()
         self.assertNotEqual(self.fleet.status()["main"], "dell")
-        self.assertFalse(services.healthy())
+        self.assertTrue(services.healthy())
+        self.assertFalse(services.running())
 
     def test_acting_main_config_is_a_copy(self):
         config = _config("dell")
         view = acting_main_config(config)
         self.assertEqual(view["cluster"]["main_device"], "dell")
         self.assertEqual(config["cluster"]["main_device"], "zenbook")
+
+    def test_service_sync_preserves_not_ready_grant_until_cancelled(self):
+        services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],
+                                   console_factory=lambda *_: FakeServer(),
+                                   phone_start=lambda *_: FakeServer())
+        self.manage("dell")
+        candidate = self.bind("dell", services=services)
+        transition, lease = self.fleet.promote("dell", until="grant")
+        candidate.runtime.accept_lease(lease)
+        phone, console = FakeServer(), FakeServer()
+        services.phone, services.console = phone, console
+        with patch.object(candidate.production_controller, "close") as close:
+            services.sync(candidate.runtime)
+            self.assertEqual(candidate.runtime.lease_snapshot(),
+                             {key: lease[key] for key in ("holder", "lease_id", "incarnation", "epoch")})
+            self.assertFalse(phone.closed)
+            self.assertFalse(console.closed)
+            close.assert_not_called()
+            self.fleet.owner.step(transition, "cancel")
+            services.sync(candidate.runtime)
+            self.assertTrue(phone.closed)
+            self.assertTrue(console.closed)
+            close.assert_called_once()
 
     def test_checkpoint_changes_with_memory(self):
         state = self.states["dell"]

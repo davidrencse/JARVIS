@@ -1,8 +1,9 @@
 """Manual SafeHandoff against the real authority store and a loopback gateway.
 
 The in-process cases drive ``StoreAdapter``. The loopback case runs the authority
-in one process and two ``MainRuntime`` processes in two others, with installation
-keys the gateway actually verifies. Each test installs an explicit stub
+in one process and two ``MainRuntime`` processes in two others, on 127.0.0.1,
+with installation keys the gateway actually verifies. That case is not a live
+Oracle or Dell handoff. Each test installs an explicit stub
 ``jarvis.brainsync.handoff``. The real storage hook is not the code under test.
 """
 
@@ -13,6 +14,8 @@ import select
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -24,8 +27,10 @@ from jarvis.continuity.runtime import (
     RuntimeRefusal,
     SafeHandoff,
     StoreAdapter,
+    _HandoffJournal,
     _repoint_ok,
 )
+from jarvis.continuity import runtime as runtime_module
 from tests.continuity._fleet import Clock, ack, cutover, open_store, promote, ticket
 
 
@@ -221,7 +226,7 @@ class SafeHandoffTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "stale")
         self.assertNotIn(TOKEN.encode(), self.disk())
         self.assertFalse(Path(BASE).exists())
-        self.assertFalse((Path("/home/jdoe/projects/JARVIS") / ".jarvis" / "handoff-journal.json").exists())
+        self.assertFalse((Path(__file__).resolve().parents[2] / ".jarvis" / "handoff-journal.json").exists())
 
     def test_02_live_old_cannot_recover(self):
         self.use_brain(self.brain)
@@ -734,7 +739,7 @@ class SafeHandoffTests(unittest.TestCase):
         self.assertNotIn("ls-", text)
         self.assertNotIn(TOKEN, text)
         self.assertEqual(journal.stat().st_mode & 0o777, 0o600)
-        self.assertFalse((Path("/home/jdoe/projects/JARVIS") / ".jarvis" / "handoff-journal.json").exists())
+        self.assertFalse((Path(__file__).resolve().parents[2] / ".jarvis" / "handoff-journal.json").exists())
 
     def test_15_multiprocess_loopback_handoff(self):
         _loopback_handoff(self)
@@ -954,6 +959,39 @@ class SafeHandoffTests(unittest.TestCase):
         saved = journal.read_text(encoding="utf-8")
         self.assertNotIn("ls-hidden", saved)
         self.assertNotIn(TOKEN, saved)
+
+    def test_20_in_memory_journal_claim_has_one_winner(self):
+        journal = _HandoffJournal(None)
+        barrier = threading.Barrier(3)
+        outcomes = []
+        errors = []
+        original_deepcopy = runtime_module.copy.deepcopy
+
+        def slowed_deepcopy(value):
+            copied = original_deepcopy(value)
+            time.sleep(0.05)
+            return copied
+
+        def claim():
+            try:
+                barrier.wait(timeout=2)
+                outcomes.append(journal.claim("brain"))
+            except Exception as exc:
+                errors.append(exc)
+
+        runtime_module.copy.deepcopy = slowed_deepcopy
+        try:
+            workers = [threading.Thread(target=claim) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            barrier.wait(timeout=2)
+            for worker in workers:
+                worker.join(2)
+                self.assertFalse(worker.is_alive())
+        finally:
+            runtime_module.copy.deepcopy = original_deepcopy
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(phase for phase, _ok in outcomes), ["claimed", "started"])
 
 
 class _DropResponse:
@@ -1383,6 +1421,9 @@ def _loopback_handoff(case):
         _stop(gateway)
         raise AssertionError(err_gw.read_text(encoding="utf-8")[-2000:])
     case.assertTrue(origin.startswith("http://127.0.0.1:"), origin)
+    live = Path(__file__).resolve().parents[2] / ".jarvis"
+    case.assertFalse(folder.resolve().is_relative_to(live.resolve()))
+    case.assertNotIn("jarvis.config.json", origin)
 
     def client(name=None, owner=False):
         kwargs = {"authority_id": "oracle-auth"}

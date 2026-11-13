@@ -76,6 +76,14 @@ class RepointLifecycleTests(unittest.TestCase):
         (state/'cluster-node.json').write_text(json.dumps(note))
         with self.assertRaises(RuntimeRefusal): repoint.effective_config(cfg, state)
 
+    def test_endpoint_probe_can_be_verified_without_publishing_route(self):
+        state = self.env.states['zenbook']
+        result = self.installer().verify_endpoint(self.offer())
+        self.assertTrue(result['authenticated'])
+        self.assertFalse(result['endpoint_updated'])
+        self.assertFalse((state/repoint.FILE).exists())
+        self.assertFalse((state/'cluster-node.json').exists())
+
     def test_offer_retry_does_not_rotate_credential(self):
         first = self.offer(); second = self.offer()
         self.assertEqual(first, second)
@@ -173,12 +181,17 @@ class RepointLifecycleTests(unittest.TestCase):
 
     def test_direct_https_switch_stops_old_tunnel_without_dialling_an_ssh_host(self):
         e = self.env; role = lifecycle.RoleLifecycle(e.participants['zenbook'], e.root/'config.json', e.states['zenbook'], self.pins, probe=self.probe, startup_ready=lambda: True)
+        deferred = []
+        role.after_response = deferred.append
         with patch('jarvis.cluster_tunnel.status', return_value={'running': False}), \
                 patch('jarvis.cluster_tunnel.autostart') as tunnel_startup, \
                 patch('jarvis.cluster_tunnel.start') as start, patch('jarvis.cluster_setup.role_autostart') as startup:
             self.assertTrue(role.switch_node(self.offer())['ok'])
             tunnel_startup.assert_called_once_with(e.root/'config.json', e.states['zenbook'], False)
-            start.assert_not_called(); startup.assert_called_once()
+            start.assert_not_called(); startup.assert_not_called()
+            self.assertEqual(len(deferred), 1)
+            deferred.pop()()
+            startup.assert_called_once()
 
     def test_signed_link_tamper_refuses_before_tunnel_use(self):
         e = self.env; state = e.states['zenbook']
@@ -225,6 +238,223 @@ class RepointLifecycleTests(unittest.TestCase):
         refuse(lambda body: body.pop('link'))
         (state/'cluster-node.json').write_text(note_text)
         self.assertEqual(repoint.effective_config(cfg, state)['cluster']['main_url'], self.endpoint)
+
+    def test_tampered_link_does_not_open_ssh(self):
+        from jarvis import cluster_tunnel
+        e = self.env
+        state = e.states['zenbook']
+        link = {'targets': ['david@198.51.100.10'],
+                'host_key': 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDLTmUvsc7l7vzfOy/yHk0DpdkDZ62R+t93R+78kEG+R',
+                'hostname': 'dell.example', 'identity_file': '/tmp/jarvis-return-repoint-not-a-key'}
+        instruction = self.issuer.issue('zenbook', self.endpoint, link=link)
+        self.assertTrue(self.installer().install(instruction)['ok'])
+        cfg = {'cluster': {'enabled': True, 'local_device': 'zenbook', 'main_device': 'zenbook',
+                           'tunnel': 'forward'},
+               'devices': {'zenbook': {'hostname': 'zenbook'},
+                           'dell': {'hostname': 'dell', 'transport': 'ssh',
+                                    'target': 'david@198.51.100.9',
+                                    'host_key': link['host_key']}},
+               'continuity': {'operator_config': 'operator.json'}}
+        (state.parent/'operator.json').write_text(json.dumps({
+            'origin': 'http://127.0.0.1:1', 'authority_id': 'oracle-auth', 'device_id': 'zenbook',
+            'installation_id': 'zenbook-inst', 'private_key_path': str(_keys()['zenbook'][1]),
+            'enrollment': self.pins}))
+        view = repoint.effective_config(cfg, state)
+        opened = cluster_tunnel.link(view, state)
+        self.assertEqual(opened['target'], 'david@198.51.100.10')
+        self.assertEqual(opened['host_key'], link['host_key'])
+        self.assertEqual(opened['hostname'], 'dell.example')
+        self.assertEqual(opened['identity_file'], link['identity_file'])
+        note = json.loads((state/'cluster-node.json').read_text())
+        note['link']['targets'][0] = 'david@203.0.113.50'
+        (state/'cluster-node.json').write_text(json.dumps(note))
+        with patch.object(cluster_tunnel.subprocess, 'Popen', side_effect=AssertionError('dialled')):
+            with self.assertRaises(RuntimeRefusal) as caught:
+                repoint.effective_config(cfg, state)
+            self.assertEqual(caught.exception.code, 'bad_state')
+            cluster_tunnel.run(cfg, state)
+
+    def test_failed_successor_unit_retries_without_reopening_or_rewriting(self):
+        e = self.env; state = e.states['dell']; instruction = self.offer('dell')
+        role = lifecycle.RoleLifecycle(e.participants['dell'], state.parent/'jarvis.config.json', state, self.pins, startup_ready=lambda: True)
+        guard = e.participants['dell'].guard
+        order = []
+        original_close = guard.close
+        def close():
+            order.append('close')
+            return original_close()
+        guard.close = close
+        calls = {'n': 0}
+        def unit(*args, **kwargs):
+            calls['n'] += 1
+            order.append(('unit', guard.local_view()['journal']))
+            if calls['n'] == 1:
+                raise OSError('unit failed')
+            return {'autostart': True}
+        with patch('jarvis.cluster_tunnel.status', return_value={'running': False}), \
+                patch('jarvis.cluster_setup.role_autostart', side_effect=unit) as activate, \
+                patch('jarvis.cluster_setup._launch_agent') as launch, \
+                patch('jarvis.autostart.system', return_value='windows'):
+            with self.assertRaises(OSError):
+                role.prepare_successor(instruction)
+            grant = (state/lifecycle.GRANT_FILE).read_bytes()
+            phase = json.loads((state/lifecycle.PHASE_FILE).read_text())
+            self.assertEqual(phase['action'], 'prepare')
+            self.assertEqual(phase['phase'], 'released')
+            self.assertEqual(set(phase), {'action', 'phase', 'incarnation', 'epoch', 'transition_id', 'digest'})
+            self.assertEqual(order, ['close', ('unit', False)])
+            self.assertFalse(guard.local_view()['journal'])
+            role.startup_ready = lambda: False
+            with self.assertRaisesRegex(RuntimeRefusal, 'startup_incomplete'):
+                role.prepare_successor(instruction)
+            self.assertEqual(calls['n'], 1)
+            self.assertEqual((state/lifecycle.GRANT_FILE).read_bytes(), grant)
+            role.startup_ready = lambda: True
+            replay = role.prepare_successor(instruction)
+            self.assertTrue(replay['scheduled'])
+            self.assertEqual(calls['n'], 2)
+            self.assertEqual(order, ['close', ('unit', False), ('unit', False)])
+            self.assertEqual((state/lifecycle.GRANT_FILE).read_bytes(), grant)
+            launch.assert_called_once()
+            activate.assert_called_with(state.parent/'jarvis.config.json', state, True, restart=True)
+            again = role.prepare_successor(instruction)
+            self.assertTrue(again['scheduled'])
+            self.assertIsNone(again['autostart'])
+            self.assertEqual(calls['n'], 2)
+        old = e.participants['dell']
+        runtime = MainRuntime(GatewayPort(old.client), 'dell', 'dell-inst', lambda: {'control_ready': True},
+                              clock=e.clock.mono, boot=lambda: 'test-boot')
+        p = rpc.Participant(old.client, runtime)
+        self.assertTrue(lifecycle.accept_successor_grant(p, state, self.pins))
+        self.assertFalse(lifecycle.accept_successor_grant(p, state, self.pins))
+        with patch('jarvis.cluster_tunnel.status', return_value={'running': False}), \
+                patch('jarvis.cluster_setup.role_autostart', side_effect=unit) as activate:
+            with self.assertRaises(RuntimeRefusal) as caught:
+                role.prepare_successor(instruction)
+            self.assertEqual(caught.exception.code, 'stale')
+            self.assertEqual(calls['n'], 2)
+            activate.assert_not_called()
+
+    def test_released_successor_refuses_busy_tunnel_stale_lease_and_tampered_note(self):
+        e = self.env; state = e.states['dell']; instruction = self.offer('dell')
+        role = lifecycle.RoleLifecycle(e.participants['dell'], state.parent/'jarvis.config.json', state, self.pins, startup_ready=lambda: True)
+        calls = {'n': 0}
+        def unit(*args, **kwargs):
+            calls['n'] += 1
+            raise OSError('unit failed')
+        running = {'up': False}
+        def status(_state):
+            return {'running': running['up']}
+        with patch('jarvis.cluster_tunnel.status', side_effect=status), \
+                patch('jarvis.cluster_tunnel.stop') as stop, \
+                patch('jarvis.cluster_setup.role_autostart', side_effect=unit) as activate, \
+                patch('jarvis.cluster_setup._launch_agent') as launch, \
+                patch('jarvis.autostart.system', return_value='linux'):
+            with self.assertRaises(OSError):
+                role.prepare_successor(instruction)
+            grant = (state/lifecycle.GRANT_FILE).read_bytes()
+            stop.assert_not_called()
+            note_path = state/'cluster-node.json'
+            note = json.loads(note_path.read_text())
+            original_note = note_path.read_text()
+            note['code_key'] = note['code_key'][:-1] + ('A' if note['code_key'][-1] != 'A' else 'B')
+            note_path.write_text(json.dumps(note))
+            with self.assertRaises(RuntimeRefusal) as caught:
+                role.prepare_successor(instruction)
+            self.assertEqual(caught.exception.code, 'bad_state')
+            note_path.write_text(original_note)
+            running['up'] = True
+            with self.assertRaisesRegex(RuntimeRefusal, 'tunnel_busy'):
+                role.prepare_successor(instruction)
+            stop.assert_called_once()
+            running['up'] = False
+            e.clock.tick(100)
+            with self.assertRaises(RuntimeRefusal) as caught:
+                role.prepare_successor(instruction)
+            self.assertEqual(caught.exception.code, 'stale')
+            self.assertEqual(calls['n'], 1)
+            activate.assert_called_once()
+            launch.assert_not_called()
+            self.assertEqual((state/lifecycle.GRANT_FILE).read_bytes(), grant)
+
+    def test_signed_link_stays_down_refuses_role_change(self):
+        e = self.env; state = e.states['zenbook']
+        link = {'targets': ['david@198.51.100.10'],
+                'host_key': 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDLTmUvsc7l7vzfOy/yHk0DpdkDZ62R+t93R+78kEG+R',
+                'hostname': 'dell.example', 'identity_file': '/tmp/jarvis-return-repoint-not-a-key'}
+        instruction = self.issuer.issue('zenbook', self.endpoint, link=link)
+        role = lifecycle.RoleLifecycle(e.participants['zenbook'], e.root/'config.json', state, self.pins,
+                                      probe=self.probe, startup_ready=lambda: True)
+        deferred = []
+        role.after_response = deferred.append
+        with patch('jarvis.cluster_tunnel.status', return_value={'running': False}), \
+                patch('jarvis.cluster_tunnel.autostart') as tunnel_startup, \
+                patch('jarvis.cluster_tunnel.start') as start, \
+                patch('jarvis.cluster_tunnel.stop') as stop, \
+                patch('jarvis.cluster_setup.role_autostart') as startup:
+            with self.assertRaises(RuntimeRefusal) as caught:
+                role.switch_node(instruction)
+            self.assertEqual(caught.exception.code, 'partition')
+            # The predecessor route remains unpublished until the signed link
+            # has actually come up; a failed tunnel start cannot strand it on
+            # a dead endpoint.
+            self.assertFalse((state/repoint.FILE).exists())
+            startup.assert_not_called(); stop.assert_not_called()
+            tunnel_startup.assert_called_once_with(e.root/'config.json', state, True)
+            start.assert_called_once()
+            with self.assertRaises(RuntimeRefusal) as caught:
+                role.switch_node(instruction)
+            self.assertEqual(caught.exception.code, 'partition')
+            startup.assert_not_called(); stop.assert_not_called()
+            self.assertEqual(start.call_count, 2)
+
+    def test_switch_retries_role_unit_without_stopping_its_tunnel(self):
+        e = self.env; state = e.states['zenbook']
+        link = {'targets': ['david@198.51.100.10'],
+                'host_key': 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDLTmUvsc7l7vzfOy/yHk0DpdkDZ62R+t93R+78kEG+R',
+                'hostname': 'dell.example', 'identity_file': '/tmp/jarvis-return-repoint-not-a-key'}
+        instruction = self.issuer.issue('zenbook', self.endpoint, link=link)
+        role = lifecycle.RoleLifecycle(e.participants['zenbook'], e.root/'config.json', state, self.pins,
+                                      probe=self.probe, startup_ready=lambda: True)
+        deferred = []
+        role.after_response = deferred.append
+        running = {'up': False}
+        calls = {'n': 0}
+        def status(_state):
+            return {'running': running['up']}
+        def start(*args, **kwargs):
+            running['up'] = True
+        def unit(*args, **kwargs):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise OSError('unit failed')
+            return {'autostart': True}
+        with patch('jarvis.cluster_tunnel.status', side_effect=status), \
+                patch('jarvis.cluster_tunnel.autostart') as tunnel_startup, \
+                patch('jarvis.cluster_tunnel.start', side_effect=start) as started, \
+                patch('jarvis.cluster_tunnel.stop') as stop, \
+                patch('jarvis.cluster_setup.role_autostart', side_effect=unit) as startup:
+            self.assertTrue(role.switch_node(instruction)['ok'])
+            self.assertEqual(len(deferred), 1)
+            with self.assertRaises(OSError):
+                deferred.pop()()
+            self.assertTrue(running['up'])
+            stop.assert_not_called(); started.assert_called_once()
+            tunnel_startup.assert_called_once_with(e.root/'config.json', state, True)
+            result = role.switch_node(instruction)
+            self.assertTrue(result['ok'])
+            self.assertEqual(len(deferred), 1)
+            deferred.pop()()
+            self.assertTrue(running['up'])
+            stop.assert_not_called(); started.assert_called_once()
+            self.assertEqual(calls['n'], 2)
+            startup.assert_called_with(e.root/'config.json', state, True)
+            e.clock.tick(100)
+            with self.assertRaises(RuntimeRefusal) as caught:
+                role.switch_node(instruction)
+            self.assertEqual(caught.exception.code, 'stale')
+            stop.assert_not_called(); started.assert_called_once()
+            self.assertEqual(calls['n'], 2)
 
 
 class ExistingUnitHelperTests(unittest.TestCase):

@@ -5,7 +5,7 @@ import time
 import types
 import unittest
 
-from jarvis.continuity.renewal import LeaseRenewer
+from jarvis.continuity.renewal import LeaseRenewer, SelfRecovery
 from jarvis.continuity.runtime import RuntimeRefusal
 
 
@@ -47,9 +47,12 @@ class NextDelay(unittest.TestCase):
             self.assertEqual(
                 self.renewer._next_delay({**base, 'renew_after': renew_after}), 3, renew_after)
         self.assertEqual(self.renewer._next_delay({'code': 'ok', 'remaining': 15}), 3)
-        for code in ('partition', 'draining', 'no_lease', 'renewal_paused'):
+        for code in ('partition', 'draining', 'no_lease', 'renewal_paused', 'suspend'):
             blocked = {'code': code, 'renew_after': 5.0, 'remaining': 15}
             self.assertEqual(self.renewer._next_delay(blocked), 3, code)
+        # Half of the remaining lease wins when that half is under the 0.5s floor.
+        tight = {'code': 'ok', 'renew_after': 5.0, 'remaining': 0.4}
+        self.assertEqual(self.renewer._next_delay(tight), 0.2)
         for result in (None, 'ok', 5, ['code', 'ok']):
             self.assertEqual(self.renewer._next_delay(result), 3, type(result))
 
@@ -108,9 +111,178 @@ class RunLoop(unittest.TestCase):
         self.addCleanup(renewer.close)
         self.assertTrue(saw.wait(1))
         started = time.monotonic()
+        thread = renewer.thread
         renewer.close()
         self.assertLess(time.monotonic() - started, 1.0)
-        self.assertFalse(renewer.thread.is_alive())
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(renewer.thread)
+
+
+class _Stuck:
+    def join(self, timeout=None):
+        return None
+
+    def is_alive(self):
+        return True
+
+
+class SuspendAndRestart(unittest.TestCase):
+    def _renewer(self, answer=None, block=None):
+        runtime = _runtime(answer or {'code': 'ok', 'renew_after': 5.0, 'remaining': 15})
+        runtime._block = block
+        services = types.SimpleNamespace(calls=0, runtime=runtime)
+
+        def sync(bound):
+            services.calls += 1
+            services.runtime = bound
+
+        services.sync = sync
+        renewer = LeaseRenewer(types.SimpleNamespace(runtime=runtime, services=services))
+        renewer.recovery = types.SimpleNamespace(calls=0)
+
+        def recover():
+            renewer.recovery.calls += 1
+            return {'code': 'recover'}
+
+        renewer.recovery.tick = recover
+        return renewer, runtime, services
+
+    def test_suspend_does_not_renew_recover_or_sync(self):
+        renewer, runtime, services = self._renewer(block='suspend')
+        self.assertEqual(renewer.tick(), {'code': 'suspend'})
+        self.assertEqual(runtime.calls, 0)
+        self.assertEqual(renewer.recovery.calls, 0)
+        self.assertEqual(services.calls, 0)
+        self.assertIsNone(renewer.last_recovery)
+
+    def test_resume_renews_again(self):
+        renewer, runtime, services = self._renewer(block='resumed')
+        answer = renewer.tick()
+        self.assertEqual(answer['code'], 'ok')
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(renewer.recovery.calls, 1)
+        self.assertEqual(services.calls, 1)
+
+    def test_restarted_runtime_with_no_lease_does_not_renew(self):
+        renewer, runtime, services = self._renewer()
+        runtime.lease_snapshot = lambda: None
+        self.assertEqual(renewer.tick(), {'code': 'no_lease'})
+        self.assertEqual(runtime.calls, 0)
+        self.assertEqual(renewer.recovery.calls, 1)
+        self.assertEqual(services.calls, 1)
+
+    def test_finished_close_allows_a_new_start(self):
+        started = threading.Event()
+
+        def renew_once():
+            started.set()
+            return {'code': 'suspend'}
+
+        runtime = types.SimpleNamespace(
+            lease_snapshot=lambda: {'holder': 'dell'}, renew_once=renew_once)
+        renewer = LeaseRenewer(types.SimpleNamespace(runtime=runtime), interval=0.05)
+        self.addCleanup(renewer.close)
+        renewer.start()
+        self.assertTrue(started.wait(1))
+        thread = renewer.thread
+        renewer.close()
+        self.assertFalse(thread.is_alive())
+        self.assertIsNone(renewer.thread)
+        started.clear()
+        renewer.start()
+        self.assertTrue(started.wait(1))
+        self.assertIsNotNone(renewer.thread)
+
+    def test_join_timeout_refuses_another_start(self):
+        renewer = LeaseRenewer(types.SimpleNamespace(), interval=3)
+        renewer.thread = _Stuck()
+        renewer.close()
+        self.assertIsInstance(renewer.thread, _Stuck)
+        with self.assertRaises(RuntimeRefusal) as caught:
+            renewer.start()
+        self.assertEqual(caught.exception.code, 'bad_state')
+
+    def test_close_before_start_does_not_stick_the_stop(self):
+        started = threading.Event()
+
+        def renew_once():
+            started.set()
+            return {'code': 'ok', 'renew_after': 5.0, 'remaining': 15}
+
+        runtime = types.SimpleNamespace(
+            lease_snapshot=lambda: {'holder': 'dell'}, renew_once=renew_once)
+        renewer = LeaseRenewer(types.SimpleNamespace(runtime=runtime), interval=0.05)
+        renewer.close()
+        self.assertIsNone(renewer.thread)
+        self.addCleanup(renewer.close)
+        renewer.start()
+        self.assertTrue(started.wait(1))
+
+
+class _PolicyClient:
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.calls = 0
+
+    def self_policy(self):
+        self.calls += 1
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    def self_request(self):
+        return None
+
+    def self_step(self):
+        return None
+
+
+class SelfRecoveryGate(unittest.TestCase):
+    def _recovery(self, canary, answers, clock):
+        runtime = types.SimpleNamespace(
+            device_id='dell',
+            readiness=lambda profile: {'meets': True, 'control_ready': True})
+        participant = types.SimpleNamespace(
+            runtime=runtime, client=_PolicyClient(answers), canary=canary)
+        return SelfRecovery(participant, clock=clock)
+
+    def test_missing_canary_does_not_activate(self):
+        clock = {'t': 0.0}
+        recovery = self._recovery(None, [], lambda: clock['t'])
+        self.assertFalse(recovery._activate('dell', {}))
+        self.assertFalse(recovery._activate('zenbook', {}))
+        recovery.participant.canary = lambda: False
+        self.assertFalse(recovery._activate('dell', {}))
+        recovery.participant.canary = lambda: 1
+        self.assertFalse(recovery._activate('dell', {}))
+
+        def broken():
+            raise RuntimeError('probe down')
+
+        recovery.participant.canary = broken
+        self.assertFalse(recovery._activate('dell', {}))
+        recovery.participant.canary = lambda: True
+        self.assertTrue(recovery._activate('dell', {}))
+        recovery.participant.runtime.readiness = lambda profile: {'meets': False}
+        self.assertFalse(recovery._activate('dell', {}))
+
+    def test_stale_policy_drops_when_refresh_fails(self):
+        clock = {'t': 0.0}
+        enabled = {
+            'enabled': True, 'candidates': ['dell'], 'preferred': 'dell', 'stability_s': 30}
+        recovery = self._recovery(
+            lambda: True, [enabled, RuntimeError('gateway down')], lambda: clock['t'])
+        self.assertEqual(
+            recovery._refresh(), (('dell',), 'dell', 30))
+        clock['t'] = 299.0
+        self.assertEqual(recovery.participant.client.calls, 1)
+        self.assertIsNotNone(recovery._refresh())
+        clock['t'] = 300.0
+        self.assertIsNone(recovery._refresh())
+        self.assertIsNone(recovery._policy)
+        self.assertIsNone(recovery._orchestrator)
+        self.assertEqual(recovery.participant.client.calls, 2)
 
 
 class Constructor(unittest.TestCase):
