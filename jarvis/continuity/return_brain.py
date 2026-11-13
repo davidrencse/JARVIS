@@ -8,7 +8,10 @@ A finished ``activated`` or ``refrozen`` approval can start another cycle: the
 old file is renamed into its archive, never deleted. ``archiving`` and
 ``needs_review`` stay a review refusal until ``retire_interrupted`` parks that
 file beside the archive. Activation records the grant before the freeze moves.
-Refreeze records an in-progress phase before the marker is restored.
+Refreeze records an in-progress phase before the marker is restored, and only
+when the live database is still the approved snapshot. A ``received`` approval
+is the import receipt: the same approved memory returns success without
+importing again.
 """
 import hashlib
 import json
@@ -127,6 +130,21 @@ def _hashes_match(record, path):
     if path.is_symlink() or not path.is_file():
         raise RuntimeRefusal('bad_state')
     return _sha(_blob(path)) == record['freeze_sha256']
+
+
+def _incoming_matches(state, record):
+    """True only when a fresh snapshot of the live database is the approved memory."""
+    from jarvis import brainsync
+    try:
+        live = brainsync.snapshot_memory(Path(state)/'memory.sqlite3')
+    except brainsync.BrainSyncError:
+        return False
+    return _sha(live) == record['incoming_memory_sha256']
+
+
+def _require_incoming(state, record):
+    if not _incoming_matches(state, record):
+        raise RuntimeRefusal('memory_conflict')
 
 
 def prepare(config, state, client, bundle_path, *, incoming_sha256, current_sha256, freeze_sha256, confirmed=False):
@@ -265,6 +283,11 @@ def receive(config, state, blob):
                 _sha(memory) != record['incoming_memory_sha256'] or
                 _sha(_blob(brainsync._marker_path(state.parent))) != record['freeze_sha256']):
             raise RuntimeRefusal('conflict')
+        if record.get('phase') == 'received':
+            # The install already committed. Do not materialize this bundle again.
+            _require_incoming(state, record)
+            return {'ok': True, 'status': 'imported', 'error': None, 'already': True,
+                    'memory_sha256': record['incoming_memory_sha256']}
         result = brainsync._receive_unlocked(config, state.parent, blob)
         if result.get('ok') is True:
             record.update(phase='received', bundle_sha256=_sha(blob))
@@ -301,9 +324,7 @@ def activate(participant):
                 not callable(binding.get('issuer'))):
             raise RuntimeRefusal('managed_unbound')
         _status, grant = _return_grant(participant, record)
-        memory = brainsync.snapshot_memory(state/'memory.sqlite3')
-        if _sha(memory) != record['incoming_memory_sha256']:
-            raise RuntimeRefusal('memory_conflict')
+        _require_incoming(state, record)
         marker = brainsync._marker_path(state.parent)
         archive = state/record['archive']; _regular(archive)
         if not archive.is_dir() or archive.is_symlink():
@@ -361,6 +382,8 @@ def refreeze(participant):
         record = _approval(state); status = participant.client.status()
         if not _refreeze_status_ok(participant, record, status):
             raise RuntimeRefusal('stale')
+        # The receipt claims the incoming database is still the one that was approved.
+        _require_incoming(state, record)
         marker = brainsync._marker_path(state.parent)
         archive = state/record['archive']; _regular(archive)
         archived = archive/'activated-freeze.json'

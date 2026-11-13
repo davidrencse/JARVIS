@@ -51,6 +51,8 @@ _EFFECTS = frozenset({"control", "ordinary", "ai"})
 _LANES = ("luna", "grok", "quota_ok", "mediated_tools", "session_local")
 # Renew must not undo these. "suspend" stays until invalidate_after_resume.
 _NO_RENEW = frozenset({"suspend", "draining"})
+# A successful admit may clear these. Drain, suspend, and legacy stay latched.
+_STICKY_BLOCK = frozenset({"suspend", "draining", "legacy", "quarantined", "partition"})
 # status() does not return lease_id. The holder must keep the grant response.
 _LEASE_FIELDS = ("holder", "lease_id", "incarnation", "epoch")
 _STEPS = frozenset({"drain", "fence", "grant", "complete", "cancel"})
@@ -116,6 +118,52 @@ def _finite_wait(value):
     if value < 0 or value != value or value == float("inf"):
         return None
     return value
+
+
+def _plain_int(value):
+    """Non-negative int. ``True`` and ``1.0`` are not epoch counters."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _status_tuple(status):
+    if not isinstance(status, dict):
+        return None
+    incarnation, epoch = status.get("incarnation"), status.get("epoch")
+    if not _plain_int(incarnation) or not _plain_int(epoch):
+        return None
+    return (incarnation, epoch)
+
+
+def _grant_still_current(lease, status):
+    """This process's grant is the live MAIN tuple.
+
+    ``main`` is set only while the lease is valid. A lingering ``lease_holder``
+    after expiry, a bool, or a float does not count. HANDOVER still names the
+    current holder until the fence; that renew may extend the lease and still
+    must not admit.
+    """
+    if not isinstance(lease, dict) or not isinstance(status, dict):
+        return False
+    live = _status_tuple(status)
+    if live is None:
+        return False
+    if not _plain_int(lease.get("incarnation")) or not _plain_int(lease.get("epoch")):
+        return False
+    if (lease["incarnation"], lease["epoch"]) != live:
+        return False
+    if status.get("mode") not in ("V2_ACTIVE", "HANDOVER"):
+        return False
+    return status.get("main") == lease.get("holder")
+
+
+def _grant_refusal(lease, status):
+    """``not_holder`` only when the counters match and someone else is MAIN."""
+    live = _status_tuple(status)
+    if live is not None and isinstance(lease, dict) and (
+            lease.get("incarnation"), lease.get("epoch")) == live:
+        if status.get("main") != lease.get("holder"):
+            return "not_holder"
+    return "stale"
 
 
 def _from_client(exc):
@@ -569,12 +617,13 @@ class MainRuntime:
             self._lose_link()
             raise RuntimeRefusal("partition")
         self._last = status
+        if not isinstance(status, dict) or not isinstance(status.get("mode"), str):
+            raise RuntimeRefusal("stale")
         if status["mode"] in _LEGACY_MODES or status["mode"] == "QUARANTINED":
             raise RuntimeRefusal(self._block or "legacy")
-        if status.get("incarnation") != lease["incarnation"] or status.get("epoch") != lease["epoch"]:
-            raise RuntimeRefusal("stale")
-        if status.get("main") != self.device_id:
-            raise RuntimeRefusal("not_holder")
+        # Bool and float compare equal to ints. They are not this grant's counters.
+        if not _grant_still_current(lease, status):
+            raise RuntimeRefusal(_grant_refusal(lease, status))
         with self._lock:
             self._lease = {key: lease[key] for key in _LEASE_FIELDS}
             # A new grant is allowed to renew. The handoff pause applied to the
@@ -680,26 +729,33 @@ class MainRuntime:
                 # A newer block (a drain begun during this call) is not replaced.
                 self._set_block(err.code, gen)
             return {"code": err.code, "wait": err.wait}
-        cached = False
-        with self._lock:
-            if self._gen == gen and started is not None and isinstance(answer, dict):
-                cached = self._cache.observe(
-                    holder=lease["holder"], incarnation=lease["incarnation"],
-                    epoch=lease["epoch"], valid_for=answer.get("valid_for"),
-                    ready=answer.get("ready") is True, request_started=started)
         try:
             status = self._port.status()
         except LinkError:
             self._lose_link()
             return {"code": "partition", "wait": None}
+        # Cache only after status still names this grant. A fence that landed
+        # during the renew must not be returned as a successful tuple.
+        if not _grant_still_current(lease, status):
+            with self._lock:
+                self._last = status
+                self._cache.invalidate("stale")
+                self._set_block(_grant_refusal(lease, status), gen)
+            return {"code": _grant_refusal(lease, status), "wait": None}
+        answer_ready = isinstance(answer, dict) and answer.get("ready") is True
+        confirmed = (answer_ready and status.get("mode") == "V2_ACTIVE" and status.get("main_ready") is True
+                     and not status.get("transition") and status.get("main") == lease["holder"])
+        cached = False
         with self._lock:
             self._last = status
-            ready = isinstance(answer, dict) and answer.get("ready") is True
+            if self._gen == gen and started is not None and isinstance(answer, dict):
+                cached = self._cache.observe(
+                    holder=lease["holder"], incarnation=lease["incarnation"],
+                    epoch=lease["epoch"], valid_for=answer.get("valid_for"),
+                    ready=confirmed, request_started=started)
             # The status read began after ``gen`` was taken. If any block was set
             # since (a drain, suspend, hold of a later call), that block stays.
-            if (ready and status.get("mode") == "V2_ACTIVE" and not status.get("transition")
-                    and status.get("main") == self.device_id and status.get("main_ready")
-                    and self._gen == gen):
+            if confirmed and self._gen == gen:
                 self._block = None
             remaining = self._cache.remaining(self.device_id) if self._cache.now() is not None else 0.0
             reason = self._cache.reason
@@ -710,7 +766,7 @@ class MainRuntime:
             "holder": lease["holder"], "lease_id": lease["lease_id"],
             "incarnation": lease["incarnation"], "epoch": lease["epoch"],
             "valid_for": None if not isinstance(answer, dict) else answer.get("valid_for"),
-            "ready": ready, "remaining": remaining, "cached": cached,
+            "ready": confirmed, "remaining": remaining, "cached": cached,
             "renew_after": renew_after, "wait": None,
         }
 
@@ -738,37 +794,49 @@ class MainRuntime:
             self._lose_link()
             raise RuntimeRefusal("partition")
         self._last = status
+        if not isinstance(status, dict) or not isinstance(status.get("mode"), str):
+            raise RuntimeRefusal(self._drop("stale", gen))
         if status["mode"] in _LEGACY_MODES:
-            self._set_block("legacy", gen)
-            raise RuntimeRefusal("legacy")
+            raise RuntimeRefusal(self._drop("legacy", gen))
         if status["mode"] == "QUARANTINED":
-            self._set_block("quarantined", gen)
-            raise RuntimeRefusal("quarantined")
+            raise RuntimeRefusal(self._drop("quarantined", gen))
         if status.get("mode") != "V2_ACTIVE" or not status.get("lease_valid"):
-            self._set_block("no_main", gen)
-            raise RuntimeRefusal("no_main")
+            raise RuntimeRefusal(self._drop("no_main", gen))
         if status.get("main") != self.device_id:
-            self._cache.invalidate("not_holder")
-            self._set_block("not_holder", gen)
-            raise RuntimeRefusal("not_holder")
+            raise RuntimeRefusal(self._drop("not_holder", gen))
         if not status.get("main_ready"):
             raise RuntimeRefusal("not_ready")
+        with self._lock:
+            lease = self._lease_copy()
+        # Status naming this device is not enough. The process must hold that
+        # incarnation and epoch. Windows has no cache veto, so this is the fence.
+        # A local probe miss must not hide a stale tuple.
+        if lease is None:
+            self._cache.invalidate("no_lease_id")
+            raise RuntimeRefusal("no_lease_id")
+        if not _grant_still_current(lease, status):
+            raise RuntimeRefusal(self._drop(_grant_refusal(lease, status), gen))
         report = self.readiness("ai" if effect_class == "ai" else "control")
         if not report["meets"]:
             raise RuntimeRefusal(report["reason"])
         if self._cache.now() is not None:
-            if self._cache.remaining(self.device_id) <= 0 or self._lease is None:
-                if self._lease is None:
-                    raise RuntimeRefusal("no_lease_id")
+            if self._cache.remaining(self.device_id) <= 0:
                 renewed = self.renew_once()
                 if renewed["code"] != "ok" or self._cache.remaining(self.device_id) <= 0:
                     raise RuntimeRefusal("expired" if renewed["code"] == "ok" else renewed["code"])
                 status = self._last
-            seen = self._cache.seen
-            if seen != (status["incarnation"], status["epoch"]):
-                self._cache.invalidate("newer_tuple")
-                self._set_block("stale", gen)
-                raise RuntimeRefusal("stale")
+                with self._lock:
+                    lease = self._lease_copy()
+                if lease is None or not _grant_still_current(lease, status):
+                    raise RuntimeRefusal(self._drop("stale", gen))
+            live = _status_tuple(status)
+            # ``seen`` starts at (0, 0). Equality with a real tuple means this
+            # process observed it. A newer high-water means this status is stale.
+            if live is None or self._cache.seen != live:
+                raise RuntimeRefusal(self._drop("stale", gen))
+        live = _status_tuple(status)
+        if live is None:
+            raise RuntimeRefusal(self._drop("stale", gen))
         with self._lock:
             if self._block == "partition":
                 raise RuntimeRefusal("partition")
@@ -777,9 +845,14 @@ class MainRuntime:
                 raise RuntimeRefusal(self._hold)
             if self._gen != gen and self._block is not None:
                 raise RuntimeRefusal(self._block)
+            if not _grant_still_current(self._lease_copy(), status):
+                raise RuntimeRefusal("stale")
+            if self._block not in _STICKY_BLOCK:
+                self._block = None
+        incarnation, epoch = live
         return {
             "effect_class": effect_class, "target": target, "holder": self.device_id,
-            "incarnation": status["incarnation"], "epoch": status["epoch"],
+            "incarnation": incarnation, "epoch": epoch,
             "mode": status["mode"], "mode_version": status["mode_version"],
             "authority_id": status["authority_id"], "policy_version": status["policy_version"],
             "ready": True, "online": True, "consume_required": True,
@@ -808,8 +881,12 @@ class MainRuntime:
             self._last = status
             # The generation moves here. A renew that began earlier cannot cache
             # its grant again or clear this block from an older status read.
-            self._set_block("draining")
-            self._cache.invalidate("draining")
+            # Suspend is stronger than a temporary transition drain: if a
+            # release attempt was busy, a later drain/cancel must not reopen
+            # heartbeats for a machine that is preparing to sleep.
+            if self._block != "suspend":
+                self._set_block("draining")
+                self._cache.invalidate("draining")
         return {"transition_id": transition_id, "admission_stopped": True,
                 "renewals_stopped": True, "authority_drain": False,
                 "state": current.get("state"), "code": "draining"}
@@ -887,6 +964,19 @@ class MainRuntime:
             self._gen += 1
             self._cache.invalidate("stopped")
 
+    def _lease_copy(self):
+        lease = self._lease
+        if not isinstance(lease, dict) or any(key not in lease for key in _LEASE_FIELDS):
+            return None
+        return {key: lease[key] for key in _LEASE_FIELDS}
+
+    def _drop(self, code, gen=None):
+        """Forget the cached grant. A newer block (drain, suspend) wins the latch."""
+        self._cache.invalidate(code)
+        if not self._set_block(code, gen):
+            return self._block or code
+        return code
+
     def _drain_finished(self):
         """A local drain latch lasts only while the authority transition is still open."""
         gen = self._generation()
@@ -900,7 +990,7 @@ class MainRuntime:
             if status.get("transition"):
                 return False
             # A block set after this read began (a new drain) is not cleared by it.
-            if self._gen != gen:
+            if self._gen != gen or self._block != "draining":
                 return False
             self._block = None
             return True
@@ -917,8 +1007,14 @@ class MainRuntime:
         if not stale and self._cache.now() is not None:
             remaining = self._cache.remaining(self.device_id)
         phase = self._phase(status)
+        lease = self._lease if isinstance(self._lease, dict) else None
+        live = _status_tuple(status)
+        held = (lease is not None and live is not None
+                and (lease.get("incarnation"), lease.get("epoch")) == live
+                and lease.get("holder") == self.device_id)
+        # No suspend-aware clock is not a reason to admit without the grant.
         open_admission = (
-            not stale and not self._hold and not self._block and phase == "main"
+            not stale and not self._hold and not self._block and phase == "main" and held
             and (self._cache.now() is None or remaining > 0)
         )
         reason = self._hold or self._block or ("stale" if stale else "ok")
@@ -1371,6 +1467,10 @@ class _HandoffJournal:
 
     def __init__(self, path):
         self.path = None if path is None else Path(path)
+        # File-backed journals have a process lock below. The in-memory journal
+        # still needs a thread lock so concurrent callback claimers cannot both
+        # copy the same empty state and win a compare-and-set.
+        self._lock = threading.RLock()
         self.corrupt = False
         # True when the last update could not be written. Memory was not changed,
         # so nothing was recorded and nothing has run: the caller may retry.
@@ -1477,6 +1577,10 @@ class _HandoffJournal:
 
     def _update(self, merge):
         """Apply ``merge`` to a copy. Memory adopts it only after the write lands."""
+        with self._lock:
+            return self._update_locked(merge)
+
+    def _update_locked(self, merge):
         self.write_failed = False
         if self.corrupt:
             return False

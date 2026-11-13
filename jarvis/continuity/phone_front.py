@@ -36,6 +36,46 @@ _TS_HOST = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0
 _DEVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 
 
+# Every PC keeps its own pairing store, so one phone holds one session per PC. On this
+# single origin the front gives each PC its own cookie name and CSRF header:
+#   phone -> front:  Cookie __Host-jarvis_phone.<device>=...   X-Jarvis-Csrf-<device>: ...
+#   front -> PC:     Cookie __Host-jarvis_phone=...            X-CSRF-Token: ...
+# The PC's code does not change; the phone app keeps one CSRF token per PC (X-Jarvis-Main).
+PHONE_COOKIE = "__Host-jarvis_phone"
+
+
+def _cookie_for(headers, device):
+    """The Cookie header for one PC: its namespaced phone cookie under the plain name.
+    Other PCs' phone cookies and any plain phone cookie the phone still holds stay here."""
+    mine = PHONE_COOKIE + "." + device
+    out = []
+    for header in headers:
+        for part in str(header).split(";"):
+            name, sep, value = part.strip().partition("=")
+            if not sep or not name:
+                continue
+            if name == mine:
+                out.append(f"{PHONE_COOKIE}={value}")
+            elif name == PHONE_COOKIE or name.startswith(PHONE_COOKIE + "."):
+                continue
+            else:
+                out.append(f"{name}={value}")
+    return "; ".join(out)
+
+
+def _namespaced(headers):
+    """Has this phone app any per-PC CSRF token? Then a plain X-CSRF-Token is stale."""
+    return any(name.lower().startswith("x-jarvis-csrf-") for name in headers.keys())
+
+
+def _rename_cookie(value, device):
+    """A PC's `__Host-jarvis_phone=` Set-Cookie becomes that PC's namespaced cookie."""
+    text = str(value)
+    if text.startswith(PHONE_COOKIE + "="):
+        return PHONE_COOKIE + "." + device + text[len(PHONE_COOKIE):]
+    return text
+
+
 def _check_origin(value):
     """`https://<name>.ts.net[:port]`, or loopback `http://127.0.0.1|localhost:<port>`."""
     if not isinstance(value, str) or not value or value != value.strip():
@@ -246,16 +286,37 @@ class _Handler(BaseHTTPRequestHandler):
         headers = {}
         for name in self.headers.keys():
             low = name.lower()
-            if low in ("x-jarvis-front", "x-jarvis-front-main"):
-                continue
+            if low.startswith("x-jarvis-front") or low.startswith("x-jarvis-csrf-"):
+                continue  # only this front sets these; a client's copy never passes
+            if low == "cookie" or low == "x-csrf-token":
+                continue  # namespaced per MAIN below
             if low in _REQUEST_HEADERS or low.startswith("x-jarvis-"):
                 headers[name] = self.headers[name]
+        cookie = _cookie_for(self.headers.get_all("Cookie") or [], device)
+        if cookie:
+            headers["Cookie"] = cookie
+        csrf = self.headers.get_all("X-Jarvis-Csrf-" + device) or []
+        if len(csrf) > 1:
+            csrf = []  # two answers is no answer: the PC then refuses with csrf
+        if not csrf and not _namespaced(self.headers):
+            csrf = self.headers.get_all("X-CSRF-Token") or []
+        for value in csrf[:1]:
+            headers["X-CSRF-Token"] = value
+        # Host stays the upstream's own name (urllib sets it from the URL): the MAIN's
+        # `tailscale serve` routes by it. The front's name travels as X-Forwarded-Host.
         host = self.headers.get("Host")
         if host:
-            headers["Host"] = host
             headers["X-Forwarded-Host"] = host
         headers["X-Jarvis-Front"] = "1"
         headers["X-Jarvis-Front-Main"] = device
+        # Who the phone is, as this server's own `tailscale serve` saw it. The MAIN's
+        # serve only sees the Oracle node, so the PC reads these instead, and only when
+        # the hop it sees is the configured front node (`phone.front_origin`).
+        hops = self.headers.get_all("X-Forwarded-For") or []
+        logins = self.headers.get_all("Tailscale-User-Login") or []
+        if len(hops) == 1 and len(logins) == 1:
+            headers["X-Jarvis-Front-For"] = str(hops[0]).split(",")[-1].strip()
+            headers["X-Jarvis-Front-Login"] = str(logins[0]).strip()
         request = urllib.request.Request(origin + self.path, data=body, headers=headers,
                                          method=self.command)
         try:
@@ -292,7 +353,7 @@ class _Handler(BaseHTTPRequestHandler):
             for value in info.get_all(name) or ():
                 self.send_header(name, value)
         for value in info.get_all("Set-Cookie") or ():
-            self.send_header("Set-Cookie", value)
+            self.send_header("Set-Cookie", _rename_cookie(value, device))
         self.send_header("X-Jarvis-Main", device)
         no_body = self.command == "HEAD" or status in (204, 304) or 100 <= status < 200
         if length is not None:

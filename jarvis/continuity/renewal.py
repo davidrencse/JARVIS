@@ -45,8 +45,8 @@ class SelfRecovery:
     calls and the gateway answers `enabled`. The orchestrator is node-owned
     (`candidate_runtime`): it only advances transitions where this node is the
     candidate, except cancelling a dead candidate's not-ready grant. Readiness
-    is this node's own probe; activation is the participant's canary when one
-    is wired, else the runtime's control readiness.
+    is this node's own probe; activation is the participant's canary.
+    A missing canary does not count as success.
     """
 
     def __init__(self, participant, *, clock=None):
@@ -69,7 +69,10 @@ class SelfRecovery:
         try:
             answer = self.participant.client.self_policy()
         except Exception:
-            return self._policy  # keep the last answer through a blip
+            # The cached answer is already past its TTL. A failed refresh must
+            # not keep an enabled policy forever.
+            self._policy, self._orchestrator, self._policy_at = None, None, None
+            return None
         self._policy_at = now
         if not isinstance(answer, dict) or answer.get('enabled') is not True:
             self._policy, self._orchestrator = None, None
@@ -118,12 +121,12 @@ class SelfRecovery:
         except Exception:
             return False
         canary = getattr(self.participant, 'canary', None)
-        if callable(canary):
-            try:
-                return canary() is True
-            except Exception:
-                return False
-        return True
+        if not callable(canary):
+            return False
+        try:
+            return canary() is True
+        except Exception:
+            return False
 
     def tick(self):
         if not self._usable:
@@ -149,14 +152,26 @@ class LeaseRenewer:
         self.thread = None
         self.recovery = SelfRecovery(participant)
         self.last_recovery = None
+        self.last_error = None
+
+    def _suspended(self):
+        """True while this PC has released for sleep and must not extend a lease."""
+        runtime = getattr(self.participant, 'runtime', None)
+        return getattr(runtime, '_block', None) == 'suspend'
 
     def tick(self):
+        if self._suspended():
+            # Sleep already invalidated the cache. Do not renew, recover, or
+            # tell services this node is still MAIN.
+            self.last_recovery = None
+            return {'code': 'suspend'}
         try:
             self.last_recovery = self.recovery.tick()
         except Exception as exc:
             # Recovery must never stop renewal of a lease this node already holds.
             self.last_recovery = {'code': 'error', 'error': type(exc).__name__}
         if self.participant.runtime.lease_snapshot() is None:
+            # A restarted process has no grant in RAM and must not renew one.
             result = {'code': 'no_lease'}
         else:
             result = self.participant.runtime.renew_once()
@@ -196,23 +211,38 @@ class LeaseRenewer:
         while not self.stop.wait(delay):
             try:
                 result = self.tick()
-            except Exception:
+                self.last_error = None
+            except RuntimeRefusal as exc:
+                # renew_once already returns partition and authority codes.
+                # A refusal here is a poll, not a schedule and not a new lease.
+                result = {'code': exc.code, 'wait': None}
+                self.last_error = exc.code
+            except Exception as exc:
                 # The runtime/guard still validate authority at every effect.
                 # An unreachable gateway does not kill the hub or open a lease.
                 result = None
+                self.last_error = type(exc).__name__
             delay = self._next_delay(result)
 
     def start(self):
         if self.thread is not None:
             raise RuntimeRefusal('bad_state')
+        self.stop.clear()
         self.thread = threading.Thread(target=self._run, name='continuity-lease-renewal', daemon=True)
         self.thread.start()
         return self
 
     def close(self):
+        """Stop the thread. A finished join can start again; a stuck one cannot."""
+        thread = self.thread
+        if thread is None:
+            return
         self.stop.set()
-        if self.thread is not None:
-            self.thread.join(timeout=2)
+        thread.join(timeout=2)
+        if thread.is_alive():
+            return
+        self.thread = None
+        self.stop.clear()
 
 
 def start_bound(state, config=None, base=None):

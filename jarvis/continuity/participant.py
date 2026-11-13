@@ -11,12 +11,14 @@ import threading
 from .runtime import GatewayPort, MainRuntime, RuntimeRefusal
 
 KIND = 'continuity'
-_ACTIONS = frozenset({'readiness', 'drain', 'release', 'accept', 'snapshot', 'fence', 'probe', 'brain', 'canary', 'activate_return'})
+_ACTIONS = frozenset({'readiness', 'drain', 'release', 'accept', 'snapshot', 'fence', 'probe', 'brain', 'canary', 'activate_return', 'repoint', 'pause_renewal', 'owner_proxy'})
 _PHASES = {
     'readiness': {'REQUESTED', 'VALIDATING'},
     'drain': {'DRAINING'}, 'release': {'DRAINING'},
     'accept': {'GRANTED_NOT_READY'}, 'snapshot': {'GRANTED_NOT_READY'},
     'fence': {'DRAINING', 'FENCING'}, 'brain': {'GRANTED_NOT_READY'}, 'canary': {'GRANTED_NOT_READY'}, 'activate_return': {'GRANTED_NOT_READY'},
+    'repoint': {'GRANTED_NOT_READY'},
+    'pause_renewal': {'GRANTED_NOT_READY'},
 }
 _REGISTRY = {}
 _LOCK = threading.RLock()
@@ -33,15 +35,69 @@ def validate(payload):
         required.add('operation')
     if action == 'canary':
         required.add('nonce')
+    if action == 'repoint':
+        required.add('target')
+    if action == 'owner_proxy':
+        required.add('operation')
     if action not in _ACTIONS or set(payload) != required:
         raise RuntimeRefusal('bad_request')
     from .runtime import _ident_ok
-    if not (action == 'probe' and payload['transition_id'] is None) and not _ident_ok(payload['transition_id']):
+    proxy_request = (action == 'owner_proxy' and isinstance(payload.get('operation'), dict)
+                     and payload['operation'].get('kind') == 'request')
+    if not ((action == 'probe' and payload['transition_id'] is None)
+            or (proxy_request and payload['transition_id'] is None)) and not _ident_ok(payload['transition_id']):
         raise RuntimeRefusal('bad_request')
     if action == 'canary' and not _ident_ok(payload['nonce']):
         raise RuntimeRefusal('bad_request')
+    if action == 'repoint' and not _ident_ok(payload['target']):
+        raise RuntimeRefusal('bad_request')
     if any(type(payload[k]) is not int or payload[k] < 0 for k in ('incarnation', 'epoch')):
         raise RuntimeRefusal('bad_request')
+
+
+def _closed_epoch(status, transition):
+    """Epoch a fence acknowledgement must name.
+
+    The transition opens under ``expected_epoch``. ``fence()`` advances the
+    authority epoch only after every executor has acknowledged that one.
+    A later status read shows the new epoch. Acknowledging it would mark
+    the new MAIN's targets as already fenced.
+    """
+    state = transition.get('state')
+    expected, epoch = transition.get('expected_epoch'), status.get('epoch')
+    if (type(expected) is not int or type(epoch) is not int or expected < 0 or epoch < 0
+            or transition.get('expected_incarnation') != status.get('incarnation')):
+        raise RuntimeRefusal('bad_state')
+    if state == 'DRAINING':
+        if epoch != expected:
+            raise RuntimeRefusal('stale')
+        return expected
+    if state == 'FENCING':
+        if epoch != expected + 1 or transition.get('fenced_epoch') != epoch:
+            raise RuntimeRefusal('stale')
+        return expected
+    raise RuntimeRefusal('bad_state')
+
+
+def _bound_ack(result, *, device_id, transition_id, incarnation, epoch, mode_version):
+    """Reject a fence result that is not this device's ack of the closed epoch."""
+    from .runtime import _ident_ok
+    receipt = result.get('receipt') if isinstance(result, dict) else None
+    signature = result.get('signature') if isinstance(result, dict) else None
+    if (not isinstance(receipt, dict) or not isinstance(signature, str)
+            or 'BEGIN SSH SIGNATURE' not in signature or result.get('authority_recorded') is not True
+            or result.get('fenced_epoch') != epoch or result.get('device_id') != device_id):
+        raise RuntimeRefusal('signature')
+    if (receipt.get('device_id') != device_id or receipt.get('transition_id') != transition_id
+            or receipt.get('incarnation') != incarnation or receipt.get('epoch') != epoch
+            or receipt.get('mode_version') != mode_version
+            or receipt.get('installation_id') != result.get('installation_id')
+            or receipt.get('authority_id') != result.get('authority_id')
+            or receipt.get('fleet_id') != result.get('fleet_id')
+            or not _ident_ok(receipt.get('installation_id'))
+            or not _ident_ok(receipt.get('authority_id')) or not _ident_ok(receipt.get('fleet_id'))):
+        raise RuntimeRefusal('stale')
+    return receipt
 
 
 class Participant:
@@ -53,6 +109,7 @@ class Participant:
         self.config, self.state, self.canary = config, state, canary
         self.device_id = runtime.device_id
         self._lock = threading.RLock()
+        self._fence_acks = {}
 
     def _authorized(self, payload, requester):
         validate(payload)
@@ -61,6 +118,10 @@ class Participant:
         if (status.get('incarnation') != payload['incarnation'] or
                 status.get('epoch') != payload['epoch']):
             raise RuntimeRefusal('stale')
+        if payload['action'] == 'owner_proxy':
+            self._last_proxy_result = self._authorize_owner_proxy(
+                payload['operation'], requester, status, transition)
+            return status, transition
         if payload['action'] == 'probe':
             coordinator = status.get('main') if status.get('lease_valid') else self.device_id
             if requester != coordinator:
@@ -84,8 +145,17 @@ class Participant:
         if action == 'brain':
             self._brain_authorized(payload['operation'], transition)
             role = self.device_id
-        # Every enrolled executor may acknowledge an owner-created fence; the
-        # gateway checks that this installation has its own fence capability.
+        if action == 'repoint':
+            if (transition.get('action') != 'set_preferred_main'
+                    or transition.get('source') != requester
+                    or transition.get('candidate') != self.device_id
+                    or payload.get('target') != requester):
+                raise RuntimeRefusal('candidacy_mismatch')
+            role = self.device_id
+        # Every enrolled executor may acknowledge the epoch this transition
+        # opened under. The gateway still requires this installation's fence
+        # capability on the signed acknowledge. The post-fence epoch is the
+        # new MAIN's and is not an acknowledgement target.
         if action != 'fence' and self.device_id != role:
             raise RuntimeRefusal('candidacy_mismatch')
         if action not in ('readiness', 'snapshot'):
@@ -97,6 +167,54 @@ class Participant:
                     binding.get('executor') is not self.guard or not callable(binding.get('issuer'))):
                 raise RuntimeRefusal('managed_unbound')
         return status, transition
+
+    def _authorize_owner_proxy(self, operation, requester, status, transition):
+        """Authorize one enrolled ready MAIN to request/step a return to this PC."""
+        controller = getattr(self, 'production_controller', None)
+        if controller is None:
+            raise RuntimeRefusal('managed_unbound')
+        allowed = controller.operator.get('owner_proxy_clients', ())
+        client = self.client
+        owner_path = getattr(client, '_owner_key', None)
+        if (requester not in allowed or not getattr(client, 'can_sign_owner', False)
+                or owner_path is None or not Path(owner_path).is_file()):
+            raise RuntimeRefusal('owner_proof_unavailable')
+        if not isinstance(operation, dict):
+            raise RuntimeRefusal('bad_request')
+        from .runtime import GatewayPort, _caller_key
+        owner = GatewayPort(client)
+        if operation == {'kind': 'request'}:
+            if (transition or status.get('mode') != 'V2_ACTIVE' or status.get('main') != requester
+                    or status.get('lease_valid') is not True or status.get('main_ready') is not True):
+                raise RuntimeRefusal('stale')
+            request = {
+                'caller': 'safe-handoff',
+                'client_key': _caller_key('set_preferred_main', requester, self.device_id, status),
+                'action': 'set_preferred_main', 'candidate': self.device_id,
+                'expected_incarnation': status['incarnation'], 'expected_epoch': status['epoch'],
+                'expected_policy': status['policy_version'], 'profile': 'control',
+            }
+            return owner.transition_request(request)
+        keys = {'kind', 'transition_id', 'step', 'incarnation', 'epoch'}
+        if operation.get('step') == 'complete':
+            keys.add('canary_ok')
+        if set(operation) != keys or operation.get('kind') != 'step':
+            raise RuntimeRefusal('bad_request')
+        if (operation.get('transition_id') != transition.get('transition_id')
+                or transition.get('action') != 'set_preferred_main'
+                or transition.get('source') != requester
+                or transition.get('candidate') != self.device_id
+                or operation.get('incarnation') != status.get('incarnation')
+                or operation.get('epoch') != status.get('epoch')
+                or operation.get('step') not in {'drain', 'fence', 'grant', 'complete', 'cancel'}):
+            raise RuntimeRefusal('stale')
+        if operation['step'] == 'complete':
+            if type(operation.get('canary_ok')) is not bool:
+                raise RuntimeRefusal('bad_request')
+        elif 'canary_ok' in operation:
+            raise RuntimeRefusal('bad_request')
+        return owner.transition_step(operation['transition_id'], operation['step'],
+                                     operation.get('canary_ok'))
 
     def _brain_authorized(self, operation, transition):
         from jarvis import transfer
@@ -189,6 +307,19 @@ class Participant:
             if action == 'brain':
                 from jarvis.transfer import run_here
                 return run_here(payload['operation'], self.state, self.config)
+            if action == 'repoint':
+                controller = getattr(self, 'production_controller', None)
+                if controller is None:
+                    raise RuntimeRefusal('managed_unbound')
+                return controller.prepare_repoint(payload['target'])
+            if action == 'owner_proxy':
+                result, self._last_proxy_result = self._last_proxy_result, None
+                if result is None:
+                    raise RuntimeRefusal('bad_state')
+                return result
+            if action == 'pause_renewal':
+                self.runtime.pause_renewal()
+                return {'paused': True}
             if action == 'readiness':
                 facts = self.runtime.readiness(transition['profile'])
                 # The client signs locally; no facts supplied by the source are used.
@@ -199,9 +330,7 @@ class Participant:
             if action == 'release':
                 return self.runtime.release_for_handoff(tid)
             if action == 'fence':
-                if self.guard is None:
-                    raise RuntimeRefusal('managed_unbound')
-                return self.guard.fence(status['incarnation'], status['epoch'], status['mode_version'])
+                return self._fence(payload, status, transition)
             if action == 'accept':
                 lease = payload['lease']
                 if (not isinstance(lease, dict) or lease.get('holder') != self.device_id or
@@ -213,6 +342,59 @@ class Participant:
                 self.runtime.start()
                 self.runtime.accept_lease(lease)
             return self.runtime.lease_snapshot()
+
+    def _fence(self, payload, status, transition):
+        """Sign one idempotent acknowledgement of the closed epoch.
+
+        A repeat of the same transition, incarnation and closed epoch returns
+        the receipt already issued. It does not ask the authority to record a
+        higher epoch. A guard that has already fenced past that epoch refuses
+        before another acknowledge is sent.
+        """
+        if self.guard is None:
+            raise RuntimeRefusal('managed_unbound')
+        from .authority import AuthorityError
+        from .gateway import RUNTIME_NS, GatewayError, _message, sign_message
+        from .runtime import _ident_ok
+        closed = _closed_epoch(status, transition)
+        incarnation = status['incarnation']
+        if (not _ident_ok(status.get('authority_id')) or not _ident_ok(status.get('fleet_id'))
+                or type(status.get('mode_version')) is not int or status['mode_version'] < 0):
+            raise RuntimeRefusal('bad_state')
+        key = (payload['transition_id'], incarnation, closed)
+        cached = self._fence_acks.get(key)
+        if cached is not None:
+            return cached
+        view = self.guard.local_view()
+        prior_epoch, prior_inc = view.get('fenced_epoch'), view.get('fenced_incarnation')
+        if (type(prior_epoch) is int and type(prior_inc) is int
+                and (prior_inc, prior_epoch) > (incarnation, closed)):
+            raise RuntimeRefusal('stale')
+        try:
+            recorded = self.guard.fence(incarnation, closed, status['mode_version'])
+        except AuthorityError as exc:
+            raise RuntimeRefusal(exc.code, exc.wait) from None
+        if (not isinstance(recorded, dict) or recorded.get('fenced_epoch') != closed
+                or recorded.get('fenced_incarnation') != incarnation
+                or recorded.get('authority_recorded') is not True
+                or recorded.get('device_id') != self.device_id
+                or recorded.get('installation_id') != self.client.installation_id
+                or recorded.get('authority_id') != status['authority_id']
+                or recorded.get('fleet_id') != status['fleet_id']):
+            raise RuntimeRefusal('stale')
+        receipt = {
+            'device_id': self.device_id, 'installation_id': self.client.installation_id,
+            'authority_id': status['authority_id'], 'fleet_id': status['fleet_id'],
+            'transition_id': payload['transition_id'], 'incarnation': incarnation,
+            'epoch': closed, 'mode_version': status['mode_version'],
+        }
+        try:
+            signature = sign_message(RUNTIME_NS, self.client._key, _message(RUNTIME_NS, receipt))
+        except GatewayError:
+            raise RuntimeRefusal('signature') from None
+        signed = {**recorded, 'receipt': receipt, 'signature': signature}
+        self._fence_acks = {key: signed}
+        return signed
 
 
 def load_local(config, state, *, probe, client_factory=None, guard=None, boot=None):
@@ -302,6 +484,12 @@ class RemoteRuntime:
     def lease_snapshot(self):
         return self._request('snapshot')
 
+    def pause_renewal(self):
+        return self._request('pause_renewal')
+
+    def issue_repoint(self, target):
+        return self._request('repoint', target=target)
+
 
 class CandidatePort:
     """Route readiness to the candidate, keeping owner steps on the owner port."""
@@ -325,11 +513,18 @@ class CandidatePort:
     def transition_step(self, transition_id, step, canary_ok=None):
         if step == 'fence':
             status = self.owner_port.status()
-            if (status.get('transition') or {}).get('transition_id') != transition_id:
+            transition = status.get('transition') or {}
+            if transition.get('transition_id') != transition_id:
                 raise RuntimeRefusal('unknown_transition')
-            scope = transition_scope(status)
-            for peer in self.participants:
-                peer._request('fence', _scope=scope)
+            # Only the draining epoch is collected. A replay after fence()
+            # advanced the epoch must not acknowledge the new MAIN's epoch.
+            if transition.get('state') == 'DRAINING':
+                scope = transition_scope(status)
+                for peer in self.participants:
+                    result = peer._request('fence', _scope=scope)
+                    _bound_ack(result, device_id=peer.device_id, transition_id=transition_id,
+                               incarnation=status['incarnation'], epoch=status['epoch'],
+                               mode_version=status['mode_version'])
         return self.owner_port.transition_step(transition_id, step, canary_ok)
 
 

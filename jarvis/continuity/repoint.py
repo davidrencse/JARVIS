@@ -237,7 +237,7 @@ class Installer:
     def __init__(self, participant, state, pins, *, probe=probe_endpoint):
         self.participant, self.state, self.pins, self.probe = participant, Path(state), pins, probe
 
-    def install(self, instruction):
+    def _install(self, instruction, *, publish):
         from jarvis.locking import exclusive_lock
         from .integration import production_binding
         # Publish exactly what was verified even if the caller changes its offer
@@ -272,6 +272,9 @@ class Installer:
                                        self.pins[body['main']]['public_key'])):
                 raise RuntimeRefusal('signature')
             _grant(client.status(), body)  # a slow probe cannot publish a lost grant
+            if not publish:
+                return {'ok': True, 'authenticated': True, 'key_updated': True,
+                        'endpoint_updated': False}
             # Publish intent first. A crash before pairing is fail closed on readback.
             _save(path, instruction)
             note = {'node_id': client.device_id, 'main_device': body['main'], 'token': body['token'],
@@ -282,6 +285,18 @@ class Installer:
             if _read(path) != instruction or _read(self.state/'cluster-node.json') != note:
                 raise RuntimeRefusal('bad_state')
             return {'ok': True, 'authenticated': True, 'key_updated': True, 'endpoint_updated': True}
+
+    def verify_endpoint(self, instruction):
+        """Verify a fresh successor receipt without publishing a new route.
+
+        RoleLifecycle uses this before releasing its old tunnel. The signed
+        endpoint is published only after the replacement transport is active.
+        """
+        return self._install(instruction, publish=False)
+
+    def install(self, instruction):
+        """Verify and publish the signed endpoint (for direct, already-routed use)."""
+        return self._install(instruction, publish=True)
 
 
 def effective_config(config, state):
