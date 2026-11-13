@@ -16,7 +16,7 @@ import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from . import transfer
-from .transfer import _check_target, _fail, _ssh_args, collision_name, safe_name
+from .transfer import _check_target, _fail, _ssh_args, collision_name, safe_name, ssh_host
 
 MAX_ENTRIES = 3000
 MAX_COLLISIONS = 200  # each probe is an SSH round trip, so don't hunt for a free name forever
@@ -186,7 +186,8 @@ class Storage:
             script = inspect.getsource(thumbnail_payload) + "\n" + script
         try:
             done = subprocess.run(
-                [*_ssh_args(ssh, device.get("identity_file")), "-T", device["target"], "python3 -"],
+                [*_ssh_args(ssh, device.get("identity_file")), "-T", *ssh_host(device["target"]),
+                 "python3 -"],
                 input=script, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=30, shell=False)
         except subprocess.TimeoutExpired:

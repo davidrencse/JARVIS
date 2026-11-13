@@ -136,14 +136,16 @@ def probe_ssh(target, identity_file=None):
         out["error"] = (f"{host}:22 didn't answer. The laptop may be asleep, off Wi-Fi, "
                         "or on a new DHCP address.")
         return out
-    args = [binary, "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-            "-o", "ConnectTimeout=5"]
-    if identity_file:
-        args += ["-i", str(Path(identity_file).expanduser()), "-o", "IdentitiesOnly=yes"]
+    try:
+        from .transfer import _ssh_args, ssh_host
+        args = [*_ssh_args(binary, identity_file, timeout=5), "-T", *ssh_host(target), "bash -s"]
+    except ValueError as exc:
+        out["error"] = str(exc)
+        return out
     start = time.perf_counter()
     try:
         # Bytes, not text: Windows text mode would turn the script's \n into \r\n for bash.
-        result = subprocess.run([*args, target, "bash -s"], input=REMOTE_SCRIPT.encode(),
+        result = subprocess.run(args, input=REMOTE_SCRIPT.encode(),
                                 capture_output=True, timeout=15, shell=False,
                                 creationflags=NO_WINDOW)
     except (OSError, subprocess.TimeoutExpired) as exc:

@@ -356,7 +356,7 @@ def _task_exists(name):
     return os.name == "nt" and _run("schtasks", "/Query", "/TN", name, timeout=10).returncode == 0
 
 
-def start():
+def start(_attempt=0):
     first = lan_mouse_status()
     if first["running"]:
         return {"started": False, "note": "Lan Mouse is already running.", **first}
@@ -367,19 +367,20 @@ def start():
         # Elevated, so Windows lets it inject input into admin windows too (UIPI).
         done = _run("schtasks", "/Run", "/TN", ELEVATED_TASK, timeout=15)
         if done.returncode:
+            if _attempt < 2:
+                return start(_attempt=_attempt + 1)
             raise RuntimeError("schtasks couldn't start Lan Mouse: " + (done.stderr.strip()[-200:] or "no detail"))
     elif os.name != "nt" and "lan-mouse.service" in units:
         wanted = [u for u in UNITS if u in units]
         done = _run("systemctl", "--user", "start", *wanted, timeout=30)
         if done.returncode:
             raise RuntimeError("systemctl couldn't start Lan Mouse: " + (done.stderr.strip()[-200:] or "no detail"))
-    elif os.name == "nt" and _windows_launcher().is_file():
-        # The startup launcher also raises its priority and keeps its log, as at login.
-        subprocess.Popen(["wscript.exe", str(_windows_launcher())], creationflags=FLAGS, close_fds=True)
     elif os.name == "nt" and _windows_once_launcher().is_file():
         # Through Explorer, so the daemon runs outside the calling shell's job (a remote
         # `lanmouse start` otherwise dies when the node's command shell exits).
         subprocess.Popen(["explorer.exe", str(_windows_once_launcher())], creationflags=FLAGS, close_fds=True)
+    elif os.name == "nt" and _windows_launcher().is_file():
+        subprocess.Popen(["explorer.exe", str(_windows_launcher())], creationflags=FLAGS, close_fds=True)
     else:
         binary = _binary()
         if not binary:
@@ -397,7 +398,9 @@ def start():
         status = _quick_status()
         if status["running"]:
             return {"started": True, **(lan_mouse_status() if os.name == "nt" else status)}
-    return {"started": False, "note": "Lan Mouse didn't come up; check its log.", **lan_mouse_status()}
+    if os.name == "nt" and _attempt < 2:
+        return start(_attempt=_attempt + 1)
+    return {"started": False, "note": "Lan Mouse did not stay up after three launch attempts; check daemon.log and run jarvis lanmouse elevate from an admin terminal if the task is missing or broken.", **lan_mouse_status()}
 
 
 def stop(sharing_only=False):
@@ -589,8 +592,11 @@ def _install_copy(binary, home):
     keep = {binary.name.lower(), "start-elevated.vbs", "daemon.log"}
     home.mkdir(parents=True, exist_ok=True)
     for src in binary.parent.iterdir():
-        if src.is_file() and (src.name.lower() == binary.name.lower() or src.suffix.lower() == ".dll"):
-            _shutil.copy2(src, home / src.name)
+        # A symlink in the user-writable bin folder must not be copied into Program Files.
+        if src.is_symlink() or not src.is_file():
+            continue
+        if src.name.lower() == binary.name.lower() or src.suffix.lower() == ".dll":
+            _shutil.copy2(src, home / src.name, follow_symlinks=False)
             keep.add(src.name.lower())
     for old in home.iterdir():
         if old.is_file() and old.name.lower() not in keep:
@@ -748,7 +754,8 @@ def peer_nearby(config=None, status=None, nets=None):
     if host:  # online and Tailscale reaches it elsewhere: that beats a configured address,
         # which a spoofed mDNS answer on café Wi-Fi could have planted (audit 2026-11-07)
         return {"near": False, "peer": name, "why": f"{name} is on another network ({host})."}
-    lan = sorted(ip for ip in ips if _in(ip, nets) and not ip.startswith("100."))
+    from .pathsafe import lan_mouse_ip_blocked
+    lan = sorted(ip for ip in ips if _in(ip, nets) and not lan_mouse_ip_blocked(ip))
     if lan:  # the IP watcher only writes addresses it just found
         return {"near": True, "peer": name, "why": f"{name} has an address on this network ({lan[0]})."}
     if not p.get("Online"):
@@ -770,8 +777,9 @@ def _save_memo(path, memo):
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         atomic_write(path, json.dumps(memo))
+        return True
     except OSError:
-        pass
+        return False
 
 
 def guard(state, nearby=None, status_fn=None, start_fn=None, stop_fn=None, autostart=False, boot=None,
@@ -808,24 +816,31 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
     clock = time.time() if now is None else now
     path = Path(state) / GUARD_FILE
     memo = read_json(path, {})
+    memo = memo if isinstance(memo, dict) else {}
     reading = nearby()
     near = reading["near"]
-    # Two readings in a row: a "can't tell" between them breaks the streak (the safe side).
+    running = status_fn()["running"]
+    previous_boot = memo.get("boot")
+    new_boot = boot is not None and (previous_boot is None or abs(boot - float(previous_boot)) > BOOT_JITTER)
+    if new_boot:
+        memo.update(boot=boot, apart=0, together=0, override=bool(running))
+        memo.pop("apart_now", None)
+        memo.pop("pending_start", None)
+        # A stop recorded after this boot, even before the first guard tick, wins.
+        if float(memo.get("manual_stop_at") or 0) < boot:
+            memo.pop("manual_stop_at", None)
+        memo["stopped_by_guard"] = bool(autostart and not running and not memo.get("manual_stop_at"))
+        memo["stopped_at"] = 0
+    if memo.get("manual_stop_at"):
+        memo["stopped_by_guard"] = False
+    # Two consecutive readings from THIS boot are required.
     memo["apart"] = memo.get("apart", 0) + 1 if near is False else 0
     memo["together"] = memo.get("together", 0) + 1 if near is True else 0
-    running = status_fn()["running"]
-    if boot is not None and abs(boot - float(memo.get("boot") or 0)) > BOOT_JITTER:
-        memo["boot"] = round(boot)  # once per boot, so a stop by hand later in the session sticks
-        if autostart and not running:
-            memo["stopped_by_guard"], memo["override"] = True, False
-            memo["stopped_at"] = 0
-        elif not autostart and memo.get("stopped_by_guard"):
-            # Last session's guard stop doesn't outlive the boot: nothing comes up on its own.
-            # Already running again means David started it by hand: an override, as ever.
-            memo["stopped_by_guard"] = False
-            if running:
-                memo["override"] = True
     dying = False
+    if running and memo.pop("pending_start", False):
+        # We crashed after launching but before acknowledging it. This is OUR start,
+        # never a manual override that could keep sharing enabled while apart.
+        memo["stopped_by_guard"], memo["override"] = False, False
     if running and memo.get("stopped_by_guard"):
         # stop() only signals: the daemon we just stopped may still be alive at this reading.
         # Only a daemon still up after the grace period is a start by hand.
@@ -854,12 +869,23 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
           and not running and not remote_session_live(state)  # a remote-control session owns this desktop
           and not controlling_remote(state)):  # or David is driving another computer from this one
         action = "started"
+        memo["pending_start"] = True
     # Before a stop, so a crash mid-action can't lose what we did. A start is saved only once
     # it worked: a failed one leaves stopped_by_guard set and the next reading tries again.
-    _save_memo(path, memo)
+    if _save_memo(path, memo) is False:
+        return {**reading, "running": running, "action": None, "reason": "persistence_failed",
+                "why": "Guard state could not be saved; no action taken."}
     if action == "stopped":
-        stop_fn()
-        _notify(f"Sharing is off: {reading['why']} It comes back when the laptops are together again.")
+        try:
+            stopped = stop_fn()
+            if isinstance(stopped, dict) and stopped.get("stopped") is False:
+                raise RuntimeError("Lan Mouse is still running after stop; retrying next reading.")
+        except Exception as exc:
+            action = "stop_failed"
+            memo["stopped_by_guard"] = False
+            reading = {**reading, "why": f"{reading['why']} Stop failed: {exc}"}
+        if action == "stopped":
+            _notify(f"Sharing is off: {reading['why']} It comes back when the laptops are together again.")
     elif action == "started":
         try:
             start_fn()
@@ -869,11 +895,20 @@ def _guard(state, nearby, status_fn, start_fn, stop_fn, autostart, boot, now, al
         else:
             if status_fn()["running"]:
                 memo["stopped_by_guard"] = False
+                memo.pop("pending_start", None)
                 _save_memo(path, memo)
                 _notify(f"Sharing is back on: {reading['why']}")
             else:
                 action = "start_failed"
-    return {**reading, "running": status_fn()["running"] if action else running, "action": action,
+    reason = ("disabled" if not allow_start else
+              "remote_control" if remote_session_live(state) or controlling_remote(state) else
+              "manual_stop" if memo.get("manual_stop_at") else
+              action or ("apart" if memo.get("apart_now") else
+                         "waiting_together" if memo.get("stopped_by_guard") else
+                         "boot_unavailable" if autostart and boot is None and not running else "idle"))
+    memo.update(reason=reason, why=reading.get("why", ""))
+    _save_memo(path, memo)
+    return {**reading, "reason": reason, "running": status_fn()["running"] if action else running, "action": action,
             "stopped_by_guard": bool(memo.get("stopped_by_guard")), "override": bool(memo.get("override"))}
 
 
@@ -885,7 +920,9 @@ def remote_session_live(state):
     """A remote-control session from the main is driving this computer right now."""
     import time
     try:
-        return time.time() - (Path(state) / REMOTE_MARKER).stat().st_mtime < REMOTE_MARKER_TTL
+        stamp = (Path(state) / REMOTE_MARKER).stat().st_mtime
+        boot = platforms.boot_time()
+        return (boot is None or stamp >= boot) and time.time() - stamp < REMOTE_MARKER_TTL
     except (OSError, TypeError):
         return False
 
@@ -897,7 +934,9 @@ def controlling_remote(state):
     """This computer's console is driving another computer right now (ControllerPause)."""
     import time
     try:
-        return time.time() - (Path(state) / CONTROLLING_MARKER).stat().st_mtime < REMOTE_MARKER_TTL
+        stamp = (Path(state) / CONTROLLING_MARKER).stat().st_mtime
+        boot = platforms.boot_time()
+        return (boot is None or stamp >= boot) and time.time() - stamp < REMOTE_MARKER_TTL
     except (OSError, TypeError):
         return False
 
@@ -979,7 +1018,9 @@ class ControllerPause:
                     # Not now: the guard brings it back once the laptops are together. Said
                     # here too, so a busy guard lock at pause time can't lose the debt.
                     self._guard_memo(stopped_by_guard=True, override=False, stopped_at=time.time())
-                elif self.was_running and not self.status_fn().get("running"):
+                elif (self.was_running and not self.status_fn().get("running")
+                      and not read_json(self.state / GUARD_FILE, {}).get("manual_stop_at")
+                      and not remote_session_live(self.state)):
                     self.start_fn()
                     # Ours to undo: left set, the guard would read this start as one by hand
                     # (an override) and never stop Lan Mouse when the laptops part.
@@ -1025,8 +1066,7 @@ def update_guard_memo(state, tries=50, **fields):
                 if not isinstance(memo, dict):
                     memo = {}
                 memo.update(fields)
-                _save_memo(path, memo)
-                return True
+                return _save_memo(path, memo) is not False
         except ValueError:
             continue
     return False
@@ -1097,6 +1137,7 @@ def sharing_availability(state, now=None):
     out = {"state": "unknown", "settled": settled, "available": None, "remote": True,
            "override": bool(memo.get("override")),
            "stopped_by_guard": bool(memo.get("stopped_by_guard")),
+           "reason": memo.get("reason", "not_checked"),
            "why": "Not checked yet: the guard hasn't read the network."}
     try:
         age = clock - float(memo.get("read_at"))
@@ -1215,12 +1256,46 @@ def guard_for(config, state):
     return guard(state, autostart=on, boot=boot, allow_start=enabled)
 
 
+def validate_pairing(text):
+    """Reject incomplete or VPN-routed configs before touching the known-good file."""
+    import ipaddress
+    if tomllib is None:
+        raise ValueError("Safe pairing requires Python 3.11+ (tomllib).")
+    data = tomllib.loads(text)
+    clients = data.get("clients") or []
+    trusted = data.get("authorized_fingerprints") or {}
+    if not clients or not trusted:
+        raise ValueError("Pairing must keep a peer and its authorized fingerprint.")
+    if any(not re.fullmatch(r"(?:[0-9a-f]{2}:){31}[0-9a-f]{2}", fp) for fp in trusted):
+        raise ValueError("Invalid authorized fingerprint.")
+    for client in clients:
+        name = client.get("hostname")
+        if not name or name not in trusted.values() or not client.get("ips"):
+            raise ValueError("Pairing must keep the peer, fingerprint and nonempty IPs.")
+        for ip in client["ips"]:
+            addr = ipaddress.ip_address(ip)
+            if addr in ipaddress.ip_network("100.64.0.0/10") or addr in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
+                raise ValueError("Tailscale addresses cannot carry shared input.")
+    return data
+
+
 def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None, state=None, config=None):
+    from .locking import exclusive_lock
+    target = Path(path or config_path())
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with exclusive_lock(target.with_name(target.name + ".lock")):
+        return _write_pairing(peer_name, peer_ips, position, peer_fingerprint, target, state, config)
+
+
+def _write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None, state=None, config=None):
     """Write this computer's config for one peer; the old file is kept as a dated backup.
     The release shortcut, port and motion_scale already chosen here carry over."""
     import time
     from .desktop import lan_mouse_config
+    from .fsio import atomic_write
     path = Path(path or config_path())
+    if path.is_symlink():
+        raise ValueError("Lan Mouse config is a link; nothing was written.")
     old = read_config(path) or {}
     backend = old.get("capture_backend") or ("layer-shell" if _desktop() == "hyprland" else None)
     text = lan_mouse_config(peer_name, peer_ips, position, peer_fingerprint,
@@ -1228,12 +1303,13 @@ def write_pairing(peer_name, peer_ips, position, peer_fingerprint, path=None, st
                             ("KeyLeftCtrl", "KeyLeftShift", "KeyLeftMeta", "KeyLeftAlt"),
                             port=old.get("port") or 4242, capture_backend=backend,
                             motion_scale=old.get("motion_scale"))
+    validate_pairing(text)
     path.parent.mkdir(parents=True, exist_ok=True)
     backup = None
     if path.is_file():
-        backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-        backup.write_bytes(path.read_bytes())
-    path.write_text(text, encoding="utf-8")
+        backup = path.with_name(f"{path.name}.bak-{time.time_ns()}")
+        atomic_write(backup, path.read_bytes(), mode=0o600, fsync=True)
+    atomic_write(path, text, mode=0o600, fsync=True)
     restarted = False
     if lan_mouse_status()["running"]:  # it reads the config only at startup
         # Fresh or stale apart: leave the running daemon. Stopping it here and starting
@@ -1263,10 +1339,19 @@ def control(arg, state=None, config=None, now=None):
             if blocked:
                 return False, blocked
             result = start()
+            if state and result.get("running"):
+                update_guard_memo(state, manual_stop_at=None, pending_start=False)
         elif arg == "stop":
+            if state:
+                import time
+                # Record intent BEFORE the action; a crash cannot turn the stop into a retry.
+                if not update_guard_memo(state, manual_stop_at=time.time() if now is None else now,
+                                         stopped_by_guard=False, override=False):
+                    raise RuntimeError("Guard busy; manual stop was not recorded. Retry stop.")
             result = stop()
         elif arg == "status":
-            result = {**lan_mouse_status(), "config": read_config()}
+            result = {**lan_mouse_status(), "config": read_config(),
+                      "guard": sharing_availability(state, now=now)}
         else:
             request = json.loads(arg)
             spec = request.get("pair") if isinstance(request, dict) else None

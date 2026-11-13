@@ -44,7 +44,7 @@ STATIONS = [
     {"id": "log", "title": "Log", "verb": "records",
      "plain": "Everything is written down: the conversation in memory, agent runs in the "
               "task ledger, and live events to this console.",
-     "modules": ["store", "events", "locking", "config_lock", "cluster_store", "fsio"]},
+     "modules": ["store", "events", "locking", "config_lock", "cluster_store", "fsio", "pathsafe"]},
 ]
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
@@ -53,7 +53,7 @@ SIDE = [
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",
-     "modules": ["devices", "inventory", "hostmeter", "probe", "desktop", "selftest", "credits",
+     "modules": ["devices", "lanmouse_peer_ips", "inventory", "hostmeter", "probe", "desktop", "selftest", "credits",
                  "cluster", "topology", "locate"]},
 ]
 # Which station a request's tier lights up, in order.

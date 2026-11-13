@@ -319,17 +319,13 @@ class Remote:
         python = f"$( [ -x {folder}/.venv/bin/python ] && echo {folder}/.venv/bin/python || echo python3 )"
         remote = (f"cd {folder} && {python} -m jarvis desktop {shlex.quote(action)} "
                   f"--b64 {shlex.quote(data)}")
-        args = [binary, "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                "-o", "ConnectTimeout=6"]
-        if machine.get("identity_file"):
-            args += ["-i", str(Path(machine["identity_file"]).expanduser()), "-o", "IdentitiesOnly=yes"]
         from .cluster_tunnel import pinned_host
-        from .transfer import _check_target
-        args += pinned_host(machine, self.state)
+        from .transfer import _ssh_args, ssh_host
+        args = [*_ssh_args(binary, machine.get("identity_file"), timeout=6), "-T",
+                *pinned_host(machine, self.state)]
         last = ""
         for target in [machine["target"], *machine.get("fallback_targets", [])]:
-            _check_target(target)
-            out = subprocess.run([*args, target, remote], capture_output=True, text=True,
+            out = subprocess.run([*args, *ssh_host(target), remote], capture_output=True, text=True,
                                  encoding="utf-8", errors="replace", timeout=45, creationflags=FLAGS)
             if out.returncode == 255:
                 last = out.stderr.strip()[-200:]

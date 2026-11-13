@@ -556,12 +556,9 @@ class Grokbot:
         else:
             if not shutil.which("ssh"):
                 raise LookupError("OpenSSH client is not installed.")
-            argv = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                    "-o", "ConnectTimeout=5"]
-            if route.get("identity_file"):
-                argv += ["-i", str(Path(route["identity_file"]).expanduser()),
-                         "-o", "IdentitiesOnly=yes"]
-            argv += [route["target"], "bash -s"]
+            from .transfer import _ssh_args, ssh_host
+            argv = [*_ssh_args("ssh", route.get("identity_file"), timeout=5), "-T",
+                    *ssh_host(route["target"]), "bash -s"]
         try:
             # Bytes, not text: Windows text mode would turn \n into \r\n for bash.
             done = subprocess.run(argv, input=script, capture_output=True, timeout=timeout,
@@ -595,8 +592,10 @@ class Grokbot:
     def tunnel(self, to=None, relay_port=RELAY_PORT, remote_port=TUNNEL_PORT, once=False):
         """Run on the laptop whose Grokbot the other one should reach (the Dell). Blocks;
         Ctrl+C stops it and withdraws the token."""
+        from .topology import DEVICE_ID
+        from .transfer import _ssh_args, ssh_host
         here = self.here()
-        if not here:
+        if not isinstance(here, str) or not DEVICE_ID.fullmatch(here):
             raise LookupError("This laptop's hostname isn't in jarvis.config.json devices.")
         to = to or next((k for k, d in self.machines.items() if d.get("transport") == "ssh"), None)
         ssh = self.machines.get(to) or {}
@@ -605,18 +604,17 @@ class Grokbot:
         binary = shutil.which("ssh")
         if not binary:
             raise LookupError("OpenSSH client is not installed.")
+        targets = [ssh["target"], *ssh.get("fallback_targets", [])]
+        for item in targets:
+            ssh_host(item)  # refuse a target that would be an ssh option, before the relay starts
+        base = [*_ssh_args(binary, ssh.get("identity_file"), timeout=5), "-T"]
+        note = shlex.quote(f".config/jarvis/grokbot-{here}.json")
         token = secrets.token_urlsafe(32)
         relay = relay_server(self, token, relay_port)
         threading.Thread(target=relay.serve_forever, daemon=True).start()
-        base = [binary, "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-                "-o", "ConnectTimeout=5"]
-        if ssh.get("identity_file"):
-            base += ["-i", str(Path(ssh["identity_file"]).expanduser()), "-o", "IdentitiesOnly=yes"]
-        note = f".config/jarvis/grokbot-{here}.json"
         flags = NO_WINDOW
         print(f"Relay for {here}'s Grokbot on 127.0.0.1:{relay_port}; forwarding to "
               f"{to} 127.0.0.1:{remote_port}. Ctrl+C stops.", flush=True)
-        targets = [ssh["target"], *ssh.get("fallback_targets", [])]
         target = targets[0]
         try:
             while True:
@@ -626,7 +624,8 @@ class Grokbot:
                 for target in targets:
                     try:
                         put = subprocess.run(
-                            [*base, target, f"umask 077; mkdir -p .config/jarvis && cat > {note}"],
+                            [*base, *ssh_host(target),
+                             f"umask 077; mkdir -p .config/jarvis && cat > {note}"],
                             input=json.dumps({"port": remote_port, "token": token,
                                               "from": here}).encode(),
                             capture_output=True, timeout=20, creationflags=flags)
@@ -642,7 +641,7 @@ class Grokbot:
                     subprocess.run([*base, "-N", "-o", "ExitOnForwardFailure=yes",
                                     "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
                                     "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{relay_port}",
-                                    target], creationflags=flags)
+                                    *ssh_host(target)], creationflags=flags)
                     print(f"Tunnel to {to} closed.", flush=True)
                 if once:
                     return
@@ -652,7 +651,7 @@ class Grokbot:
         finally:
             relay.shutdown()
             try:
-                subprocess.run([*base, target, f"rm -f {note}"], capture_output=True,
+                subprocess.run([*base, *ssh_host(target), f"rm -f {note}"], capture_output=True,
                                timeout=10, creationflags=flags)
             except subprocess.SubprocessError:
                 pass

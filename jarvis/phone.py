@@ -4,13 +4,17 @@ Why its own listener: the console on :7777 trusts anything that reaches loopback
 header is all it asks), so a tailnet name must never reach it. This server binds
 127.0.0.1:7787 only; David publishes it to his tailnet with `tailscale serve` (never
 funnel). Every request must prove, failing closed at each step:
-  1. Host is this PC's tailnet name (or the loopback address, in case Serve rewrites it);
-  2. Serve forwarded the tailnet address (X-Forwarded-For) and `tailscale whois` knows it;
-  3. Tailscale-User-Login matches whois's login;
-  4. no other site sent it (Sec-Fetch-Site);
-  5. a POST carries X-JARVIS-Phone and a JSON object;
-  6. /phone/api/* carries the cookie of a phone paired at the main's own terminal, from the
-     same tailnet device and login it paired from.
+  1. the TCP peer is loopback (this listener binds 127.0.0.1 only; Tailscale headers are
+     not an identity unless the peer is the local serve proxy);
+  2. Host is this PC's tailnet name (or the loopback address, in case Serve rewrites it),
+     once, and a sent Origin is that same host (a missing Origin stays allowed);
+  3. Serve forwarded one tailnet address (X-Forwarded-For) and `tailscale whois` knows it;
+  4. Tailscale-User-Login is present once and matches whois's login;
+  5. no other site sent it (Sec-Fetch-Site);
+  6. a POST carries X-JARVIS-Phone and one JSON object;
+  7. /phone/api/* carries the cookie of a phone paired at the main's own terminal, from the
+     same tailnet device and login it paired from. A phone paired after the CSRF token
+     existed also sends that token on POST. A phone paired before it keeps working.
 It serves a fixed list of shell files and a typed allowlist of routes, and never falls
 through to console routes.
 
@@ -50,6 +54,7 @@ CODE_LEN = 8
 CODE_TTL = 300        # s a pairing code lives
 APPROVED_GRACE = 60   # s the phone has to collect its key after David says yes
 BAD_CODES, BAD_WINDOW = 5, 600  # wrong codes per source per window
+GLOBAL_BAD = 50  # wrong codes from every source in that same window
 MAX_BODY = 256 * 1024
 MAX_CONNECTIONS = 24
 SOCKET_TIMEOUT = 30
@@ -104,6 +109,8 @@ TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
 LASTING = (".png", ".svg", ".woff2")  # fonts and icons: cached a day; the rest revalidates
 PAIR_PATHS = ("/phone/pair", "/phone/pair/status")
 _ASK_KEY = re.compile(r"[A-Za-z0-9_-]{8,64}")
+_TOKEN = re.compile(r"[A-Za-z0-9_-]{16,128}")
+_API_CSP = "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f​-‏‪-‮⁦-⁩]")
 # Short answers that would approve or refuse a pending confirmation, beyond
 # assistant.confirmation_words: those are answered on the PC, never from the phone.
@@ -299,14 +306,16 @@ def _pair_step(data, code, who, name, ua, mobile, claim, now):
     if entry["state"] != "approved":
         return "bad", None
     token = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(32)
     ids = {p["id"] for p in data["phones"]}
     phone_id = next(i for i in iter(lambda: secrets.token_hex(4), None) if i not in ids)
     phone = {"id": phone_id, "name": request.get("name") or "Phone", "token_sha256": _digest(token),
+             "csrf_sha256": _digest(csrf),
              "stable_id": who["stable_id"], "node": request.get("node"), "os": request.get("os"),
              "login": request.get("login"), "ua": request.get("ua"), "created": now, "last_seen": now}
     data["phones"].append(phone)
     data["codes"] = [c for c in data["codes"] if c is not entry]
-    return "paired", (phone, token)
+    return "paired", (phone, token, csrf)
 
 
 def known_origins(state):
@@ -481,38 +490,112 @@ def cookie_values(headers):
     return out
 
 
+def _header_values(headers, name):
+    """Every value of one header. A repeated header is a list, not the first value only:
+    email.message.Message.get returns the first and would hide a second identity."""
+    get_all = getattr(headers, "get_all", None)
+    if get_all is not None:
+        return [str(value).strip() for value in (get_all(name) or [])]
+    getter = getattr(headers, "get", None)
+    if getter is None:
+        return []
+    found = getter(name)
+    if found is None:
+        return []
+    return [str(found).strip()]
+
+
+def forwarded_ip(headers):
+    """The one X-Forwarded-For value as a tailnet address, or None when it is missing,
+    repeated, or not a tailnet address. The last hop of that one value is the client."""
+    values = _header_values(headers, "X-Forwarded-For")
+    if len(values) != 1 or not values[0]:
+        return None
+    return tailnet_ip(values[0])
+
+
+def loopback_peer(address):
+    """True when the TCP peer is loopback, including an IPv4-mapped ::ffff:127.0.0.1."""
+    host = address[0] if isinstance(address, tuple) and address else address
+    text = str(host or "").strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    text = text.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_loopback)
+
+
 def set_cookie(token, age=COOKIE_AGE):
+    """The session cookie. Empty token is the logout clear (Max-Age 0). A token with a
+    control character, or a shape this server did not mint, is refused rather than written."""
+    token = "" if token is None else str(token)
+    if token and not _TOKEN.fullmatch(token):
+        raise ValueError("cookie token")
+    if isinstance(age, bool) or not isinstance(age, int):
+        raise ValueError("cookie age")
+    age = 0 if age < 0 else min(age, COOKIE_AGE)
+    if not token and age != 0:
+        raise ValueError("cookie token")
     return f"{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={age}"
 
 
 # ---- rate limits -------------------------------------------------------------------------
 
 class Limiter:
-    """Wrong pairing codes per source (tailnet address, then tailnet node): BAD_CODES per
-    BAD_WINDOW. Counted per source, never globally, so nobody can lock David out."""
+    """Wrong pairing codes: BAD_CODES per source (tailnet address, then tailnet node) and
+    GLOBAL_BAD from every source, each per BAD_WINDOW. Behind tailscale serve every TCP
+    peer is loopback, so a per-IP table alone does not bound a local flood. A source that
+    is already locked is kept when the table is compacted. The global count is separate
+    and is never wiped. Fifty wrong codes pause pairing for the rest of the window."""
 
-    def __init__(self, clock, limit=BAD_CODES, window=BAD_WINDOW):
+    def __init__(self, clock, limit=BAD_CODES, window=BAD_WINDOW, global_limit=GLOBAL_BAD):
         self.clock, self.limit, self.window = clock, limit, window
+        self.global_limit = global_limit
         self._mu, self._hits = threading.Lock(), {}
+        self._global = []
 
-    def _recent(self, key):
-        now = self.clock()
-        hits = [t for t in self._hits.get(key, ()) if now - t < self.window]
-        if hits:
-            self._hits[key] = hits
-        else:
-            self._hits.pop(key, None)
-        return hits
+    def _fresh(self, stamps, now):
+        return [t for t in stamps if now - t < self.window]
 
-    def blocked(self, key):
+    def blocked(self, key=None):
         with self._mu:
-            return len(self._recent(key)) >= self.limit
+            now = self.clock()
+            self._global = self._fresh(self._global, now)
+            if len(self._global) >= self.global_limit:
+                return True
+            if key is None:
+                return False
+            fresh = self._fresh(self._hits.get(key, ()), now)
+            if fresh:
+                self._hits[key] = fresh
+            else:
+                self._hits.pop(key, None)
+            return len(fresh) >= self.limit
 
     def hit(self, key):
         with self._mu:
+            now = self.clock()
             if len(self._hits) > 1024:
-                self._hits.clear()
-            self._hits[key] = self._recent(key) + [self.clock()]
+                kept = {}
+                for name, stamps in self._hits.items():
+                    fresh = self._fresh(stamps, now)
+                    if len(fresh) >= self.limit:
+                        kept[name] = fresh
+                self._hits = kept
+            self._hits[key] = self._fresh(self._hits.get(key, ()), now) + [now]
+
+    def hit_global(self):
+        """One wrong code, counted once however many per-source keys that attempt updates."""
+        with self._mu:
+            now = self.clock()
+            self._global = self._fresh(self._global, now)
+            self._global.append(now)
 
 
 # ---- the server --------------------------------------------------------------------------
@@ -566,7 +649,10 @@ class PhoneHTTPServer(ThreadingHTTPServer):
     _BUSY_BODY = b'{"error": "JARVIS is busy; try again."}'
     BUSY = (b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: application/json\r\n"
             b"Content-Length: " + str(len(_BUSY_BODY)).encode() + b"\r\n"
-            b"X-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n"
+            b"X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+            b"X-Frame-Options: DENY\r\n"
+            b"Content-Security-Policy: default-src 'none'; frame-ancestors 'none'\r\n"
+            b"Cache-Control: no-store\r\n"
             b"Connection: close\r\n\r\n" + _BUSY_BODY)
 
     def __init__(self, address, handler, slots=MAX_CONNECTIONS):
@@ -880,16 +966,49 @@ class PhoneServer:
             allowed |= {name, f"{name}:443"}
         return host in allowed
 
+    def origin_ok(self, headers):
+        """A missing Origin is allowed (the app's own urllib tests, and a top-level
+        navigation). A present Origin must be this tailnet name or the loopback port,
+        exactly once. `null`, a foreign origin, and a trailing slash are refused."""
+        values = _header_values(headers, "Origin")
+        if not values:
+            return True
+        if len(values) != 1 or not values[0] or values[0].casefold() == "null" or values[0].endswith("/"):
+            return False
+        allowed = {f"http://127.0.0.1:{self.port}", f"http://localhost:{self.port}"}
+        name = self.tailnet.dns_name()
+        if name:
+            allowed |= {f"https://{name}", f"https://{name}:443"}
+        return values[0] in allowed
+
+    def csrf_ok(self, headers, phone):
+        """POST CSRF for a phone that was given a token at pairing. A row with no
+        csrf_sha256 is a phone paired before that token existed: it keeps working.
+        The check is the hash, in constant time. The plaintext is not stored."""
+        expected = str(phone.get("csrf_sha256") or "")
+        if not expected:
+            return True
+        values = _header_values(headers, "X-CSRF-Token")
+        if len(values) != 1 or not _TOKEN.fullmatch(values[0]):
+            return False
+        try:
+            return hmac.compare_digest(_digest(values[0]), expected)
+        except (TypeError, ValueError):
+            return False
+
     def identify(self, headers, ip=None):
-        """The tailnet device and login behind a request (checks 2 and 3), or a Reply."""
-        ip = ip or tailnet_ip(headers.get("X-Forwarded-For"))
+        """The tailnet device and login behind a request, or a Reply. A repeated
+        Tailscale-User-Login is not a login: Message.get would have kept only the first."""
+        if ip is None:
+            ip = forwarded_ip(headers)
         if ip is None:
             raise _refuse(401, NO_ADDRESS, pair=False)
         who = self.tailnet.whois(ip)
         if not who:
             raise _refuse(401, "Tailscale couldn't say which device sent this.", pair=False)
-        login = str(headers.get("Tailscale-User-Login") or "").strip()
-        if not login or not who["login"] or login.casefold() != who["login"].casefold():
+        logins = _header_values(headers, "Tailscale-User-Login")
+        if len(logins) != 1 or not logins[0] or not who["login"] or \
+                logins[0].casefold() != who["login"].casefold():
             raise _refuse(403, "That Tailscale login doesn't match this device.")
         return who
 
@@ -989,6 +1108,7 @@ class PhoneServer:
         if outcome == "bad":
             for key in keys:
                 self.limiter.hit(key)
+            self.limiter.hit_global()  # once per attempt, not once per source key
             raise _refuse(403, "That code is wrong or has expired. Make a new one on your PC.")
         if outcome == "unclaimed":
             raise _refuse(400, "Send the code first.")
@@ -998,11 +1118,13 @@ class PhoneServer:
             raise _refuse(403, "Pairing was refused on the PC.")
         if outcome == "pending":
             raise Reply(202, {"pending": True})
-        phone, token = detail
+        phone, token, csrf = detail
         with self._mu:
             self._known[phone["id"]] = phone["name"]
         self.publish("phone.paired", {"name": phone["name"]})
-        return Reply(200, {"ok": True, "phone": {"id": phone["id"], "name": phone["name"]}},
+        # csrf_token is the one copy the page can read. The store keeps the hash.
+        return Reply(200, {"ok": True, "phone": {"id": phone["id"], "name": phone["name"]},
+                           "csrf_token": csrf},
                      {"Set-Cookie": set_cookie(token)})
 
     # ---- what a paired phone may do
@@ -1511,8 +1633,10 @@ class PhoneHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     def _json(self, status, body, headers=None):
+        extra = {"Content-Security-Policy": _API_CSP, "Vary": "Cookie"}
+        extra.update(headers or {})
         self._send(status, json.dumps(body, default=str).encode(), "application/json; charset=utf-8",
-                   headers=headers)
+                   headers=extra)
 
     def do_GET(self):
         self._handle("GET")
@@ -1547,14 +1671,21 @@ class PhoneHandler(BaseHTTPRequestHandler):
             self._json(500, {"error": "Something went wrong on the PC."})
 
     def _body(self):
-        """Check 5: the POST header, a JSON content type, and a JSON object of at most 256 KiB."""
-        if self.headers.get("X-JARVIS-Phone") != "1":
+        """The POST header, one JSON content type, and a JSON object of at most 256 KiB.
+        A second Content-Length or a Transfer-Encoding is refused before the body is read."""
+        if _header_values(self.headers, "X-JARVIS-Phone") != ["1"]:
             raise _refuse(403, "Refused.")
-        ctype = str(self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if _header_values(self.headers, "Transfer-Encoding"):
+            raise _refuse(400, "Send JSON.")
+        types = _header_values(self.headers, "Content-Type")
+        ctype = types[0].split(";")[0].strip().lower() if len(types) == 1 else ""
         if ctype != "application/json":
             raise _refuse(415, "Send JSON.")
+        lengths = _header_values(self.headers, "Content-Length")
+        if len(lengths) != 1:
+            raise _refuse(411, "Content-Length is required.")
         try:
-            length = int(self.headers.get("Content-Length") or "")
+            length = int(lengths[0])
         except ValueError:
             raise _refuse(411, "Content-Length is required.") from None
         if not 0 <= length <= MAX_BODY:
@@ -1568,15 +1699,21 @@ class PhoneHandler(BaseHTTPRequestHandler):
         return body
 
     def _route(self, method):
+        if not loopback_peer(getattr(self, "client_address", None)):
+            raise _refuse(403, "Refused.")
         srv = self.phone
         url = urlsplit(self.path)
         path = url.path
         why = srv.refusal()
         if why:
             raise _refuse(503, why)
-        if not srv.host_ok(self.headers.get("Host")):
+        hosts = _header_values(self.headers, "Host")
+        if len(hosts) != 1 or not srv.host_ok(hosts[0]):
             raise _refuse(403, "Unexpected Host header.")
-        if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
+        if not srv.origin_ok(self.headers):
+            raise _refuse(403, "Unexpected Origin header.")
+        sites = _header_values(self.headers, "Sec-Fetch-Site")
+        if len(sites) > 1 or (len(sites) == 1 and sites[0] not in ("same-origin", "none")):
             raise _refuse(403, "Requests from other sites are refused.")
         if method == "GET" and path in SHELL:
             found = srv.shell_file(path)
@@ -1590,7 +1727,7 @@ class PhoneHandler(BaseHTTPRequestHandler):
         if path in PAIR_PATHS and method != "POST":
             raise _refuse(405, "Method not allowed.")
         body = self._body() if method == "POST" else None
-        ip = tailnet_ip(self.headers.get("X-Forwarded-For"))
+        ip = forwarded_ip(self.headers)
         if path in PAIR_PATHS:
             if ip is None:
                 raise _refuse(401, NO_ADDRESS, pair=False)
@@ -1605,6 +1742,8 @@ class PhoneHandler(BaseHTTPRequestHandler):
 
     def _api(self, method, path, query, body, phone):
         srv = self.phone
+        if method == "POST" and not srv.csrf_ok(self.headers, phone):
+            raise _refuse(403, "This phone needs to pair again.", code="csrf")
         if method == "GET":
             if path == "/phone/api/me":
                 return self._json(200, srv.me(phone))

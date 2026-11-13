@@ -31,6 +31,8 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 
+from . import pathsafe
+
 REMOTE_DIR = "JARVIS-Drop"
 MAX_BYTES = 2 * 1024 ** 3
 CLIP_BYTES = 32 * 1024 * 1024  # clipsync.MAX_BYTES; a clipboard copy never needs more
@@ -95,11 +97,22 @@ def _occupied(path):
     return True
 
 
-def _ssh_args(binary, identity_file):
+def _ssh_args(binary, identity_file=None, timeout=8):
+    """Options shared by every JARVIS ssh/scp client. Not ClearAllForwardings: it also drops
+    the -L/-R given on the command line, which would kill the cluster tunnel. ``--`` is not
+    included: callers that still add -o/-L/-R must put ``ssh_host`` after those."""
+    try:
+        timeout = int(timeout)
+    except (TypeError, ValueError):
+        timeout = 8
     args = [binary, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
-            "-o", "ConnectTimeout=8"]
+            "-o", f"ConnectTimeout={timeout}",
+            "-o", "ForwardAgent=no", "-o", "ForwardX11=no"]
     if identity_file:
-        args += ["-i", str(Path(identity_file).expanduser()), "-o", "IdentitiesOnly=yes"]
+        text = str(Path(identity_file).expanduser())
+        if text.startswith("-") or any(c in text for c in "\n\r\x00"):
+            raise ValueError("SSH identity path is not usable.")
+        args += ["-i", text, "-o", "IdentitiesOnly=yes"]
     return args
 
 
@@ -114,6 +127,12 @@ def _check_target(target):
     if not isinstance(target, str) or not re.fullmatch(
             r"[A-Za-z_][A-Za-z0-9_.-]*@[A-Za-z0-9][A-Za-z0-9.-]*", target):
         raise ValueError("Use user@hostname or user@IPv4 for the configured SSH target.")
+
+
+def ssh_host(target):
+    """Validated ``user@host`` plus ``--``, so the value cannot be read as an ssh option."""
+    _check_target(target)
+    return ["--", target]
 
 
 def _run(args, timeout, **kw):
@@ -140,7 +159,7 @@ def send(target, identity_file, local_path, name=None):
         raise ValueError(f"Files over {MAX_BYTES // 1024 ** 3} GB aren't sent this way.")
     name = safe_name(name or path.name)
     ssh, scp = _tools()
-    made = _run([*_ssh_args(ssh, identity_file), target, f"mkdir -p -- {REMOTE_DIR}"], 20)
+    made = _run([*_ssh_args(ssh, identity_file), *ssh_host(target), f"mkdir -p -- {REMOTE_DIR}"], 20)
     if made.returncode:
         _fail("Preparing the drop folder", made)
     # scp to a name that exists would overwrite it; pick a free one instead.
@@ -149,6 +168,7 @@ def send(target, identity_file, local_path, name=None):
     while final in taken:
         n += 1
         final = collision_name(name, n, max_bytes=200)
+    pathsafe.scp_remote_filename(final)
     done = _run([scp, "-q", *_ssh_args(scp, identity_file)[1:], "--", str(path),
                  f"{target}:{REMOTE_DIR}/{final}"], max(60, size // (1024 * 1024)))
     if done.returncode:
@@ -160,7 +180,7 @@ def inbox(target, identity_file, include_directories=False):
     """File names waiting in the other laptop's drop folder."""
     _check_target(target)
     ssh, _ = _tools()
-    out = _run([*_ssh_args(ssh, identity_file), target,
+    out = _run([*_ssh_args(ssh, identity_file), *ssh_host(target),
                 f"mkdir -p -- {REMOTE_DIR} && ls -1p -- {REMOTE_DIR}"], 20)
     if out.returncode:
         _fail("Listing the drop folder", out)
@@ -174,6 +194,7 @@ def fetch(target, identity_file, name, dest=None):
     _check_target(target)
     if name not in inbox(target, identity_file):
         raise ValueError(f"No file called {name!r} in the drop folder.")
+    pathsafe.scp_remote_filename(name)
     _, scp = _tools()
     folder = Path(dest) if dest else Path.home() / "Downloads" / REMOTE_DIR
     folder.mkdir(parents=True, exist_ok=True)
@@ -193,7 +214,7 @@ def fetch(target, identity_file, name, dest=None):
 # ---- over the cluster link -------------------------------------------------------------
 def drop_folder():
     folder = Path.home() / REMOTE_DIR
-    folder.mkdir(parents=True, exist_ok=True)
+    pathsafe.ensure_private_dir(folder)
     return folder
 
 
@@ -226,13 +247,17 @@ def _plain_path(value):
 def is_path_op(payload):
     """True for the operations that name paths on the receiving computer (storage copies)."""
     action = payload.get("action")
-    return (action in ("tree", "mkdir") or (action == "get" and "path" in payload)
+    return (action in ("brain_receive", "brain_export", "brain_freeze", "brain_stage", "tree", "mkdir")
+            or (action == "get" and "path" in payload)
             or (action == "put" and payload.get("dest") == "path"))
 
 
 def validate(payload):
     """Refuse anything but the fixed transfer operations (cluster.validate_action)."""
     action = payload.get("action")
+    if action in ("brain_receive", "brain_export", "brain_freeze", "brain_stage"):
+        from .continuity.brain_channel import validate as validate_brain
+        return validate_brain(payload)
     if action == "inbox":
         return
     if action == "tree":
@@ -282,7 +307,7 @@ def _sweep(folder, hours=24):
     """Remove upload parts abandoned by a transfer that never finished."""
     for part in folder.glob(PART.format("*")):
         try:
-            if time.time() - part.stat().st_mtime > hours * 3600:
+            if time.time() - part.lstat().st_mtime > hours * 3600:
                 part.unlink()
         except OSError:
             pass
@@ -302,18 +327,22 @@ def _land(part, folder, name):
     """Give a finished part a free name in the drop folder, never replacing a file."""
     final, n = name, 1
     while True:
+        dest = folder / final
         try:
-            os.link(part, folder / final)  # fails on an existing name, unlike rename on POSIX
+            pathsafe.link_new(part, dest)  # fails on an existing name, unlike rename on POSIX
         except FileExistsError:
             n += 1
             final = collision_name(name, n, max_bytes=200)
             continue
-        except OSError:  # no hard links (FAT, some shares): fall back to a checked rename
-            if _occupied(folder / final):
+        except ValueError:
+            raise
+        except OSError:  # no hard links (FAT, some shares): exclusive placeholder, then replace
+            try:
+                pathsafe.publish_new(part, dest)
+            except FileExistsError:
                 n += 1
                 final = collision_name(name, n, max_bytes=200)
                 continue
-            os.rename(part, folder / final)
             return final
         part.unlink()
         return final
@@ -437,7 +466,11 @@ def _path_op(payload, config):
     size = target["size"]
     if size > MAX_BYTES:
         raise ValueError(f"Files over {MAX_BYTES // 1024 ** 3} GB aren't copied this way.")
-    with open(target["path"], "rb") as stream:
+    target_path = Path(target["path"])
+    with pathsafe.open_leaf(target_path.parent, target_path.name, "rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        if size > MAX_BYTES:
+            raise ValueError(f"Files over {MAX_BYTES // 1024 ** 3} GB aren't copied this way.")
         stream.seek(payload["offset"])
         data = stream.read(CHUNK)
     return {"data": base64.b64encode(data).decode(), "size": size,
@@ -447,6 +480,9 @@ def _path_op(payload, config):
 def run_here(payload, state=None, config=None):
     """One transfer operation on this machine (a cluster job, or the main serving a node)."""
     validate(payload)
+    if payload["action"] in ("brain_receive", "brain_export", "brain_freeze", "brain_stage"):
+        from .continuity.brain_channel import run_here as run_brain
+        return run_brain(payload, state, config)
     if is_path_op(payload) and payload["action"] != "put":
         return _path_op(payload, config)
     if payload["action"] == "put" and payload.get("dest") == "path":
@@ -467,12 +503,15 @@ def run_here(payload, state=None, config=None):
         return {"entries": sorted(entries, key=lambda e: e["name"].lower())}
     if action == "get":
         path = folder / payload["name"]
-        if path.parent != folder or not path.is_file():
+        if path.parent != folder:
             raise ValueError(f"No file called {payload['name']!r} in the drop folder.")
-        size = path.stat().st_size
-        with open(path, "rb") as stream:
-            stream.seek(payload["offset"])
-            data = stream.read(CHUNK)
+        try:
+            with pathsafe.open_leaf(folder, payload["name"], "rb") as stream:
+                size = os.fstat(stream.fileno()).st_size
+                stream.seek(payload["offset"])
+                data = stream.read(CHUNK)
+        except (OSError, ValueError):
+            raise ValueError(f"No file called {payload['name']!r} in the drop folder.") from None
         return {"data": base64.b64encode(data).decode(), "size": size,
                 "eof": payload["offset"] + len(data) >= size}
     data = base64.b64decode(payload["data"], validate=True)
@@ -480,13 +519,14 @@ def run_here(payload, state=None, config=None):
     if payload["offset"] == 0:
         _sweep(folder)
         _check_space(folder, len(data), payload.get("size") or 0)
-        mode = "xb"
     else:
-        mode = "ab"
         try:
-            have = part.stat().st_size
+            have = pathsafe.regular_size(part)
         except FileNotFoundError:
             raise ValueError("That upload isn't in progress here; send the file again.") from None
+        except ValueError:
+            part.unlink(missing_ok=True)  # a symlink planted under the part name, not its target
+            raise
         if have != payload["offset"]:
             part.unlink(missing_ok=True)
             raise ValueError("A chunk of that upload went missing; send the file again.")
@@ -499,7 +539,7 @@ def run_here(payload, state=None, config=None):
                                          else CLIP_BYTES):
         part.unlink(missing_ok=True)
         raise ValueError("That is too large to send this way.")
-    with open(part, mode) as stream:
+    with pathsafe.open_leaf(folder, part.name, "xb" if payload["offset"] == 0 else "ab") as stream:
         stream.write(data)
     size = payload["offset"] + len(data)
     if not payload.get("last"):
@@ -564,7 +604,7 @@ def call(config, state, device, payload, timeout=120):
         "timeout": max(1, timeout - 5)}, timeout=timeout)
 
 
-def push(config, state, device, source, size, name=None, dest="drop", kind=None, folder=None):
+def push(config, state, device, source, size, name=None, dest="drop", kind=None, folder=None, *, call_fn=None):
     """Stream `source` (a binary file object of `size` bytes) to `device` in chunks.
 
     dest "path" lands the file in `folder`, a folder on that device inside its storage roots.
@@ -578,7 +618,7 @@ def push(config, state, device, source, size, name=None, dest="drop", kind=None,
     while True:
         data = source.read(CHUNK)
         last = offset + len(data) >= size or len(data) < CHUNK
-        result = call(config, state, device, {
+        result = (call if call_fn is None else call_fn)(config, state, device, {
             "action": "put", "upload": upload, "offset": offset, "last": last,
             "data": base64.b64encode(data).decode(), **extra})
         offset += len(data)
@@ -650,7 +690,7 @@ def fetch_file(config, state, name, device=None, dest=None):
     folder.mkdir(parents=True, exist_ok=True)
     part = folder / PART.format(uuid.uuid4().hex)
     try:
-        with open(part, "xb") as out:
+        with pathsafe.open_leaf(folder, part.name, "xb") as out:
             chunk = first
             while True:
                 data = base64.b64decode(chunk["data"], validate=True)
@@ -674,7 +714,7 @@ def pull_path(config, state, device, path, folder, name, rel=None):
     extra = {"rel": rel} if rel else {}
     part = folder / PART.format(uuid.uuid4().hex)
     try:
-        with open(part, "xb") as out:
+        with pathsafe.open_leaf(folder, part.name, "xb") as out:
             while True:
                 chunk = call(config, state, device, {"action": "get", "path": path,
                                                      "offset": out.tell(), **extra})

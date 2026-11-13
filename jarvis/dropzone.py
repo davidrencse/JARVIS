@@ -46,7 +46,8 @@ def uri_paths(data):
         if uri.scheme != "file" or uri.netloc not in ("", "localhost") or uri.query or uri.fragment:
             continue
         path = unquote(uri.path, errors="strict")
-        if path.startswith("/") and "\x00" not in path and path not in paths:
+        if (path.startswith("/") and "\x00" not in path and path not in paths
+                and ".." not in path.split("/")):
             paths.append(path)
     return paths
 
