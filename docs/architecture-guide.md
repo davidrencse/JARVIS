@@ -76,7 +76,7 @@ a module is not listed, so add new modules to `sysview.py`.
 | Think | chatgpt, fastlane, runner, orchestrator, prompts, adapters, claude_auth, grok_preflight | model lanes, failover, agent runs |
 | Act | actions, control, terminal, agent_browser, remote, remote_view, grokbot, transfer, dropzone, storage, clipsync, showcase, observe, sharedinput, fleet_management | executors per OS, cross-machine calls, Grok Bot, files, clipboard, Lan Mouse |
 | Speak | speech, voice, agent | Kokoro TTS (local), speech queue, ElevenLabs live agent |
-| Log | store, events, locking, cluster_store | task ledger, event feed, file locks, cluster job store |
+| Log | store, events, locking, cluster_store, pathsafe | task ledger, event feed, file locks, cluster job store, path checks on names that arrive from another machine |
 | Console / ops | ui, __main__, phone, sysview, cluster_cli, cluster_proxy, cluster_tunnel, deploy, node, platforms, autostart, rest | CLI, web console, cluster control, code deploy, OS detection, login startup |
 
 Key files in plain words:
@@ -138,11 +138,93 @@ Key files in plain words:
   or deleted. Secret-shaped names and `state/memory.sqlite3` are not pushed unless that
   exact path is on `remote_allowlist` (empty by default).
 - `continuity/`: MAIN continuity prototype. `authority` is the single-writer lease store;
-  `clock` is the PC-side cached-validity view. Tested on loopback, not deployed. Hooks in
-  `cluster_cli`, `cluster`, `remote`, `rest` and `phone` are lazy and default-off, and do
-  nothing until a cutover closes them. `cluster.main_device` stays the live authority.
-  `gateway` binds nothing on import, and `executor` is not wired into `Remote.call`.
-  This is not failover.
+  `clock` is the PC-side cached-validity view. Tested on loopback, not deployed.
+  `cluster.main_device` stays the live authority. `gateway` binds nothing on import, and
+  `executor` is not wired into `Remote.call`. This is not failover. Lazy hooks in
+  `cluster_cli`, `cluster`, `remote`, `rest` and `phone` stay default-off until a cutover
+  closes them. The hub does have owner routes `/v1/continuity/main` and
+  `/v1/continuity/recover`, and a node will take a `continuity` job. `run_main` refuses
+  when `configured_handoff` returns None. `run_recover` refuses when
+  `hub.continuity_recovery` is not callable. `execute_job` refuses with
+  `managed_unbound` when no participant is bound. `participant`, `brain_channel`,
+  `hub_control` and `recovery` are those adapters. Nothing in `jarvis/` calls
+  `participant.bind` or assigns `hub.continuity_recovery`.
+- `continuity/participant.py`: transition-scoped RPCs on the signed cluster job channel
+  (`kind` `continuity`). Actions are `readiness`, `drain`, `release`, `accept`,
+  `snapshot`, `fence`, `probe`, `brain`, `canary` and `activate_return`. A callback does
+  not take a key path, a gateway URL, a readiness flag or a shell command; the
+  installation client and runtime are built on this machine. Each call re-reads this
+  installation's authenticated status and must match that incarnation and epoch. Drain
+  and release belong to the source. The other actions belong to the candidate, except
+  `probe` (the requester must be the live main when the lease is valid, otherwise this
+  device), `fence` (any enrolled executor may acknowledge), and `brain`. Incoming
+  `brain_stage`, `put` and `brain_receive` run only on the candidate; `brain_export`,
+  `get` and `brain_freeze` run only on the source. The path stays inside this device's
+  `brain_transfer_dir`, outside Git, and a file name must match `brain-<32 hex>.bundle`.
+  A `GRANTED_NOT_READY` transition also requires `lease_valid`,
+  `main_ready` false, and `main` equal to the candidate. Except for `readiness` and
+  `snapshot`, the state directory must already hold a production binding whose runtime,
+  executor and issuer are this participant's; otherwise the code is `managed_unbound`.
+  The node runs `execute_job` for a `continuity` job, and an empty registry is the same
+  refusal. `RemoteRuntime` forwards SafeHandoff calls on that job transport.
+  `dispatch` is a separate maintenance queue (code match, the `files` capability, poll
+  signatures, deadlines, at-most-once). It is not a fallback that admits an ordinary job.
+- `continuity/brain_channel.py`: brain bundles over owner-only cluster transfer path
+  operations. No shell and no SSH. Actions are `brain_receive`, `brain_export`,
+  `brain_freeze` and `brain_stage`, and the payload must be exactly the keys that action
+  requires. `devices.<id>.brain_transfer_dir` has no default. The directory must already
+  exist inside that peer's storage roots and outside every Git checkout. Ordinary
+  transfer admission still applies; this module does not bypass a drained runtime's
+  fence. `run_here` freezes through `brainsync.freeze`, answers `brain_stage` once the
+  path is a directory, receives only when the file is not a directory, is within
+  `brainsync.MAX_BUNDLE_BYTES` and matches `sha256` (then deletes it only if receive
+  returned `ok`), and exports a mode-0600 `brain-<uuid>.bundle` with its size and digest.
+  `ClusterBundleTransport` is what `brainsync` selects when any `devices` entry has
+  `brain_transfer_dir`. Push checks `brain_stage`, sends the bytes with `transfer.push`
+  (`timeout` 180 s), then `brain_receive` with the digest. Pull exports, and when that
+  returns `ok` true it reads `get` chunks until the declared size and checks the digest.
+  `ConnectionError`, `OSError` and `TimeoutError` come back as `source_offline`.
+  `ValueError`, `RuntimeError`, `KeyError` and `TypeError` come back as `transport_failed`.
+  On `/v1/action` and `/v1/control` the hub rejects these actions unless the caller has
+  the owner credential.
+  `TransitionBundleTransport` refuses to construct unless this PC's remote status is
+  `GRANTED_NOT_READY`, with `lease_valid` true and `main_ready` false. Every later chunk
+  is sent with that transition id, incarnation and epoch; the receiver checks the live
+  transition again. Nothing in `jarvis/` constructs it.
+- `continuity/hub_control.py`: owner-only bridge on the hub socket that is already
+  listening. It is not an authority fallback and it opens no new port. `request_main`
+  and `request_recover` refuse unless `cluster.main_url`'s host is loopback, then post
+  as the local owner to `/v1/continuity/main` (`{"device"}`) or `/v1/continuity/recover`
+  (`{"device", "request_id"}`), each with `timeout` 600 s. The hub requires the owner
+  capability and a loopback peer address before it calls `run_main` or `run_recover`.
+  `run_main` accepts exactly a device-id string and refuses with "Safe handoff has no
+  bound managed runtime." when `configured_handoff` returns None, so `set_main` cannot
+  recurse into this same server. `run_recover` accepts only the local device id plus a
+  request id that passes the identity check, and calls `hub.continuity_recovery` only
+  when that attribute is callable. Otherwise it refuses and no lease is requested.
+  `RuntimeRefusal`, `LinkError` and `AuthorityError` come back as
+  `{ok: false, status: unconfirmed, code}` and are not turned into `no_main` or retried.
+  `operator_configured` reads an optional `continuity.operator_config` file locally and
+  returns true only when that file's device id is this PC; it does not contact the
+  authority. `cluster_cli.set_main` uses that check. `jarvis continuity recover` (`lease`
+  is the same action) calls `request_recover`.
+- `continuity/recovery.py`: `ManualRecovery` is a manual initial-lease coordinator. No
+  timer, no election, no force flag and no automatic recover. It takes a port, the
+  candidate runtime (the one that must outlive the CLI, normally inside the hub) and a
+  callable canary. The device must be that candidate, and the client key must pass the
+  identity check. A valid lease is `main_alive` unless this same candidate is already in
+  a `recover` transition at `GRANTED_NOT_READY`. The mode must be `V2_ONLY_NO_MAIN` or
+  `HANDOVER`. With no transition it requests `action` `recover`, `profile` `control` and
+  caller `manual-recovery`. It then submits the candidate's own readiness, drains (a
+  `not_ready` or `profile` refusal cancels the transition and re-raises), fences, grants
+  and accepts the lease. A lost grant is not rebuilt from status. After
+  `GRANTED_NOT_READY` the candidate snapshot must still match a fresh status
+  (`lease_unavailable` otherwise). The canary must return true; a failure or any
+  exception is false, and that value is what `complete` is called with. The result is
+  `{ok, status, transition_id, main, incarnation, epoch}`. `status` is `ready` only when
+  the canary was true, the mode is `V2_ACTIVE`, the lease is valid and `main_ready`,
+  `main` is this device, incarnation and epoch match the snapshot, and no transition is
+  open. Otherwise `status` is `no_main`.
 - `fleet/`: P1 facades over today's single main. `legacy_topology` names the config-driven
   roles and does not treat `cluster.main_device` as a lease. `readiness` is a read-only
   report on a possible MAIN candidate and does not authorize promotion, failover, sleep or
@@ -176,10 +258,29 @@ Key files in plain words:
 - `dropzone.py`: a thin Wayland strip just inside the Lan Mouse edge. A file dropped on it
   is copied to the other laptop through `transfer.push`. It accepts COPY only, so the file
   manager does not delete the original.
+- `pathsafe.py`: stdlib checks for paths, SSH names and addresses that arrive from another
+  machine. Callers keep their own destination roots. It will not follow a final symlink,
+  publish over a name that already exists, or treat a Tailscale address as a Lan Mouse
+  peer. `open_leaf` opens one regular-file child of a folder (`rb`, `xb` or `ab`); it uses
+  `dir_fd` and `O_NOFOLLOW` when the platform allows it, and on Windows it rejects a
+  reparse point and opens with `O_BINARY`. `xb` and `ab` are mode 0600. `link_new`
+  hard-links a regular file only when the destination name is absent (`follow_symlinks`
+  false where that flag exists). `publish_new` creates an exclusive placeholder and
+  replaces that placeholder, not a file or symlink a peer already planted. `ensure_private_dir`
+  creates a real directory (0700, except on Windows) and refuses a symlink.
+  `write_text_private` writes a regular file and will not open an existing symlink.
+  `scp_remote_filename` is one component of at most 255 characters; shell metacharacters
+  are refused and one ` (digits)` collision marker is allowed. `ssh_destination` is
+  `user@host` only. `is_tailscale_ip` matches 100.64.0.0/10 and fd7a:115c:a1e0::/48.
+  `lan_mouse_ip_blocked` is that check, or any text that starts with `100.`. `release_key`
+  is one `[A-Za-z0-9_]{1,64}` token. `has_parent_segment` is true for a non-string, a NUL
+  or a `..` segment. `sysview` lists it on Log. `transfer`, `clipsync`, `desktop` and
+  `sharedinput` call it.
 - `transfer.py`: files between the laptops, over chunked hub `transfer` jobs, or over SSH
   when the cluster is off or the node is offline. `jarvis send` lands in `~/JARVIS-Drop`;
   `jarvis fetch` pulls a file back to `~/Downloads/JARVIS-Drop`. The receiver keeps a hidden
-  `.part` file until the last chunk is in.
+  `.part` file until the last chunk is in. Opens, part files and the published name go
+  through `pathsafe`. Brain bundle actions are checked and run by `continuity/brain_channel`.
 
 ## Main and nodes
 
@@ -421,6 +522,9 @@ Add new model calls through it, never as a bare `ChatGPTLane`/`FastLane`:
 - Every direct action is read back (`observe.py`); unverifiable ones are reported as such.
 - Cluster: loopback-only hub, pinned SSH host keys, per-node pairing tokens, read-only
   endpoints separated (`cluster._read_only`), code-mismatch refusal.
+- Paths, SSH destinations and Lan Mouse peer addresses that arrive from another machine
+  go through `pathsafe.py`: no symlink follow, no publish over an existing name, no
+  Tailscale address as a peer.
 - No system-wide input or cursor changes without a tested fail-safe.
 
 ## 10 Configuration reference
