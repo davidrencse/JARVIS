@@ -12,6 +12,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -138,6 +139,17 @@ def link(config, state):
             "identity_file": saved.get("identity_file")}
 
 
+def _peer_pin(machine):
+    """SSH identity of a peer, ignoring which address this session dialed.
+
+    Learned and failback addresses move without a new signed link. A new target
+    list, host key, hostname, or identity file is a different link: the live SSH
+    must not keep the previous one.
+    """
+    targets = tuple(item for item in [machine.get("target"), *(machine.get("fallback_targets") or [])] if item)
+    return (targets, machine.get("host_key"), machine.get("hostname"), machine.get("identity_file"))
+
+
 def peer(config, state=None):
     """The machine this end opens SSH to: a node (reverse, run on the main) or the main
     (forward, run on a node; the joined link in `state` wins over the config)."""
@@ -180,6 +192,7 @@ def candidates(config, state):
 def hub_healthy(config, state):
     """Probe the forwarded hub, not merely a live ssh -N process."""
     from .cluster import Client
+    from .continuity.runtime import RuntimeRefusal
     try:
         from .cluster_recovery import signature
         import secrets
@@ -190,7 +203,8 @@ def hub_healthy(config, state):
         expected = signature(client.token, client.main, client.local, nonce, [])
         return (isinstance(response, dict) and isinstance(response.get("signature"), str)
                 and hmac.compare_digest(response["signature"], expected))
-    except (OSError, ValueError, RuntimeError):
+    except (OSError, ValueError, RuntimeError, RuntimeRefusal):
+        # A continuity refusal is a down tunnel. It is not a live handshake.
         return False
 
 
@@ -303,12 +317,84 @@ def manual_stop_holds(config, state):
     return True
 
 
+def worker_locked(state):
+    """True when this state's tunnel worker holds cluster-tunnel.lock.
+
+    A stale status note is not ownership: the pid in it can be reused. A missing
+    lock file is not a holder. The check takes the lock only when nobody else has
+    it, then releases it before the caller starts a worker.
+    """
+    path = Path(state) / f"{NAME}.lock"
+    if not path.exists():
+        return False
+    from .locking import LockBusy, exclusive_lock
+    try:
+        with exclusive_lock(path, timeout=0):
+            return False
+    except LockBusy:
+        return True
+    except OSError:
+        return False
+
+
+def _reap(proc):
+    """Stop a live ssh and wait with a deadline. False when it never exits.
+
+    An unbounded wait keeps the worker lock, so the next start dies LockBusy
+    while this process no longer publishes a heartbeat.
+    """
+    if proc is None or proc.poll() is not None:
+        return True
+    proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
+
+
+def _discover_keeping_heartbeat(config, state, publish, marker):
+    """Scan without letting the status note go stale, and leave when asked to stop.
+
+    discover's own budget is longer than the 15s status window. A handoff that
+    sees a dead note starts another worker against a lock this process still
+    holds. Returning 'stop' releases that lock without waiting out the scan.
+    """
+    from .linkfinder import discover
+    box = {}
+    done = threading.Event()
+
+    def work():
+        try:
+            discover(peer(config, state), state, config)
+        except BaseException as exc:
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="cluster-tunnel-discover", daemon=True).start()
+    while not done.wait(0.05):
+        publish()
+        if marker.exists():
+            return "stop"
+    if "error" in box:
+        raise box["error"]
+    return "ok"
+
+
 def run(config, state):
-    if manual_stop_holds(config, state):
-        return  # operator stop: do not delete it and do not open SSH
+    from .continuity.runtime import RuntimeRefusal
+    try:
+        if manual_stop_holds(config, state):
+            return  # operator stop: do not delete it and do not open SSH
+    except RuntimeRefusal:
+        return  # unverifiable continuity state: do not open SSH and do not crash-loop
     from .linkfinder import role
     original_config = config
-    config, _, _ = role(config, state)
+    try:
+        config, _, _ = role(config, state)
+    except RuntimeRefusal:
+        return
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True)
     machine = peer(config, state)
@@ -353,14 +439,22 @@ def run(config, state):
         logs = state / "logs"
         logs.mkdir(exist_ok=True)
         try:
+            refused = None
             while not marker.exists():
-                config, local, main = role(original_config, state)
+                try:
+                    config, local, main = role(original_config, state)
+                except RuntimeRefusal as exc:
+                    # A bad signed note must not keep the previous SSH or raise once
+                    # per probe (systemd Restart=on-failure would burn the start limit).
+                    publish(ssh_alive=False, hub_healthy=False, error=exc.code)
+                    break
                 if mode(config) == "forward" and local == main:
                     break  # a promoted main no longer owns a node's forward tunnel
                 targets = candidates(config, state)  # pick up addresses learned while connected
                 # Probe every candidate first; never spend a full SSH timeout on a dead LAN.
                 from .cluster_recovery import rank_targets, SessionHealth, parallel_probe, next_backoff
                 ordered = rank_targets(targets, lambda t: reachable(t, timeout=REACH_TIMEOUT), parallel_probe)
+                refresh = False
                 for target in ordered:
                     if marker.exists():
                         break
@@ -371,6 +465,7 @@ def run(config, state):
                     publish(target=target, ssh_alive=False, hub_healthy=False, error=None)
                     try:
                         with (logs / f"{NAME}.log").open("a", encoding="utf-8") as log:
+                            session_pin = _peer_pin(peer(config, state))
                             proc = subprocess.Popen(command(config, state, target), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=log,
                                 creationflags=NO_WINDOW)
@@ -381,7 +476,24 @@ def run(config, state):
                                     refresh = True
                                     proc.terminate()
                                     break
-                                if role(original_config, state)[2] != identity(config)[1]:
+                                try:
+                                    resolved, _local, current_main = role(original_config, state)
+                                except RuntimeRefusal as exc:
+                                    refused = exc
+                                    proc.terminate()
+                                    break
+                                if current_main != identity(config)[1]:
+                                    refresh = True
+                                    proc.terminate()
+                                    break
+                                try:
+                                    if _peer_pin(peer(resolved, state)) != session_pin:
+                                        # Same main, new signed link: drop this SSH before
+                                        # the next dial. Do not keep the old host key.
+                                        refresh = True
+                                        proc.terminate()
+                                        break
+                                except (OSError, ValueError):
                                     refresh = True
                                     proc.terminate()
                                     break
@@ -399,7 +511,7 @@ def run(config, state):
                                     if preferred:
                                         proc.terminate()
                                         break
-                            if marker.exists() and proc.poll() is None:
+                            if (marker.exists() or refresh or refused is not None) and proc.poll() is None:
                                 proc.terminate()
                             proc.wait(timeout=5)
                             publish(ssh_alive=False, hub_healthy=False, error=f"{preferred} is reachable again; switching back"
@@ -407,21 +519,26 @@ def run(config, state):
                     except (OSError, subprocess.SubprocessError) as exc:
                         publish(ssh_alive=False, hub_healthy=False, error=str(exc))
                     finally:
-                        if proc is not None and proc.poll() is None:
-                            proc.kill()
-                            proc.wait()
+                        if not _reap(proc):
+                            publish(ssh_alive=False, hub_healthy=False, error="SSH did not exit")
+                            marker.touch()
                         proc = None
-                    if refresh:
-                        break  # reload current roles and learned candidates before another SSH attempt
+                    if refused is not None or refresh:
+                        break  # reload the signed role, or leave, before another SSH
                     lasted = time.monotonic() - started
                     if lasted >= STABLE_SESSION:
                         delay = 1
                     if preferred:
                         break  # next round ranks again and dials the better target
                     wait(TARGET_PAUSE)  # no instant redial of the next target
+                if refused is not None:
+                    publish(ssh_alive=False, hub_healthy=False, error=refused.code)
+                    break
+                if refresh:
+                    continue  # a new main or signed link is dialed without the scan budget
                 if not marker.exists():
-                    from .linkfinder import discover
-                    discover(peer(config, state), state, config)
+                    if _discover_keeping_heartbeat(config, state, publish, marker) == "stop":
+                        break
                 wait(delay)
                 delay = next_backoff(delay)
         finally:
@@ -460,6 +577,17 @@ def start(config_path, state):
         return {"started": False, **status(state)}
     state = Path(state).resolve()
     state.mkdir(parents=True, exist_ok=True)
+    if worker_locked(state):
+        # The holder is alive even when its heartbeat is stale. A second process
+        # would die on the lock and leave the old SSH up. Ask it to exit, then
+        # take over only after it releases the lock.
+        (state / f"{NAME}.stop").touch()
+        for _ in range(40):
+            time.sleep(0.25)
+            if not worker_locked(state):
+                break
+        else:
+            return {"started": False, "note": "Tunnel worker still holds its lock.", **status(state)}
     argv = launcher(config_path, state)
     if on_windows():
         script = state / f"{NAME}-launch.vbs"

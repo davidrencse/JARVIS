@@ -156,6 +156,12 @@ def ensure_tunnel(config, state, config_path):
         cluster_tunnel.autostart(config_path, state, True)
         acted = True
     if not cluster_tunnel.status(state)['running']:
+        # A live holder with a stale note still owns the lock. Starting here
+        # would spawn a worker that exits LockBusy and would also signal the
+        # holder to stop. Handoff and an explicit start do that; this poll must
+        # not. A dead holder has no lock, so start still runs.
+        if cluster_tunnel.worker_locked(state):
+            return acted
         cluster_tunnel.start(config_path, state)
         acted = True
     return acted

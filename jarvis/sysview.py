@@ -53,18 +53,18 @@ STATIONS = [
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay, the phone app.",
-     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "cluster_recovery", "cluster_discovery", "linkfinder", "deploy", "release", "node", "platforms", "autostart", "settings", "rest"]},
+     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "cluster_recovery", "cluster_discovery", "linkfinder", "deploy", "release", "release_runtime", "release_gate", "node", "platforms", "autostart", "settings", "rest"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",
      "modules": ["devices", "lanmouse_peer_ips", "inventory", "hostmeter", "probe", "desktop", "selftest", "credits",
                  "cluster", "topology", "locate",
                  "fleet", "fleet.legacy_topology", "fleet.readiness",
-                 "continuity", "continuity.authority", "continuity.brain_channel", "continuity.cli",
+                 "continuity", "continuity.authority", "continuity.bootstrap", "continuity.brain_channel", "continuity.cli",
                  "continuity.clock", "continuity.console", "continuity.executor", "continuity.gateway",
                  "continuity.hub_control", "continuity.ingress", "continuity.integration",
-                 "continuity.lifecycle", "continuity.participant", "continuity.recovery",
-                 "continuity.renewal", "continuity.repoint", "continuity.return_brain",
+                 "continuity.lifecycle", "continuity.local_lifecycle", "continuity.participant", "continuity.production", "continuity.recovery",
+                 "continuity.renewal", "continuity.startup", "continuity.phone_front", "continuity.gateway_deploy", "continuity.repoint", "continuity.return_brain",
                  "continuity.runtime"]},
 ]
 # Which station a request's tier lights up, in order.
@@ -536,16 +536,14 @@ def components(console):
         want = served_code(state)
         online = [n for n in nodes if n.get("online")]
         same = [n for n in online if n.get("code") == want]
-        failed = {}
-        try:
-            failed = _json.loads((state / "code-release-failed.json").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            pass
+        from .release import status as release_status
+        release = release_status(state)
         rows = [["main", main], ["nodes online", f"{len(online)} / {len(nodes)}" if nodes else "hub not here"],
-                ["same code", f"{len(same)} / {len(online)}" if online else "-"], ["release", (want or "?")[:12]]]
-        bad = failed.get("code") and failed.get("code") != want and failed.get("at", 0) > (current(state).get("at") or 0)
+                ["same code", f"{len(same)} / {len(online)}" if online else "-"],
+                ["release", (want or "?")[:12]], ["release status", release["message"]]]
+        bad = bool(release.get("failures") or release.get("warnings"))
         return _card("cluster", "Cluster", "machines", "warn" if bad else "ok", rows,
-                     "Jobs to nodes are signed; nodes only get code that passed the tests.")
+                     release["message"])
 
     def _lanmouse():
         try:

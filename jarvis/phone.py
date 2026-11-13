@@ -1104,7 +1104,31 @@ class PhoneServer:
         who = self.tailnet.whois(ip)
         if not who:
             raise _refuse(401, "Tailscale couldn't say which device sent this.", pair=False)
+        front = self._front_origin()
+        if front and who.get("name") and who["name"] == (urlsplit(front).hostname or ""):
+            return self._identify_through_front(headers)
         logins = _header_values(headers, "Tailscale-User-Login")
+        if len(logins) != 1 or not logins[0] or not who["login"] or \
+                logins[0].casefold() != who["login"].casefold():
+            raise _refuse(403, "That Tailscale login doesn't match this device.")
+        return who
+
+    def _identify_through_front(self, headers):
+        """A request relayed by the phone front (the hop is the configured front node).
+
+        The front copies what its own `tailscale serve` saw: the phone's tailnet address
+        (X-Jarvis-Front-For) and login (X-Jarvis-Front-Login). This PC asks whois about
+        that address itself, so the front can name a device but not invent its login.
+        Trusting the front node this far is the cost of one stable phone origin.
+        """
+        fors = _header_values(headers, "X-Jarvis-Front-For")
+        logins = _header_values(headers, "X-Jarvis-Front-Login")
+        ip = tailnet_ip(fors[0]) if len(fors) == 1 else None
+        if ip is None:
+            raise _refuse(401, NO_ADDRESS, pair=False)
+        who = self.tailnet.whois(ip)
+        if not who:
+            raise _refuse(401, "Tailscale couldn't say which device sent this.", pair=False)
         if len(logins) != 1 or not logins[0] or not who["login"] or \
                 logins[0].casefold() != who["login"].casefold():
             raise _refuse(403, "That Tailscale login doesn't match this device.")
@@ -1971,12 +1995,24 @@ def start(config, state, console=None, hub=None):
 
 # ---- the CLI: jarvis phone on|off|status|pair|list|revoke --------------------------------
 
-def _main_only(config):
+def _main_only(config, state=None):
     from .topology import enabled, is_node
     if not enabled(config):
         raise ValueError("The phone app needs the cluster on (JARVIS's main runtime serves it).")
-    if is_node(config):
+    if is_node(config) and not _standby_main(state):
         raise ValueError("Phones pair with the main PC. Run this there.")
+
+
+def _standby_main(state):
+    """A continuity-managed node can become MAIN and then serves phones from its own
+    pairing store, so `jarvis phone on|pair|list|revoke` work there too."""
+    if state is None:
+        return False
+    try:
+        from .continuity.integration import continuity_state
+        return continuity_state(state) == "managed"
+    except Exception:
+        return False
 
 
 def _listening(port):
@@ -2077,7 +2113,7 @@ def pair_cli(state, name=None, allow_desktop=False, ask=input, out=print, sleep=
 
 def cli(args, config, state):
     """The `jarvis phone` subcommands -> what to print (pair prints its code itself)."""
-    _main_only(config)
+    _main_only(config, state)
     store = Store(state)
     if args.action in ("on", "off"):
         store.set_on(args.action == "on")

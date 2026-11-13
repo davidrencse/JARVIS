@@ -708,7 +708,18 @@ def set_main(config, path, device, state=None):
         _known_device(devices, device)
         _refuse_cloud(device, devices.get(device))
         cluster = doc.get("cluster") if isinstance(doc.get("cluster"), dict) else {}
-        old_main = cluster.get("main_device")
+        raw_main = cluster.get("main_device")
+        old_main = raw_main
+        # A former MAIN's signed endpoint overlay proves the current route, but
+        # while it is serving as a node its raw config can still name the old
+        # recipient. Prefer the authenticated live MAIN only when it is this
+        # local installation and is fully ready; never infer from a ping.
+        from jarvis.topology import identity
+        live = _call_authority_status(handoff)
+        local = identity(doc)[0]
+        if (live.get("mode") == "V2_ACTIVE" and live.get("lease_valid") is True
+                and live.get("main_ready") is True and live.get("main") == local):
+            old_main = local
         intent = _load_intent(state)
         if (intent.get("target") not in (None, device) and intent.get("publication") in _OPEN_INTENT
                 and intent.get("publication") != "published"):

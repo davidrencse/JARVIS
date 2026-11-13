@@ -284,7 +284,7 @@ def _safe_name(name):
     return parts
 
 
-def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
+def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None, *, health=None):
     """Check a /v1/code bundle's signature against the pinned main `key` and its
     fingerprint, then replace this checkout's files (tmp + os.replace each, so a crash
     never leaves a half-written .py). Returns the count.
@@ -293,7 +293,16 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
     here is refused (a replayed old signed bundle would downgrade the node), and once a
     versioned bundle was installed an unversioned one is refused too. Until
     LEGACY_UNVERSIONED_UNTIL a node with no version on record may still install a
-    signature-only bundle; that bundle does not write a version file."""
+    signature-only bundle; that bundle does not write a version file.
+
+    After those files are on disk, a health check imports the agent and runs local
+    config and state checks (no network, no systemd). `_starts` still runs first, on
+    the staged tree, and still refuses a bundle that cannot be imported. `health`
+    replaces only the post-apply check: health(repo, state) returns None when the
+    install should stay. Any other result, or a check that raises, restores
+    `jarvis.prev` from `_keep_previous`, deletes files the bundle added, and does not
+    advance the installed version. With `state`, that failure records the bundle
+    fingerprint as a bad release."""
     repo = Path(repo).resolve()
     if not key:
         raise ValueError("No code-signing key is pinned for the main PC; re-join with a fresh "
@@ -319,6 +328,7 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
     # `version` stays None, so the write below never records a version file for it.
     elif not verify(raw, bundle.get("signature"), key):
         raise ValueError("The code bundle isn't signed by the main PC's pinned key; not installed.")
+    previous_project = None
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
         entries = []
         for info in archive.infolist():
@@ -348,6 +358,10 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
             if problem:
                 raise ValueError(f"The main's code doesn't start ({problem}); kept this node's code.")
             _keep_previous(repo)
+            # pyproject.toml is not inside jarvis.prev. Hold the bytes so a failed
+            # health check can put the previous declaration back too.
+            project_path = repo / "pyproject.toml"
+            previous_project = project_path.read_bytes() if project_path.is_file() else None
             for name, parts in entries:
                 target = repo.joinpath(*parts).resolve()
                 if repo not in target.parents:
@@ -361,6 +375,28 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None):
             for path in _files(repo / "jarvis"):
                 if path.resolve() not in keep:
                     path.unlink(missing_ok=True)
+    # The staged import already passed. This check sees the tree just swapped in,
+    # including config and state that are not part of the bundle.
+    outcome = _post_apply_health(health, repo, state)
+    if outcome is not None:
+        rollback_error = _restore_previous(repo, previous_project)
+        mark_error = None
+        # A failed restore leaves the new files. Don't record the fingerprint as bad
+        # then: a retry is the only way back, and the version below is still unwritten.
+        if rollback_error is None and state is not None:
+            try:
+                _mark_bad(state, bundle.get("code"), str(outcome))
+            except OSError as exc:
+                mark_error = str(exc)
+        if rollback_error:
+            raise ValueError("The installed code failed its health check "
+                             f"({outcome}); rollback failed: {rollback_error}")
+        if mark_error:
+            raise ValueError("The installed code failed its health check "
+                             f"({outcome}); restored the previous code, but could not mark "
+                             f"the release bad ({mark_error}).")
+        raise ValueError(f"The installed code failed its health check ({outcome}); "
+                         "restored the previous code.")
     if state is not None and version is not None:
         from .fsio import atomic_write
         atomic_write(Path(state) / VERSION_FILE, json.dumps({"version": version}))
@@ -399,11 +435,163 @@ def _keep_previous(repo):
     current, previous = Path(repo) / "jarvis", Path(repo) / "jarvis.prev"
     if not current.is_dir():
         return
+    # An install must never proceed without a complete recoverable prior tree.
+    fresh = Path(repo) / "jarvis.prev.new"
+    shutil.rmtree(fresh, ignore_errors=True)
+    shutil.copytree(current, fresh, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.rmtree(previous, ignore_errors=True)
+    os.replace(fresh, previous)
+
+
+def _post_apply_health(health, repo, state):
+    """The post-apply check's reason to roll back, or None. A raised check is a failure.
+    `health is None` means the real check. It is not a way to skip it."""
+    checker = release_health if health is None else health
     try:
-        shutil.rmtree(previous, ignore_errors=True)
-        shutil.copytree(current, previous, ignore=shutil.ignore_patterns("__pycache__"))
-    except OSError:
-        pass  # a backup that can't be made never blocks the update itself
+        return checker(repo, state)
+    except Exception as exc:
+        return f"health check failed: {exc}"
+
+
+def _restore_previous(repo, previous_project):
+    """Put `jarvis.prev` back over `jarvis/` and drop files the new bundle added.
+    `previous_project` is the pyproject.toml bytes from before the swap, or None if
+    there wasn't one. Returns None, or why the restore could not finish."""
+    repo = Path(repo)
+    current, previous = repo / "jarvis", repo / "jarvis.prev"
+    if not previous.is_dir():
+        return "no jarvis.prev backup to restore"
+    try:
+        restored = set()
+        for path in _files(previous):
+            relative = path.relative_to(previous)
+            target = (current / relative).resolve()
+            if current.resolve() not in target.parents:
+                return f"backup path escapes the package: {relative.as_posix()}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f".{target.name}.{os.getpid()}.rollback")
+            try:
+                shutil.copyfile(path, temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            restored.add(target)
+        if current.is_dir():
+            for path in list(_files(current)):
+                if path.resolve() not in restored:
+                    path.unlink(missing_ok=True)
+        project = repo / "pyproject.toml"
+        if previous_project is None:
+            project.unlink(missing_ok=True)
+        else:
+            temporary = project.with_name(f".{project.name}.{os.getpid()}.rollback")
+            try:
+                temporary.write_bytes(previous_project)
+                os.replace(temporary, project)
+            finally:
+                temporary.unlink(missing_ok=True)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def _mark_bad(state, code, why):
+    """Record this fingerprint the way release.guard does, so the node does not pull it again."""
+    from .fsio import atomic_write
+    from .release import BAD
+    atomic_write(Path(state) / BAD, json.dumps({"code": code, "at": time.time(), "why": why}))
+
+
+def release_health(repo, state=None):
+    """Why this checkout should not keep the release just installed, or None when it should.
+
+    A tree with no `jarvis/__init__.py` is not a package. Signature tests use those
+    trees; the fingerprint check is what judges them. A package is never reported
+    healthy without both of the following actually running:
+
+    - a child interpreter imports every agent module (`NODE_MODULES`); a missing
+      module is a failure, not a skip
+    - local config and state checks of the kind `cluster doctor` makes before it
+      opens a socket or touches systemd: the config parses, cluster identity
+      resolves, and a node's credential matches that identity
+
+    Nothing here calls `doctor()`, opens a connection, runs ssh, or calls systemctl.
+    """
+    repo = Path(repo)
+    package = repo / "jarvis"
+    if not (package / "__init__.py").is_file():
+        return None
+    missing = [name for name in NODE_MODULES if not (package / f"{name}.py").is_file()]
+    if missing:
+        return "agent modules missing: " + ", ".join(missing)
+    problem = _import_agent(repo)
+    if problem:
+        return problem
+    return _local_doctor(repo, state)
+
+
+def _import_agent(repo, timeout=60):
+    """Why the installed agent modules did not import, or None.
+
+    Unlike `_starts`, this does not treat a missing package as success. The caller
+    has already required every `NODE_MODULES` file. A child that cannot be started
+    is a failure."""
+    import sys
+    code = "import " + ", ".join(f"jarvis.{name}" for name in NODE_MODULES)
+    try:
+        done = subprocess.run([sys.executable, "-c", code], cwd=str(repo), capture_output=True,
+                              text=True, timeout=timeout, creationflags=NO_WINDOW,
+                              env={**os.environ, "PYTHONPATH": str(repo), "PYTHONDONTWRITEBYTECODE": "1"})
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"couldn't import the agent: {exc}"
+    if done.returncode:
+        last = (done.stderr.strip().splitlines() or ["exit " + str(done.returncode)])[-1]
+        return last[-300:]
+    return None
+
+
+def _local_doctor(repo, state):
+    """Config and state checks that do not leave this machine.
+
+    `cluster doctor` goes on to the hub, SSH, and the service manager. Those stay
+    out of an install: a code swap must not depend on the network or on systemd.
+    """
+    from .topology import enabled, identity
+    config_path = Path(repo) / "jarvis.config.json"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "jarvis.config.json can't be read"
+    if not isinstance(config, dict):
+        return "jarvis.config.json isn't a JSON object"
+    try:
+        if not enabled(config):
+            return "cluster.enabled is false"
+        local, main = identity(config)
+    except (TypeError, ValueError, AttributeError) as exc:
+        return str(exc) or "cluster config is unusable"
+    if state is None:
+        return None
+    state = Path(state)
+    if not state.is_dir():
+        return "state folder is missing"
+    if local == main:
+        return None
+    try:
+        note = json.loads((state / "cluster-node.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "node credential can't be read"
+    if not isinstance(note, dict):
+        return "node credential isn't a JSON object"
+    if note.get("node_id") != local or note.get("main_device") != main:
+        return "node credential does not match this PC's configured identity"
+    token = note.get("token")
+    if not isinstance(token, str) or len(token) < 20:
+        return "node credential is missing a token"
+    code_key = note.get("code_key")
+    if not isinstance(code_key, str) or not CODE_KEY.fullmatch(code_key):
+        return "node credential is missing the main's code-signing key"
+    return None
 
 
 def _ssh(config, state, node):

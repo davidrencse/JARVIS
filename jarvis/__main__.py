@@ -212,6 +212,11 @@ def main():
                     help="flood the capture queue while captured (implies --capture)")
     st.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args()
+    if args.command == "continuity":
+        # Operator commands own their configuration and lifecycle. In
+        # particular, read-only preflight must not create application state.
+        from .continuity.cli import run as continuity_run
+        return continuity_run(args)
     from .platforms import private_dir
     # brain status and a disabled sync must not create .jarvis. Mutating brain
     # paths create that private directory themselves. Every other command still does.
@@ -265,9 +270,6 @@ def main():
             from . import phone
             emit(phone.cli(args, config, args.state))
             return 0
-        if args.command == "continuity":
-            from .continuity.cli import run as continuity_run
-            return continuity_run(args)
         if args.command == "camera":  # this PC's own consent: works on the main and on nodes
             from . import camera
             if args.action == "allow":

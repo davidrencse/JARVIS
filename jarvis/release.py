@@ -4,13 +4,11 @@ Nodes used to pull whatever `jarvis/` held on disk, and every saved file changed
 fingerprint, so a half-finished edit reached them at once: on 2026-10-30 the Dell pulled code
 mid-edit at 14:38, its node agent stopped checking in, and nothing put the old code back.
 
-Main side: `cut()` copies the repo into a staging folder (only once the tree has been quiet
-for QUIET seconds, and only if it didn't change while copying), runs the full test suite on
-that copy, and only when it passes swaps the copy's `jarvis/` and `pyproject.toml` into
-`.jarvis/code-release/`. /v1/code, the SSH push (`jarvis cluster update`) and the main's
-"same code?" check all use that snapshot (`served_code`). The hub cuts one by itself when
-the tree has changed and gone quiet; `jarvis cluster release` cuts one now. A fingerprint that
-failed its tests isn't tried again until the code changes.
+Main side: cut() resolves origin/main (local HEAD fallback), extracts that commit
+with git archive, and tests the clean stage. Commit hashes trigger cuts; the existing
+package fingerprint remains the node wire identity. Core and safety failures block;
+other full-suite failures ship with recorded warnings. State lives under the caller's
+--state directory, including code-release-failed.json.
 
 Node side: before installing, `backup()` copies the running package to
 `.jarvis/code-prev/`. `guard()` then starts a stdlib-only watchdog (GUARD, run from a file in
@@ -18,9 +16,14 @@ the state folder, so it doesn't import the code it judges) that waits for the ne
 check in (`confirm()`, after its first successful poll). If it doesn't within GUARD_WAIT
 seconds, or dies first, the watchdog restores the backup, records the fingerprint as bad
 (`is_bad`: never pulled again), and starts the old code.
+
+`code_parity` is the read-only transfer check. `served_code` still falls back to the live
+tree until a snapshot exists; parity does not. A match there does not cut a release, deploy,
+or update, and it does not authorize a transfer.
 """
 
 import json
+import tarfile
 import os
 from .platforms import on_windows
 import shutil
@@ -36,7 +39,7 @@ RELEASE = "code-release"        # in the main's state folder: jarvis/, pyproject
 FAILED = "code-release-failed.json"
 QUIET = 600                     # seconds without a saved file before the tree counts as settled (a cut runs the whole suite)
 FAST_QUIET = 60                 # ...when an online node is behind on code and waiting for it
-TEST_TIMEOUT = 900
+TEST_TIMEOUT = 3600
 # Copied into the staging folder for the test run: everything but history, state and caches.
 STAGE_SKIP = {".git", ".jarvis", ".venv", "node_modules", "__pycache__", "jarvis.egg-info",
               "dist", "build"}
@@ -76,6 +79,113 @@ def served_code(state):
     return current(state).get("code") or code_fingerprint()
 
 
+def _tested_fingerprint(state):
+    """The snapshot fingerprint, or None. Never the live-tree fallback `served_code` uses."""
+    try:
+        note = current(state)
+    except (OSError, ValueError, TypeError):
+        return None
+    code = note.get("code") if isinstance(note, dict) else None
+    return code if isinstance(code, str) and code else None
+
+
+def _live_fingerprint():
+    try:
+        live = code_fingerprint()
+    except (OSError, ValueError, TypeError):
+        return None
+    return live if isinstance(live, str) and live else None
+
+
+def _failed_code(state):
+    code = _read(Path(state) / FAILED).get("code")
+    return code if isinstance(code, str) and code else None
+
+
+def _parity(tested, live, reported, blocks):
+    """`authorizes` stays false: a fingerprint match is not permission to transfer."""
+    return {
+        "matched": not blocks,
+        "authorizes": False,
+        "code": tested,
+        "live": live,
+        "reported": reported,
+        "blocks": [{"code": code, "instruction": text} for code, text in blocks],
+        "instruction": blocks[0][1] if blocks else "",
+        "limits": "This check does not release, deploy, update, or authorize a transfer.",
+    }
+
+
+def _unreleased_instruction():
+    try:
+        quiet = settled(quiet=QUIET)
+    except (OSError, ValueError, TypeError):
+        quiet = None
+    if quiet is False:
+        return (f"Code was saved in the last {QUIET} s and differs from the tested release. "
+                "Wait for it to settle, then: jarvis cluster release. This check does not cut one.")
+    if quiet is True:
+        return ("The working tree differs from the tested release and has been quiet long enough to cut. "
+                "On this main: jarvis cluster release. This check does not cut one.")
+    return ("The working tree differs from the tested release. "
+            "On this main: jarvis cluster release. This check does not cut one.")
+
+
+def code_parity(state, reported=None):
+    """Whether a transfer's code matches the tested release. Reads state. Changes nothing.
+
+    ``matched`` is true only when a tested release exists, the live tree equals it,
+    ``reported`` (the other PC's fingerprint) equals it, and neither fingerprint was
+    rolled back here. ``served_code`` matching ``reported`` is not enough: before the
+    first snapshot it is the live tree. ``authorizes`` is always false.
+    """
+    limits = "This check does not release, deploy, update, or authorize a transfer."
+    try:
+        state = Path(state)
+    except (TypeError, ValueError):
+        return _parity(None, None, None, [("unreadable",
+            "Code parity could not be read. Do not treat that as a match. " + limits)])
+    tested = _tested_fingerprint(state)
+    live = _live_fingerprint()
+    reported_code = reported if isinstance(reported, str) and reported else None
+    failed_code = _failed_code(state)
+    blocks = []
+    if live and failed_code == live and live != tested:
+        tail = str(_read(state / FAILED).get("tests") or "").strip()
+        extra = f" ({tail[-160:]})" if tail else ""
+        failed = (
+            "This computer's latest code failed its release tests, so nodes can't get it yet. "
+            "Fix the failing test, then run: jarvis cluster release." + extra
+            + " This check does not cut one."
+        )
+        blocks.append(("release_tests_failed", failed))
+    if not tested:
+        blocks.append(("no_tested_release", (
+            "No tested release on this main. On this main: jarvis cluster release. "
+            "A live tree is not a tested release. This check does not cut one.")))
+    elif live and live != tested and failed_code != live:
+        blocks.append(("unreleased_edits", _unreleased_instruction()))
+    if live is None:
+        blocks.append(("live_unreadable", (
+            "The local code fingerprint could not be read. Do not treat that as a match. "
+            "This check does not deploy or update.")))
+    if reported_code is None:
+        blocks.append(("reported_missing", (
+            "The other PC's code fingerprint was not supplied. A transfer needs that fingerprint. "
+            "This check does not contact the other PC.")))
+    elif tested and reported_code != tested:
+        blocks.append(("code_mismatch", (
+            f"The other PC runs different JARVIS code ({reported_code}, tested release {tested}). "
+            "On the main: jarvis cluster update <node>. This check does not update a node.")))
+    bad = [code for code in (tested, reported_code) if code and is_bad(state, code)]
+    if bad:
+        shown = ", ".join(dict.fromkeys(bad))
+        blocks.append(("rolled_back", (
+            f"Fingerprint {shown} was rolled back on this PC and must not be installed again. "
+            "This check does not deploy it.")))
+    return _parity(tested, live, reported_code, blocks)
+
+
 def source(state):
     """The package folder nodes are sent (the release's jarvis/, else the live one)."""
     return release_dir(state) / "jarvis" if current(state) else PACKAGE
@@ -92,13 +202,37 @@ def settled(root=PACKAGE, quiet=QUIET, now=None):
     return (now or time.time()) - newest >= quiet
 
 
+def source_commit(repo=None):
+    """Resolve a local remote-tracking commit; never fetch or read dirty files."""
+    repo = Path(repo or PACKAGE.parent)
+    for ref in ("origin/main", "HEAD"):
+        result = subprocess.run(["git", "rev-parse", "--verify", ref + "^{commit}"],
+                                cwd=repo, capture_output=True, text=True, timeout=15)
+        if result.returncode == 0:
+            return result.stdout.strip()
+    raise ValueError("No origin/main or local HEAD commit available")
+
+
 def due(state, quiet=QUIET):
-    """Should the hub cut a release now? The live code differs from the release, hasn't
-    already failed its tests, and has been left alone for `quiet` seconds."""
-    live = code_fingerprint()
-    if live == current(state).get("code") or live == _read(Path(state) / FAILED).get("code"):
+    try:
+        commit = source_commit()
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
-    return settled(quiet=quiet)
+    return commit not in (current(state).get("commit"), _read(Path(state) / FAILED).get("commit"))
+
+
+def _archive(repo, stage, commit):
+    archive = Path(stage) / "source.tar"
+    subprocess.run(["git", "archive", "--format=tar", "-o", str(archive), commit],
+                   cwd=repo, check=True, capture_output=True, timeout=60)
+    with tarfile.open(archive) as tar:
+        # Reject links and traversal even on Python versions without extraction filters.
+        for member in tar.getmembers():
+            path = Path(member.name)
+            if path.is_absolute() or ".." in path.parts or member.issym() or member.islnk():
+                raise ValueError("Unsafe git archive entry: " + member.name)
+        tar.extractall(stage)
+    archive.unlink()
 
 
 def _nested_repo(path):
@@ -122,21 +256,17 @@ def _stage(repo, stage):
 
 
 def run_tests(stage, timeout=TEST_TIMEOUT):
-    """(passed, last lines of output) for the suite run on the staged copy."""
-    env = {**os.environ, "PYTHONPATH": str(stage)}
-    nice = ["nice", "-n", "10"] if not on_windows() and shutil.which("nice") else []
-    try:
-        out = subprocess.run([*nice, sys.executable, "-m", "unittest", "discover", "-s", "tests"],
-                             cwd=stage, env=env, capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=timeout,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    except subprocess.TimeoutExpired:
-        return False, f"tests took over {timeout} s"
-    lines = (out.stderr or out.stdout).strip().splitlines()
-    # Name what failed, so a blocked release says which test to fix (not just "failures=1").
-    failed = [l for l in lines if l.startswith(("FAIL: ", "ERROR: "))][:10]
-    tail = "\n".join(failed + lines[-3:])
-    return out.returncode == 0, tail
+    from .release_gate import run_tests as gate
+    return gate(stage, timeout=timeout)
+
+
+def status(state):
+    failed = _read(Path(state) / FAILED)
+    note = current(state)
+    if failed and failed.get("blocking", True):
+        names = failed.get("failures") or [failed.get("tests") or "unknown test"]
+        return {**failed, "message": "Release blocked: " + str(names[0])}
+    return {**note, "message": "Release shipped with warnings" if note.get("warnings") else "Release ready"}
 
 
 def cut(state, repo=None, quiet=QUIET, tests=run_tests):
@@ -158,23 +288,32 @@ def cut(state, repo=None, quiet=QUIET, tests=run_tests):
 
 
 def _cut(state, repo, quiet, tests):
-    package = repo / "jarvis"
-    if quiet and not settled(package, quiet):
-        return {"released": False, "note": f"Code was saved in the last {quiet} s; waiting for it to settle."}
-    live = code_fingerprint(package)
-    if live == current(state).get("code"):
-        return {"released": False, "code": live, "note": "Nodes already get this code."}
+    try:
+        commit = source_commit(repo)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return {"released": False, "note": str(exc)}
+    if commit == current(state).get("commit"):
+        return {"released": False, "code": current(state)["code"], "note": "Nodes already get this code."}
     with tempfile.TemporaryDirectory(prefix="jarvis-release-") as stage:
         stage = Path(stage)
-        _stage(repo, stage)
-        code = code_fingerprint(stage / "jarvis")
-        if code != live or code_fingerprint(package) != live:
-            return {"released": False, "note": "Code changed while it was being copied; try again."}
-        passed, tail = tests(stage)
+        _archive(repo, stage, commit)
+        code = code_fingerprint(stage / "jarvis")  # retain old nodes' wire fingerprint
+        passed, result = tests(stage)
+        detail = result if isinstance(result, dict) else {"summary": result}
+        tail = detail.get("summary", "")
+        if detail.get("deferred"):
+            return {"released": False, "deferred": True, "note": tail}
         if not passed:
-            _write(state / FAILED, {"code": code, "at": time.time(), "tests": tail})
-            return {"released": False, "code": code, "tests": tail,
-                    "note": "Tests failed; nodes keep the last release."}
+            note = {"code": code, "commit": commit, "at": time.time(), "tests": tail,
+                    "failures": detail.get("failures", [tail]), "blocking": True}
+            _write(state / FAILED, note)
+            notified = _read(state / "code-release-notified.json")
+            commits = notified.get("commits", [])
+            if commit not in commits:
+                _write(state / "code-release-notified.json", {"commits": [*commits, commit]})
+                from .confirm import notify
+                notify("Release blocked: " + str(note["failures"][0] if note["failures"] else tail))
+            return {"released": False, **note, "note": "Tests failed; nodes keep the last release."}
         fresh, final = state / (RELEASE + ".new"), release_dir(state)
         shutil.rmtree(fresh, ignore_errors=True)
         fresh.mkdir()
@@ -184,7 +323,8 @@ def _cut(state, repo, quiet, tests):
     if code_fingerprint(fresh / "jarvis") != code:
         shutil.rmtree(fresh, ignore_errors=True)
         return {"released": False, "note": "The release copy didn't match what was tested."}
-    note = {"code": code, "at": time.time(), "tests": tail}
+    note = {"code": code, "commit": commit, "at": time.time(), "tests": tail,
+            "warnings": detail.get("warnings", [])}
     _write(fresh / "release.json", note)
     old = state / (RELEASE + ".old")
     shutil.rmtree(old, ignore_errors=True)
@@ -192,7 +332,10 @@ def _cut(state, repo, quiet, tests):
         os.replace(final, old)
     os.replace(fresh, final)
     shutil.rmtree(old, ignore_errors=True)
-    (state / FAILED).unlink(missing_ok=True)
+    if note["warnings"]:
+        _write(state / FAILED, {**note, "blocking": False, "failures": note["warnings"]})
+    else:
+        (state / FAILED).unlink(missing_ok=True)
     return {"released": True, **note}
 
 

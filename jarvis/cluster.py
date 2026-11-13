@@ -39,6 +39,94 @@ HANDSHAKE_TIMEOUT = 10  # seconds a TLS client has to finish its handshake
 POLL_WAIT = 25
 WAIT_HOLD = 20  # seconds a requester asks the hub to hold a job-result request
 FRESH = 10  # seconds after a check-in that a node counts as alive between polls
+_PROCESS_RECORD = "cluster-process.json"
+_STOP_REQUEST = "cluster-stop-request.json"
+_STOP_ACK = "cluster-stop-ack.json"
+_PROCESS_SCHEMA = 1
+
+
+def _local_record(path):
+    """Read one regular local lifecycle record; never follow a symlink."""
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _local_pid_alive(pid):
+    if type(pid) is not int or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:  # process exists, but the caller cannot signal it
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def request_node_worker_stop(config_path, state, *, timeout=35.0):
+    """Request a bounded cooperative stop of this exact local NodeWorker.
+
+    The local registration nonce binds the request to the worker's PID, config,
+    and state directory. No OS signal, owner token, shell command, or remote
+    control channel is used. A timeout leaves the request for a safe retry.
+    """
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or not 0 < timeout <= 45):
+        raise ValueError("cooperative stop timeout must be in (0, 45] seconds")
+    config = Path(config_path).expanduser().resolve(strict=True)
+    state = Path(state).expanduser().resolve(strict=True)
+    registration_path = state / _PROCESS_RECORD
+    registration = _local_record(registration_path)
+    required = {"schema", "kind", "pid", "nonce", "config", "state"}
+    if (not isinstance(registration, dict) or set(registration) != required
+            or registration.get("schema") != _PROCESS_SCHEMA
+            or registration.get("kind") != "node-worker"
+            or registration.get("config") != str(config)
+            or registration.get("state") != str(state)
+            or not isinstance(registration.get("nonce"), str)
+            or len(registration["nonce"]) != 48
+            or any(c not in "0123456789abcdef" for c in registration["nonce"])):
+        raise RuntimeError("matching local NodeWorker registration is unavailable")
+    if not _local_pid_alive(registration["pid"]):
+        raise RuntimeError("registered NodeWorker is not running")
+
+    request_path, ack_path = state / _STOP_REQUEST, state / _STOP_ACK
+    from .fsio import atomic_write
+    from .locking import exclusive_lock
+    with exclusive_lock(state / "cluster-stop-request.lock"):
+        existing = _local_record(request_path)
+        if existing is not None:
+            if (set(existing) != {"schema", "kind", "pid", "nonce", "config", "state", "request_id"}
+                    or any(existing.get(k) != registration.get(k) for k in
+                           ("schema", "kind", "pid", "nonce", "config", "state"))):
+                raise RuntimeError("a different cooperative stop request is already pending")
+            request = existing
+        else:
+            if request_path.is_symlink() or ack_path.is_symlink():
+                raise RuntimeError("cooperative stop receipt is unsafe")
+            request = {**registration, "request_id": uuid.uuid4().hex}
+            atomic_write(request_path, json.dumps(request, sort_keys=True), mode=0o600, fsync=True)
+
+    deadline = time.monotonic() + float(timeout)
+    while time.monotonic() < deadline:
+        ack = _local_record(ack_path)
+        if (isinstance(ack, dict) and set(ack) == {"schema", "kind", "pid", "nonce", "config", "state",
+                                                  "request_id", "status"}
+                and all(ack.get(k) == request.get(k) for k in
+                        ("schema", "kind", "pid", "nonce", "config", "state", "request_id"))
+                and ack.get("status") == "stopped"):
+            return {"ok": True, "status": "stopped", "request_id": request["request_id"]}
+        current = _local_record(registration_path)
+        if current is None and not _local_pid_alive(registration["pid"]):
+            raise RuntimeError("NodeWorker exited without a matching cooperative stop receipt")
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+    raise TimeoutError("NodeWorker did not cooperatively stop before the bounded timeout")
 # The console API a node (with "console") may reach on the main; the owner token, held only
 # by the main's own windows, reaches all of it. Left out on purpose: settings, files, screen,
 # memory, uploads, plan runs and Grokbot commands (its /terminal opens a shell here), so a
@@ -106,6 +194,29 @@ def _refresh_clipboard(state, config=None, stop=None):
             if stop is None:
                 time.sleep(CLIP_CHECK)
     threading.Thread(target=run, name="jarvis-clip-keepalive", daemon=True).start()
+
+
+def _keepalive_after_update(state, config=None, stop=None, delay=3):
+    """After a release restart, re-check clipboard and Lan Mouse soon. The minute
+    guard and ensure_dependents's tunnel-health edge both miss that restart.
+    No-op under tests, same as the clipboard keep-alive."""
+    from . import _under_tests
+    if _under_tests():
+        return
+    threading.Thread(target=_run_keepalive_after_update, name="jarvis-post-update-keepalive",
+                     args=(state, config, stop, delay), daemon=True).start()
+
+
+def _run_keepalive_after_update(state, config, stop, delay):
+    if stop is not None:
+        stop.wait(delay)
+    else:
+        time.sleep(delay)
+    try:
+        from .cluster_recovery import ensure_dependents
+        ensure_dependents(config or {}, state)
+    except Exception as exc:  # a failed re-check must not take the new process down
+        print(f"JARVIS node: post-update keep-alive failed: {exc}", flush=True)
 
 
 class NodeOffline(ConnectionError):
@@ -629,6 +740,10 @@ class Hub:
         self.stop_event = threading.Event()
         self._condition = threading.Condition()
         self._polling = {}  # node -> sockets of polls held open now (guarded by _condition)
+        self._response_context = threading.local()
+        self._active_responses = {}
+        self._active_responses_lock = threading.RLock()
+        self._orphaned_response_callbacks = []
         self.server = self.thread = self.worker = self._lock = None
         self.started = False
         from .remote_view import Sessions
@@ -668,6 +783,34 @@ class Hub:
                 pass
         return {"token": token, "key_rotated": rotated}
 
+    def defer_after_response(self, callback):
+        """Schedule a process pivot after this request's result is written."""
+        if not callable(callback):
+            raise RuntimeError("response_ack_unavailable")
+        request = getattr(self._response_context, "request", None)
+        if request is not None:
+            with self._active_responses_lock:
+                if request.get("written"):
+                    run_now = True
+                else:
+                    request["callbacks"].append(callback)
+                    return True
+            if run_now:
+                callback()
+                return True
+        with self._active_responses_lock:
+            candidates = [item for item in self._active_responses.values()
+                          if item.get("role_transition") and not item.get("written")]
+            if not candidates:
+                orphaned = getattr(self, "_orphaned_response_callbacks", None)
+                if orphaned:
+                    orphaned.append(callback)
+                    return True
+                return False
+            request = candidates[-1]
+            request["callbacks"].append(callback)
+            return True
+
     def authenticate(self, headers, capability=None, source=None):
         if headers.get("X-JARVIS-Main") != self.main:
             raise PermissionError("This endpoint is not the configured main PC; update cluster config.")
@@ -701,6 +844,7 @@ class Hub:
         from .release import FAST_QUIET, QUIET, cut, due
         if self.stop_event.wait(settle):  # let nodes reconnect and report their code
             return
+        self._release_started_code = code_fingerprint()
         auto = (self.config.get("cluster") or {}).get("auto_release", True)
         while True:
             try:
@@ -715,6 +859,8 @@ class Hub:
                     print(f"JARVIS: release {report.get('code')}: "
                           f"{'released' if report.get('released') else report.get('note')}", flush=True)
                 self._auto_update(settle=0)
+                from .release_runtime import maybe_restart
+                maybe_restart(self)
             except Exception as exc:  # a file saved mid-copy must not end auto-update for good
                 print(f"JARVIS: auto-update step failed: {exc}", flush=True)
             if self.stop_event.wait(every):
@@ -729,6 +875,9 @@ class Hub:
         if self.stop_event.wait(settle):  # let nodes reconnect and report their code
             return
         from .deploy import is_ssh_node, update
+        from .release_runtime import busy
+        if busy(self.state, hub=self):
+            return
         want = served_code(self.state)
         pushed = self.__dict__.setdefault("_pushed", {})
         for status in self.broker.nodes():
@@ -1176,8 +1325,14 @@ class Hub:
             from . import _under_tests
             if not _under_tests():
                 threading.Thread(target=self._linkfinder, name="main-linkfinder", daemon=True).start()
-            from .continuity.renewal import start_bound
-            self._continuity_renewer = start_bound(self.state, self.config, self.base)
+            if not getattr(self, "continuity_standby", False):
+                # Build managed adapters with the real Hub context before the renewer
+                # starts. Owner-only coordinator methods stay gated by owner proof;
+                # an installation key alone is never promoted to owner.
+                from .continuity.startup import bind_managed
+                bind_managed(self.config, self.state, self.base, hub=self)
+                from .continuity.renewal import start_bound
+                self._continuity_renewer = start_bound(self.state, self.config, self.base)
             if settings.get("auto_update", True):
                 threading.Thread(target=self._keep_up, name="jarvis-auto-update",
                                  daemon=True).start()
@@ -1228,11 +1383,40 @@ def hub_hosts(bound, config):
     return tuple(sorted(allowed))
 
 
+def _remote_pinned_host_match(host, main_url):
+    """Match a non-loopback Host only to the exact pinned URL authority."""
+    pinned = urlsplit(str(main_url or ""))
+    if not pinned.hostname or pinned.hostname.lower() in {"127.0.0.1", "localhost", "::1"}:
+        return None
+    try:
+        incoming = urlsplit("//" + str(host))
+        actual_port = incoming.port
+    except ValueError:
+        return False
+    if (not incoming.hostname or incoming.hostname.lower() != pinned.hostname.lower()
+            or incoming.username is not None or incoming.password is not None
+            or incoming.path or incoming.query or incoming.fragment):
+        return None
+    expected = pinned.port or (443 if pinned.scheme == "https" else 80)
+    actual = actual_port or (443 if pinned.scheme == "https" else 80)
+    return actual == expected
+
+
 def make_server(hub, host, port):
     from .ui import ConsoleServer, Handler
 
     class MainHandler(Handler):
         console = hub.console
+
+        def _host_ok(self):
+            found = self._header_all("Host")
+            if len(found) != 1:
+                return False
+            match = _remote_pinned_host_match(
+                found[0], (hub.config.get("cluster") or {}).get("main_url"))
+            if match is not None:
+                return match
+            return Handler._host_ok(self)
 
         def _allowed(self):
             try:
@@ -1269,9 +1453,42 @@ def make_server(hub, host, port):
             # A node's answer: top-level fields only (see NODE_API_FIELDS); errors pass through.
             if self._node_path and status == 200 and isinstance(body, dict):
                 body = node_fields(self._node_path, body)
-            return super()._send(status, body, *args, **kwargs)
+            try:
+                result = super()._send(status, body, *args, **kwargs)
+            except BaseException:
+                response_context = getattr(hub, "_response_context", None)
+                request = None if response_context is None else getattr(response_context, "request", None)
+                if request is not None:
+                    with hub._active_responses_lock:
+                        request["written"] = False
+                        hub._active_responses.pop(id(request), None)
+                        hub._orphaned_response_callbacks.extend(request["callbacks"])
+                        request["callbacks"] = []
+                    response_context.request = None
+                raise
+            response_context = getattr(hub, "_response_context", None)
+            request = None if response_context is None else getattr(response_context, "request", None)
+            pending = []
+            if request is not None:
+                with hub._active_responses_lock:
+                    request["written"] = True
+                    pending, request["callbacks"] = request["callbacks"], []
+                    hub._active_responses.pop(id(request), None)
+                response_context.request = None
+            for callback in pending or ():
+                try:
+                    callback()
+                except Exception as exc:
+                    print(f"JARVIS deferred role action failed: {type(exc).__name__}", flush=True)
+            return result
 
         def _request(self, post):
+            request = {"callbacks": [], "written": False, "role_transition": False}
+            response_context = getattr(hub, "_response_context", None)
+            if response_context is not None:
+                response_context.request = request
+                with hub._active_responses_lock:
+                    hub._active_responses[id(request)] = request
             try:
                 self._node_path = None  # one handler serves a whole keep-alive connection
                 if not Handler._allowed(self):  # this class's _allowed is the console credential
@@ -1292,9 +1509,22 @@ def make_server(hub, host, port):
                     with request_from(self.node_id):
                         return Handler.do_POST(self) if post else Handler.do_GET(self)
                 node, caps = hub.authenticate(self.headers, source=self.client_address[0])
+                request["role_transition"] = (post and "owner" in caps
+                                                and self.path == "/v1/continuity/main")
+                if request["role_transition"]:
+                    response_lock = getattr(hub, "_active_responses_lock", None)
+                    if response_lock is not None:
+                        with response_lock:
+                            orphaned = getattr(hub, "_orphaned_response_callbacks", [])
+                            if orphaned:
+                                request["callbacks"].extend(orphaned)
+                                orphaned.clear()
                 if self.path == "/v1/status" and not post:
                     return self._send(200, {"main_device": hub.main, "code": served_code(hub.state),
                                             "nodes": hub.broker.nodes()})
+                if self.path.startswith("/v1/code/chunk?") and not post and "owner" not in caps:
+                    from .release_runtime import serve_chunk
+                    return self._send(200, serve_chunk(hub, parse_qs(urlparse(self.path).query)))
                 if self.path == "/v1/code" and not post and "owner" not in caps:
                     from .deploy import code_bundle  # nodes pull the main's code over their own channel
                     return self._send(200, code_bundle(hub.state))
@@ -1364,7 +1594,7 @@ def make_server(hub, host, port):
                         kinds |= {"remote"}
                     if "files" in caps:
                         kinds |= {"storage", "transfer", "continuity"}
-                    deadline = time.monotonic() + POLL_WAIT
+                    deadline = time.monotonic() + (2 if data.get("code") != served_code(hub.state) else POLL_WAIT)
                     with hub._condition:
                         hub._polling.setdefault(node, set()).add(self.connection)
                         try:
@@ -1393,7 +1623,7 @@ def make_server(hub, host, port):
                                 hub._condition.notify_all()
                             raise
                     from .linkfinder import offer
-                    return self._send(200, {"job": job, "main_device": hub.main,
+                    return self._send(200, {"job": job, "main_device": hub.main, "code_chunks": True,
                         "code": served_code(hub.state), "addresses": offer(hub.config, hub.main, node,
                             self.headers.get("Authorization", "")[7:], data.get("address_nonce"), hub._addresses)})
                 if self.path in ("/v1/remote/frame", "/v1/remote/input") and "owner" not in caps:
@@ -1539,6 +1769,60 @@ class NodeWorker:
         self.stats = {"started": time.time(), "polls_ok": 0, "polls_failed": 0, "outages": 0,
                       "results_sent": 0, "results_resent": 0, "last_ok": None, "last_error": None}
         self._down = False
+        self._process_registration = None
+        self._cooperative_request = None
+        self.cooperative_stop = False
+
+    def _register_local_process(self):
+        from .fsio import atomic_write
+        config = Path(self.config_path).expanduser().resolve(strict=True)
+        record = {"schema": _PROCESS_SCHEMA, "kind": "node-worker", "pid": os.getpid(),
+                  "nonce": secrets.token_hex(24), "config": str(config), "state": str(self.state)}
+        path = self.state / _PROCESS_RECORD
+        if path.is_symlink():
+            raise RuntimeError("unsafe local process registration")
+        atomic_write(path, json.dumps(record, sort_keys=True), mode=0o600, fsync=True)
+        self._process_registration = record
+        return record
+
+    def _cooperative_stop_requested(self):
+        registration = self._process_registration
+        if registration is None:
+            return False
+        request = _local_record(self.state / _STOP_REQUEST)
+        keys = {"schema", "kind", "pid", "nonce", "config", "state", "request_id"}
+        if not isinstance(request, dict) or set(request) != keys:
+            return False
+        if (any(request.get(key) != registration.get(key) for key in
+                ("schema", "kind", "pid", "nonce", "config", "state"))
+                or not isinstance(request.get("request_id"), str)
+                or len(request["request_id"]) != 32
+                or any(c not in "0123456789abcdef" for c in request["request_id"])):
+            return False
+        self._cooperative_request = request
+        self.cooperative_stop = True
+        self.stop_event.set()
+        return True
+
+    def _finish_local_process(self):
+        registration = self._process_registration
+        request = self._cooperative_request
+        if registration is None:
+            return
+        registration_path = self.state / _PROCESS_RECORD
+        current = _local_record(registration_path)
+        if current == registration and not registration_path.is_symlink():
+            registration_path.unlink()
+        if request is not None:
+            from .fsio import atomic_write
+            ack = {**request, "status": "stopped"}
+            path = self.state / _STOP_ACK
+            if path.is_symlink():
+                return
+            atomic_write(path, json.dumps(ack, sort_keys=True), mode=0o600, fsync=True)
+            pending_path = self.state / _STOP_REQUEST
+            if _local_record(pending_path) == request and not pending_path.is_symlink():
+                pending_path.unlink()
 
     def _record(self, **change):
         for key, value in change.items():
@@ -1572,12 +1856,15 @@ class NodeWorker:
         per target fingerprint per 10 minutes so a bad package can't loop the node, and never
         again once that code failed to start here and was rolled back (release.guard)."""
         from .deploy import apply_bundle
+        from .release_runtime import busy, fetch
+        if busy(self.state):
+            return False
         from .release import backup, is_bad
         if is_bad(self.state, want):
             return False
         mark = self.state / "cluster-update.json"
         last = read_json(mark, {})
-        if last.get("code") == want and time.time() - last.get("at", 0) < 600:
+        if last.get("code") == want and time.time() - last.get("at", 0) < 15:
             return False
         save_json(mark, {"code": want, "at": time.time()})
         try:  # the main's code-signing key, pinned from the invite (cluster_setup.join)
@@ -1586,7 +1873,12 @@ class NodeWorker:
             key = None
         if not key:
             return False  # apply_bundle would refuse an unpinned bundle; don't fetch and back up for it
-        bundle = self.client.request("/v1/code", timeout=60)
+        if getattr(self, '_chunked_release', False):
+            bundle = fetch(self.client, self.state, want)
+        else:
+            bundle = self.client.request("/v1/code", timeout=60)
+        if busy(self.state):
+            return False
         backup(self.state)  # what the watchdog restores if the new code won't start
         count = apply_bundle(bundle, key, state=self.state)  # installs changed requirements before its start check
         self.installed = bundle.get("code")
@@ -1650,6 +1942,7 @@ class NodeWorker:
             confirm(self.state, self.code)  # this code starts and reaches the main: keep it
             self._confirmed = True
         received = time.monotonic()
+        self._chunked_release = response.get("code_chunks") is True
         want = response.get("code")
         if want and want != self.code:
             job = response.get("job")
@@ -1875,6 +2168,8 @@ class NodeWorker:
             threading.Thread(target=self._tunnel_guard, name="tunnel-keepalive", daemon=True).start()
         delay = 1
         while not self.stop_event.is_set() and not self.restarting:
+            if self._cooperative_stop_requested():
+                break
             if self._rejoined():  # before redeem_invite, which would use the stale client
                 print("JARVIS node: paired again (new credential); restarting to use it.", flush=True)
                 self.restarting = True
@@ -1891,6 +2186,8 @@ class NodeWorker:
                 print(f"JARVIS node: unexpected {type(exc).__name__}: {exc}", flush=True)
                 worked = False
                 delay = min(delay * 2, 15)
+            if self._cooperative_stop_requested():
+                break
             if not worked:
                 self.stop_event.wait(delay)
 
@@ -1903,6 +2200,7 @@ class NodeWorker:
             except ValueError:
                 print("A JARVIS node agent is already running for this state directory.", flush=True)
             else:
+                self._register_local_process()
                 # A node restarts after each code update: bring the watcher along, and keep it
                 # up. Only the agent holding the lock does (audit cluster-05: a console's
                 # worker that lost the lock ran a second keep-alive beside the agent's).
@@ -1911,6 +2209,9 @@ class NodeWorker:
                                        getattr(self, "stop_event", None))
                 else:
                     _refresh_clipboard(self.state)
+                # Release restart: don't wait 60s or a new tunnel edge to re-check dependents.
+                if getattr(self, "_acts_locally", False):
+                    _keepalive_after_update(self.state, self.config, self.stop_event)
                 if getattr(self, "_acts_locally", False):  # the last agent died mid-session: let go of its keys
                     from .remote_view import recover
                     try:
@@ -1931,9 +2232,34 @@ class NodeWorker:
                         end_all()  # a restart or stop never leaves David's keys held down
                     finally:
                         from .camera import end_all as end_cameras
-                        end_cameras()  # nor the camera on: ffmpeg stops with the agent
+                        try:
+                            end_cameras()  # nor the camera on: ffmpeg stops with the agent
+                        finally:
+                            self._close_managed_process()
+                            self._finish_local_process()
         if self.restarting:
             self.respawn()
+
+    def _close_managed_process(self):
+        """Close process-local continuity/runtime journals before stop ack."""
+        try:
+            from .continuity.participant import lookup, unbind
+            participant = lookup(self.state)
+            if participant is None:
+                return
+            services = getattr(participant, "services", None)
+            if services is not None and callable(getattr(services, "deactivate", None)):
+                services.deactivate("cooperative stop")
+            else:
+                controller = getattr(participant, "production_controller", None)
+                if controller is not None:
+                    controller.close()
+            guard = getattr(participant, "guard", None)
+            if guard is not None:
+                guard.close()
+            unbind(self.state)
+        except Exception as exc:
+            print(f"JARVIS node: continuity shutdown: {type(exc).__name__}", flush=True)
 
     def respawn(self):
         """Start the same command again (the lock is released by now), then exit. No execv:
