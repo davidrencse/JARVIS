@@ -41,7 +41,7 @@ self.addEventListener("fetch", (event) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
-  if (url.pathname.startsWith("/phone/")) return;  // pairing and the API: network only, never cached
+  if (url.pathname === "/phone" || url.pathname.startsWith("/phone/")) return;  // pairing and the API: network only, never cached
   const key = req.mode === "navigate" ? (url.pathname === "/" ? "/" : null) : url.pathname;
   if (!key || !SHELL.includes(key)) return;
   const live = fetchShell(req, key);
@@ -55,12 +55,25 @@ self.addEventListener("fetch", (event) => {
 function fetchShell(req, key) {
   const live = req.mode === "navigate" ? fetch(req) : fetch(req.url, { cache: "no-cache", credentials: "same-origin" });
   return live.then((res) => {
-    if (res && res.ok && res.type === "basic") {
+    if (cacheable(res, key)) {
       const copy = res.clone();
       caches.open(CACHE).then((cache) => cache.put(key, copy)).catch(() => {});
     }
     return res;
   });
+}
+
+// A good shell answer is cached. An authenticated response is not: a Set-Cookie, a
+// no-store or private Cache-Control, or a final URL under /phone/ stays on the network.
+function cacheable(res, key) {
+  if (!res || !res.ok || res.type !== "basic") return false;
+  let path = key;
+  try { path = new URL(res.url).pathname; } catch (e) { /* keep the request key */ }
+  if (path === "/phone" || path.startsWith("/phone/")) return false;
+  if (res.headers.has("Set-Cookie")) return false;
+  const control = (res.headers.get("Cache-Control") || "").toLowerCase();
+  if (control.includes("no-store") || control.includes("private")) return false;
+  return true;
 }
 
 function cached(key) {
