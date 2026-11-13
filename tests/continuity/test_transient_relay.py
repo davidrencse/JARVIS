@@ -48,7 +48,7 @@ class Transient(unittest.TestCase):
     def patched(self, reply):
         calls = []
 
-        def fake(url, data, limit):
+        def fake(url, data, limit, timeout=2):
             calls.append((url, data, limit))
             if isinstance(reply, Exception):
                 raise reply

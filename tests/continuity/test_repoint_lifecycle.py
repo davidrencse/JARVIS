@@ -64,6 +64,13 @@ class RepointLifecycleTests(unittest.TestCase):
         client = Client(cfg, state)
         self.assertEqual(client.main, 'dell'); self.assertEqual(client.url, self.endpoint)
         self.assertEqual(client.token, note['token'])
+        # Omitted link and JSON null are the same direct-HTTPS route.
+        null_note = dict(note); null_note['link'] = None
+        (state/'cluster-node.json').write_text(json.dumps(null_note))
+        null_view = repoint.effective_config(cfg, state)
+        self.assertEqual(null_view['cluster']['main_device'], 'dell')
+        self.assertEqual(null_view['cluster']['main_url'], self.endpoint)
+        self.assertEqual(cfg, original)
         # No instruction fallback after partial/tampered pairing publication.
         note['code_key'] = _keys()['zenbook'][0]
         (state/'cluster-node.json').write_text(json.dumps(note))
@@ -160,6 +167,52 @@ class RepointLifecycleTests(unittest.TestCase):
             self.assertTrue(role.switch_node(self.offer())['ok'])
             tunnel_startup.assert_called_once_with(e.root/'config.json', e.states['zenbook'], False)
             start.assert_not_called(); startup.assert_called_once()
+
+    def test_signed_link_tamper_refuses_before_tunnel_use(self):
+        e = self.env; state = e.states['zenbook']
+        link = {'targets': ['david@198.51.100.10'],
+                'host_key': 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDLTmUvsc7l7vzfOy/yHk0DpdkDZ62R+t93R+78kEG+R',
+                'hostname': 'dell.example', 'identity_file': '/tmp/jarvis-return-repoint-not-a-key'}
+        instruction = self.issuer.issue('zenbook', self.endpoint, link=link)
+        self.assertEqual(instruction['body']['link'], link)
+        self.assertTrue(self.installer().install(instruction)['ok'])
+        cfg = {'cluster': {'enabled': True, 'local_device': 'zenbook', 'main_device': 'zenbook'},
+               'devices': {'zenbook': {}, 'dell': {}}, 'continuity': {'operator_config': 'operator.json'}}
+        (state.parent/'operator.json').write_text(json.dumps({'origin': 'http://127.0.0.1:1',
+            'authority_id': 'oracle-auth', 'device_id': 'zenbook', 'installation_id': 'zenbook-inst',
+            'private_key_path': str(_keys()['zenbook'][1]), 'enrollment': self.pins}))
+        original = copy.deepcopy(cfg)
+        note_text = (state/'cluster-node.json').read_text()
+        from jarvis import linkfinder
+        with patch('jarvis.linkfinder.handoff_config', wraps=linkfinder.handoff_config) as handoff, \
+                patch('jarvis.cluster_tunnel.link') as tunnel, patch('jarvis.cluster_tunnel.start') as start:
+            view = repoint.effective_config(cfg, state)
+        self.assertEqual(view['cluster']['main_device'], 'dell')
+        self.assertEqual(view['cluster']['main_url'], self.endpoint)
+        self.assertEqual(cfg, original)
+        handoff.assert_called_once(); tunnel.assert_not_called(); start.assert_not_called()
+        self.assertEqual(json.loads(note_text)['link'], link)
+
+        def refuse(mutate):
+            body = json.loads(note_text); mutate(body)
+            (state/'cluster-node.json').write_text(json.dumps(body))
+            with patch('jarvis.linkfinder.handoff_config') as overlay, \
+                    patch('jarvis.cluster_tunnel.link') as reader, \
+                    patch('jarvis.cluster_tunnel.start') as dial:
+                with self.assertRaises(RuntimeRefusal) as caught:
+                    repoint.effective_config(cfg, state)
+            self.assertEqual(caught.exception.code, 'bad_state')
+            overlay.assert_not_called(); reader.assert_not_called(); dial.assert_not_called()
+            self.assertEqual(cfg, original)
+
+        refuse(lambda body: body['link']['targets'].__setitem__(0, 'david@203.0.113.50'))
+        refuse(lambda body: body['link'].__setitem__('host_key', 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINotTheSignedHostKey'))
+        refuse(lambda body: body['link'].__setitem__('hostname', 'evil.example'))
+        refuse(lambda body: body['link'].__setitem__('identity_file', '/tmp/not-the-signed-key'))
+        refuse(lambda body: body.__setitem__('link', None))
+        refuse(lambda body: body.pop('link'))
+        (state/'cluster-node.json').write_text(note_text)
+        self.assertEqual(repoint.effective_config(cfg, state)['cluster']['main_url'], self.endpoint)
 
 
 class ExistingUnitHelperTests(unittest.TestCase):

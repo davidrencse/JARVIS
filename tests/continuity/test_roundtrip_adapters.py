@@ -107,28 +107,35 @@ class RoundTripAdapters(unittest.TestCase):
                 patch('jarvis.deploy._remote', side_effect=AssertionError('no SSH')):
             return coordinator(old, new, self.configs[old], e.states[old].parent)
 
-    def prepare_return(self, **changes):
+    def approval(self, device):
+        return json.loads((self.e.states[device]/return_brain.FILE).read_text())
+
+    def stage_return(self, source, target, **changes):
         e = self.e
-        with sqlite3.connect(e.states['dell']/'memory.sqlite3') as db:
-            db.execute("insert into items values ('new Dell memory')")
-        request = json.dumps({'schema': brainsync.EXPORT_SCHEMA, 'old_main': 'dell', 'new_main': 'zenbook'}).encode()
-        exported = brainsync.export_result(self.configs['dell'], e.states['dell'].parent, request)
+        request = json.dumps({'schema': brainsync.EXPORT_SCHEMA, 'old_main': source, 'new_main': target}).encode()
+        exported = brainsync.export_result(self.configs[source], e.states[source].parent, request)
         self.assertTrue(exported['ok'], exported)
         blob = base64.b64decode(exported['payload']); _, _, memory = brainsync._unbundle(blob)
-        path = Path(self.configs['zenbook']['devices']['zenbook']['brain_transfer_dir'])/'return-proposal.bundle'
+        path = Path(self.configs[target]['devices'][target]['brain_transfer_dir'])/'return-proposal.bundle'
         path.write_bytes(blob)
-        current = brainsync.snapshot_memory(e.states['zenbook']/'memory.sqlite3')
-        freeze = brainsync._marker_path(e.states['zenbook'].parent).read_bytes()
+        current = brainsync.snapshot_memory(e.states[target]/'memory.sqlite3')
+        freeze = brainsync._marker_path(e.states[target].parent).read_bytes()
         hashes = {'incoming_sha256': hashlib.sha256(memory).hexdigest(),
-                  'current_sha256': hashlib.sha256(current).hexdigest(), 'freeze_sha256': hashlib.sha256(freeze).hexdigest()}
+                  'current_sha256': hashlib.sha256(current).hexdigest(),
+                  'freeze_sha256': hashlib.sha256(freeze).hexdigest()}
         confirmed = changes.pop('confirmed', True)
         hashes.update(changes)
         with patch('jarvis.transfer._within', side_effect=self.within):
-            result = return_brain.prepare(self.configs['zenbook'], e.states['zenbook'], e.clients['zenbook'],
+            result = return_brain.prepare(self.configs[target], e.states[target], e.clients[target],
                                          path, **hashes, confirmed=confirmed)
         self.assertTrue(result['freeze_preserved'])
-        self.assertTrue(brainsync._frozen(e.states['zenbook'].parent, 'zenbook'))
+        self.assertTrue(brainsync._frozen(e.states[target].parent, target))
         return path, hashes
+
+    def prepare_return(self, **changes):
+        with sqlite3.connect(self.e.states['dell']/'memory.sqlite3') as db:
+            db.execute("insert into items values ('new Dell memory')")
+        return self.stage_return('dell', 'zenbook', **changes)
 
     def test_zenbook_to_dell_to_zenbook_with_explicit_return_confirmation(self):
         e = self.e; first = self.handoff('zenbook', 'dell')
@@ -211,3 +218,276 @@ class RoundTripAdapters(unittest.TestCase):
         approval.write_text(json.dumps(record))
         with self.assertRaises(RuntimeRefusal): return_brain.activate(self.e.participants['zenbook'])
         self.assertTrue(brainsync._frozen(self.e.states['zenbook'].parent, 'zenbook'))
+
+    def test_two_outward_and_return_cycles_preserve_archives(self):
+        e = self.e
+        self.assertTrue(self.handoff('zenbook', 'dell')['ok'])
+        self.prepare_return()
+        first_archive = self.approval('zenbook')['archive']
+        self.assertTrue(self.handoff('dell', 'zenbook')['ok'])
+        approval = e.states['zenbook']/return_brain.FILE
+        self.assertEqual(self.approval('zenbook')['phase'], 'activated')
+        request = json.dumps({'schema': brainsync.EXPORT_SCHEMA, 'old_main': 'dell', 'new_main': 'zenbook'}).encode()
+        exported = brainsync.export_result(self.configs['dell'], e.states['dell'].parent, request)
+        self.assertTrue(exported['ok'], exported)
+        blob = base64.b64decode(exported['payload']); _, _, memory = brainsync._unbundle(blob)
+        bundle = Path(self.configs['zenbook']['devices']['zenbook']['brain_transfer_dir'])/'still-main.bundle'
+        bundle.write_bytes(blob)
+        with patch('jarvis.transfer._within', side_effect=self.within):
+            with self.assertRaises(RuntimeRefusal) as alive:
+                return_brain.prepare(self.configs['zenbook'], e.states['zenbook'], e.clients['zenbook'], bundle,
+                    incoming_sha256=hashlib.sha256(memory).hexdigest(), current_sha256='0'*64,
+                    freeze_sha256='0'*64, confirmed=True)
+        self.assertEqual(alive.exception.code, 'main_alive')
+        self.assertTrue(approval.is_file())
+        self.assertFalse((e.states['zenbook']/first_archive/return_brain.FILE).exists())
+        with sqlite3.connect(e.states['zenbook']/'memory.sqlite3') as db:
+            db.execute("insert into items values ('second outward')")
+        self.stage_return('zenbook', 'dell')
+        dell_archive = self.approval('dell')['archive']
+        dell_memory = (e.states['dell']/dell_archive/'memory.sqlite3').read_bytes()
+        self.assertTrue(self.handoff('zenbook', 'dell')['ok'])
+        self.assertEqual(e.store.status()['main'], 'dell')
+        self.assertFalse(brainsync._frozen(e.states['dell'].parent, 'dell'))
+        self.assertTrue(brainsync._frozen(e.states['zenbook'].parent, 'zenbook'))
+        self.assertEqual((e.states['dell']/dell_archive/'memory.sqlite3').read_bytes(), dell_memory)
+        with sqlite3.connect(e.states['dell']/'memory.sqlite3') as db:
+            db.execute("insert into items values ('second return')")
+        with self.assertRaises(RuntimeRefusal) as wrong:
+            self.stage_return('dell', 'zenbook', incoming_sha256='0'*64)
+        self.assertEqual(wrong.exception.code, 'conflict')
+        self.assertFalse((e.states['zenbook']/first_archive/return_brain.FILE).exists())
+        self.stage_return('dell', 'zenbook')
+        parked = json.loads((e.states['zenbook']/first_archive/return_brain.FILE).read_text())
+        self.assertEqual(parked['phase'], 'activated')
+        second = self.approval('zenbook')
+        self.assertEqual(second['phase'], 'prepared')
+        self.assertNotEqual(second['archive'], first_archive)
+        self.assertTrue(self.handoff('dell', 'zenbook')['ok'])
+        self.assertEqual(e.store.status()['main'], 'zenbook')
+        self.assertEqual(self.approval('zenbook')['phase'], 'activated')
+        self.assertEqual(self.switches, [('zenbook', 'dell'), ('dell', 'zenbook'), ('zenbook', 'dell'), ('dell', 'zenbook')])
+        with sqlite3.connect(e.states['zenbook']/'memory.sqlite3') as db:
+            self.assertEqual([row[0] for row in db.execute('select body from items order by rowid')],
+                             ['first brain', 'new Dell memory', 'second outward', 'second return'])
+        with sqlite3.connect(e.states['zenbook']/first_archive/'memory.sqlite3') as db:
+            self.assertEqual([row[0] for row in db.execute('select body from items')], ['first brain'])
+        self.assertTrue((e.states['zenbook']/first_archive/'activated-freeze.json').is_file())
+        with sqlite3.connect(e.states['zenbook']/second['archive']/'memory.sqlite3') as db:
+            self.assertEqual(db.execute('select count(*) from items').fetchone()[0], 3)
+        self.assertEqual((e.states['dell']/dell_archive/'memory.sqlite3').read_bytes(), dell_memory)
+
+    def test_activate_crash_before_marker_move_checks_grant_and_hash(self):
+        e = self.e
+        self.assertTrue(self.handoff('zenbook', 'dell')['ok']); self.prepare_return()
+        record = self.approval('zenbook')
+        archive = e.states['zenbook']/record['archive']
+        archived_memory = (archive/'memory.sqlite3').read_bytes()
+        marker = brainsync._marker_path(e.states['zenbook'].parent)
+        freeze = marker.read_bytes()
+        real = return_brain._save_durable
+        def crash(path, value):
+            real(path, value)
+            if value.get('phase') == 'activated':
+                raise RuntimeError('crash before marker move')
+        with patch.object(return_brain, '_save_durable', side_effect=crash):
+            self.assertFalse(self.handoff('dell', 'zenbook')['ok'])
+        saved = self.approval('zenbook')
+        self.assertEqual(saved['phase'], 'activated')
+        self.assertEqual(set(saved['grant']), {'transition_id', 'incarnation', 'epoch'})
+        self.assertEqual(marker.read_bytes(), freeze)
+        self.assertFalse((archive/'activated-freeze.json').exists())
+        marker.chmod(0o644); marker.write_bytes(freeze + b'\n')
+        with self.assertRaises(RuntimeRefusal) as conflict:
+            return_brain.activate(e.participants['zenbook'])
+        self.assertEqual(conflict.exception.code, 'conflict')
+        self.assertFalse((archive/'activated-freeze.json').exists())
+        marker.write_bytes(freeze); marker.chmod(0o444)
+        approval = e.states['zenbook']/return_brain.FILE
+        tampered = dict(saved); tampered['grant'] = dict(saved['grant'], epoch=saved['grant']['epoch']+1)
+        approval.write_text(json.dumps(tampered))
+        with self.assertRaises(RuntimeRefusal) as reconcile:
+            return_brain.activate(e.participants['zenbook'])
+        self.assertEqual(reconcile.exception.code, 'reconcile')
+        self.assertEqual(marker.read_bytes(), freeze)
+        approval.write_text(json.dumps(saved))
+        self.assertEqual(return_brain.activate(e.participants['zenbook'])['status'], 'return_activated')
+        self.assertFalse(marker.exists())
+        self.assertEqual((archive/'activated-freeze.json').read_bytes(), freeze)
+        self.assertEqual((archive/'memory.sqlite3').read_bytes(), archived_memory)
+        self.assertEqual(return_brain.activate(e.participants['zenbook'])['status'], 'return_activated')
+
+    def test_activate_finishes_when_the_freeze_moved_before_the_approval_write(self):
+        e = self.e
+        self.assertTrue(self.handoff('zenbook', 'dell')['ok']); self.prepare_return()
+        record = self.approval('zenbook')
+        archive = e.states['zenbook']/record['archive']
+        memory = (archive/'memory.sqlite3').read_bytes()
+        marker = brainsync._marker_path(e.states['zenbook'].parent)
+        freeze = marker.read_bytes()
+        def old_crash(participant):
+            approval = json.loads((Path(participant.state)/return_brain.FILE).read_text())
+            brainsync._marker_path(Path(participant.state).parent).rename(
+                Path(participant.state)/approval['archive']/'activated-freeze.json')
+            raise RuntimeError('crash after marker move')
+        with patch.object(return_brain, 'activate', side_effect=old_crash):
+            self.assertFalse(self.handoff('dell', 'zenbook')['ok'])
+        self.assertEqual(self.approval('zenbook')['phase'], 'received')
+        self.assertNotIn('grant', self.approval('zenbook'))
+        self.assertFalse(marker.exists())
+        archived = archive/'activated-freeze.json'
+        self.assertEqual(archived.read_bytes(), freeze)
+        archived.chmod(0o644)
+        archived.write_bytes(freeze + b'x')
+        with self.assertRaises(RuntimeRefusal) as conflict:
+            return_brain.activate(e.participants['zenbook'])
+        self.assertEqual(conflict.exception.code, 'conflict')
+        self.assertNotIn('grant', self.approval('zenbook'))
+        archived.write_bytes(freeze)
+        self.assertEqual(return_brain.activate(e.participants['zenbook'])['status'], 'return_activated')
+        self.assertEqual(self.approval('zenbook')['phase'], 'activated')
+        self.assertFalse(marker.exists())
+        self.assertEqual((archive/'memory.sqlite3').read_bytes(), memory)
+        self.assertEqual(archived.read_bytes(), freeze)
+
+    def test_refreeze_crash_points_retry_and_refrozen_cycle_keeps_the_archive(self):
+        e = self.e
+        self.assertTrue(self.handoff('zenbook', 'dell')['ok']); self.prepare_return()
+        archive = e.states['zenbook']/self.approval('zenbook')['archive']
+        original = (archive/'memory.sqlite3').read_bytes()
+        self.bad_canary = 'zenbook'
+        self.assertFalse(self.handoff('dell', 'zenbook')['ok'])
+        self.bad_canary = None
+        marker = brainsync._marker_path(e.states['zenbook'].parent)
+        self.assertEqual(self.approval('zenbook')['phase'], 'activated')
+        self.assertFalse(marker.exists())
+        live = brainsync.snapshot_memory(e.states['zenbook']/'memory.sqlite3')
+        real = return_brain._save_durable
+        def crash_before(path, value):
+            if value.get('phase') == 'refreezing':
+                raise RuntimeError('crash before intent')
+            real(path, value)
+        with patch.object(return_brain, '_save_durable', side_effect=crash_before):
+            with self.assertRaises(RuntimeError): return_brain.refreeze(e.participants['zenbook'])
+        self.assertEqual(self.approval('zenbook')['phase'], 'activated')
+        self.assertFalse(marker.exists())
+        def crash_after_intent(path, value):
+            real(path, value)
+            if value.get('phase') == 'refreezing':
+                raise RuntimeError('crash before restore')
+        with patch.object(return_brain, '_save_durable', side_effect=crash_after_intent):
+            with self.assertRaises(RuntimeError): return_brain.refreeze(e.participants['zenbook'])
+        self.assertEqual(self.approval('zenbook')['phase'], 'refreezing')
+        self.assertFalse(marker.exists())
+        with patch('jarvis.brainsync._write_private', side_effect=OSError('crash during marker restore')):
+            with self.assertRaises(OSError): return_brain.refreeze(e.participants['zenbook'])
+        self.assertEqual(self.approval('zenbook')['phase'], 'refreezing')
+        self.assertFalse(marker.exists())
+        def crash_final(path, value):
+            if value.get('phase') == 'refrozen':
+                raise RuntimeError('crash after restore before approval write')
+            real(path, value)
+        with patch.object(return_brain, '_save_durable', side_effect=crash_final):
+            with self.assertRaises(RuntimeError): return_brain.refreeze(e.participants['zenbook'])
+        self.assertEqual(self.approval('zenbook')['phase'], 'refreezing')
+        restored = marker.read_bytes()
+        self.assertEqual(restored, (archive/'activated-freeze.json').read_bytes())
+        self.assertTrue(return_brain.refreeze(e.participants['zenbook'])['memory_preserved'])
+        self.assertEqual(self.approval('zenbook')['phase'], 'refrozen')
+        self.assertEqual(marker.read_bytes(), restored)
+        self.assertEqual(brainsync.snapshot_memory(e.states['zenbook']/'memory.sqlite3'), live)
+        self.assertEqual((archive/'memory.sqlite3').read_bytes(), original)
+        self.assertTrue(return_brain.refreeze(e.participants['zenbook'])['memory_preserved'])
+        forged = self.approval('zenbook'); forged['phase'] = 'activated'
+        (e.states['zenbook']/return_brain.FILE).write_text(json.dumps(forged))
+        phases = []
+        def watch(path, value):
+            phases.append(value['phase']); real(path, value)
+        with patch.object(return_brain, '_save_durable', side_effect=watch):
+            self.assertTrue(return_brain.refreeze(e.participants['zenbook'])['memory_preserved'])
+        self.assertEqual(phases, ['refrozen'])
+        self.assertEqual(marker.read_bytes(), restored)
+        self.stage_return('dell', 'zenbook')
+        parked = json.loads((archive/return_brain.FILE).read_text())
+        self.assertEqual(parked['phase'], 'refrozen')
+        self.assertEqual((archive/'memory.sqlite3').read_bytes(), original)
+        self.assertFalse((e.states['zenbook']/'memory.sqlite3').exists())
+        self.assertEqual(self.approval('zenbook')['phase'], 'prepared')
+
+    def test_prepare_failpoints_and_review_retire_preserve_memory(self):
+        from jarvis.locking import exclusive_lock, LockBusy
+        e = self.e
+        self.assertTrue(self.handoff('zenbook', 'dell')['ok'])
+        state = e.states['zenbook']
+        before = brainsync.snapshot_memory(state/'memory.sqlite3')
+        marker = brainsync._marker_path(state.parent)
+        freeze = marker.read_bytes()
+        real = return_brain._save_durable
+        def crash_before(path, value):
+            if value.get('phase') == 'archiving':
+                raise RuntimeError('crash before approval write')
+            real(path, value)
+        with patch.object(return_brain, '_save_durable', side_effect=crash_before):
+            with self.assertRaises(RuntimeError): self.prepare_return()
+        self.assertFalse((state/return_brain.FILE).exists())
+        self.assertEqual(brainsync.snapshot_memory(state/'memory.sqlite3'), before)
+        self.assertEqual(marker.read_bytes(), freeze)
+        write_private = brainsync._write_private
+
+        def crash_archive_write(path, data, mode):
+            if Path(path).name == 'memory-backup.sqlite3' and Path(path).parent.name.startswith('return-archive-'):
+                raise OSError('crash after approval write')
+            return write_private(path, data, mode)
+
+        with patch('jarvis.brainsync._write_private', side_effect=crash_archive_write):
+            with self.assertRaises(OSError): self.prepare_return()
+        record = self.approval('zenbook')
+        self.assertEqual(record['phase'], 'needs_review')
+        self.assertEqual(brainsync.snapshot_memory(state/'memory.sqlite3'), before)
+        self.assertEqual(marker.read_bytes(), freeze)
+        with self.assertRaises(RuntimeRefusal) as again:
+            self.stage_return('dell', 'zenbook')
+        self.assertEqual(again.exception.code, 'reconcile')
+        self.assertEqual(brainsync.snapshot_memory(state/'memory.sqlite3'), before)
+        with self.assertRaises(RuntimeRefusal) as bad_hash:
+            return_brain.retire_interrupted(self.configs['zenbook'], state, e.clients['zenbook'],
+                incoming_sha256='0'*64, current_sha256=record['current_memory_sha256'],
+                freeze_sha256=record['freeze_sha256'], confirmed=True)
+        self.assertEqual(bad_hash.exception.code, 'conflict')
+        self.assertTrue((state/return_brain.FILE).is_file())
+        untouched = (state/return_brain.FILE).read_bytes()
+        with exclusive_lock(state/'cluster-main.lock'):
+            with self.assertRaises(LockBusy):
+                return_brain.retire_interrupted(self.configs['zenbook'], state, e.clients['zenbook'],
+                    incoming_sha256=record['incoming_memory_sha256'], current_sha256=record['current_memory_sha256'],
+                    freeze_sha256=record['freeze_sha256'], confirmed=True)
+        self.assertEqual((state/return_brain.FILE).read_bytes(), untouched)
+        archive = state/record['archive']
+        (archive/'memory.sqlite3').write_bytes(before)
+        parked = (state/return_brain.FILE).read_bytes()
+        retired = return_brain.retire_interrupted(self.configs['zenbook'], state, e.clients['zenbook'],
+            incoming_sha256=record['incoming_memory_sha256'], current_sha256=record['current_memory_sha256'],
+            freeze_sha256=record['freeze_sha256'], confirmed=True)
+        self.assertEqual(retired['status'], 'return_review_retired')
+        self.assertEqual((archive/return_brain.FILE).read_bytes(), parked)
+        self.assertEqual((archive/'memory.sqlite3').read_bytes(), before)
+        self.assertFalse((state/return_brain.FILE).exists())
+        with self.assertRaises(RuntimeRefusal) as partial:
+            self.stage_return('dell', 'zenbook')
+        self.assertEqual(partial.exception.code, 'reconcile')
+        self.assertEqual(brainsync.snapshot_memory(state/'memory.sqlite3'), before)
+        self.assertFalse((state/return_brain.FILE).exists())
+        (archive/'memory.sqlite3').unlink()
+        self.prepare_return()
+        retried = self.approval('zenbook')
+        self.assertEqual(retried['phase'], 'prepared')
+        retry_archive = state/retried['archive']
+        self.assertEqual((retry_archive/'memory-backup.sqlite3').read_bytes(), before)
+        self.assertEqual(json.loads((archive/return_brain.FILE).read_text())['phase'], 'needs_review')
+        self.assertEqual(marker.read_bytes(), freeze)
+        with self.assertRaises(RuntimeRefusal) as prepared:
+            return_brain.retire_interrupted(self.configs['zenbook'], state, e.clients['zenbook'],
+                incoming_sha256=record['incoming_memory_sha256'], current_sha256=record['current_memory_sha256'],
+                freeze_sha256=record['freeze_sha256'], confirmed=True)
+        self.assertEqual(prepared.exception.code, 'reconcile')
+        self.assertTrue((state/return_brain.FILE).is_file())
