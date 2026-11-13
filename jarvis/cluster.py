@@ -6,6 +6,7 @@ Only the main creates model lanes, writes shared memory, or accepts control requ
 
 import hmac
 import json
+import math
 import os
 import platform
 import secrets
@@ -18,6 +19,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlsplit
 
@@ -491,12 +493,136 @@ def execute_local(kind, payload, config, state):
         state, config, kind, payload, lambda: _execute_local_body(kind, payload, config, state))
 
 
+# A valid owner or node token is always served. Backoff counts only failed
+# credentials, and a good token clears that source. Failures older than the
+# window are forgotten, so the delay falls on its own. The hub is on loopback
+# behind SSH tunnels, so most clients share one address; the global counter
+# is what bounds a flood from that shared address.
+class AuthBackoff:
+    """Per-source and global exponential delay after repeated bad credentials."""
+
+    _MAX_SOURCES = 1024
+
+    def __init__(self, clock=time.monotonic, free=5, global_free=50, base=1.0, cap=60.0, window=300.0):
+        self._clock = clock
+        self._free = free
+        self._global_free = global_free
+        self._base = base
+        self._cap = cap
+        self._window = window
+        self._lock = threading.Lock()
+        self._hits = {}  # source -> deque of failure times, oldest first; insertion order
+        self._global = deque()
+        self._keep = self._keep_of(free)
+        self._global_keep = self._keep_of(global_free)
+
+    def _keep_of(self, free):
+        """Newest stamps that can still change the delay. At this count the delay is at the cap."""
+        try:
+            free_n = int(free)
+        except (TypeError, ValueError):
+            free_n = 0
+        if free_n < 0:
+            free_n = 0
+        try:
+            base, cap = float(self._base), float(self._cap)
+        except (TypeError, ValueError):
+            return min(4096, max(1, free_n))
+        if base <= 0 or cap <= 0 or base >= cap:
+            return min(4096, max(1, free_n))
+        steps = min(63, max(0, math.ceil(math.log2(cap / base))))
+        return min(4096, max(1, free_n + steps))
+
+    def _key(self, source):
+        if source is None:
+            return "?"
+        return source if isinstance(source, str) else str(source)
+
+    def _delay(self, count, free):
+        # delay = min(cap, base * 2**(n-free)) once n reaches free; else none.
+        try:
+            if count < free or not (self._base > 0) or not (self._cap > 0):
+                return 0.0
+        except TypeError:
+            return 0.0
+        extra = count - free
+        if extra >= 63:
+            return float(self._cap)
+        delay = float(self._base) * (2.0 ** extra)
+        if not math.isfinite(delay) or delay >= self._cap:
+            return float(self._cap)
+        return delay
+
+    def _trim(self, stamps, now, keep):
+        window = self._window
+        while stamps and now - stamps[0] > window:
+            stamps.popleft()
+        while keep >= 0 and len(stamps) > keep:
+            stamps.popleft()
+
+    def _expire(self, now):
+        self._trim(self._global, now, self._global_keep)
+        stale = []
+        for key, stamps in self._hits.items():
+            self._trim(stamps, now, self._keep)
+            if not stamps:
+                stale.append(key)
+        for key in stale:
+            self._hits.pop(key, None)
+
+    def retry_after(self, source):
+        try:
+            now = self._clock()
+            with self._lock:
+                self._expire(now)
+                stamps = self._hits.get(self._key(source))
+                local = self._delay(len(stamps), self._free) if stamps else 0.0
+                glob = self._delay(len(self._global), self._global_free)
+                return float(max(local, glob))
+        except Exception:
+            return 0.0
+
+    def fail(self, source):
+        now = self._clock()
+        with self._lock:
+            self._expire(now)
+            key = self._key(source)
+            stamps = self._hits.pop(key, None)
+            if stamps is None:
+                while len(self._hits) >= self._MAX_SOURCES:
+                    self._hits.pop(next(iter(self._hits)))
+                stamps = deque()
+            stamps.append(now)
+            self._trim(stamps, now, self._keep)
+            self._hits[key] = stamps
+            self._global.append(now)
+            self._trim(self._global, now, self._global_keep)
+
+    def ok(self, source):
+        with self._lock:
+            self._hits.pop(self._key(source), None)
+
+
+class AuthBackoffError(PermissionError):
+    """A failed credential from a source that must wait. No token or node detail."""
+
+    def __init__(self, retry_after):
+        super().__init__("Too many failed authentications.")
+        try:
+            seconds = int(math.ceil(float(retry_after)))
+        except (TypeError, ValueError, OverflowError):
+            seconds = 1
+        self.retry_after = seconds if seconds > 0 else 1
+
+
 class Hub:
     def __init__(self, config, base, state, console=None, ask_handler=None):
         self.config, self.base, self.state = config, Path(base), Path(state).resolve()
         self.local, self.main = identity(config)
         if self.local != self.main:
             raise ValueError("Only the configured main PC may host JARVIS.")
+        self._addresses = []
+        self.backoff = AuthBackoff()
         self.broker = Broker(state)
         self.owner = self.broker.owner_token()
         self.console, self.ask_handler = console, ask_handler
@@ -527,10 +653,10 @@ class Hub:
         token, first = self.broker.redeem(node, token)
         rotated = False
         if public_key and first:
-            from .cluster_setup import DEFAULT_PORT, authorize
+            from .cluster_setup import DEFAULT_PORT, authorize, pinned_from
             port = int((self.config.get("cluster") or {}).get("listen_port") or DEFAULT_PORT)
             try:
-                authorize(node, str(public_key), port)
+                authorize(node, str(public_key), port, from_addr=pinned_from(self.config, node))
                 rotated = True
             except (OSError, ValueError):  # e.g. Windows admin keys need an elevated shell
                 pass
@@ -542,19 +668,30 @@ class Hub:
                 pass
         return {"token": token, "key_rotated": rotated}
 
-    def authenticate(self, headers, capability=None):
+    def authenticate(self, headers, capability=None, source=None):
         if headers.get("X-JARVIS-Main") != self.main:
             raise PermissionError("This endpoint is not the configured main PC; update cluster config.")
+        if source is None:
+            source = "?"
         auth = headers.get("Authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
         presented, owner = token.encode(), self.owner.encode()
         if (token and len(presented) == len(owner) and 20 <= len(token) <= 256
                 and hmac.compare_digest(presented, owner)):
+            self.backoff.ok(source)
             return self.main, CAPABILITIES | {"owner"}
         found = self.broker.authenticate(token)
-        if not found or (capability and capability not in found[1]):
-            raise PermissionError("Node credential is missing, revoked, or lacks this capability.")
-        return found
+        if found and (not capability or capability in found[1]):
+            self.backoff.ok(source)
+            return found
+        # A real token that merely lacks this capability is not a credential failure,
+        # and backoff never applies to it. Only a bad, missing, or revoked token counts.
+        if not found:
+            self.backoff.fail(source)
+            wait = self.backoff.retry_after(source)
+            if wait > 0:
+                raise AuthBackoffError(wait)
+        raise PermissionError("Node credential is missing, revoked, or lacks this capability.")
 
     def _keep_up(self, settle=20, every=30):
         """After start and then every `every` s: cut a tested release once the main's code
@@ -910,6 +1047,33 @@ class Hub:
         return self.remote.seal(sid, "frame", self.remote.frame(
             node, sid, jpeg, data.get("width"), data.get("height")))
 
+    def _linkfinder(self):
+        from .linkfinder import main_tick
+        while not self.stop_event.is_set():
+            try:
+                from .cluster_setup import addresses
+                self._addresses = addresses(self.config, self.main)
+                main_tick(self)
+            except Exception as exc:
+                print(f"JARVIS: main discovery: {exc}", flush=True)
+            self.stop_event.wait(10)
+
+    def _offline_alerts(self):
+        from .linkfinder import OfflineAlerts
+        from .confirm import notify
+        alerts = OfflineAlerts()
+        while not self.stop_event.is_set():
+            try:
+                from .linkfinder import role
+                _, local, main = role(self.config, self.state)
+                if local != main:  # a node: nothing to alert on, but it may be promoted later
+                    self.stop_event.wait(10)
+                    continue
+                alerts.check(self.broker.nodes(), time.monotonic(), notify)
+            except Exception as exc:
+                print(f"JARVIS: offline monitor: {exc}", flush=True)
+            self.stop_event.wait(10)
+
     def _asks(self):
         while not self.stop_event.is_set():
             try:
@@ -1007,7 +1171,11 @@ class Hub:
             self.worker = threading.Thread(target=self._asks, daemon=True)
             self.thread.start()
             self.worker.start()
+            threading.Thread(target=self._offline_alerts, name="node-offline-alerts", daemon=True).start()
             self.started = True
+            from . import _under_tests
+            if not _under_tests():
+                threading.Thread(target=self._linkfinder, name="main-linkfinder", daemon=True).start()
             from .continuity.renewal import start_bound
             self._continuity_renewer = start_bound(self.state)
             if settings.get("auto_update", True):
@@ -1068,10 +1236,26 @@ def make_server(hub, host, port):
 
         def _allowed(self):
             try:
-                self.node_id, self.capabilities = hub.authenticate(self.headers, "console")
+                self.node_id, self.capabilities = hub.authenticate(
+                    self.headers, "console", self.client_address[0])
                 return True
+            except AuthBackoffError as exc:
+                # Unsupported methods call _refuse after a False here. One response only.
+                self._send(429, {"error": "Too many failed authentications."}, close=True,
+                           headers={"Retry-After": str(exc.retry_after)})
+                self._backoff_sent = True
+                return False
             except PermissionError:
                 return False
+
+        def _refuse(self):
+            if getattr(self, "_backoff_sent", False):
+                length = self._content_length()
+                self.close_connection = True
+                if length:
+                    self._drain(length, self.REFUSE_DRAIN_BYTES)
+                return None
+            return Handler._refuse(self)
 
         def do_GET(self):
             self._request(False)
@@ -1097,7 +1281,8 @@ def make_server(hub, host, port):
                               else "Requests from other sites are refused.")
                     return self._send(403, {"error": detail})
                 if self.path.startswith("/api/"):
-                    self.node_id, caps = hub.authenticate(self.headers, "console")
+                    self.node_id, caps = hub.authenticate(
+                        self.headers, "console", self.client_address[0])
                     if "owner" not in caps:
                         path = urlparse(self.path).path
                         node_api(path, post, caps)
@@ -1106,7 +1291,7 @@ def make_server(hub, host, port):
                         self._node_path = None if post else path
                     with request_from(self.node_id):
                         return Handler.do_POST(self) if post else Handler.do_GET(self)
-                node, caps = hub.authenticate(self.headers)
+                node, caps = hub.authenticate(self.headers, source=self.client_address[0])
                 if self.path == "/v1/status" and not post:
                     return self._send(200, {"main_device": hub.main, "code": served_code(hub.state),
                                             "nodes": hub.broker.nodes()})
@@ -1141,6 +1326,10 @@ def make_server(hub, host, port):
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ValueError("Cluster body must be an object.")
+                if self.path == "/v1/link-health" and "owner" not in caps:
+                    from .cluster_recovery import signature
+                    return self._send(200, {"signature": signature(
+                        self.headers.get("Authorization", "")[7:], hub.main, node, data.get("nonce"), [])})
                 if self.path in ("/v1/action", "/v1/control") and data.get("kind") == "transfer":
                     from .continuity.brain_channel import ACTIONS as brain_actions
                     payload = data.get("payload")
@@ -1203,8 +1392,10 @@ def make_server(hub, host, port):
                                     pass
                                 hub._condition.notify_all()
                             raise
+                    from .linkfinder import offer
                     return self._send(200, {"job": job, "main_device": hub.main,
-                                             "code": served_code(hub.state)})
+                        "code": served_code(hub.state), "addresses": offer(hub.config, hub.main, node,
+                            self.headers.get("Authorization", "")[7:], data.get("address_nonce"), hub._addresses)})
                 if self.path in ("/v1/remote/frame", "/v1/remote/input") and "owner" not in caps:
                     if not caps & {"desktop", "camera"}:  # before any session lookup: no id oracle
                         raise PermissionError("This node isn't enrolled for desktop actions.")
@@ -1268,6 +1459,9 @@ def make_server(hub, host, port):
                 raise PermissionError("This node cannot use that endpoint.")
             except NodeOffline as exc:
                 self._send(409, {"error": str(exc), "code": "node_offline"})
+            except AuthBackoffError as exc:
+                self._send(429, {"error": "Too many failed authentications."},
+                           headers={"Retry-After": str(exc.retry_after)})
             except PermissionError as exc:
                 self._send(403, {"error": str(exc)})
             except LookupError as exc:
@@ -1321,11 +1515,14 @@ class NodeWorker:
         from .speech import may_speak
         return "yes" if may_speak(self.config) else "no"
 
-    def __init__(self, config, state, executor=None):
+    def __init__(self, config, state, executor=None, config_path=None):
+        from .linkfinder import role
+        config, _, _ = role(config, state)
         if not is_node(config):
             raise ValueError("Run the node agent on a PC other than the configured main.")
         self.config, self.state = config, Path(state).resolve()
         self.client = Client(config, state)
+        self.config_path = config_path or Path(__file__).resolve().parent.parent / "jarvis.config.json"
         self.executor = executor or (lambda kind, payload: execute_local(kind, payload, config, state))
         self._acts_locally = executor is None  # a test's stand-in executor: don't touch real Lan Mouse
         self.stop_event = threading.Event()
@@ -1420,7 +1617,8 @@ class NodeWorker:
             else:
                 self._send_result(note["message"])
                 self._record(results_resent=1)
-        body = {"hostname": platform.node(),
+        nonce = secrets.token_hex(24)
+        body = {"address_nonce": nonce, "hostname": platform.node(),
                 "platform": platform.system(), "version": __version__,
                 "code": self.code, "pulls": "yes" if self._can_pull() else "no",
                 "speaks": self._speaks()}
@@ -1443,6 +1641,8 @@ class NodeWorker:
             # instead of crashing the agent on job.get (audit 2026-11-07).
             self._record(polls_failed=1, last_error=f"{time.strftime('%H:%M:%S')} malformed poll reply")
             raise ValueError("The main sent a malformed poll reply; ignored.")
+        from .linkfinder import learn
+        learn(self.client, response, nonce)
         self._record(polls_ok=1, last_ok=time.time())
         self._down = False
         if not getattr(self, "_confirmed", False):
@@ -1621,6 +1821,38 @@ class NodeWorker:
         seen[job_id] = now
         save_json(seen_path, seen)
 
+    def _announce_listener(self):
+        from .linkfinder import listen
+        while not self.stop_event.is_set():
+            try:
+                listen(self.config, self.state, self.stop_event)
+            except Exception as exc:
+                print(f"JARVIS node: announce listener: {exc}", flush=True)
+            self.stop_event.wait(5)
+
+    def _tunnel_guard(self):
+        from .linkfinder import ensure_tunnel, ensure_dependents, CHECK, role
+        from .cluster_tunnel import status
+        connected = False
+        while not self.stop_event.is_set():
+            try:
+                current, local, main = role(self.config, self.state)
+                if local == main:  # promoted: nothing to supervise now; keep watching for a demotion
+                    connected = False
+                    # Role no longer matches an operator stop. ensure_tunnel drops that
+                    # record and returns before any start while this machine is the main.
+                    ensure_tunnel(current, self.state, self.config_path)
+                    self.stop_event.wait(CHECK)
+                    continue
+                ensure_tunnel(current, self.state, self.config_path)
+                healthy = bool(status(self.state).get("hub_healthy"))
+                if healthy and not connected:
+                    ensure_dependents(self.config, self.state)
+                connected = healthy
+            except Exception as exc:
+                print(f"JARVIS node: tunnel supervisor: {exc}", flush=True)
+            self.stop_event.wait(CHECK)
+
     def _input_guard(self):
         """Lan Mouse off while this laptop and its peer are apart (sharedinput.guard), checked
         once a minute on its own thread so a slow check never delays a poll."""
@@ -1636,6 +1868,11 @@ class NodeWorker:
         # worker that loses the lock must not start a second guard).
         if self._acts_locally and (self.config.get("lan_mouse") or {}).get("off_when_apart", True):
             threading.Thread(target=self._input_guard, name="lanmouse-guard", daemon=True).start()
+        from . import _under_tests
+        if self._acts_locally and not _under_tests():
+            threading.Thread(target=self._announce_listener,
+                             name="address-announce-listener", daemon=True).start()
+            threading.Thread(target=self._tunnel_guard, name="tunnel-keepalive", daemon=True).start()
         delay = 1
         while not self.stop_event.is_set() and not self.restarting:
             if self._rejoined():  # before redeem_invite, which would use the stale client

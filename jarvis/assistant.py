@@ -13,21 +13,36 @@ from .router import classify, grok_first, pick_adapter
 from .runner import run_task
 from .vault import recall as vault_recall
 
-def vault_answer(text, config, state):
+def _briefing_question(text):
+    """True when briefing.answer would recognise a briefing, agenda or due question.
+    Those patterns are the cheap check, so a miss never opens the memory database."""
+    from .briefing import BRIEF, DAY, DUE
+    if not isinstance(text, str) or not text.strip():
+        return False
+    asked = text.replace("\u2019", "'").strip()
+    return bool(BRIEF.match(asked) or DAY.match(asked) or DUE.match(asked))
+
+
+def vault_answer(text, config, state, memory=None):
     """Briefings, today's agenda and what's due, read from the vault (briefing.py).
-    None when there's no vault, the question isn't one of those, or anything fails."""
+    None when there's no vault, the question isn't one of those, or anything fails.
+    memory: an already-open Memory. When omitted, one is opened only after the
+    text is a briefing, agenda or due question."""
     try:
+        if not _briefing_question(text):
+            return None
         from .briefing import answer
         from .tasks import tasks_for
         from .vault import vault_for
         vault = vault_for(config, state)
         if not vault:
             return None
-        try:
-            from .memory import Memory
-            memory = Memory(Path(state))
-        except Exception:  # no memory: the briefing goes without its open loops
-            memory = None
+        if memory is None:
+            try:
+                from .memory import Memory
+                memory = Memory(Path(state))
+            except Exception:  # no memory: the briefing goes without its open loops
+                memory = None
         return answer(text, vault, tasks_for(vault), memory=memory)
     except Exception:
         return None
@@ -149,7 +164,8 @@ def _ask(text, store, memory, config, base, tier=None, write=False, timeout=600,
             return fast
     # The clock or the vault answers it with no model: never hand it to Grok or the
     # interpreter for sounding like web or account work ("what's on my calendar today").
-    quick = (instant_answer(text) or vault_answer(text, config, memory.path.parent)
+    quick = (instant_answer(text) or vault_answer(text, config, memory.path.parent,
+                                                  memory=memory)
              if tier in (None, "simple") and not write else None)
     agent = tier is None and not write and not quick and _needs_agent(text, config)
     if agent and lane is not None and _plays_named(text, config):
@@ -847,7 +863,7 @@ def _orchestrated(text, config, base, memory, lane, step, recalled, on_sentence,
             return reply
     try:
         out = orchestrate(text, config, base, memory.path.parent, run_tools=run_tools, step=step,
-                          recall=recalled())
+                          recall=recalled(), level=verdict.get("level"))
     except Exception as exc:  # e.g. both providers limited: let the brain lane try
         ran = [t for log, _ in acted for t in log]
         started = [n for _, names in acted for n in names]

@@ -18,6 +18,7 @@ the same file on every machine and never holds a secret.
 """
 
 import base64
+import copy
 import errno
 import getpass
 import hashlib
@@ -89,30 +90,58 @@ SSHD_FIX = {
 
 def init(config, path, state, device=None, autostart=True):
     """Make this PC the main: register it under its hostname, use the forward tunnel
-    (only the main needs an SSH server), and run the hub at login."""
+    (only the main needs an SSH server), and run the hub at login.
+
+    The file under the fleet lock decides. An enabled fleet that already names
+    another main is refused before any write or autostart. That change is
+    `jarvis cluster main`, not init. First setup, a disabled cluster, and a
+    refresh when this PC is already the main still write."""
     host = _hostname()
-    devices = dict(config.get("devices") or {})
-    device = device or _this_device(config) or _slug(host)
-    if not DEVICE_ID.fullmatch(device):
-        raise ValueError("Device IDs are letters, digits, - and _ (e.g. zenbook).")
-    entry = dict(devices.get(device) or {})
-    known = str(entry.get("hostname", ""))
-    if known and known.casefold() != host.casefold():
-        raise ValueError(f"devices.{device}.hostname is {known}, but this PC is {host}. "
-                         f"Run init with --id set to this PC's device, or fix that hostname.")
+    requested = device
     from .platforms import detect
-    entry.setdefault("hostname", host)
-    entry.setdefault("label", detect()["label"])
-    devices[device] = entry
-    settings = dict(config.get("cluster") or {})
-    port = int(settings.get("listen_port") or DEFAULT_PORT)
-    settings.update(enabled=True, main_device=device, local_device="auto",
-                    tunnel=settings.get("tunnel", "forward"), listen_host="127.0.0.1",
-                    listen_port=port, main_url=f"http://127.0.0.1:{port}")
-    proposed = {**config, "devices": devices, "cluster": settings}
-    identity(proposed)  # fails before saving if the hostname is ambiguous
-    from .config_lock import save_delta
-    save_delta(state, path, config, proposed, backup="cluster-init")
+    label = detect()["label"]
+    chosen = {}
+
+    def change(doc):
+        # A missing file has no disk role yet: the caller's document is the
+        # first setup. An existing file, including {}, is the only source.
+        if not doc and not Path(path).is_file() and isinstance(config, dict):
+            doc.update(copy.deepcopy(config))
+        devices = dict(doc.get("devices") or {})
+        device_id = requested or _this_device(doc) or _slug(host)
+        if not DEVICE_ID.fullmatch(device_id):
+            raise ValueError("Device IDs are letters, digits, - and _ (e.g. zenbook).")
+        entry = dict(devices.get(device_id) or {})
+        known = str(entry.get("hostname", ""))
+        if known and known.casefold() != host.casefold():
+            raise ValueError(f"devices.{device_id}.hostname is {known}, but this PC is {host}. "
+                             f"Run init with --id set to this PC's device, or fix that hostname.")
+        settings = dict(doc.get("cluster") or {})
+        existing = settings.get("main_device")
+        if (isinstance(existing, str) and existing and enabled(doc)
+                and existing != device_id):
+            raise ValueError(f"This fleet already has a main ({existing}). "
+                             f"Change it with: jarvis cluster main {device_id}")
+        entry.setdefault("hostname", host)
+        entry.setdefault("label", label)
+        devices[device_id] = entry
+        port = int(settings.get("listen_port") or DEFAULT_PORT)
+        settings.update(enabled=True, main_device=device_id, local_device="auto",
+                        tunnel=settings.get("tunnel", "forward"), listen_host="127.0.0.1",
+                        listen_port=port, main_url=f"http://127.0.0.1:{port}")
+        preview = {**doc, "devices": devices, "cluster": settings}
+        identity(preview)  # fails before saving if the hostname is ambiguous
+        doc["devices"] = devices
+        doc["cluster"] = settings
+        chosen["device"] = device_id
+        chosen["settings"] = settings
+        chosen["port"] = port
+
+    from .config_lock import patch_config
+    patch_config(state, path, change, backup="cluster-init", create=True)
+    device = chosen["device"]
+    settings = chosen["settings"]
+    port = chosen["port"]
     report = {"main_device": device, "hostname": host, "hub": f"127.0.0.1:{port}",
               "tunnel": settings["tunnel"]}
     if settings["tunnel"] == "forward":
@@ -179,9 +208,10 @@ def addresses(config, main, extra=()):
     configured = [t.split("@", 1)[-1] for t in [machine.get("target"), *machine.get("fallback_targets", [])]
                   if isinstance(t, str)]
     out = []
-    for value in [*extra, *_local_ips(), *configured]:
+    from .cluster_recovery import magic_names, valid_address
+    for value in [*extra, *_local_ips(), *magic_names(), *configured]:
         value = str(value).strip()
-        if (value and ADDRESS.fullmatch(value) and not value.startswith("127.")
+        if (value and valid_address(value) and not value.startswith("127.")
                 and value != "localhost" and value not in out):
             out.append(value)
     return out[:8]
@@ -234,11 +264,97 @@ def _keys_locked(path):
     return locked_ssh_keys(path)
 
 
-def restrictions(port):
+def _checked_from(from_addr):
+    """Text safe to place inside ``from="..."``, or None when there is no pin.
+
+    None and "" leave the key line unchanged. Any other value must be one address,
+    or a comma-separated list of them, and each element must match ADDRESS. Quotes,
+    spaces, and newlines are refused: they would close the option or start another.
+    The result is the joined checked parts, never the raw argument."""
+    if from_addr is None or from_addr == "":
+        return None
+    if not isinstance(from_addr, str) or any(c in from_addr for c in "\r\n\x00\"' \t"):
+        raise ValueError("Invalid source address pin.")
+    parts = from_addr.split(",")
+    if not parts or any(not ADDRESS.fullmatch(part) for part in parts):
+        raise ValueError("Invalid source address pin.")
+    return ",".join(parts)
+
+
+def _recorded_node_addresses(device):
+    """Addresses this config already stores for one node. Loopback is not one of them."""
+    if not isinstance(device, dict):
+        return []
+    raw = []
+    for field in ("lan_ip", "tailscale_ip"):
+        value = device.get(field)
+        if isinstance(value, str):
+            raw.append(value)
+    fallbacks = device.get("fallback_targets") or []
+    if not isinstance(fallbacks, (list, tuple)):
+        fallbacks = []
+    for target in (device.get("target"), *fallbacks):
+        if isinstance(target, str):
+            raw.append(target.split("@", 1)[-1])
+    out = []
+    for value in raw:
+        value = value.strip()
+        if (value and ADDRESS.fullmatch(value) and not value.startswith("127.")
+                and value.casefold() != "localhost" and value not in out):
+            out.append(value)
+    return out[:8]
+
+
+def pinned_from(config, node):
+    """Source pin for this node's key, or None so the line stays as it is today.
+
+    There is no ``cluster.nodes`` map. The opt-in is the boolean
+    ``cluster.pin_node_address`` on the existing cluster object. The address is not a
+    free-form string: it is taken from what the device entry already records
+    (``lan_ip``, ``tailscale_ip``, then the host in ``target`` and ``fallback_targets``).
+    Several recorded addresses become one comma list, and only after each element matches
+    ADDRESS. A value with a quote, a space, or a newline is ignored.
+
+    The Dell's address changes between networks (home LAN, another LAN, Tailscale, DHCP).
+    A pin sshd does not see locks that node out of the hub, so this is never turned on
+    by itself. When the flag is on and no recorded address checks out, this returns None
+    and the key is written exactly as before. Nothing about the address is logged.
+    """
+    if not isinstance(config, dict) or not isinstance(node, str) or not node:
+        return None
+    cluster = config.get("cluster")
+    if not isinstance(cluster, dict) or cluster.get("pin_node_address") is not True:
+        return None
+    devices = config.get("devices")
+    device = devices.get(node) if isinstance(devices, dict) else None
+    found = _recorded_node_addresses(device)
+    if not found:
+        return None
+    return ",".join(found)
+
+
+def restrictions(port, from_addr=None):
     """Everything the node's key may do on the main: forward to the hub. Verified against
-    OpenSSH 10: a shell gets the forced echo, -L elsewhere and any -R are refused."""
-    return (f'restrict,port-forwarding,permitopen="127.0.0.1:{int(port)}",'
+    OpenSSH 10: a shell gets the forced echo, -L elsewhere and any -R are refused.
+
+    ``from_addr`` prepends ``from="<addr>",`` ahead of ``restrict``. OpenSSH reads
+    authorized_keys options as one comma-separated field with no required order and no
+    spaces outside quotes (sshd(8) AUTHORIZED_KEYS FILE FORMAT). ``from=`` only limits
+    which client address may use the key; it does not interact with ``restrict``, so
+    placing it first is valid. Leave ``from_addr`` unset and the result is the historical
+    line, byte for byte.
+
+    The Dell's address changes between networks, so nothing here enables the pin. A
+    caller passes an address only when ``pinned_from`` saw ``cluster.pin_node_address``.
+    Opted in with no known address, the caller passes nothing and this line is today's.
+    The address is not logged.
+    """
+    line = (f'restrict,port-forwarding,permitopen="127.0.0.1:{int(port)}",'
             f'permitlisten="127.0.0.1:1",command="echo jarvis-node-link"')
+    pin = _checked_from(from_addr)
+    if pin is None:
+        return line
+    return f'from="{pin}",{line}'
 
 
 def _key_lines(path):
@@ -325,17 +441,22 @@ def _write_keys(path, lines):
                  mode=None if _os() == "windows" else 0o600)
 
 
-def authorize(node, public_key, port, path=None):
-    """Replace this node's JARVIS key line (only that one) with a fresh restricted one."""
+def authorize(node, public_key, port, path=None, from_addr=None):
+    """Replace this node's JARVIS key line (only that one) with a fresh restricted one.
+
+    ``from_addr`` is passed through to ``restrictions``. Callers pass it only when the
+    node opted in via ``pinned_from``. The default writes the same line as before."""
     if not isinstance(node, str) or not DEVICE_ID.fullmatch(node):
         raise ValueError("Invalid node ID.")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("Invalid cluster listen port.")
     kind, blob = _public_key_parts(public_key)
+    # Check the pin before opening the key file, so a bad address writes nothing.
+    options = restrictions(port, from_addr)
     path = path or _authorized_keys()
     with _keys_locked(path):
         lines = [line for line in _key_lines(path) if not line.rstrip().endswith(" " + MARK + node)]
-        lines.append(f"{restrictions(port)} {kind} {blob} {MARK}{node}")
+        lines.append(f"{options} {kind} {blob} {MARK}{node}")
         _write_keys(path, lines)
     return str(path)
 
@@ -350,6 +471,37 @@ def unauthorize(node, path=None):
         if len(keep) != len(lines):
             _write_keys(path, keep)
     return len(lines) - len(keep)
+
+
+def unauthorize_key(node, public_key, path=None):
+    """Remove this node's line only when it still holds this exact public key.
+
+    A newer line for the same node is left as it is. Callers that also hold the
+    fleet lock take that lock first: this takes the SSH-key lock, which is the
+    order revoke already uses. Returns how many lines were removed.
+    """
+    if not isinstance(node, str) or not DEVICE_ID.fullmatch(node):
+        raise ValueError("Invalid node ID.")
+    try:
+        kind, blob = _public_key_parts(public_key)
+    except ValueError:
+        return 0
+    bits = f"{kind} {blob}"
+    path = path or _authorized_keys()
+    mark = " " + MARK + node
+    with _keys_locked(path):
+        lines = _key_lines(path)
+        keep = []
+        removed = 0
+        for line in lines:
+            stripped = line.rstrip()
+            if stripped.endswith(mark) and f" {bits} " in f" {stripped} ":
+                removed += 1
+                continue
+            keep.append(line)
+        if removed:
+            _write_keys(path, keep)
+    return removed
 
 
 def keypair(node):
@@ -614,7 +766,8 @@ def _invite_locked(config, path, state, node, caps, found, target, signing, host
         devices = disk.get("devices") or {}
         port = int((disk.get("cluster") or {}).get("listen_port") or DEFAULT_PORT)
         try:
-            keys_file = authorize(node, public, port, path=keys_path)
+            keys_file = authorize(node, public, port, path=keys_path,
+                                  from_addr=pinned_from(disk, node))
         except PermissionError:
             raise ValueError(f"Can't write {keys_path}. On Windows, admin accounts' SSH keys "
                              "live there: run this invite in an administrator terminal.") from None
@@ -701,11 +854,14 @@ def _private_file(path, text):
     """
     from .platforms import private_key_permissions
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(path.name + ".writing")
     try:
         temporary.unlink(missing_ok=True)
-        with open(temporary, "x", encoding="ascii", newline="\n") as stream:
+        # Born 0600 (not 0666 & ~umask, then chmod): no window where another user can read it.
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                     0o600)
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as stream:
             stream.write(text)
         private_key_permissions(temporary)
         os.replace(temporary, path)
@@ -963,7 +1119,7 @@ _TUNNEL_LOCK = "cluster-tunnel.lock"
 _LINK_NAMES = (
     "cluster-node.json", "cluster-node.key", "cluster-node-pending.key",
     "cluster-node-launch.vbs", "cluster-tunnel.json", "cluster-tunnel.stop",
-    "cluster-tunnel-launch.vbs",
+    "cluster-tunnel-launch.vbs", "cluster-addresses.json", "cluster-discovered.json", "cluster-scan.json",
 )
 
 
@@ -1320,7 +1476,7 @@ def _readiness_report(config, state, role, status):
     return main_readiness(config if isinstance(config, dict) else {}, state, expected_code=expected)
 
 
-def doctor(config, path, state):
+def doctor(config, path, state, fix=False):
     """Every link in the chain from config to a working node, in order, with a fix each.
 
     ``main_readiness`` is the local main_readiness report on every result, including a
@@ -1352,7 +1508,8 @@ def doctor(config, path, state):
             if role == "main":
                 _doctor_main(config, state, main, forward, checks, _tested_release_code(state))
             else:
-                status = _doctor_node(config, state, local, main, forward, checks, code_fingerprint())
+                status = _doctor_node(config, state, local, main, forward, checks, code_fingerprint(),
+                                      fix=fix, config_path=path)
             report = {"ok": all(c["ok"] for c in checks), "role": role, "checks": checks}
     source = role if role is not None else _known_role(config)
     report["main_readiness"] = _readiness_report(config, state, source, status)
@@ -1418,10 +1575,11 @@ def _link_hint(error, forward, main):
             "jarvis cluster tunnel status and its log.")
 
 
-def _doctor_node(config, state, local, main, forward, checks, code):
+def _doctor_node(config, state, local, main, forward, checks, code, fix=False, config_path=None):
     """Append node checks. Return the /v1/status object when that call succeeded."""
     from . import cluster_tunnel
     from .transfer import _ssh_args, ssh_host
+    apply_fix = fix  # `fix` is reused below for a hint string
     status = None
     try:
         Client(config, state)
@@ -1444,7 +1602,13 @@ def _doctor_node(config, state, local, main, forward, checks, code):
         if key and not _check(checks, "SSH key file", Path(key).expanduser().is_file(), key,
                               f"Join again with a new invite from {main}"):
             return None
-        targets = [machine["target"], *machine.get("fallback_targets", [])]
+        targets = cluster_tunnel.candidates(config, state)
+        from .cluster_recovery import tailscale_status
+        ts = tailscale_status()
+        if ts is not None:
+            _check(checks, "Tailscale connected", ts.get("BackendState") == "Running",
+                   "connected" if ts.get("BackendState") == "Running" else "tailscale installed but not connected",
+                   "Open Tailscale, connect, and enable Run unattended on Windows")
         reachable = [t for t in targets if cluster_tunnel.reachable(t)]
         if not _check(checks, f"{main} reachable", reachable,
                       ", ".join(reachable) if reachable else "no answer on port 22 at " + ", ".join(targets),
@@ -1465,9 +1629,44 @@ def _doctor_node(config, state, local, main, forward, checks, code):
             fix = f"On {main}: jarvis cluster invite {local}; here: jarvis cluster join CODE"
         _check(checks, "SSH login", ok, detail, fix)
         tunnel = cluster_tunnel.status(state)
-        _check(checks, "tunnel running", tunnel.get("ssh_alive"),
-               tunnel.get("error") or tunnel.get("target") or "",
-               "jarvis cluster tunnel start --autostart")
+        from .cluster_recovery import SUPERVISOR_WITHIN, ensure_tunnel, ensure_dependents
+        # Same predicate as ensure_tunnel. While it holds, the node supervisor and
+        # `doctor --fix` leave the worker down; `jarvis cluster tunnel start` clears it.
+        operator_stop = cluster_tunnel.manual_stop_holds(config, state)
+        stopped_detail = "tunnel stopped by the operator; the supervisor will not restart it"
+        start_fix = "jarvis cluster tunnel start"
+        if ok and not tunnel.get("hub_healthy"):
+            # The main answers but the forwarded hub does not. Promise a restart only
+            # when no operator stop holds for this boot and role.
+            acted = False
+            if apply_fix and config_path is not None:
+                try:
+                    acted = ensure_tunnel(config, state, config_path)
+                    ensure_dependents(config, state)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    detail_fix = f"--fix failed: {exc}"
+                else:
+                    if operator_stop:
+                        detail_fix = f"--fix left the operator stop in place; {start_fix}"
+                    else:
+                        detail_fix = ("--fix started the tunnel worker" if acted
+                                      else "--fix: worker already supervised")
+            elif operator_stop:
+                detail_fix = start_fix
+            else:
+                detail_fix = "jarvis cluster doctor --fix starts it now"
+            supervisor_detail = (stopped_detail if operator_stop else
+                                 f"reachable but tunnel down: the supervisor fixes it within {SUPERVISOR_WITHIN} s")
+            _check(checks, "tunnel supervisor", False, supervisor_detail, detail_fix)
+        if operator_stop and not tunnel.get("ssh_alive"):
+            running_detail = stopped_detail
+            running_fix = start_fix
+        else:
+            running_detail = tunnel.get("error") or tunnel.get("target") or ""
+            running_fix = (
+                "The node agent supervisor checks within 5 s and restarts a dead worker within 15 s; unhealthy SSH sessions rotate within 20 s per candidate, with backoff capped at 30 s. "
+                "If the agent is stopped: jarvis cluster run")
+        _check(checks, "tunnel running", tunnel.get("ssh_alive"), running_detail, running_fix)
     try:
         status = Client(config, state).request("/v1/status", timeout=3)
         _check(checks, "hub answers", True, (config.get("cluster") or {}).get("main_url", ""))

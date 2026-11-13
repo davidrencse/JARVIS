@@ -111,8 +111,13 @@ class Relay:
         if not listed:
             from .browser_gate import observe_result
             # Snapshots name refs for David's questions; only a snapshot-bearing tool's reply
-            # counts, never page text a read tool returned.
-            observe_result(self.name, result, tool)
+            # counts, never page text a read tool returned. A page the browser landed on after
+            # a redirect that may not be read replaces the reply: no page content reaches the model.
+            refusal = observe_result(self.name, result, tool)
+            if refusal:
+                message["result"] = {"content": [{"type": "text", "text": f"Refused: {refusal}"}],
+                                     "isError": True}
+                return
         tools = result.get("tools") if isinstance(result, dict) else None
         if listed and isinstance(tools, list):
             result["tools"] = [t for t in tools if not isinstance(t, dict)

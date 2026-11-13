@@ -305,6 +305,10 @@ def browse(spec, state_dir=None):
         url = str(args.get("url") or "")
         if not re.match(r"https?://", url, re.I):
             return False, "The agent browser only opens http(s) pages."
+        from .actions import _local_address
+        local = _local_address(url)  # also decimal/hex/octal/127.1 forms; a page could steer it
+        if local:
+            return False, f"{local}; the agent browser may only open public pages."
         ok, data = run("open", url, state_dir=state_dir, timeout=45)
         if not ok:
             return False, f"The agent browser couldn't open {url}: {data}"

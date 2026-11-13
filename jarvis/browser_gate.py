@@ -18,6 +18,7 @@ harmless can still pass. It narrows the risk; it doesn't remove it.
 import re
 import threading
 import time
+import unicodedata
 from urllib.parse import urlparse
 
 WAIT = 180  # seconds the browser waits for David on a high-stakes action before declining
@@ -71,9 +72,34 @@ SNAPSHOT_TOOL = re.compile(r"(?:^|_)(?:snapshot|navigate|goto|open|click|type|pr
                            r"fill|tabs?|drag|back|forward|reload|dialog|check|scroll|wait)", re.I)
 PAGE_STATE = re.compile(r"^#{1,4}\s*Page state\s*$", re.I | re.M)
 FENCE = re.compile(r"^```.*$", re.M)
-SHARED_SUFFIXES = ("github.io", "vercel.app", "netlify.app", "pages.dev", "herokuapp.com",
-                   "web.app", "firebaseapp.com", "blogspot.com", "workers.dev", "onrender.com",
-                   "glitch.me")
+# Suffixes where anyone can rent a subdomain: the whole host is the site, so a question never
+# says "windows.net" or "amazonaws.com" for a stranger's tenant. No public-suffix list ships in the
+# venv (and nothing is fetched or added), so this is a hand-kept set of the common ones.
+SHARED_SUFFIXES = (
+    "github.io", "githubusercontent.com", "gitlab.io", "vercel.app", "netlify.app", "pages.dev",
+    "workers.dev", "r2.dev", "herokuapp.com", "web.app", "firebaseapp.com", "blogspot.com",
+    "onrender.com", "glitch.me", "fly.dev", "railway.app", "run.app", "appspot.com",
+    "ngrok.io", "ngrok-free.app", "ngrok.app", "trycloudflare.com", "repl.co", "replit.app",
+    "replit.dev", "surge.sh", "pythonanywhere.com", "wixsite.com", "weebly.com",
+    "wordpress.com", "tumblr.com", "notion.site", "webflow.io", "carrd.co", "myshopify.com",
+    "bubbleapps.io", "framer.website", "typedream.app", "sharepoint.com", "cloudfront.net",
+    "amazonaws.com", "s3.amazonaws.com", "digitaloceanspaces.com", "storage.googleapis.com",
+    "googleusercontent.com", "windows.net", "blob.core.windows.net", "azurewebsites.net",
+    "azurestaticapps.net", "azureedge.net", "cloudapp.azure.com", "trafficmanager.net")
+# Where David's signed-in accounts can pay or speak for him. A page that calls its composer
+# "Search" there still gets asked; the label is the page's own word.
+SENSITIVE_SITES = (
+    "x.com", "twitter.com", "facebook.com", "messenger.com", "instagram.com", "threads.net",
+    "linkedin.com", "reddit.com", "tiktok.com", "discord.com", "slack.com", "whatsapp.com",
+    "telegram.org", "t.me", "signal.org", "gmail.com", "mail.google.com", "outlook.com",
+    "outlook.live.com", "office.com", "yahoo.com", "proton.me", "protonmail.com", "icloud.com",
+    "paypal.com", "stripe.com", "venmo.com", "cash.app", "wise.com", "coinbase.com",
+    "amazon.com", "ebay.com", "etsy.com", "walmart.com", "target.com", "bestbuy.com",
+    "airbnb.com", "booking.com", "uber.com", "doordash.com", "ticketmaster.com", "github.com")
+SENSITIVE_HINT = re.compile(r"bank|pay|checkout|shop|store|mail|chat|messag|wallet|broker", re.I)
+# Permission grants: clicking one lets an app, a person or a page act as David.
+PERMISSION = re.compile(r"\b(authori[sz]e|allow(?: access)?|agree|accept|approve|grant|consent)\b", re.I)
+COOKIE_BANNER = re.compile(r"\b(cookies?|privacy|tracking|analytics|gdpr)\b", re.I)
 
 
 def _tool(params):
@@ -204,13 +230,13 @@ def observe(server, text, tool=None):
     required); None = a caller that already knows this is a snapshot. Page text is data: it
     only ever names things in David's question, and only a snapshot section is read."""
     if not isinstance(text, str) or not text:
-        return
+        return None
     if tool is not None and tool and not SNAPSHOT_TOOL.search(str(tool)):
-        return
+        return None
     part = _snapshot_part(text)
     if part is None:
         if tool is not None and not tool:
-            return
+            return None
         part = (text, text)
     header, body = part
     refs = {}
@@ -220,25 +246,65 @@ def observe(server, text, tool=None):
         if found:
             refs[found.group(1)] = (match.group(1), _clean(match.group(2)))
     url = URL_LINE.search(header)
+    landed = url.group(1) if url else ""
+    with _LOCK:
+        before = PAGES.get(server) or {}
+        known, held = before.get("url", ""), before.get("blocked")
+    # The page the browser really landed on is checked, not just the URL the tool was given: a
+    # public page can redirect to the console or a LAN device (--blocked-origins stops requests,
+    # not the page a redirect ends on). Page content is then withheld, whatever tool asked.
+    problem = held if held and (landed == known or not landed) else \
+        _landed_problem(landed, server) if landed and landed != known else None
+    if problem:
+        with _LOCK:
+            PAGES[server] = {"url": landed or known, "refs": {}, "blocked": problem}
+        return (f"the browser ended up on a page JARVIS may not read ({problem}); its content is "
+                "withheld. Navigate to a public page to continue.")
     with _LOCK:
         page = PAGES.setdefault(server, {"url": "", "refs": {}})
         if url and url.group(1) != page["url"]:
             page["url"], page["refs"] = url.group(1), {}
+            page.pop("blocked", None)
         if refs:
             if "agent" in server:  # renumbered by every snapshot
                 page["refs"] = refs
             else:
                 page["refs"].update(refs)
+    return None
+
+
+def _landed_problem(url, server=""):
+    """Why a page the browser ended up on may not be read (the same test approve_browser applies
+    to a URL argument), or None. Fails closed when the check itself can't run."""
+    try:
+        scheme = urlparse(url).scheme.lower()
+        if scheme in ("about", "chrome-error"):
+            return None
+        if scheme not in ("http", "https"):
+            return f"a {scheme or 'non-web'}: page"
+        from .actions import _local_address, _off_limits
+        local = _local_address(url)
+        if local:
+            return local
+        if server == "chrome" and _off_limits(url):
+            return f"{_off_limits(url)} is off limits in David's own Chrome"
+    except Exception as exc:
+        return f"the address could not be checked ({type(exc).__name__})"
+    return None
 
 
 def observe_result(server, result, tool=None):
-    """observe() over an MCP tools/call result ({"content": [{"type": "text", ...}]})."""
+    """observe() over an MCP tools/call result ({"content": [{"type": "text", ...}]}). Returns
+    the refusal to hand the model instead when the page landed on is off limits, else None."""
     content = result.get("content") if isinstance(result, dict) else None
+    refusal = None
     for part in content if isinstance(content, list) else ():
         if isinstance(part, dict) and part.get("type") == "text":
-            observe(server, part.get("text"), "" if tool is None else tool)
+            refusal = observe(server, part.get("text"), "" if tool is None else tool) or refusal
+    return refusal
 
 
+LEAVING = re.compile(r"navigate|goto|open|back|close|tabs?$", re.I)  # allowed from an off-limits page
 NAVIGATING = re.compile(r"navigate|goto|open|tab|back|forward|reload|close", re.I)
 
 
@@ -260,12 +326,43 @@ def observe_call(server, tool, args):
             PAGES[server] = {"url": url, "refs": {}}
 
 
-def site_of(url):
-    """x.com for https://mobile.x.com/home; None when there is no usable host."""
+def _host(url):
     try:
-        host = (urlparse(url or "").hostname or "").lower()
+        return (urlparse(url or "").hostname or "").lower().rstrip(".")
     except ValueError:
-        return None
+        return ""
+
+
+def _ascii_host(host):
+    """The host as it travels (xn--...): what a look-alike name really is."""
+    if host.isascii():
+        return host
+    try:
+        return host.encode("idna").decode()
+    except UnicodeError:
+        return ".".join(label if label.isascii() else "xn--" + label.encode("punycode").decode()
+                        for label in host.split("."))
+
+
+def _scripts(host):
+    return {unicodedata.name(ch, "?").split()[0] for ch in host if ch.isalpha()}
+
+
+def _host_note(url):
+    """"" for an ASCII host; else the Unicode spelling and, when scripts are mixed, a warning:
+    a name David reads as paypal.com can be another one (the question shows the punycode)."""
+    host = _host(url)
+    if not host or host.isascii():
+        return ""
+    mixed = any(len(_scripts(label)) > 1 for label in host.split("."))
+    return f" (non-ASCII name, written “{_clean(host, 60)}”" + \
+        ("; MIXED SCRIPTS: possible look-alike)" if mixed else "; check it is the site you expect)")
+
+
+def site_of(url):
+    """x.com for https://mobile.x.com/home; None when there is no usable host. Non-ASCII names
+    come back as punycode, tenants of shared hosting (SHARED_SUFFIXES) as the full host."""
+    host = _ascii_host(_host(url))
     if not host:
         return None
     parts = host.split(".")
@@ -294,11 +391,22 @@ def _lookup(server, item):
     return refs.get(ref.lstrip("@")) if ref else None
 
 
-def _is_search(server, item):
-    """Only what the snapshot shows counts: a searchbox, or a name that says search. The
-    model's own description of an unresolved ref is not evidence."""
+def sensitive_site(site):
+    """True for a site where David's account can pay or speak for him (SENSITIVE_SITES, or a
+    name that says bank, pay, shop, mail, chat...)."""
+    site = (site or "").lower()
+    return bool(site) and (any(site == s or site.endswith("." + s) for s in SENSITIVE_SITES)
+                           or bool(SENSITIVE_HINT.search(site)))
+
+
+def _is_search(server, item, site=None):
+    """A searchbox, or a name that says search, in the last snapshot; the model's own description
+    of an unresolved ref is not evidence. That role and name are the page's own words, so they
+    only excuse Enter/submit on a site that is known and is not one David's account acts on:
+    on x.com a composer called "Search" still asks."""
     hit = _lookup(server, item)
-    return bool(hit) and (hit[0].lower() == "searchbox" or bool(SEARCH.search(hit[1] or "")))
+    searchy = bool(hit) and (hit[0].lower() == "searchbox" or bool(SEARCH.search(hit[1] or "")))
+    return searchy and bool(site) and not sensitive_site(site)
 
 
 def enrich(server, args):
@@ -368,7 +476,7 @@ def judge(params):
     resolved = args.get("resolved")
     element = args.get("element") if isinstance(args.get("element"), str) else ""
     target = resolved or (f"“{_clean(element)}”" if element.strip() else None)
-    where = f" on {site}" if site else ""
+    where = f" on {site}{_host_note((PAGES.get(server) or {}).get('url'))}" if site else ""
     named = bool(_label(args))
 
     def out(reason, stakes, question, suffix="", checked=True):
@@ -385,7 +493,7 @@ def judge(params):
     if typing:
         items = [i for i in (args.get("fields") if isinstance(args.get("fields"), list) else [args])
                  if isinstance(i, dict)]
-        searching = bool(items) and all(_is_search(server, i) for i in items)
+        searching = bool(items) and all(_is_search(server, i, site) for i in items)
         with _LOCK:
             _TYPED[server] = searching
         field = target or "a field the page didn't name"
@@ -427,7 +535,9 @@ def judge(params):
     name = re.sub(r"^(?:agent_)?browser_", "", tool).replace("_", " ")
     ref = _ref_of(args)
     described = " ".join(s for k, v in args.items() if k not in ("text",) for s in _strings(v))
-    found = COMMIT.search(described) or _selector_commit(args)
+    # COMMIT misses money and message words ("Tip", "Payment", "Book now", "Message", "Email"),
+    # so a snapshot-named click on them used to pass: the always-ask words count here too.
+    found = COMMIT.search(described) or _selector_commit(args) or _always_ask_words(described)
     if found:
         return out(f"{name} “{found.group(0)}” ({described[:60]})", "high",
                    f"{name} {target or described[:60]}")
@@ -467,6 +577,11 @@ def gate(policy, config, state, wait=None, queue=None):
         if not ok:
             return ok, why
         server = params.get("serverName") or ""
+        with _LOCK:
+            held = (PAGES.get(server) or {}).get("blocked")
+        if held and not LEAVING.search(_tool(params)):
+            return False, (f"the page the browser is on is off limits ({held}); navigate to a "
+                           "public page first")
         raw = (params.get("_meta") or {}).get("tool_params")
         refusal = blocked(_tool(params), enrich(server, raw) if isinstance(raw, dict) else raw)
         if refusal:  # not a question: refused even under rules.confirm: never
@@ -506,6 +621,23 @@ SEND_OR_PAY = re.compile(r"\b(submit|confirm|order|checkout)\b|“(?:send|post|t
                          r"subscribe|share|retweet|repost|comment|withdraw)”", re.I)
 
 
+def _always_ask_words(text):
+    for pattern in ALWAYS_ASK.values():
+        found = pattern.search(text)
+        if found:
+            return found
+    return None
+
+
+def _permission_grant(info):
+    """A click that grants something: Authorize, Allow access, Agree, Accept, Approve. A cookie
+    banner ("Accept cookies") is ordinary unless the site is one David's account acts on."""
+    text = " ".join(str(info.get(k) or "") for k in ("target", "reason"))
+    if not PERMISSION.search(text):
+        return False
+    return not COOKIE_BANNER.search(text) or sensitive_site(info.get("site"))
+
+
 def always_asks(info, config):
     """True when this browser action waits for David even under rules.confirm: never. Judged
     by the action's stakes, not the question's wording: Enter or Ctrl+Enter in a composer,
@@ -529,7 +661,7 @@ def always_asks(info, config):
     text = " ".join(str(info.get(k) or "") for k in ("question", "target", "reason"))
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
     return bool(SEND_OR_PAY.search(text)) or \
-        any(ALWAYS_ASK[k].search(text) for k in kinds if k in ALWAYS_ASK)
+        any(ALWAYS_ASK[k].search(text) for k in kinds if k in ALWAYS_ASK) or _permission_grant(info)
 
 
 def ask(action, config, state, wait=WAIT, queue=None, info=None, subject="the browser"):

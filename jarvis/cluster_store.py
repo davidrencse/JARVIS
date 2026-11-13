@@ -47,7 +47,7 @@ OWNER_TOKEN = "cluster-owner.token"  # in the state folder; the main's owner cre
 class Broker:
     def __init__(self, state):
         self.state = Path(state).resolve()
-        self.state.mkdir(parents=True, exist_ok=True)
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.path = self.state / "cluster.sqlite3"
         self._bulk = {}  # job id -> {"payload", "encoded", "result"}; memory only, never persisted
         with self.db() as db:

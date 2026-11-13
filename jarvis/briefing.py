@@ -131,14 +131,10 @@ def priorities_line(vault, today, back=3, limit=3):
     still unchecked in the latest note of the last few days ("carried over from Friday")."""
     for ago in range(back + 1):
         day = today - timedelta(days=ago)
-        path = vault.daily_path(day)
-        if path.is_file():
+        text = vault.daily_text(day)  # None for a missing note, a symlink or a path out of the vault
+        if text is not None:
             break
     else:
-        return ""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
         return ""
     items = [_priority(m) for m in re.findall(r"^\s*\d+\.\s+- \[[ /]\]\s+(\S.*)$", text, re.M)]
     items = [i for i in items if i]

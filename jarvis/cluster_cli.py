@@ -57,6 +57,7 @@ def parser(sub):
                               + ", ".join(sorted(NODE_DEFAULT)) + ")")
     command.add_argument("--output", help="Enroll: write the one-time pairing bundle here")
     command.add_argument("--port", type=int, default=7777, help="Main: local console port")
+    command.add_argument("--fix", action="store_true", help="Doctor: restart the tunnel supervisor and the clipboard/Lan Mouse keep-alive now")
     command.add_argument("--rollback", action="store_true", help="Update: swap a node back to its previous code")
     command.add_argument("--autostart", action="store_true", help="Tunnel start/stop: also enable or disable login startup")
 
@@ -1040,7 +1041,8 @@ def run(args, config, base):
         return init(config, path, state, args.device_id, autostart=not args.no_autostart)
     if action == "doctor":
         from .cluster_setup import doctor
-        report = doctor(config, path, state)
+        report = (doctor(config, path, state, fix=True) if getattr(args, "fix", False)
+                  else doctor(config, path, state))
         if not sys.stdout.isatty():
             return report
         for check in report["checks"]:  # a checklist for people; JSON when piped
@@ -1225,6 +1227,9 @@ def run(args, config, base):
             return cluster_tunnel.run(config, state)
         if args.value == "start":
             return cluster_tunnel.start(path, state)
+        if args.value == "stop":
+            # CLI stop is the operator stop. Lifecycle stop() does not set this.
+            return cluster_tunnel.stop(state, operator=True, config=config)
         return getattr(cluster_tunnel, args.value)(state)
     if action == "invite":
         from .cluster_setup import invite
@@ -1346,7 +1351,7 @@ def run(args, config, base):
     if action == "serve" and local != main:
         raise ValueError("This PC is a node. Run jarvis cluster node.")
     if action == "node" or (action == "run" and local != main):
-        worker = NodeWorker(config, state)
+        worker = NodeWorker(config, state, config_path=path)
         try:
             worker.run()
         except KeyboardInterrupt:
