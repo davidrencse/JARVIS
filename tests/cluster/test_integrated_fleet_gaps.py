@@ -148,7 +148,7 @@ class InviteAdmissionTests(Base):
     def test_authorize_tunnel_save_does_not_return_a_code(self):
         enrolled = []
 
-        def authorize(node, public, port, path=None):
+        def authorize(node, public, port, path=None, from_addr=None):
             memory = json.loads(json.dumps(MAIN))
             settings.write(memory, self.path, self.state, {"cluster.tunnel": "reverse"})
 

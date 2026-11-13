@@ -19,6 +19,9 @@ MAIN = {"cluster": {"enabled": True, "main_device": "zenbook", "local_device": "
 
 class SetupTests(unittest.TestCase):
     def setUp(self):
+        discovery = mock.patch("jarvis.cluster_recovery.magic_names", return_value=[])
+        discovery.start()
+        self.addCleanup(discovery.stop)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.keys = self.tmp / "authorized_keys"
@@ -221,6 +224,9 @@ class InviteRollbackTests(unittest.TestCase):
     """A failed invite removes only the credential and key line that attempt still owns."""
 
     def setUp(self):
+        discovery = mock.patch("jarvis.cluster_recovery.magic_names", return_value=[])
+        discovery.start()
+        self.addCleanup(discovery.stop)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.keys = self.tmp / "authorized_keys"

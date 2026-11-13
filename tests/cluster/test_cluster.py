@@ -525,6 +525,9 @@ class TunnelTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.state = Path(self.tmp.name)
         self.config = configuration()
+        probe = patch("jarvis.cluster_tunnel.reachable", return_value=False)
+        probe.start()
+        self.addCleanup(probe.stop)
         self.config["devices"]["node"].update(target="jdoe@192.0.2.1",
             fallback_targets=["jdoe@192.0.2.2"], host_key_alias="known-host", identity_file="id_ed25519")
 
@@ -665,7 +668,7 @@ class TunnelTests(unittest.TestCase):
                 (self.state / "cluster-tunnel.stop").touch()
             return live if argv[-1] == "jdoe@192.0.2.2" else dead
 
-        def reachable(target):
+        def reachable(target, **kwargs):
             probes.append((clock[0], target))
             return clock[0] >= 2 * tunnel.LAN_RETRY
 
@@ -679,7 +682,8 @@ class TunnelTests(unittest.TestCase):
                 patch.object(tunnel.time, "sleep", side_effect=sleep):
             tunnel.run(self.config, self.state)
         self.assertEqual(attempts, ["jdoe@192.0.2.1", "jdoe@192.0.2.2", "jdoe@192.0.2.1"])
-        self.assertEqual([t for _, t in probes], ["jdoe@192.0.2.1"] * 2)
+        self.assertEqual([t for _, t in probes[:2]], ["jdoe@192.0.2.1", "jdoe@192.0.2.2"])
+        self.assertEqual([t for _, t in probes[2:4]], ["jdoe@192.0.2.1"] * 2)
         live.terminate.assert_called_once()
 
     def test_http_offline_error_preserves_safe_fallback_signal(self):
