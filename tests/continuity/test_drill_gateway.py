@@ -1,5 +1,8 @@
 """Gateway process drill. Real CLI subprocess, loopback ports, real SSH signatures.
 
+The child is a temp sqlite on 127.0.0.1. A passing run does not enroll Oracle,
+Dell, or the phone listener. `write_config` refuses a path under live state.
+
 Run: env $(env | grep -o '^CODEX_[A-Z_]*' | sed 's/^/-u /') JARVIS_NO_MODELS=1 \
   .venv/bin/python -m unittest tests.continuity.test_drill_gateway
 """
@@ -127,6 +130,8 @@ class GatewayDrill(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="jarvis-drill-gw-")
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        live = Path(__file__).resolve().parents[2] / ".jarvis"
+        self.assertFalse(self.root.resolve().is_relative_to(live.resolve()))
         self.keys = make_keys(self.root / "keys", ("owner", "node-a"))
         self.owner_pub = self.keys["owner"][0]
         self.procs = []
@@ -207,7 +212,7 @@ class GatewayDrill(unittest.TestCase):
         device = self._device(info["origin"])
         self._enroll(device)
         before = device.status()
-        code, out, err = run_cli(["serve", "--config", str(cfg)], timeout=10)
+        code, out, err = run_cli(["serve", "--config", str(cfg)], timeout=60)
         self.assertEqual(code, 2)
         self.assertNotIn(b"origin", out)
         self.assertEqual(cli_payload(err), {"error": "writer_busy"})
@@ -240,11 +245,13 @@ class GatewayDrill(unittest.TestCase):
         self.assertEqual(gateway.stop(), 0)
         again = self._track(GatewayProc(cfg))
         restarted = again.serve()
+        # No enroll() after the new process. The temp sqlite's gateway_directory
+        # is what answers. This is not an Oracle host.
         fresh = self._device(restarted["origin"])
-        lived = fresh.status()
-        self.assertGreater(lived["incarnation"], first["incarnation"])
-        self.assertEqual(lived["mode"], "LEGACY_ACTIVE")
-        self.assertEqual(lived["authority_id"], AUTH)
+        reloaded = fresh.status()
+        self.assertGreater(reloaded["incarnation"], first["incarnation"])
+        self.assertEqual(reloaded["mode"], "LEGACY_ACTIVE")
+        self.assertEqual(reloaded["authority_id"], AUTH)
         stale_status, _headers, stale_body = post_bytes(restarted["origin"], path, raw)
         self.assertNotEqual(stale_status, 200)
         self.assertEqual(_error_body(stale_body), "unauthorized")
@@ -282,7 +289,7 @@ class GatewayDrill(unittest.TestCase):
         self.assertFalse(consumed["already"])
         pinned = device.status()
         live_out = self.root / "live.sqlite"
-        code, out, err = run_cli(["backup", "--config", str(cfg), "--output", str(live_out)], timeout=10)
+        code, out, err = run_cli(["backup", "--config", str(cfg), "--output", str(live_out)], timeout=60)
         self.assertEqual(code, 2)
         self.assertEqual(cli_payload(err), {"error": "writer_busy"})
         self.assertFalse(live_out.exists())
@@ -435,7 +442,7 @@ class GatewayDrill(unittest.TestCase):
                 body.update(extra)
                 path = self.root / ("%s.json" % name)
                 path.write_text(json.dumps(body), encoding="utf-8")
-                status, out, err = run_cli(["serve", "--config", str(path)], timeout=10)
+                status, out, err = run_cli(["serve", "--config", str(path)], timeout=60)
                 self.assertEqual(status, 2)
                 self.assertEqual(cli_payload(err), {"error": code})
                 self.assertNotIn(b"origin", out)

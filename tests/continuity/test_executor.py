@@ -4,6 +4,7 @@ A successful accept consumes twice: once to record CONSUMED, and again immediate
 """
 
 import sqlite3
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -452,6 +453,90 @@ class Admission(Base):
         self.assertTrue(again["already"])
         self.assertFalse(again["replay"])
 
+    def test_interactive_stop_during_second_consume_releases_receipt(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-click-late-stop", effect="interactive")
+        entered, resume = threading.Event(), threading.Event()
+        original_consume = self.spy.consume
+
+        def parked_consume(**kwargs):
+            result = original_consume(**kwargs)
+            if self.spy.consumes == 2:
+                entered.set()
+                if not resume.wait(2):
+                    raise AssertionError("timed out waiting to resume consume")
+            return result
+
+        self.spy.consume = parked_consume
+        errors = []
+
+        def accept():
+            try:
+                guard.accept(signed, admit, sink)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=accept)
+        worker.start()
+        self.assertTrue(entered.wait(2), "second consume was not reached")
+        guard.stop_interactive("op-click-late-stop", "owner_lost")
+        resume.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], AuthorityError)
+        self.assertEqual(errors[0].code, "released")
+        receipt = guard.reconcile("op-click-late-stop", "a-1")
+        self.assertEqual((receipt["state"], receipt["result_code"], receipt["effect"]),
+                         ("RELEASED", "released", "released"))
+        self.assertEqual(calls, [])
+        self.refuse("released", guard.accept, signed, admit, sink)
+
+    def test_close_waits_for_admission_inside_consume(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-close-during-consume")
+        entered, resume, closed = threading.Event(), threading.Event(), threading.Event()
+        original_consume = self.spy.consume
+
+        def parked_consume(**kwargs):
+            entered.set()
+            if not resume.wait(2):
+                raise AssertionError("timed out waiting to resume consume")
+            return original_consume(**kwargs)
+
+        self.spy.consume = parked_consume
+        errors = []
+
+        def accept():
+            try:
+                guard.accept(signed, admit, sink)
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=accept)
+        worker.start()
+        self.assertTrue(entered.wait(2), "consume was not reached")
+        closer = threading.Thread(target=lambda: (guard.close(), closed.set()))
+        closer.start()
+        self.assertFalse(closed.wait(0.05), "close returned during an active admission")
+        resume.set()
+        worker.join(2)
+        closer.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertTrue(closed.is_set())
+        self.assertEqual(errors, [])
+        self.assertEqual(calls, ["ran"])
+        reopened = self.guard(path=guard.path)
+        reopened._authority = Down()
+        result = reopened.accept(signed, admit, sink)
+        self.assertTrue(result["already"])
+        self.assertEqual(calls, ["ran"])
+
     def ready(self):
         guard = self.guard()
         self.fence_working(guard)
@@ -586,6 +671,81 @@ class Crash(Base):
         self.assertEqual(calls, ["ran"])
         self.assertEqual(guard.reconcile("op-drain", "a-1")["state"], "COMPLETED")
 
+    def test_open_transition_does_not_admit_new_or_consumed_work(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-open")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_consume")
+        self.assertEqual(self.spy.consumes, 1)
+        tid = transition(self.store, "make_main_now", "dell", "k-open")
+        self.assertEqual(self.store.status()["mode"], "V2_ACTIVE")
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.spy.consumes, 1)
+        held = guard.reconcile("op-open", "a-1")
+        self.assertEqual((held["state"], held["effect"]), ("CONSUMED", "not_run"))
+        fresh, fresh_ticket = self.work(op="op-open-new")
+        self.refuse("no_admission", guard.accept, fresh, fresh_ticket, sink)
+        self.refuse("no_admission", guard.accept, fresh, fresh_ticket, sink)
+        self.assertEqual(self.spy.consumes, 1)
+        self.assertEqual(guard.reconcile("op-open-new", "a-1")["state"], "PREPARED")
+        self.store.cancel(tid)
+        guard.accept(signed, admit, sink)
+        guard.accept(fresh, fresh_ticket, sink)
+        again = guard.accept(signed, admit, sink)
+        self.assertTrue(again["already"])
+        self.assertEqual(calls, ["ran", "ran"])
+        self.assertEqual(guard.reconcile("op-open", "a-1")["state"], "COMPLETED")
+
+    def test_drain_during_consume_does_not_start_the_effect(self):
+        self.activate()
+        raced = DrainDuringConsume(self.store)
+        guard = self.guard(authority=raced)
+        self.fence_working(guard)
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-race")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_consume")
+        self.assertEqual(calls, [])
+        self.assertEqual(raced.consumes, 1)
+        raced.arm = True
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.store.status()["mode"], "HANDOVER")
+        held = guard.reconcile("op-race", "a-1")
+        self.assertEqual((held["state"], held["effect"]), ("CONSUMED", "not_run"))
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.assertEqual(raced.consumes, 2)
+        guard.close()
+        reopened = self.guard(authority=raced)
+        self.refuse("no_admission", reopened.accept, signed, admit, sink)
+        self.assertEqual(reopened.reconcile("op-race", "a-1")["state"], "CONSUMED")
+        self.assertEqual(calls, [])
+        self.store.cancel(raced.tid)
+        reopened.accept(signed, admit, sink)
+        replay = reopened.accept(signed, admit, sink)
+        self.assertTrue(replay["already"])
+        self.assertEqual(calls, ["ran"])
+        self.assertEqual(reopened.reconcile("op-race", "a-1")["state"], "COMPLETED")
+
+    def test_lapsed_lease_leaves_prepared_and_does_not_admit(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-lapse")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_prepare")
+        self.assertEqual(self.spy.consumes, 0)
+        self.clock.tick(30)
+        self.assertIsNone(self.store.status()["main"])
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        receipt = guard.reconcile("op-lapse", "a-1")
+        self.assertEqual((receipt["state"], receipt["result_code"], receipt["effect"]),
+                         ("PREPARED", None, "not_run"))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.spy.consumes, 0)
+
     def test_accepted_effect_stays_uncertain_after_revoke(self):
         self.activate()
         guard = self.ready()
@@ -597,6 +757,33 @@ class Crash(Base):
         self.assertEqual(calls, [])
         receipt = guard.reconcile("op-accepted", "a-1")
         self.assertEqual((receipt["state"], receipt["effect"]), ("ACCEPTED", "uncertain"))
+
+    def test_accepted_effect_stays_uncertain_across_drain_and_restart(self):
+        self.activate()
+        guard = self.ready()
+        calls, sink = self.ran()
+        signed, admit = self.work(op="op-accepted-drain")
+        self.refuse("crash", guard.accept, signed, admit, sink, failpoint="after_accept")
+        before = self.spy.consumes
+        tid = transition(self.store, "make_main_now", "dell", "k-accepted")
+        self.store.readiness(tid, True, True, "cp-1")
+        self.store.drain(tid)
+        first = self.refuse("uncertain", guard.accept, signed, admit, sink)
+        second = self.refuse("uncertain", guard.accept, signed, admit, sink)
+        self.assertNotIn(SECRET, str(first) + str(second))
+        self.assertEqual(calls, [])
+        self.assertEqual(self.spy.consumes, before)
+        receipt = guard.reconcile("op-accepted-drain", "a-1")
+        self.assertEqual((receipt["state"], receipt["effect"], receipt["result_code"]),
+                         ("ACCEPTED", "uncertain", None))
+        guard.close()
+        reopened = self.guard()
+        reopened._authority = Down()
+        self.refuse("uncertain", reopened.accept, signed, admit, sink)
+        again = reopened.reconcile("op-accepted-drain", "a-1")
+        self.assertEqual((again["state"], again["effect"], again["admission_id"]),
+                         ("ACCEPTED", "uncertain", receipt["admission_id"]))
+        self.assertEqual(calls, [])
 
     def test_sink_exception_is_uncertain_and_not_replayed(self):
         self.activate()
@@ -675,6 +862,20 @@ class Crash(Base):
         self.assertEqual(guard.local_view()["high_epoch"], 1)
         self.assertNotIn(SECRET, str(error))
 
+    def test_non_bool_ready_flag_does_not_admit(self):
+        script = Scripted()
+        script.st["main_ready"] = 1
+        script.st["lease_valid"] = 1
+        guard = self.guard(authority=script)
+        guard.fence(1, 0, script.st["mode_version"])
+        calls, sink = self.ran()
+        signed, admit = self.script_ticket(script)
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.refuse("no_admission", guard.accept, signed, admit, sink)
+        self.assertEqual(script.consumes, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(guard.reconcile("op-script", "a-script")["state"], "PREPARED")
+
     def script_ticket(self, script):
         body = digest("script-body")
         signed = {
@@ -693,6 +894,35 @@ class Crash(Base):
         guard = self.guard()
         self.fence_working(guard)
         return guard
+
+
+class DrainDuringConsume:
+    """First armed consume drains the authority, then replays the stored ticket."""
+
+    def __init__(self, store):
+        self.store = store
+        self.consumes = 0
+        self.arm = False
+        self.tid = None
+        self.drained = False
+
+    def status(self):
+        return self.store.status()
+
+    def acknowledge(self, *args, **kwargs):
+        return self.store.acknowledge(*args, **kwargs)
+
+    def admission(self, admission_id):
+        return self.store.admission(admission_id)
+
+    def consume(self, **kwargs):
+        self.consumes += 1
+        if self.arm and not self.drained:
+            self.tid = transition(self.store, "make_main_now", "dell", "k-during-consume")
+            self.store.readiness(self.tid, True, True, "cp-1")
+            self.store.drain(self.tid)
+            self.drained = True
+        return self.store.consume(**kwargs)
 
 
 class Scripted:

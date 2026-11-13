@@ -664,5 +664,191 @@ class CancelDrainQuorum(Base):
         self._assert_old_main_kept(lease, epoch, tid)
 
 
+class TransferInvariants(Base):
+    """CAS, exclusivity, epoch, and idempotency holes the earlier suites did not pin."""
+
+    def _authority(self):
+        return self.store._db.execute(
+            "SELECT mode, incarnation, epoch, holder, lease_id, lease_ready, transition_id, policy_version"
+            " FROM authority WHERE fleet_id='home'").fetchone()
+
+    def test_open_transition_blocks_rollback(self):
+        cutover(self.store)
+        version = self.store.status()["mode_version"]
+        tid = transition(self.store, "recover", "dell", "k-rollback")
+        self.refuse("busy", self.store.set_mode, "ROLLBACK_QUIESCED", version)
+        self.assertEqual(self.store.status()["mode"], "V2_ONLY_NO_MAIN")
+        self.assertEqual(self.store.transition(tid)["state"], "REQUESTED")
+        self.store.cancel(tid)
+        self.assertEqual(self.store.set_mode("ROLLBACK_QUIESCED", version), version + 1)
+        self.assertEqual(self.store.status()["mode"], "ROLLBACK_QUIESCED")
+
+    def test_fence_refuses_a_rollback_mode_without_granting(self):
+        cutover(self.store)
+        epoch = self.store.status()["epoch"]
+        tid = transition(self.store, "recover", "dell", "k-rollback-fence")
+        self.store.readiness(tid, True, False)
+        self.store.drain(tid)
+        ack(self.store)
+        self.store._db.execute("UPDATE authority SET mode='ROLLBACK_QUIESCED'")
+        self.store._db.commit()
+        self.refuse("mode", self.store.fence, tid)
+        row = self._authority()
+        self.assertEqual((row["mode"], row["epoch"], row["holder"], row["lease_id"]),
+                         ("ROLLBACK_QUIESCED", epoch, None, None))
+        self.assertEqual(self.store.transition(tid)["state"], "DRAINING")
+
+    def test_vacuous_ack_does_not_retire_a_live_lease(self):
+        lease = self.active()
+        epoch = self.store.status()["epoch"]
+        tid = transition(self.store, "make_main_now", "dell", "k-vacuous-fence")
+        self.store.readiness(tid, True, False)
+        self.store.drain(tid)
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE participants SET eligible=0")
+        con.execute("UPDATE participants SET fenced_epoch=? WHERE device_id='zenbook'", (epoch,))
+        con.commit()
+        con.close()
+        self.refuse("lease_live", self.store.fence, tid)
+        st = self.store.status()
+        self.assertEqual((st["mode"], st["main"], st["epoch"], st["lease_valid"]),
+                         ("HANDOVER", "zenbook", epoch, True))
+        self.assertEqual(self.store.transition(tid)["state"], "DRAINING")
+        self.assertEqual(self._authority()["lease_id"], lease["lease_id"])
+        # Drain already stopped heartbeats. Renew still matches this lease, so the
+        # refusal is draining rather than a cleared or stale tuple.
+        self.refuse("draining", self.store.renew, lease["holder"], lease["lease_id"],
+                    lease["incarnation"], lease["epoch"])
+
+    def test_fence_retry_does_not_bump_the_epoch(self):
+        self.active()
+        ack(self.store)
+        epoch = self.store.status()["epoch"]
+        tid = transition(self.store, "make_main_now", "dell", "k-fence-retry")
+        self.store.readiness(tid, True, False)
+        self.store.drain(tid)
+        first = self.store.fence(tid)
+        second = self.store.fence(tid)
+        self.assertEqual(first["transition_id"], second["transition_id"])
+        self.assertEqual((second["state"], second["fenced_epoch"]), ("FENCING", epoch + 1))
+        self.assertEqual(self.store.status()["epoch"], epoch + 1)
+        self.assertIsNone(self._authority()["holder"])
+
+    def test_fence_refuses_a_moved_expected_epoch(self):
+        lease = self.active()
+        ack(self.store)
+        epoch = self.store.status()["epoch"]
+        tid = transition(self.store, "make_main_now", "dell", "k-stale-epoch")
+        self.store.readiness(tid, True, False)
+        self.store.drain(tid)
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE transitions SET expected_epoch=? WHERE transition_id=?", (epoch + 9, tid))
+        con.commit()
+        con.close()
+        self.refuse("stale", self.store.fence, tid)
+        row = self._authority()
+        self.assertEqual((row["epoch"], row["holder"], row["lease_id"]),
+                         (epoch, "zenbook", lease["lease_id"]))
+        self.assertTrue(self.store.status()["lease_valid"])
+        self.assertEqual(self.store.transition(tid)["state"], "DRAINING")
+
+    def test_grant_retry_returns_the_same_lease_without_extending_it(self):
+        self.active()
+        ack(self.store)
+        tid = transition(self.store, "make_main_now", "dell", "k-grant-retry")
+        self.store.readiness(tid, True, False)
+        self.store.drain(tid)
+        self.store.fence(tid)
+        first = self.store.grant(tid)
+        self.clock.tick(3)
+        second = self.store.grant(tid)
+        self.assertEqual(second["lease_id"], first["lease_id"])
+        self.assertEqual((second["holder"], second["incarnation"], second["epoch"], second["ready"]),
+                         (first["holder"], first["incarnation"], first["epoch"], False))
+        self.assertEqual(second["valid_for"], 12.0)
+        self.assertEqual(self.store.status()["lease_remaining"], 12.0)
+        self.assertEqual(self._authority()["lease_id"], first["lease_id"])
+        self.assertEqual(self.store.transition(tid)["state"], "GRANTED_NOT_READY")
+        renewed = self.store.renew(first["holder"], first["lease_id"], first["incarnation"], first["epoch"])
+        self.assertEqual(renewed["valid_for"], A.LEASE_SECONDS)
+
+    def test_grant_refuses_an_ineligible_candidate(self):
+        self.active()
+        ack(self.store)
+        epoch = self.store.status()["epoch"]
+        tid = transition(self.store, "make_main_now", "dell", "k-ineligible-grant")
+        self.store.readiness(tid, True, False)
+        self.store.drain(tid)
+        self.store.fence(tid)
+        fenced = self.store.status()["epoch"]
+        self.assertEqual(fenced, epoch + 1)
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE participants SET eligible=0 WHERE device_id='dell'")
+        con.commit()
+        con.close()
+        self.refuse("ineligible", self.store.grant, tid)
+        row = self._authority()
+        self.assertEqual((row["epoch"], row["holder"], row["lease_id"], row["mode"]),
+                         (fenced, None, None, "HANDOVER"))
+        self.assertEqual(self.store.transition(tid)["state"], "FENCING")
+
+    def test_complete_refuses_a_moved_epoch_without_activating(self):
+        self.active()
+        ack(self.store)
+        tid = transition(self.store, "make_main_now", "dell", "k-complete-stale")
+        self.store.readiness(tid, True, False)
+        self.store.drain(tid)
+        self.store.fence(tid)
+        lease = self.store.grant(tid)
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE authority SET epoch=epoch+5")
+        con.commit()
+        con.close()
+        moved = self._authority()["epoch"]
+        self.refuse("stale", self.store.complete, tid, True)
+        row = self._authority()
+        self.assertEqual((row["mode"], row["epoch"], row["holder"], row["lease_ready"]),
+                         ("HANDOVER", moved, "dell", 0))
+        self.assertEqual(self.store.transition(tid)["state"], "GRANTED_NOT_READY")
+        self.refuse("stale", self.store.renew, lease["holder"], lease["lease_id"],
+                    lease["incarnation"], lease["epoch"])
+
+    def test_mode_preack_outside_quiesce_writes_nothing(self):
+        lease = self.active()
+        status = self.store.status()
+        before = self.store._db.execute(
+            "SELECT mode_version, fenced_epoch FROM participants WHERE device_id='dell'").fetchone()
+        self.refuse("ahead", self.store.acknowledge, "dell", "dell-inst",
+                    status["mode_version"] + 1, status["epoch"])
+        after = self.store._db.execute(
+            "SELECT mode_version, fenced_epoch FROM participants WHERE device_id='dell'").fetchone()
+        self.assertEqual(tuple(after), tuple(before))
+        consumed = self.store.consume(**ticket(self.store, lease, self.clock, target="dell"))
+        self.assertFalse(consumed["already"])
+
+    def test_symlink_cannot_take_a_second_writer(self):
+        link = Path(self.tmp.name) / "link.sqlite"
+        link.symlink_to(self.db)
+        self.refuse("writer_busy", open_store, link, self.clock)
+        self.assertFalse(Path(str(link) + ".writer").exists())
+        lock = Path(str(self.db) + ".writer")
+        self.assertTrue(lock.is_file())
+        self.assertFalse(lock.is_symlink())
+        self.assertGreaterEqual(lock.stat().st_size, 1)
+
+    def test_writer_lock_symlink_is_refused(self):
+        path = Path(self.tmp.name) / "locked.sqlite"
+        store = open_store(path, self.clock)
+        store.close()
+        lock = Path(str(path) + ".writer")
+        lock.unlink()
+        target = Path(self.tmp.name) / "elsewhere"
+        target.write_bytes(b"keep")
+        lock.symlink_to(target)
+        self.refuse("bad_request", open_store, path, self.clock)
+        self.assertEqual(target.read_bytes(), b"keep")
+        self.assertTrue(lock.is_symlink())
+
+
 if __name__ == "__main__":
     unittest.main()

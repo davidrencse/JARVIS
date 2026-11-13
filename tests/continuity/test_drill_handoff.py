@@ -1,8 +1,9 @@
 """MAIN handoff across a gateway process, two PCs, and a scripted phone.
 
-A, B, the phone, and the gateway are separate processes. Leases use real time.
-Signed phone identity is a device signature, not a cookie. Brain movement and
-membership removal are separate rows.
+A, B, the phone, and the gateway are separate processes on 127.0.0.1. Leases
+use real time. Signed phone identity is a device signature, not a cookie. Brain
+movement and membership removal are separate rows. A passing row is not a live
+Oracle host, a Dell service, or the phone listener on 127.0.0.1:7787.
 
 Run: env $(env | grep -o '^CODEX_[A-Z_]*' | sed 's/^/-u /') JARVIS_NO_MODELS=1 \
   .venv/bin/python -m unittest tests.continuity.test_drill_handoff
@@ -32,6 +33,7 @@ from tests.continuity.test_drill_process import (
     make_keys,
     origin_port,
     post_bytes,
+    refuse_live,
     write_config,
 )
 
@@ -84,6 +86,7 @@ class World:
         self.pids = {}
         case.addCleanup(lambda: shutil.rmtree(self.root, ignore_errors=True))
         case.addCleanup(self.close)
+        refuse_live(self.root)
         self.keys = make_keys(self.root / "keys", ("owner", "node-a", "node-b", "node-c", "phone"))
         self.sentinel = self.root / "sentinel"
         self.sentinel.write_bytes(b"drill-sentinel-not-a-vault")
@@ -180,7 +183,7 @@ class World:
             record["relay_origin"] = relay
         # One attempt can sit for the client timeout before it reports
         # unavailable. The retry budget has to cover more than one attempt.
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + 120
         while True:
             try:
                 return self.owner.enroll(record)
@@ -351,7 +354,7 @@ class HandoffDrill(SeamMixin, unittest.TestCase):
         must(world.workers["node-b"].call("hold", {"on": False}))
         old_port = origin_port(world.origin)[1]
         self.assertEqual(world.gateway.stop(), 0)
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 90
         while listener_open(old_port) and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertFalse(listener_open(old_port))
@@ -443,7 +446,10 @@ class HandoffDrill(SeamMixin, unittest.TestCase):
             "mode_version": still["mode_version"],
         })
         self.assertFalse(refused["ok"])
-        self.assertEqual(refused["error"], "revoked")
+        # The worker reads authenticated status before acknowledging a fence.
+        # Disabled installations now lose that status capability immediately;
+        # direct acknowledge still retains the authority's revoked response.
+        self.assertEqual(refused["error"], "unauthorized")
 
     def test_phone_cookie_is_a_ws4_seam(self):
         world = World(self)
@@ -478,10 +484,26 @@ class HandoffDrill(SeamMixin, unittest.TestCase):
             for key in response_headers)
         session = any(status == 200 for _path, status, _headers, _body in responses)
         if session or cookie_set:
+            # A body that mentions node-b is not a session. The raw cookie has
+            # to change the result, and the same call without it must not be a
+            # 200 or a Set-Cookie. This gateway is still the temp loopback
+            # process, not the live phone listener.
             text = b" ".join(body for _path, _status, _headers, body in responses).decode("utf-8", "replace")
             self.assertIn("node-b", text)
             self.assertNotIn("node-a", text)
             self.assertNotIn("BEGIN SSH SIGNATURE", text)
+            self.assertNotIn("drill-cookie-not-a-signature", text)
+            for path, status, response_headers, body in responses:
+                self.assertTrue(status == 200 or any(
+                    key.lower() == "set-cookie" for key in response_headers), path)
+                for key, value in response_headers.items():
+                    if key.lower() == "set-cookie":
+                        self.assertNotIn("drill-cookie-not-a-signature", value)
+                bare_status, bare_headers, bare_body = post_bytes(
+                    info["origin"], path, b"{}", headers={"X-CSRF-Token": "drill-csrf"})
+                self.assertNotEqual(bare_status, 200, path)
+                self.assertFalse(any(key.lower() == "set-cookie" for key in bare_headers), path)
+                self.assertNotEqual(bare_body, body, path)
             return
         for path, status, _headers, body in responses:
             self.assertEqual(status, 404, path)
@@ -507,6 +529,10 @@ class HandoffDrill(SeamMixin, unittest.TestCase):
         folder = tempfile.TemporaryDirectory(prefix="jarvis-drill-brain-")
         self.addCleanup(folder.cleanup)
         root = Path(folder.name)
+        repo_live = Path(__file__).resolve().parents[2] / ".jarvis"
+        home_live = Path.home() / ".local" / "state" / "jarvis"
+        self.assertFalse(root.resolve().is_relative_to(repo_live.resolve()))
+        self.assertFalse(root.resolve().is_relative_to(home_live.resolve()))
         sentinel = root / "sentinel"
         sentinel.write_bytes(b"drill-sentinel-not-a-vault")
         digest = _sha(sentinel)

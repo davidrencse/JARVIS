@@ -8,6 +8,11 @@ Nodes use the production ``AuthorityClient``, ``AuthenticatedPort``,
 ``MainRuntime``, ``ExecutorGuard``, and ``SignedAuthority``. The relay sink and
 the command loop share one thread so the executor journal is not used across
 threads. Nothing here starts ``IsolatedFleet``.
+
+The gateway child is ``python -m tests.continuity.test_drill_process`` calling
+``jarvis.continuity.gateway.main`` on a temp config. It is not a live Oracle
+process. ``_join_until`` fails when the thread is still alive: a stuck proxy
+is not a pass.
 """
 
 import hashlib
@@ -52,10 +57,18 @@ _LIVE = (REPO / ".jarvis", Path.home() / ".local" / "state" / "jarvis")
 # node is not scheduled inside 2s, so the gateway answers no_relay before the
 # effect runs. The drill keeps that path and only raises those two deadlines
 # inside its own gateway and worker processes. The parent suite is not patched.
-DRILL_RELAY_TIMEOUT = 20
-DRILL_CLIENT_TIMEOUT = 30
-DRILL_CALL_TIMEOUT = 50
-_JOIN_BUDGET = 15
+DRILL_RELAY_TIMEOUT = 40
+DRILL_CLIENT_TIMEOUT = 60
+DRILL_CALL_TIMEOUT = 120
+_JOIN_BUDGET = 45
+# Every other wall-clock wait in the drills (process readiness, CLI exit, keygen, one posted
+# request) is a budget, not a measurement: each returns the moment its condition holds, so a
+# long budget costs nothing on a quiet machine and keeps a loaded one (load >30 in release
+# runs) from reporting a scheduling delay as a failure. No assertion is relaxed.
+DRILL_START_TIMEOUT = 90
+DRILL_CLI_TIMEOUT = 90
+DRILL_REQUEST_TIMEOUT = 60
+DRILL_KEYGEN_TIMEOUT = 60
 
 
 class SeamGap(AssertionError):
@@ -135,14 +148,22 @@ def _serve_drill_gateway(argv):
 
 
 def _join_until(thread, budget):
+    """Join ``thread``. A thread still alive after ``budget`` seconds fails the drill.
+
+    The old return-on-timeout let a stuck accept or pump thread stay up while
+    the test passed. Daemon threads do not change that.
+    """
     if thread is None or getattr(thread, "ident", None) is None:
         return
     deadline = time.monotonic() + budget
     while thread.is_alive():
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return
+            break
         thread.join(timeout=min(0.5, remaining))
+    if thread.is_alive():
+        name = getattr(thread, "name", "") or "drill-thread"
+        raise AssertionError("drill thread still alive after %.1fs: %s" % (budget, name))
 
 
 def refuse_live(path):
@@ -217,7 +238,7 @@ def make_keys(folder, names):
         refuse_live(path)
         out = subprocess.run(
             ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "jarvis-continuity-test", "-f", str(path)],
-            check=False, capture_output=True, timeout=10,
+            check=False, capture_output=True, timeout=DRILL_KEYGEN_TIMEOUT,
         )
         if out.returncode != 0:
             raise DrillError("bad_config", out.stderr.decode("utf-8", "replace")[:300])
@@ -293,7 +314,7 @@ def origin_port(origin):
     return host.split("://", 1)[-1].strip("[]"), int(rest)
 
 
-def post_bytes(origin, path, raw, headers=None, timeout=10):
+def post_bytes(origin, path, raw, headers=None, timeout=DRILL_REQUEST_TIMEOUT):
     request = urllib.request.Request(origin + path, data=raw, method="POST")
     request.add_header("Content-Type", "application/json")
     request.add_header("Accept", "application/json")
@@ -368,7 +389,7 @@ class _Pump:
         return self.bytes().decode("utf-8", "replace")
 
 
-def run_cli(args, timeout=20):
+def run_cli(args, timeout=DRILL_CLI_TIMEOUT):
     proc = subprocess.Popen(
         [str(PY), "-u", "-m", "jarvis.continuity.gateway", *args],
         cwd=str(REPO), env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -415,7 +436,7 @@ class GatewayProc:
         self.err = _Pump(self.proc.stderr)
         return self
 
-    def ready(self, timeout=15):
+    def ready(self, timeout=DRILL_START_TIMEOUT):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             text = self.out.text()
@@ -436,7 +457,7 @@ class GatewayProc:
             "gateway readiness timed out stderr=%s stdout=%s"
             % (self.err.text()[-500:], self.out.text()[-300:]))
 
-    def serve(self, timeout=15):
+    def serve(self, timeout=DRILL_START_TIMEOUT):
         self.start()
         return self.ready(timeout)
 

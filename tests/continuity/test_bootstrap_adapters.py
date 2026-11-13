@@ -26,11 +26,50 @@ class HubControlTests(unittest.TestCase):
     def test_bound_call_uses_hub_paths_never_caller_paths(self):
         hub = SimpleNamespace(state=Path('/tmp/fake-state'), base=Path('/tmp/fake-base'), config={})
         with patch.object(cluster_cli, 'configured_handoff', return_value=object()), \
+                patch.object(hub_control, '_require_transfer_parity') as parity, \
                 patch.object(cluster_cli, 'set_main', return_value={'ok': True}) as run:
             self.assertEqual(hub_control.run_main(hub, {'device': 'dell'}, '::1'), {'ok': True})
+            parity.assert_called_once_with(hub, 'dell')
             run.assert_called_once_with({}, hub.base / 'jarvis.config.json', 'dell', state=hub.state)
             with self.assertRaises(ValueError):
                 hub_control.run_main(hub, {'device': 'dell', 'path': '/etc/x'}, '127.0.0.1')
+
+    def test_new_handoff_refuses_untested_or_mismatched_code_before_mutation(self):
+        with tempfile.TemporaryDirectory() as root:
+            hub = SimpleNamespace(state=Path(root), main='zenbook', config={}, base=Path(root),
+                broker=SimpleNamespace(nodes=lambda: [{'id': 'dell', 'code': 'old-release'}]))
+            with patch.object(cluster_cli, 'configured_handoff', return_value=object()), \
+                    patch('jarvis.release.code_parity', return_value={
+                        'matched': False, 'instruction': 'Release tests must pass.'}) as parity, \
+                    patch.object(cluster_cli, 'set_main') as run:
+                with self.assertRaisesRegex(ValueError, 'matching tested code'):
+                    hub_control.run_main(hub, {'device': 'dell'}, '127.0.0.1')
+                parity.assert_called_once_with(hub.state, reported='old-release')
+                run.assert_not_called()
+            self.assertFalse((hub.state/'main-handoff.json').exists())
+
+    def test_matching_release_allows_coordinator_and_missing_candidate_refuses(self):
+        with tempfile.TemporaryDirectory() as root:
+            hub = SimpleNamespace(state=Path(root), main='zenbook', config={}, base=Path(root),
+                broker=SimpleNamespace(nodes=lambda: [{'id': 'dell', 'code': 'tested-release'}]))
+            with patch.object(cluster_cli, 'configured_handoff', return_value=object()), \
+                    patch('jarvis.release.code_parity', return_value={'matched': True}) as parity, \
+                    patch.object(cluster_cli, 'set_main', return_value={'ok': True}) as run:
+                self.assertTrue(hub_control.run_main(hub, {'device': 'dell'}, '127.0.0.1')['ok'])
+                parity.assert_called_once_with(hub.state, reported='tested-release')
+                run.assert_called_once()
+            with patch('jarvis.release.code_parity', return_value={'matched': False}) as parity:
+                with self.assertRaises(ValueError):
+                    hub_control._require_transfer_parity(hub, 'missing')
+                parity.assert_called_once_with(hub.state, reported=None)
+
+    def test_lost_response_reconciliation_is_possible_after_code_changes(self):
+        with tempfile.TemporaryDirectory() as root:
+            hub = SimpleNamespace(state=Path(root), main='zenbook')
+            with patch.object(cluster_cli, '_load_intent', return_value={
+                    'target': 'dell', 'publication': 'outcome_unknown'}), \
+                    patch('jarvis.release.code_parity', side_effect=AssertionError('new admission')):
+                hub_control._require_transfer_parity(hub, 'dell')
 
     def test_client_uses_owner_auth_and_no_remote_or_dns_origin(self):
         cfg = {'cluster': {'main_url': 'http://127.0.0.1:7780'}}

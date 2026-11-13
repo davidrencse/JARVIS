@@ -1,5 +1,6 @@
 """PC-side cached MAIN validity: failures that must make a PC go back online."""
 
+import sys
 import unittest
 
 from jarvis.continuity import clock as C
@@ -57,6 +58,16 @@ class Cached(unittest.TestCase):
         self.assertTrue(self.grant(started=early))  # older request answered late
         self.assertAlmostEqual(self.c.remaining("dell"), 15)
 
+    def test_older_longer_renewal_does_not_extend_a_newer_shorter_one(self):
+        early = self.c.now()
+        self.assertTrue(self.grant(started=early, valid_for=15))
+        self.f.t = 110
+        self.assertTrue(self.grant(started=110, valid_for=4))
+        self.assertAlmostEqual(self.c.remaining("dell"), 4)
+        self.assertTrue(self.grant(started=early, valid_for=15))
+        self.assertAlmostEqual(self.c.remaining("dell"), 4)
+        self.assertEqual(self.c.seen, (1, 3))
+
     def test_validity_capped(self):
         self.assertFalse(self.grant(valid_for=3600))
         self.assertFalse(self.grant(valid_for=0))
@@ -98,6 +109,67 @@ class Cached(unittest.TestCase):
 
     def test_macos_has_no_suspend_aware_clock(self):
         self.assertIsNone(C.suspend_aware_clock("darwin"))
+        self.assertIsNone(C.monotonic_clock("darwin"))
+
+    def test_rejected_higher_tuple_does_not_poison_the_cache(self):
+        self.assertTrue(self.grant(epoch=3, valid_for=10))
+        seen = self.c.seen
+        left = self.c.remaining("dell")
+        self.assertFalse(self.grant(epoch=9, valid_for=0))
+        self.assertEqual(self.c.reason, "bad_validity")
+        self.assertEqual(self.c.seen, seen)
+        self.assertAlmostEqual(self.c.remaining("dell"), left)
+        self.assertTrue(self.grant(epoch=3, valid_for=10))
+        self.assertGreater(self.c.remaining("dell"), 0)
+
+    def test_bool_and_float_tuple_and_ready_are_not_coerced(self):
+        started = self.f.t
+        self.assertFalse(self.c.observe(
+            holder="dell", incarnation=True, epoch=1, valid_for=15, ready=True, request_started=started))
+        self.assertEqual(self.c.reason, "bad_tuple")
+        self.assertEqual(self.c.seen, (0, 0))
+        self.assertFalse(self.c.observe(
+            holder="dell", incarnation=1, epoch=1.9, valid_for=15, ready=True, request_started=started))
+        self.assertEqual(self.c.reason, "bad_tuple")
+        self.assertFalse(self.c.observe(
+            holder="dell", incarnation=1, epoch=1, valid_for=15, ready="false", request_started=started))
+        self.assertEqual(self.c.reason, "bad_ready")
+        self.assertEqual(self.c.remaining(), 0)
+        self.assertTrue(self.grant())
+        self.assertGreater(self.c.remaining("dell"), 0)
+
+    def test_non_finite_request_start_leaves_the_grant(self):
+        self.assertTrue(self.grant())
+        seen = self.c.seen
+        for started in (float("nan"), float("inf"), float("-inf"), True, "100"):
+            self.assertFalse(self.grant(started=started), started)
+            self.assertEqual(self.c.reason, "bad_request_start", started)
+            self.assertEqual(self.c.seen, seen)
+        self.assertGreater(self.c.remaining("dell"), 0)
+
+    def test_clock_going_backwards_voids_the_grant(self):
+        self.grant()
+        self.f.t -= 1
+        self.assertEqual(self.c.remaining("dell"), 0)
+        self.assertEqual(self.c.reason, "clock_regressed")
+
+    def test_process_restart_voids_until_a_new_answer(self):
+        token = {"pid": 10}
+        cache = C.CachedAuthority(clock=self.f.now, boot=lambda: self.f.boot, pid=lambda: token["pid"])
+        self.assertTrue(cache.observe(
+            holder="dell", incarnation=1, epoch=3, valid_for=15, ready=True, request_started=self.f.t))
+        self.assertGreater(cache.remaining("dell"), 0)
+        token["pid"] = 11
+        self.assertEqual(cache.remaining("dell"), 0)
+        self.assertEqual(cache.reason, "restart")
+        self.assertEqual(cache.seen, (1, 3))
+        self.assertFalse(cache.observe(
+            holder="dell", incarnation=1, epoch=2, valid_for=15, ready=True, request_started=self.f.t))
+        self.assertEqual(cache.reason, "stale_tuple")
+        self.assertEqual(cache.remaining("dell"), 0)
+        self.assertTrue(cache.observe(
+            holder="dell", incarnation=1, epoch=3, valid_for=15, ready=True, request_started=self.f.t))
+        self.assertGreater(cache.remaining("dell"), 0)
 
 
 class FakeKernel32:
@@ -174,6 +246,68 @@ class Windows(unittest.TestCase):
         k.ms += 20_000
         self.assertEqual(c.remaining("zenbook"), 0)
         self.assertEqual(c.reason, "expired")
+
+
+class Pair:
+    """Boottime includes a sleep; monotonic does not. Both are injected."""
+
+    def __init__(self):
+        self.boot_s = 100.0
+        self.mono_s = 80.0
+
+    def boot(self):
+        return self.boot_s
+
+    def mono(self):
+        return self.mono_s
+
+
+class SuspendGap(unittest.TestCase):
+    def test_gap_growth_voids_before_the_deadline(self):
+        pair = Pair()
+        cache = C.CachedAuthority(clock=pair.boot, boot=lambda: "b", mono=pair.mono)
+        self.assertTrue(cache.observe(
+            holder="dell", incarnation=1, epoch=1, valid_for=15, ready=True, request_started=pair.boot()))
+        pair.boot_s += 0.02
+        pair.mono_s += 0.02
+        self.assertAlmostEqual(cache.remaining("dell"), 14.98)
+        pair.boot_s += 1.0  # one second asleep; the deadline is still in the future
+        self.assertEqual(cache.remaining("dell"), 0)
+        self.assertEqual(cache.reason, "suspend")
+        self.assertTrue(cache.observe(
+            holder="dell", incarnation=1, epoch=1, valid_for=15, ready=True, request_started=pair.boot()))
+        self.assertGreater(cache.remaining("dell"), 0)
+
+    def test_running_time_does_not_look_like_suspend(self):
+        pair = Pair()
+        cache = C.CachedAuthority(clock=pair.boot, boot=lambda: "b", mono=pair.mono)
+        self.assertTrue(cache.observe(
+            holder="dell", incarnation=1, epoch=1, valid_for=15, ready=True, request_started=pair.boot()))
+        pair.boot_s += 3
+        pair.mono_s += 3
+        self.assertAlmostEqual(cache.remaining("dell"), 12)
+
+
+class HostAdapter(unittest.TestCase):
+    @unittest.skipUnless(sys.platform.startswith("linux"), "linux boottime adapter")
+    def test_host_adapter_samples_without_claiming_suspend(self):
+        # One quiet sample. This does not sleep the machine and does not show
+        # that the gap grows across a real suspend.
+        clock = C.suspend_aware_clock()
+        mono = C.monotonic_clock()
+        self.assertTrue(callable(clock))
+        self.assertTrue(callable(mono))
+        boot_sample = clock()
+        mono_sample = mono()
+        self.assertGreater(boot_sample, 0)
+        self.assertGreater(mono_sample, 0)
+        self.assertEqual(boot_sample, boot_sample)
+        self.assertEqual(mono_sample, mono_sample)
+        again = clock() - mono()
+        self.assertLess(abs(again - (boot_sample - mono_sample)), C._SUSPEND_GAP_SECONDS)
+        boot = C.boot_id()
+        self.assertIsInstance(boot, str)
+        self.assertTrue(boot)
 
 
 if __name__ == "__main__":

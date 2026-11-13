@@ -7,7 +7,9 @@ import hashlib
 import inspect
 import json
 import math
+import os
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -16,12 +18,13 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 from jarvis.continuity.authority import AuthorityError, AuthorityStore
 from jarvis.continuity.gateway import (
     DEVICE_NS, HTTP_STATUS, AuthenticatedPort, AuthorityClient, ContinuityGateway, DevicePrincipal,
-    GatewayError, TICKET_NS, _Record, _agreed_wait, _message, _post_json, canonical, pin_origin,
-    pin_relay, sign_message, verify_message,
+    GatewayConfig, GatewayError, TICKET_NS, _Record, _agreed_wait, _message, _post_json,
+    backup_gateway, canonical, pin_origin, pin_relay, sign_message, verify_message,
 )
 from jarvis.continuity.ingress import ContinuityGatewaySession, IngressError
 from jarvis.continuity.integration import (
@@ -603,6 +606,9 @@ class Removal(GatewayCase):
             self._client("dell").acknowledge(status["mode_version"], status["epoch"])
         self.assertEqual(acked.exception.code, "revoked")
         self.assertTrue(self.owner.disable_participant("dell", "dell-inst")["already"])
+        with self.assertRaises(GatewayError) as status:
+            self._client("dell").status()
+        self.assertEqual(status.exception.code, "unauthorized")
 
     def test_current_main_cannot_be_removed(self):
         self.cutover()
@@ -662,6 +668,149 @@ class Removal(GatewayCase):
         return _exchange(self.origin, _OWNER_PATH["disable"], {"payload": payload, "device": {
             "device_id": name, "installation_id": name + "-inst", "nonce": "n-dev-rm",
             "issued_at": issued, "signature": signature}})
+
+    def _directory(self, device_id):
+        return self.gw.store._db.execute(
+            "SELECT installation_id, kind FROM gateway_directory WHERE device_id=?",
+            (device_id,)).fetchone()
+
+    def test_disabled_installation_loses_status_and_relay_but_keeps_revoked_ack(self):
+        upstream = _serve(Upstream)
+        upstream.bodies = []
+        self.addCleanup(_stop, upstream)
+        origin = f"http://127.0.0.1:{upstream.server_address[1]}"
+        self.cutover(origin)
+        self.promote("zenbook", "k-boot")
+        self.enroll("phone", "client", CLIENT)
+        phone = self._client("phone")
+        self.assertEqual(phone.status()["main"], "zenbook")
+        with self.assertRaises(GatewayError) as wrong:
+            self.owner.disable_participant("phone", "other-inst")
+        self.assertEqual(wrong.exception.code, "unknown_participant")
+        self.assertEqual(tuple(self._directory("phone")), ("phone-inst", "client"))
+        self.assertEqual(phone.status()["main"], "zenbook")
+        removed = self.owner.disable_participant("phone", "phone-inst")
+        self.assertEqual(removed["kind"], "client")
+        self.assertTrue(removed["disabled"])
+        self.assertFalse(removed["already"])
+        self.assertIsNone(self._directory("phone"))
+        self.assertNotIn("phone", self.gw._devices)
+        with self.assertRaises(GatewayError) as phone_status:
+            self._client("phone").status()
+        self.assertEqual(phone_status.exception.code, "unauthorized")
+        with self.assertRaises(GatewayError) as again:
+            self.owner.disable_participant("phone", "phone-inst")
+        self.assertEqual(again.exception.code, "unknown_participant")
+        self.assertIsNone(self._directory("phone"))
+        current = self._client("zenbook").status()
+        self.owner.disable_participant("dell", "dell-inst")
+        self.assertEqual(tuple(self._directory("dell")), ("dell-inst", "pc"))
+        with self.assertRaises(GatewayError) as acked:
+            self._client("dell").acknowledge(current["mode_version"], current["epoch"])
+        self.assertEqual(acked.exception.code, "revoked")
+        with self.assertRaises(GatewayError) as dell_status:
+            self._client("dell").status()
+        self.assertEqual(dell_status.exception.code, "unauthorized")
+        self.enroll("dell", "pc", PC + ["client"])
+        self.assertEqual(self.gw.store._db.execute(
+            "SELECT eligible FROM participants WHERE device_id=?", ("dell",)).fetchone()["eligible"], 0)
+        with self.assertRaises(GatewayError) as still:
+            self._client("dell").status()
+        self.assertEqual(still.exception.code, "unauthorized")
+        with self.assertRaises(GatewayError) as relayed:
+            self._client("dell").relay("op-disabled", "zenbook", "a-1", digest("open firefox"), "client")
+        self.assertEqual(relayed.exception.code, "unauthorized")
+        self.assertEqual(upstream.bodies, [])
+        self.assertEqual(self._client("zenbook").status()["main"], "zenbook")
+
+
+class BackupPublication(unittest.TestCase):
+    def _config(self, state):
+        return GatewayConfig(
+            state_path=os.fspath(state), fleet_id="home", authority_id="oracle-auth",
+            owner_public_keys=(_keys()["owner"][0],), bind_host="127.0.0.1", bind_port=0,
+            tls_cert=None, tls_key=None, lease_seconds=None, margin=None, auto_failover=False)
+
+    def _stopped(self):
+        folder = tempfile.TemporaryDirectory(prefix="jarvis-gw-backup-")
+        self.addCleanup(folder.cleanup)
+        state = Path(folder.name) / "authority.sqlite"
+        gateway = ContinuityGateway.open(state, "home", "oracle-auth", [_keys()["owner"][0]])
+        gateway.close()
+        return Path(folder.name), state
+
+    def test_live_writer_creates_nothing(self):
+        folder = tempfile.TemporaryDirectory(prefix="jarvis-gw-backup-")
+        self.addCleanup(folder.cleanup)
+        state = Path(folder.name) / "authority.sqlite"
+        gateway = ContinuityGateway.open(state, "home", "oracle-auth", [_keys()["owner"][0]])
+        self.addCleanup(gateway.close)
+        output = Path(folder.name) / "out.sqlite"
+        with self.assertRaises(GatewayError) as raised:
+            backup_gateway(self._config(state), os.fspath(output))
+        self.assertEqual(raised.exception.code, "writer_busy")
+        self.assertFalse(os.path.lexists(output))
+
+    def test_preexisting_symlink_is_conflict(self):
+        folder, state = self._stopped()
+        victim = folder / "victim"
+        victim.write_bytes(b"KEEP")
+        output = folder / "out.sqlite"
+        output.symlink_to(victim)
+        with self.assertRaises(GatewayError) as raised:
+            backup_gateway(self._config(state), os.fspath(output))
+        self.assertEqual(raised.exception.code, "conflict")
+        self.assertEqual(victim.read_bytes(), b"KEEP")
+        self.assertTrue(output.is_symlink())
+
+    def test_stopped_backup_is_a_regular_file_and_does_not_open_the_output_path(self):
+        folder, state = self._stopped()
+        output = folder / "out.sqlite"
+        real = sqlite3.connect
+
+        def connect(target, *args, **kwargs):
+            if os.fspath(target) == os.fspath(output):
+                raise AssertionError("backup opened the output path")
+            return real(target, *args, **kwargs)
+
+        with mock.patch("jarvis.continuity.gateway.sqlite3.connect", connect):
+            saved = backup_gateway(self._config(state), os.fspath(output))
+        self.assertEqual(saved["authority_id"], "oracle-auth")
+        self.assertTrue(output.is_file())
+        self.assertFalse(output.is_symlink())
+        uri = output.resolve().as_uri() + "?mode=ro"
+        db = sqlite3.connect(uri, uri=True)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA query_only=ON")
+            row = db.execute("SELECT authority_id, incarnation FROM authority").fetchone()
+        finally:
+            db.close()
+        self.assertEqual(row["authority_id"], "oracle-auth")
+        source_uri = state.resolve().as_uri() + "?mode=ro"
+        source = sqlite3.connect(source_uri, uri=True)
+        try:
+            self.assertEqual(source.execute("SELECT incarnation FROM authority").fetchone()[0], row["incarnation"])
+        finally:
+            source.close()
+
+    def test_symlink_planted_during_write_is_not_followed(self):
+        folder, state = self._stopped()
+        victim = folder / "victim"
+        victim.write_bytes(b"KEEP")
+        output = folder / "out.sqlite"
+        real_write = backup_gateway.__globals__["_write_fd"]
+
+        def planted(fd, blob):
+            os.unlink(output)
+            os.symlink(victim, output)
+            return real_write(fd, blob)
+
+        with mock.patch("jarvis.continuity.gateway._write_fd", planted), self.assertRaises(GatewayError) as raised:
+            backup_gateway(self._config(state), os.fspath(output))
+        self.assertEqual(raised.exception.code, "conflict")
+        self.assertEqual(victim.read_bytes(), b"KEEP")
+        self.assertTrue(output.is_symlink())
 
 
 class Handover(GatewayCase):
