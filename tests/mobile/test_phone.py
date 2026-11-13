@@ -1023,10 +1023,12 @@ class Wiring(unittest.TestCase):
         done = Path(self.tmp.name) / "closed"
         script = ("import sys, time\nfrom jarvis import cluster_proxy\n"
                   "assert cluster_proxy.close_on_sigterm()\nprint('ready', flush=True)\n"
-                  "try:\n    time.sleep(30)\nfinally:\n    open(sys.argv[1], 'w').write('closed')\n")
+                  "try:\n    time.sleep(30)\nfinally:\n"
+                  "    with open(sys.argv[1], 'w') as out:\n        out.write('closed')\n")
         child = subprocess.Popen([sys.executable, "-c", script, str(done)], cwd=str(Path(__file__).resolve().parents[2]),
                                  stdout=subprocess.PIPE, text=True)
         self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.addCleanup(lambda: child.stdout is not None and not child.stdout.closed and child.stdout.close())
         self.assertEqual(child.stdout.readline().strip(), "ready")
         child.send_signal(signal.SIGTERM)
         self.assertEqual(child.wait(10), 0)

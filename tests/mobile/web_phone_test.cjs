@@ -74,7 +74,7 @@ function page(opt = {}) {
   };
   const created = [];
   const doc = {
-    hidden: false, activeElement: null, handlers: {}, els: {},
+    hidden: !!opt.hidden, activeElement: null, handlers: {}, els: {},
     getElementById(id) { return this.els[id] || (this.els[id] = element("div", id)); },
     createElement: (tag) => element(tag),
     createElementNS: (_ns, tag) => element(tag),
@@ -115,9 +115,28 @@ function page(opt = {}) {
   const win = (kind, init) => fire({ handlers: state.winHandlers }, kind, init);
 
   let hash = opt.hash || "";
+  const navigation = [{ hash, state: null }];
+  let navigationIndex = 0;
+  const history = {
+    get state() { return navigation[navigationIndex].state; },
+    replaceState(value, _title, url) { hash = url; navigation[navigationIndex] = { hash, state: value }; },
+    pushState(value, _title, url) { hash = url; navigation.splice(++navigationIndex); navigation.push({ hash, state: value }); },
+    back() { this.move(-1); },
+    forward() { this.move(1); },
+    move(delta) {
+      const next = navigationIndex + delta;
+      if (next < 0 || next >= navigation.length) return;
+      navigationIndex = next; hash = navigation[next].hash;
+      clock.setTimeout(() => { win("popstate", { state: navigation[next].state }); win("hashchange", {}); }, 0);
+    },
+  };
   const location = {
+    reload() { state.reloads = (state.reloads || 0) + 1; },
     get hash() { return hash; },
-    set hash(v) { v = String(v); if (!v.startsWith("#")) v = "#" + v; if (v === hash) return; hash = v; clock.setTimeout(() => win("hashchange", {}), 0); },
+    set hash(v) {
+      v = String(v); if (!v.startsWith("#")) v = "#" + v; if (v === hash) return;
+      history.pushState(null, "", v); clock.setTimeout(() => win("hashchange", {}), 0);
+    },
   };
 
   // ---------- network ----------
@@ -188,8 +207,8 @@ function page(opt = {}) {
   }
   const store = new Map(Object.entries(opt.storage || {}));
   const context = {
-    document: doc, location, fetch, Date: FakeDate, AbortController, Promise, console,
-    navigator: { userAgent: ua, platform: opt.platform || "Linux armv8l", maxTouchPoints: 5, standalone: opt.standalone === true,
+    document: doc, location, history, fetch, Date: FakeDate, AbortController, Promise, console,
+    navigator: { userAgent: ua, platform: opt.platform || "Linux armv8l", maxTouchPoints: 5, standalone: opt.standalone === true, serviceWorker: opt.serviceWorker, onLine: opt.onLine,
       wakeLock: { request: async () => { state.locks++; return { release: async () => {}, addEventListener() {} }; } } },
     matchMedia: (q) => ({ matches: q === "(display-mode: standalone)" ? opt.standalone === true : false, addEventListener() {} }),
     localStorage: {
@@ -211,9 +230,11 @@ function page(opt = {}) {
 
   const els = doc.els, stage = () => els["c-stage"];
   const p = {
-    state, els, doc, clock, fire, win, created,
+    state, els, doc, clock, fire, win, created, helpers: context.JarvisPhone,
     async settle(ms = 0) { await clock.advance(ms); },
     async go(h) { location.hash = h; await clock.advance(5); },
+    async back() { history.back(); await clock.advance(5); },
+    async forward() { history.forward(); await clock.advance(5); },
     click: (id) => fire(els[id], "click", {}),
     nav: context.navigator,
     storage: (k) => store.get(k),
@@ -246,6 +267,203 @@ function find(e, pred) { return findAll(e, pred)[0] || null; }
 async function booted(opt) { const p = page(opt); await p.settle(10); return p; }
 
 const scenarios = {
+  async core_hidden_launch_and_offline_launch_recover() {
+    const hidden = await booted({ hidden: true });
+    assert.equal(hidden.state.calls.length, 0);
+    assert.equal(hidden.els.down.hidden, true);
+    assert.equal(hidden.helpers.store.state("stage"), "boot");
+    hidden.hide(false); await hidden.settle(20);
+    assert.equal(hidden.els.app.hidden, false);
+    const offline = await booted({ onLine: false });
+    assert.equal(offline.els.down.hidden, false);
+    assert.equal(offline.state.calls.length, 0);
+    offline.win("online"); await offline.settle(20);
+    assert.equal(offline.els.app.hidden, false);
+  },
+  async core_update_prompt_waits_for_the_current_request() {
+    const events = {};
+    const p = await booted({ serviceWorker: { controller: {},
+      register: async () => ({ addEventListener() {} }),
+      addEventListener: (key, fn) => { events[key] = fn; } } });
+    events.controllerchange();
+    const reload = find(p.els.app, (e) => e.tagName === "BUTTON" && e.textContent === "Reload");
+    assert.ok(reload);
+    p.state.routes["POST /phone/api/ask"] = () => [200, { pending: true, job: "abc123" }];
+    p.state.routes["GET /phone/api/ask/*"] = () => [200, { reply: "Done." }];
+    p.els["a-text"].value = "hello"; p.click("a-send"); await p.settle(20);
+    p.fire(reload, "click", {});
+    assert.equal(p.state.reloads, undefined);
+    assert.match(p.els.app.textContent, /Finish the current/);
+    await p.settle(800); p.fire(reload, "click", {});
+    assert.equal(p.state.reloads, 1);
+  },
+  async core_lost_ask_reply_keeps_its_key_across_reload() {
+    const p = await booted();
+    p.state.offline = true;
+    p.els["a-text"].value = "hello"; p.click("a-send"); await p.settle(20);
+    const sent = p.callsTo("/phone/api/ask")[0];
+    const saved = p.storage("jarvis.phone.ask");
+    assert.equal(JSON.parse(saved).key, sent.body.key);
+    const next = await booted({ storage: { "jarvis.phone.ask": saved } });
+    assert.equal(next.els["a-text"].value, "hello");
+    next.click("a-send"); await next.settle(20);
+    assert.equal(next.callsTo("/phone/api/ask")[0].body.key, sent.body.key);
+  },
+  async core_store_emits_only_changes_and_unsubscribes() {
+    const p = await booted();
+    const seen = [];
+    const off = p.helpers.store.on("test", (value) => seen.push(value));
+    assert.equal(p.helpers.store.update("test", { count: 1 }), true);
+    assert.equal(p.helpers.store.update("test", { count: 1 }), false);
+    off(); p.helpers.store.update("test", { count: 2 });
+    assert.equal(seen.length, 1);
+  },
+  async core_ask_pauses_hidden_and_resumes_without_duplicate_messages() {
+    const p = await booted();
+    p.state.routes["POST /phone/api/ask"] = () => [200, { pending: true, job: "abc123" }];
+    p.state.routes["GET /phone/api/ask/*"] = () => [200, { reply: "Answer arrived." }];
+    p.els["a-text"].value = "hello"; p.click("a-send"); await p.settle(20);
+    const rows = p.els["a-thread"].children.length;
+    p.hide(true); await p.settle(30000);
+    assert.equal(p.callsTo("/phone/api/ask/abc123", "GET").length, 0);
+    const before = p.state.calls.length;
+    await p.settle(30000); assert.equal(p.state.calls.length, before);
+    p.hide(false); await p.settle(800);
+    assert.equal(p.callsTo("/phone/api/ask").length, 1);
+    assert.equal(p.els["a-thread"].children.length, rows);
+    assert.match(p.els["a-thread"].textContent, /Answer arrived/);
+  },
+  async core_pairing_stops_hidden_and_times_out_after_suspension() {
+    const p = page();
+    p.state.routes["GET /phone/api/me"] = () => [401, { pair: true }];
+    await p.settle(10);
+    p.els["p-code"].value = "ABCD1234"; p.click("p-go"); await p.settle(20);
+    p.hide(true); await p.settle(310000);
+    assert.equal(p.callsTo("/phone/pair/status").length, 0);
+    p.hide(false); await p.settle(10);
+    assert.equal(p.els["pair-form"].hidden, false);
+    assert.match(p.els["p-msg"].textContent, /timed out/);
+  },
+  async core_overview_stops_offline_and_reconnects_on_online() {
+    const p = await booted();
+    p.win("offline"); const before = p.state.calls.length;
+    await p.settle(60000); assert.equal(p.state.calls.length, before);
+    assert.equal(p.els.net.hidden, false);
+    p.win("online"); await p.settle(20);
+    assert.equal(p.els.net.hidden, true);
+    assert.ok(p.state.calls.length > before);
+  },
+  async core_read_retries_are_bounded_and_posts_never_auto_repeat() {
+    const p = await booted();
+    let attempts = 0;
+    p.state.routes["GET /phone/api/test"] = () => (++attempts < 3 ? [503, {}] : [200, { ok: true }]);
+    const read = p.helpers.api("/phone/api/test", undefined, { retries: 2, session: SID });
+    await p.settle(1600); assert.equal((await read).ok, true);
+    assert.equal(attempts, 3);
+    assert.equal(p.callsTo("/phone/api/test", "GET")[0].headers["X-JARVIS-Session"], SID);
+    p.state.routes["POST /phone/api/test"] = () => [503, {}];
+    await assert.rejects(p.helpers.api("/phone/api/test", {}, { retries: 2 }));
+    assert.equal(p.callsTo("/phone/api/test").length, 1);
+  },
+  async an_undecodable_frame_pauses_input_and_a_third_finger_never_clicks() {
+    const p = await booted(); await p.open();
+    p.fire(p.els["c-img"], "error", {}); await p.settle(5);
+    assert.equal(p.els["c-stale"].hidden, false);
+    assert.equal(p.sent().pop().t, "release");
+    p.frame(2); await p.settle(600); p.state.inputs.length = 0;
+    p.ptr("pointerdown", {pointerId:1});
+    p.ptr("pointerdown", {pointerId:2});
+    p.ptr("pointerdown", {pointerId:3});
+    await p.settle(600);
+    for (const pointerId of [1,2,3]) p.ptr("pointerup", {pointerId});
+    await p.settle(50);
+    assert.deepEqual(p.sent(), []);
+  },
+
+  async session_options_keep_keys_exclusive_and_start_collapsed() {
+    const p = await booted(); await p.open();
+    assert.equal(p.els["c-panel"].hidden, true);
+    p.click("c-more");
+    assert.equal(p.els["c-options"].hidden, false);
+    p.click("c-keys-btn");
+    assert.equal(p.els["c-options"].hidden, true);
+    assert.equal(p.els["c-panel"].hidden, false);
+    p.click("c-more");
+    assert.equal(p.els["c-panel"].hidden, true);
+  },
+
+  async lifecycle_release_drops_queued_presses_behind_an_inflight_batch() {
+    const p = await booted(); await p.open();
+    const gate = deferred(); p.state.inputGate = gate;
+    p.key("ControlLeft"); await flush();
+    p.key("ShiftLeft");
+    p.win("blur", {}); await p.settle(5);
+    gate.resolve(); await p.settle(10);
+    assert.equal(p.state.inputs.some(e => e.code === "ShiftLeft" && e.down), false);
+    assert.equal(p.sent().pop().t, "release");
+    assert.equal(p.findKey("ControlLeft").getAttribute("aria-pressed"), "false");
+  },
+
+  async stale_session_blocks_taps_and_releases_held_modifiers() {
+    const p = await booted(); await p.open();
+    p.key("ControlLeft"); await p.settle(5);
+    p.state.nodeAgo = 30; await p.settle(9000);
+    assert.equal(p.els["c-stale"].hidden, false);
+    assert.equal(p.sent().pop().t, "release");
+    const count = p.state.inputs.length;
+    p.ptr("pointerdown", {}); p.ptr("pointerup", {}); await p.settle(30);
+    assert.equal(p.state.inputs.length, count);
+    p.frame(2); await p.settle(600);
+    assert.equal(p.els["c-stale"].hidden, true);
+  },
+
+  async frame_failure_pauses_input_then_recovers_on_a_new_frame() {
+    const p = await booted(); await p.open();
+    p.frameReply(502, {error:"Temporary failure"}); await p.settle(5);
+    assert.equal(p.els["c-stale"].hidden, false);
+    assert.match(p.els["c-stale"].textContent, /Reconnecting/);
+    const count = p.state.inputs.length;
+    p.ptr("pointerdown", {}); p.ptr("pointerup", {}); await p.settle(30);
+    assert.equal(p.state.inputs.length, count);
+    p.frame(2); await p.settle(800);
+    assert.equal(p.els["c-stale"].hidden, true);
+    assert.equal(p.state.frameMaxInFlight, 1);
+  },
+
+  async quality_change_releases_stops_then_restarts_explicitly() {
+    const p = await booted(); await p.open();
+    p.click("c-more"); p.els["c-quality"].value = "high";
+    p.click("c-apply"); await p.settle(30);
+    assert.equal(p.callsTo("/phone/api/session/start").length, 2);
+    assert.equal(p.callsTo("/phone/api/session/start")[1].body.quality, "high");
+    const calls = p.state.calls;
+    const stop = calls.findIndex(c => c.path === "/phone/api/session/stop");
+    const starts = calls.map((c,i) => c.path === "/phone/api/session/start" ? i : -1).filter(i => i >= 0);
+    assert.ok(stop < starts[1]);
+    assert.ok(calls.slice(0,stop).some(c => c.body && c.body.events && c.body.events.some(e => e.t === "release")));
+  },
+
+  async old_input_reply_cannot_clear_a_new_sessions_pending_text() {
+    const p = await booted(); await p.open();
+    const gate = deferred(); p.state.inputGate = gate;
+    p.key("ControlLeft"); await flush();
+    p.click("c-end"); await p.settle(20);
+    await p.open();
+    p.els["c-text"].value = "new session"; p.click("c-send");
+    gate.resolve(); await p.settle(50);
+    assert.ok(p.state.inputs.some(e => e.t === "text" && e.text === "new session"));
+  },
+
+  async pagehide_stops_locally_and_cannot_accept_further_input() {
+    const p = await booted(); await p.open();
+    p.win("pagehide", {}); await p.settle(5);
+    const count = p.state.inputs.length;
+    p.ptr("pointerdown", {}); p.ptr("pointerup", {}); await p.settle(30);
+    assert.equal(p.state.inputs.length, count);
+    assert.equal(p.callsTo("/phone/api/session/stop").length, 1);
+    assert.ok(p.callsTo("/phone/api/session/stop")[0].keepalive);
+  },
+
   async request_cost_is_expandable_and_not_a_subscription_charge() {
     const p = await booted();
     p.state.routes["POST /phone/api/ask"] = () => [200, {reply:"Done.", usage:{usd:0.01234,tokens:420,calls:1,engine:"chatgpt"}}];
@@ -928,7 +1146,7 @@ const scenarios = {
     assert.equal(p.els["down-h"].textContent, "JARVIS didn't let this phone in");
     assert.match(p.els["down-p"].textContent, /jarvis phone on/);
     p.state.routes["GET /phone/api/me"] = () => [200, p.state.me];
-    await p.settle(15100);
+    await p.settle(30100); // A second failure backs off to 30 seconds.
     assert.equal(p.els.app.hidden, false);
   },
 
@@ -993,6 +1211,63 @@ const scenarios = {
     p.state.offline = true; p.click("fl-retry"); await p.settle(20);
     assert.match(p.els["fl-state"].textContent, /Can't reach JARVIS/);
     assert.match(p.els["fl-list"].textContent, /Main PC/);
+  },
+
+  async computer_cards_start_one_session_and_keep_refresh_focus() {
+    const p = await booted();
+    const row = p.els["dv-list"].children.find((li) => li.textContent.includes("Dell"));
+    assert.match(row.textContent, /Online/);
+    assert.match(row.textContent, /Last seen/);
+    assert.match(row.textContent, /Screen control/);
+    const action = row.children[1];
+    assert.equal(action.textContent, "Control screen");
+    p.fire(action, "click", {}); await p.settle(20);
+    assert.equal(p.hash(), "#/control/dell");
+    assert.equal(p.callsTo("/phone/api/session/start").length, 1);
+    await p.back();
+    assert.equal(p.hash(), "#/devices");
+    p.els["dv-refresh"].focus();
+    p.click("dv-refresh"); await p.settle(20);
+    assert.equal(p.doc.activeElement, p.els["dv-refresh"]);
+    assert.equal(p.els["dv-refresh"].disabled, false);
+    assert.match(p.els["dv-feedback"].textContent, /updated/);
+    assert.equal(p.els["dv-list"].children.find((li) => li.textContent.includes("Dell")), row);
+  },
+
+  async navigation_restores_scroll_focus_and_guards_the_app_entry() {
+    const p = await booted();
+    p.els.main.scrollTop = 185;
+    await p.go("#/device/dell");
+    assert.equal(p.els.main.scrollTop, 0);
+    assert.equal(p.doc.activeElement, p.els["d-h"]);
+    p.click("d-back"); await p.settle(10);
+    assert.equal(p.hash(), "#/devices");
+    assert.equal(p.els.main.scrollTop, 185);
+    assert.equal(p.doc.activeElement, p.els["dv-h"]);
+    await p.back();
+    assert.equal(p.hash(), "#/devices");
+    await p.back();
+    assert.equal(p.hash(), "#/devices");
+    await p.go("#/ask/invalid");
+    assert.equal(p.els.app.attrs["data-screen"], "devices");
+    const direct = await booted({ hash: "#/device/dell" });
+    await direct.back();
+    assert.equal(direct.hash(), "#/devices");
+  },
+
+  async missing_and_offline_computers_have_recovery_without_stale_details() {
+    const p = await booted();
+    await p.go("#/device/dell");
+    assert.equal(p.els["d-r-ssid"].hidden, false);
+    p.state.overview.devices[1].online = false;
+    p.click("dv-refresh"); await p.settle(20);
+    assert.equal(p.els["d-control"].disabled, true);
+    assert.match(p.els["d-presence"].textContent, /Wake this computer/);
+    p.state.overview.devices = [];
+    p.click("dv-refresh"); await p.settle(20);
+    assert.equal(p.els["d-r-ssid"].hidden, true);
+    assert.match(p.els["d-presence"].textContent, /Manage computers/);
+    assert.equal(p.els["dv-empty"].hidden, false);
   },
 
   async devices_screen_has_one_manage_entry_and_remote_stays_first() {

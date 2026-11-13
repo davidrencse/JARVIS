@@ -45,6 +45,11 @@ def png_header(path: Path):
 
 @unittest.skipUnless(NODE, "Node.js is required for the phone app's browser tests")
 class PhoneAppBehaviourTests(unittest.TestCase):
+    def test_service_worker_security(self):
+        result = subprocess.run([NODE, str(SCRIPT.with_name("web_phone_sw_test.cjs"))],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_every_scenario(self):
         self.assertGreaterEqual(len(SCENARIOS), 15)
         for name in SCENARIOS:
