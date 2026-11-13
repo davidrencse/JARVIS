@@ -18,6 +18,54 @@ from jarvis import runner
 from jarvis.runner import final_message, make_plan, run_task, stop_process, workspace
 from jarvis.store import Store
 
+
+def _is_run_task_standin(argv, kwargs):
+    """The process run_task just spawned: python, prompt on stdin, logs to files.
+
+    A Popen subclass installed on the subprocess module also caps taskkill and
+    every other subprocess.run. Those keep the timeout they were given.
+    """
+    if not isinstance(argv, (list, tuple)) or not argv or argv[0] != sys.executable:
+        return False
+    if kwargs.get("stdin") is not subprocess.PIPE:
+        return False
+    return kwargs.get("stdout") not in (None, subprocess.PIPE, subprocess.DEVNULL, subprocess.STDOUT)
+
+
+def _cap_communicate(cap, ready=None, safety=15):
+    """run_task refuses timeout < 1. Cap communicate on that stand-in only.
+
+    `ready`, when set, is polled before the cap applies. communicate's timeout
+    does not start until that predicate is true, so a slow spawn is not killed
+    before the child has published the state the test has to observe.
+    """
+    real = runner.subprocess.Popen
+
+    def popen(argv, *args, **kwargs):
+        process = real(argv, *args, **kwargs)
+        if _is_run_task_standin(argv, kwargs):
+            original = process.communicate
+
+            def communicate(*c_args, **c_kwargs):
+                timeout = c_kwargs.get("timeout")
+                if timeout and ready is not None:
+                    deadline = time.monotonic() + safety
+                    while time.monotonic() < deadline and not ready():
+                        if process.poll() is not None:
+                            break
+                        time.sleep(0.02)
+                    if ready():
+                        c_kwargs["timeout"] = min(float(timeout), cap)
+                elif timeout:
+                    c_kwargs["timeout"] = min(float(timeout), cap)
+                return original(*c_args, **c_kwargs)
+
+            process.communicate = communicate
+        return process
+
+    return mock.patch.object(runner.subprocess, "Popen", popen)
+
+
 CONFIG = {"workspace_roots": ["."], "models": {
     "codex": {"mid": {"model": "gpt-x", "effort": "medium"}},
     "claude": {"mid": {"model": "sonnet", "effort": "high"}}}}
@@ -271,31 +319,99 @@ class RunTests(Base):
     def test_timeout_kills_process_and_marks_timed_out(self):
         self.standin("import time; time.sleep(60)")
         start = time.time()
-        result = self.run_it(timeout=1)
+        with _cap_communicate(0.15):
+            result = self.run_it(timeout=1)
         self.assertLess(time.time() - start, 20)
+        self.assertEqual(result["state"], "timed_out")
+        self.assertEqual(self.store.get(result["task_id"])["state"], "timed_out")
+
+    def test_communicate_cap_leaves_other_timeouts_alone(self):
+        # Proved: a Popen subclass on the subprocess module made
+        # subprocess.run(..., timeout=30) of a 0.2s sleep raise TimeoutExpired
+        # after 0.053s, because communicate rewrote every timeout to the cap.
+        # Linux stop_process uses killpg, so the suite still passed; Windows
+        # taskkill goes through subprocess.run and would record failed.
+        self.standin("import time; time.sleep(60)")
+        with _cap_communicate(0.05):
+            started = time.monotonic()
+            try:
+                other = subprocess.run(
+                    [sys.executable, "-c", "import time; time.sleep(0.2)"], timeout=30)
+            except subprocess.TimeoutExpired as exc:
+                self.fail(f"other communicate was capped to {exc.timeout}")
+            other_elapsed = time.monotonic() - started
+            standin_started = time.monotonic()
+            result = self.run_it(timeout=1)
+            standin_elapsed = time.monotonic() - standin_started
+        self.assertEqual(other.returncode, 0)
+        self.assertGreater(other_elapsed, 0.15)
+        self.assertLess(standin_elapsed, 0.8)
         self.assertEqual(result["state"], "timed_out")
         self.assertEqual(self.store.get(result["task_id"])["state"], "timed_out")
 
     @unittest.skipIf(os.name == "nt", "POSIX process groups")
     def test_timeout_kills_whole_process_tree(self):
         pidfile = self.base / "grandchild.pid"
-        code = ("import subprocess,sys,time\n"
-                "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
-                f"open({str(pidfile)!r},'w').write(str(p.pid))\n"
-                "time.sleep(60)")
+        # Publish the pid with os.replace so a reader never sees a partial write.
+        # The file object is closed before the rename; a bare open().write() can
+        # still be buffered when the group is killed.
+        code = "\n".join((
+            "import os, subprocess, sys, time",
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])",
+            f"dest = {str(pidfile)!r}",
+            "with open(dest + '.tmp', 'w') as fh:",
+            "    fh.write(str(p.pid))",
+            "os.replace(dest + '.tmp', dest)",
+            "time.sleep(60)",
+        ))
         self.standin(code)
-        self.assertEqual(self.run_it(timeout=1)["state"], "timed_out")
-        pid = int(pidfile.read_text())
-        self.addCleanup(lambda: os.path.exists(f"/proc/{pid}") and os.kill(pid, signal.SIGKILL))
-        for _ in range(50):
+        recorded = {"pid": None}
+
+        def reap():
+            pid = recorded["pid"]
+            if pid is None:
+                return
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        self.addCleanup(reap)
+
+        def published():
+            try:
+                return bool(pidfile.read_text().strip())
+            except OSError:
+                return False
+
+        # timeout=1 is only the production floor. It starts when communicate()
+        # is called, which is before this child can spawn and publish. Under
+        # load that kills the group with no pidfile. Wait for the publish,
+        # then cap the same communicate so the kill still happens on the
+        # timeout path while the grandchild is alive.
+        with _cap_communicate(0.25, ready=published):
+            self.assertEqual(self.run_it(timeout=1)["state"], "timed_out")
+        try:
+            text = pidfile.read_text().strip()
+        except OSError:
+            text = ""
+        self.assertTrue(text, "grandchild pid was not published before the timeout")
+        pid = recorded["pid"] = int(text)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
             try:
                 os.kill(pid, 0)
-                state = Path(f"/proc/{pid}/stat").read_text().split()[2] if os.path.exists(f"/proc/{pid}/stat") else "gone"
-                if state in ("Z", "gone"):
-                    break
             except ProcessLookupError:
                 break
-            time.sleep(0.1)
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text()
+            except FileNotFoundError:
+                break
+            # `pid (comm) state`. comm can contain spaces; the state follows ')'.
+            state = stat.rpartition(")")[2].split()[0] if ")" in stat else ""
+            if state in ("Z", "X"):
+                break
+            time.sleep(0.02)
         else:
             self.fail("grandchild survived the timeout")
 

@@ -11,6 +11,7 @@ from jarvis.devices import ssh_inventory
 from jarvis.runner import make_plan, run_task
 from jarvis.store import Store
 from jarvis.voice import speak
+from tests.runtime.test_runner import _cap_communicate
 
 
 class KernelTests(unittest.TestCase):
@@ -79,7 +80,7 @@ class KernelTests(unittest.TestCase):
     def test_timeout_is_recorded(self):
         task = self.store.add(self.spec)
         with patch("jarvis.runner.make_plan", return_value=self.fake_plan(
-                "import time; time.sleep(30)")):
+                "import time; time.sleep(30)")), _cap_communicate(0.15):
             result = run_task(self.store, task["id"], self.config, self.base, 1)
         self.assertEqual(result["state"], "timed_out")
         self.assertEqual(self.store.get(task["id"])["state"], "timed_out")

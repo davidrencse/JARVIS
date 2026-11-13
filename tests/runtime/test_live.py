@@ -170,9 +170,13 @@ class AppModeTests(unittest.TestCase):
                 self.stopped = True
 
         bus, server = Bus(), Server()
-        thread = threading.Thread(target=close_with_window, args=(server, bus, 0.2, 0.05),
+        thread = threading.Thread(target=close_with_window, args=(server, bus, 0.05, 0.01),
                                   daemon=True)
         thread.start()
+        # A missed subscribe window leaves the watcher looping. An unbounded
+        # cleanup join would then hold the suite; the assertion still requires
+        # the server to stop.
+        self.addCleanup(lambda: thread.join(timeout=2))
         time.sleep(0.2)
         self.assertFalse(server.stopped)  # no window has connected yet: keep serving
         sub, _ = bus.subscribe()
@@ -241,7 +245,8 @@ class EventStreamTests(Temp):
         handler = type("H", (Handler,), {"console": self.console,
                                           "hosts": ("127.0.0.1", "localhost")})
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01},
+                         daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}"

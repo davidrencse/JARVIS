@@ -89,6 +89,22 @@ class PauseWakeTests(RestCase):
         record = json.loads((self.state / rest.RECORD).read_text())
         self.assertEqual(record["stopped"], ["jarvis-voice.service"])
 
+    def test_a_blocker_stopped_by_the_first_pause_is_restored_after_a_second_one(self):
+        # `jarvis sleep --no-suspend` twice: the Instabox unit is already down for the second
+        # pause (and may no longer read as a blocker), but wake must still bring it back.
+        unit = "instabox-listener.service"
+        fake = self.systemd({unit}, blockers=[(unit, "instabox", "24x7")])
+        rest.pause(self.state)
+        self.assertNotIn(unit, fake.running)
+        with mock.patch.object(rest, "sleep_blockers", return_value=[]):
+            rest.pause(self.state)
+        record = json.loads((self.state / rest.RECORD).read_text())
+        self.assertIn(unit, record["stopped"])
+        self.assertIn(unit, [b["unit"] for b in record["blockers"]])
+        out = rest.wake(self.state)
+        self.assertIn(unit, out["started"])
+        self.assertIn(unit, fake.running)
+
     def test_record_cannot_start_arbitrary_text(self):
         fake = self.systemd(set())
         (self.state / rest.RECORD).write_text(json.dumps({"stopped": ["x; rm -rf ~", 5, "evil.service", "jarvis-voice.service"]}))

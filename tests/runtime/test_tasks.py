@@ -5,7 +5,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from jarvis.tasks import TaskTools, Tasks, next_dates, parse_date, parse_line
-from jarvis.vault import Vault, is_vault_request
+from jarvis.vault import Vault, forget, is_vault_request
 
 TODAY = date(2026, 10, 22)  # a Thursday
 NOW = datetime(2026, 10, 22, 9, 30)
@@ -206,6 +206,7 @@ class WriteTests(TaskCase):
         path = self.root / "projects/drone.md"
         path.write_text(path.read_text("utf-8").replace("Sketch the frame", "Sketch the frame v2"),
                         "utf-8")
+        forget(self.vault.root)  # an outside edit is visible once the shared snapshot drops
         self.tasks._cache.clear()
         with self.assertRaises(ValueError):  # its words no longer pick out the old task id
             self.tasks.update(task["id"], "done", when=NOW)
@@ -231,6 +232,51 @@ class WriteTests(TaskCase):
         self.assertTrue(ok, text)
         ok, text = tools.call("task_update", {"task": "email", "action": "explode", "value": ""})
         self.assertFalse(ok)
+
+
+class SnapshotMemoTests(TaskCase):
+    def test_unchanged_snapshot_does_not_restat_or_reparse(self):
+        from unittest.mock import patch
+
+        first = self.tasks.all(TODAY)
+        order = [t["id"] for t in first]
+        first.reverse()  # callers may sort the list they were given
+        stats, reads, walks = [], [], []
+        real_stat, real_read = Path.stat, Path.read_text
+        real_markdown = self.tasks.vault.markdown
+
+        def stat(path, *args, **kwargs):
+            stats.append(path)
+            return real_stat(path, *args, **kwargs)
+
+        def read_text(path, *args, **kwargs):
+            reads.append(path)
+            return real_read(path, *args, **kwargs)
+
+        def markdown():
+            walks.append(1)
+            return real_markdown()
+
+        with patch.object(Path, "stat", stat), patch.object(Path, "read_text", read_text), \
+                patch.object(self.tasks.vault, "markdown", markdown):
+            second = self.tasks.all(TODAY)
+        self.assertEqual((stats, reads, walks), ([], [], []))
+        self.assertIsNot(second, first)
+        self.assertEqual([t["id"] for t in second], order)
+
+    def test_edited_note_is_picked_up_when_the_snapshot_refreshes(self):
+        def texts():
+            return [t["text"] for t in self.tasks.all(TODAY)]
+
+        self.assertIn("Decide what it is for", texts())
+        path = self.root / "projects" / "drone.md"
+        path.write_text(path.read_text(encoding="utf-8").replace(
+            "Decide what it is for", "Decide the mission"), encoding="utf-8")
+        self.assertIn("Decide what it is for", texts())  # same snapshot: no re-stat
+        forget(self.vault.root)
+        after = texts()
+        self.assertIn("Decide the mission", after)
+        self.assertNotIn("Decide what it is for", after)
 
 
 if __name__ == "__main__":

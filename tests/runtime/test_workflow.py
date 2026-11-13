@@ -6,6 +6,7 @@ scripted planner output); everything between them is the real code.
 """
 
 import json
+import queue
 import subprocess
 import sys
 import tempfile
@@ -31,8 +32,10 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[2]
 # The real config, minus the decider's shadow log and embeddings (they load a model).
-CONFIG = {**json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8")),
-          "memory": {"semantic": False}, "decisions": {"shadow": False}}
+# Vault indexing of the live tree is off; the path stays so a test that reads it still can.
+_LIVE = json.loads((ROOT / "jarvis.config.json").read_text(encoding="utf-8"))
+_VAULT = {**(_LIVE.get("vault") or {}), "enabled": False}
+CONFIG = {**_LIVE, "memory": {"semantic": False}, "decisions": {"shadow": False}, "vault": _VAULT}
 CONFIG["routing"] = {**CONFIG.get("routing", {}), "interpreter": False}  # never call ChatGPT from tests
 
 
@@ -71,19 +74,164 @@ def wait_for(predicate, timeout=10):
     raise AssertionError("timed out waiting for the condition")
 
 
-def jarvis(state, *args, check=True):
-    """Run the real CLI in a subprocess against an isolated state folder and the test config
-    (never the repo's own: with it, anything the instant lane misses reaches the real brain)."""
+def _test_config(state):
     config = Path(state) / "test-config.json"
     if not config.is_file():
         config.write_text(json.dumps({**CONFIG, "cluster": {"enabled": False},
                                       "vault": {"enabled": False}}), encoding="utf-8")
+    return config
+
+
+def jarvis(state, *args, check=True):
+    """Run the real CLI in a subprocess against an isolated state folder and the test config
+    (never the repo's own: with it, anything the instant lane misses reaches the real brain)."""
+    config = _test_config(state)
     done = subprocess.run([sys.executable, "-m", "jarvis", "--config", str(config),
                            "--state", str(state), *args],
                           cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=120)
     if check:
         assert done.returncode == 0, (args, done.stdout, done.stderr)
     return done
+
+
+_CLI_DRIVER = r'''
+import io, json, sys
+from contextlib import redirect_stderr, redirect_stdout
+from jarvis.__main__ import main
+real_out = sys.stdout
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    args = json.loads(line)
+    sys.argv = ["jarvis", *args]
+    sink, err = io.StringIO(), io.StringIO()
+    code = 0
+    try:
+        with redirect_stdout(sink), redirect_stderr(err):
+            try:
+                code = main() or 0
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else (1 if exc.code else 0)
+    except Exception as exc:
+        err.write("Traceback " + repr(exc))
+        code = 1
+    real_out.write(json.dumps({"code": int(code), "stdout": sink.getvalue(),
+                               "stderr": err.getvalue()}) + "\n")
+    real_out.flush()
+'''
+
+
+class CliSession:
+    """Several real CLI commands in one interpreter. A fresh process per command spent
+    most of its time importing jarvis.
+
+    stdout is read on a side thread and waited on with the same 120s budget the
+    fresh-process jarvis() helper uses. stderr is text with errors='replace': one
+    non-UTF-8 byte used to kill the drain, fill the pipe, and leave readline blocked.
+    """
+
+    def __init__(self, reply_timeout=120, driver=None):
+        self.reply_timeout = reply_timeout
+        self._closed = False
+        self._out = queue.Queue()
+        self._err = []
+        self.proc = subprocess.Popen(
+            [sys.executable, "-u", "-c", _CLI_DRIVER if driver is None else driver],
+            cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace")
+
+        def _drain_out():
+            try:
+                for line in self.proc.stdout:
+                    self._out.put(line)
+            except Exception as exc:
+                self._out.put(exc)
+            self._out.put(None)
+
+        def _drain_err():
+            try:
+                for chunk in self.proc.stderr:
+                    self._err.append(chunk)
+            except Exception as exc:
+                self._err.append(f"\n[stderr drain] {exc!r}")
+
+        self._out_thread = threading.Thread(target=_drain_out, daemon=True)
+        self._err_thread = threading.Thread(target=_drain_err, daemon=True)
+        self._out_thread.start()
+        self._err_thread.start()
+
+    def __call__(self, state, *args, check=True):
+        payload = ["--config", str(_test_config(state)), "--state", str(state), *args]
+        self.proc.stdin.write(json.dumps(payload) + "\n")
+        self.proc.stdin.flush()
+        try:
+            line = self._out.get(timeout=self.reply_timeout)
+        except queue.Empty:
+            err = "".join(self._err)
+            self.close()
+            raise AssertionError(f"cli driver timed out: {err}")
+        if isinstance(line, Exception) or not line:
+            err = "".join(self._err)
+            raise AssertionError(f"cli driver died: {line!r} {err}")
+        done = json.loads(line)
+        if check and done["code"] != 0:
+            raise AssertionError((args, done["stdout"], done["stderr"]))
+        return subprocess.CompletedProcess(payload, done["code"], done["stdout"], done["stderr"])
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        proc = self.proc
+        try:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            self._out_thread.join(timeout=2)
+            self._err_thread.join(timeout=2)
+        finally:
+            # The class session outlives every CliWorkflowTests method. Leaving
+            # these text pipes open keeps the wrappers until interpreter shutdown.
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+
+
+class CliSessionHarnessTests(unittest.TestCase):
+    def test_stuck_driver_fails_before_it_exits(self):
+        session = CliSession(reply_timeout=0.3, driver="import time\ntime.sleep(1)\n")
+        self.addCleanup(session.close)
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(AssertionError) as caught:
+                session(directory, "doctor")
+        self.assertLess(time.monotonic() - started, 0.9)
+        self.assertIn("timed out", str(caught.exception))
+
+    def test_non_utf8_stderr_still_returns_the_protocol_line(self):
+        driver = (
+            "import sys\n"
+            "sys.stderr.buffer.write(b'\\xff' + b'x' * 200000)\n"
+            "sys.stderr.buffer.flush()\n"
+            "sys.stdout.write('{\"code\": 0, \"stdout\": \"ok\", \"stderr\": \"\"}\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        session = CliSession(reply_timeout=2, driver=driver)
+        self.addCleanup(session.close)
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory() as directory:
+            done = session(directory, "doctor")
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "ok")
 
 
 # ------------------------------------------------------------------ text → brain → memory
@@ -160,7 +308,8 @@ class AdapterHandler(BaseHTTPRequestHandler):
 class MediumWorkflowTests(Temp):
     def test_site_request_reaches_the_owners_api_with_recall_and_token(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), AdapterHandler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01},
+                         daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         config = {**CONFIG, "routing": {**CONFIG.get("routing", {}), "orchestrator": "brain"},
@@ -847,20 +996,32 @@ class VoiceWorkflowTests(Temp):
 
 # ------------------------------------------------------------------ the real CLI
 class CliWorkflowTests(Temp):
+    @classmethod
+    def setUpClass(cls):
+        cls._session = CliSession()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._session.close()
+
+    def setUp(self):
+        super().setUp()
+        self.cli = lambda *args, **kwargs: self._session(self.base, *args, **kwargs)
+
     def test_memory_loop_through_the_real_cli(self):
-        added = json.loads(jarvis(self.base, "mem", "add", "Dell runs the Kokoro voice",
+        added = json.loads(self.cli("mem", "add", "Dell runs the Kokoro voice",
                                   "--tag", "voice", "--importance", "0.9").stdout)
-        other = json.loads(jarvis(self.base, "mem", "add", "second note").stdout)
-        hits = json.loads(jarvis(self.base, "mem", "search", "kokoro").stdout)
+        other = json.loads(self.cli( "mem", "add", "second note").stdout)
+        hits = json.loads(self.cli( "mem", "search", "kokoro").stdout)
         self.assertEqual(hits[0]["id"], added["id"])
-        linked = json.loads(jarvis(self.base, "mem", "link", other["id"], added["id"],
+        linked = json.loads(self.cli( "mem", "link", other["id"], added["id"],
                                    "related").stdout)
         self.assertEqual(linked["links"][0]["dst"], added["id"])
-        stats = json.loads(jarvis(self.base, "mem", "stats").stdout)
+        stats = json.loads(self.cli( "mem", "stats").stdout)
         self.assertEqual((stats["items"], stats["links"]), (2, 1))
 
     def test_instant_question_is_answered_remembered_and_visible_to_the_console(self):
-        out = json.loads(jarvis(self.base, "ask", "what day is it").stdout)
+        out = json.loads(self.cli( "ask", "what day is it").stdout)
         self.assertEqual(out["lane"], "instant")
         self.assertRegex(out["reply"], r"^It's \w+day, \w+ \d+\w\w, \d{4}\.$")
         feed = (self.base / "events.jsonl").read_text(encoding="utf-8")
@@ -871,7 +1032,7 @@ class CliWorkflowTests(Temp):
         self.assertEqual(history[-1]["reply"]["body"], out["reply"])
 
     def test_route_is_a_dry_run(self):
-        out = json.loads(jarvis(self.base, "route", "build a full-stack app").stdout)
+        out = json.loads(self.cli( "route", "build a full-stack app").stdout)
         self.assertIn(out["tier"], ("simple", "complex"))
         self.assertEqual(Store(self.base).list(), [])
         self.assertEqual(Memory(self.base).stats()["items"], 0)
@@ -880,7 +1041,7 @@ class CliWorkflowTests(Temp):
         for args in (("mem", "get", "note:none"), ("show", "deadbeef"), ("run", "deadbeef"),
                      ("orchestrate", "show", "plan-ffffffff"), ("add", str(self.base / "nope.json")),
                      ("ask", "   ")):
-            done = jarvis(self.base, *args, check=False)
+            done = self.cli( *args, check=False)
             self.assertEqual(done.returncode, 1, args)
             self.assertTrue(done.stderr.startswith("JARVIS:"), (args, done.stderr))
             self.assertNotIn("Traceback", done.stderr, args)
@@ -890,19 +1051,19 @@ class CliWorkflowTests(Temp):
         for spec in ({"objective": "x", "workspace": "../.."}, {"objective": "x", "mode": "root"},
                      {"objective": ""}, {"objective": "x", "provider": "gemini"}):
             bad.write_text(json.dumps(spec), encoding="utf-8")
-            done = jarvis(self.base, "add", str(bad), check=False)
+            done = self.cli( "add", str(bad), check=False)
             self.assertEqual(done.returncode, 1, spec)
             self.assertNotIn("Traceback", done.stderr, spec)
         good = self.base / "good.json"
         good.write_text(json.dumps({"objective": "Check the code", "workspace": "."}),
                         encoding="utf-8")
-        task = json.loads(jarvis(self.base, "add", str(good)).stdout)
+        task = json.loads(self.cli( "add", str(good)).stdout)
         self.assertEqual(task["state"], "queued")
-        self.assertEqual(json.loads(jarvis(self.base, "runs").stdout)[0]["id"], task["id"])
-        self.assertIn("prompt-engineering subagent", jarvis(self.base, "engineer", task["id"]).stdout)
+        self.assertEqual(json.loads(self.cli( "runs").stdout)[0]["id"], task["id"])
+        self.assertIn("prompt-engineering subagent", self.cli( "engineer", task["id"]).stdout)
 
     def test_doctor_reports_without_touching_anything(self):
-        out = json.loads(jarvis(self.base, "doctor").stdout)
+        out = json.loads(self.cli( "doctor").stdout)
         self.assertIn("tools", out)
         self.assertIn("devices", out)
 
@@ -919,6 +1080,10 @@ class LocalServerWorkflowTests(Temp):
         # listen_port; the test's own hub must not collide with it.
         config = json.loads((Path(ROOT) / "jarvis.config.json").read_text(encoding="utf-8"))
         config.setdefault("cluster", {})["enabled"] = False
+        config["memory"] = {**config.get("memory", {}), "semantic": False}
+        config["decisions"] = {**config.get("decisions", {}), "shadow": False}
+        config["routing"] = {**config.get("routing", {}), "interpreter": False}
+        config["vault"] = {**(config.get("vault") or {}), "enabled": False}
         config_path = Path(self.base) / "jarvis.config.json"
         config_path.write_text(json.dumps(config), encoding="utf-8")
         proc = subprocess.Popen([sys.executable, "-m", "jarvis", "--config", str(config_path),

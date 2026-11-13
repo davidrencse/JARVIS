@@ -95,7 +95,7 @@ class ProviderLimitTests(unittest.TestCase):
         path = self.home / ".claude" / "projects" / "sample.jsonl"
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps({"type": "assistant", "timestamp": mod._now().isoformat(),
-            "message": {"id": "reply", "usage": {"input_tokens": 10, "output_tokens": 20}}}))
+            "message": {"id": "reply", "usage": {"input_tokens": 10, "output_tokens": 20}}}) + "\n")
         with patch.object(mod, "_subscription_json", side_effect=RuntimeError("Usage endpoint returned HTTP 403")):
             reading = self.reading()
             self.credits._claude(reading, ())

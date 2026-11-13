@@ -127,6 +127,13 @@ class GuardTests(unittest.TestCase):
         tree(self.repo, {"jarvis/a.py": "old\n", "pyproject.toml": "old\n"})
         release.backup(self.state, self.repo)
         tree(self.repo, {"jarvis/a.py": "new\n", "jarvis/b.py": "new file\n", "pyproject.toml": "new\n"})
+        # The script's first sleep lets the old process exit; these tests start no old
+        # process, so the same script runs with the waits shortened.
+        fast = (release.GUARD.replace("time.sleep(2)", "time.sleep(0.05)", 1)
+                 .replace("time.sleep(1)", "time.sleep(0.02)", 1))
+        guard = patch.object(release, "GUARD", fast)
+        guard.start()
+        self.addCleanup(guard.stop)
 
     def run_guard(self, child, wait=4):
         (self.state / "logs").mkdir(parents=True, exist_ok=True)
