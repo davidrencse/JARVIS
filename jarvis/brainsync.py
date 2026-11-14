@@ -1567,6 +1567,8 @@ def approve_pending_handoff(config, base, old_main, new_main, *, incarnation, ep
               "incarnation": incarnation, "epoch": epoch, "memory_sha256": memory_sha256,
               "bundle_sha256": bundle_sha256}
     with _Lock(base):
+        if _frozen(base, old_main):
+            raise BrainSyncError("handoff_readonly")
         # Validate before publishing, preserving any old review on failure.
         blob_path = _pending_bin(base)
         review_path = _state_dir(base) / REVIEW_FILE
