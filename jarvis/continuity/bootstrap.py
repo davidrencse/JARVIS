@@ -588,3 +588,76 @@ def cutover(hub_config, state, operator_config, *, expect_mode, expect_version,
                 restored = lifecycle.wake(state)
                 if restored.get("failed"):
                     raise BootstrapError("local_service_restore_failed")
+
+
+def cancel_initial(hub_config, state, operator_config, *, expect_version, confirmed=False,
+                   client_factory=None, lifecycle=None):
+    """Restore this PC only after an owner-authenticated initial-setup cancellation.
+
+    Keep the executor journal and archive the enrollment marker. The gateway
+    refuses cancellation once any managed transition or admission has existed.
+    """
+    if confirmed is not True:
+        raise BootstrapError("confirmation_required")
+    from .cli import build_client
+    path, operator, client, before, _key, owner = _operator(
+        operator_config, client_factory or build_client)
+    if owner is None:
+        raise BootstrapError("owner_proof_unavailable")
+    if before.get("mode_version") != expect_version:
+        raise BootstrapError("gateway_tuple_moved")
+    if before.get("mode") not in ("PREPARING_V2", "QUIESCED"):
+        raise BootstrapError("unsupported_cancel_mode")
+    hub_path = Path(hub_config).expanduser().resolve()
+    hub = _hub(hub_path, operator["device_id"], tuple(operator["enrollment"]))
+    lifecycle = lifecycle or _default_lifecycle(hub_path, state, operator["device_id"])
+    if not lifecycle.supported() or not lifecycle.active(getattr(lifecycle, "service_name", _SERVICE)):
+        raise BootstrapError("local_service_not_active")
+    directory = Path(state).resolve()
+    marker = directory / _MARKER
+    archive = directory / ("continuity-managed.cancelled-v" + str(expect_version + 2) + ".json")
+    from .integration import continuity_state, clear_production, _fsync_directory
+    if continuity_state(state) != "managed" or archive.exists() or archive.is_symlink():
+        raise BootstrapError("cancel_state_invalid")
+    guard = None
+    attempted = False
+    try:
+        attempted = True
+        report = lifecycle.pause(state)
+        service = getattr(lifecycle, "service_name", _SERVICE)
+        if (report.get("paused") is not True or report.get("failed")
+                or service not in report.get("stopped", []) or lifecycle.active(service)):
+            raise BootstrapError("local_service_stop_unverified")
+        participant, guard, _controller = _validate_production(path, operator, hub, state)
+        result = client.set_mode("CANCEL_INITIAL_BOOTSTRAP", expect_version)
+        expected = {"mode": "LEGACY_ACTIVE", "mode_version": expect_version + 2,
+                    "initial_bootstrap_cancelled": True}
+        if result != expected:
+            raise BootstrapError("cancel_receipt_invalid")
+        current = client.status()
+        if (current.get("mode") != "LEGACY_ACTIVE" or current.get("mode_version") != expect_version + 2
+                or current.get("lease_valid") is not False or current.get("transition") is not None):
+            raise BootstrapError("gateway_tuple_moved")
+        guard.fence(current["incarnation"], current["epoch"], current["mode_version"], reopen_legacy=True)
+        if guard.local_view().get("legacy_closed") is not False:
+            raise BootstrapError("legacy_reopen_unverified")
+        # Recheck after acknowledgement. No unmanaged effect has been admitted.
+        if client.status() != current:
+            raise BootstrapError("gateway_tuple_moved")
+        if continuity_state(state) != "managed":
+            raise BootstrapError("cancel_state_invalid")
+        os.replace(marker, archive)
+        _fsync_directory(directory)
+        clear_production(state)
+        from .participant import unbind
+        unbind(state)
+        return {"ok": True, "initial_bootstrap_cancelled": True,
+                "mode": "LEGACY_ACTIVE", "mode_version": current["mode_version"],
+                "executor_preserved": True, "marker_archived": True}
+    finally:
+        if guard is not None:
+            guard.close()
+        if attempted:
+            restored = lifecycle.wake(state)
+            if restored.get("failed"):
+                raise BootstrapError("local_service_restore_failed")

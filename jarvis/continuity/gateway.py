@@ -1401,6 +1401,11 @@ class ContinuityGateway:
         """One cutover edge. The store still refuses jumps to V2_ACTIVE."""
         self._accept_owner(owner_proof, "mode", _exact(payload, ("mode", "expected_mode_version")))
         mode = payload["mode"]
+        if mode == "CANCEL_INITIAL_BOOTSTRAP":
+            version = self._store(lambda: self.store.cancel_initial_bootstrap(
+                _nnint(payload["expected_mode_version"])))
+            return {"mode": "LEGACY_ACTIVE", "mode_version": version,
+                    "initial_bootstrap_cancelled": True}
         if not isinstance(mode, str) or mode not in {
                 "PREPARING_V2", "QUIESCED", "V2_ONLY_NO_MAIN", "LEGACY_ACTIVE", "ROLLBACK_QUIESCED"}:
             raise GatewayError("bad_request")

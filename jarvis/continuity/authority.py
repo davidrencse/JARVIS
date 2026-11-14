@@ -610,6 +610,32 @@ class AuthorityStore:
                 raise AuthorityError("busy", "a transition is open")
             return new_version
 
+    def cancel_initial_bootstrap(self, expected_mode_version):
+        """Owner-only setup cancellation, before this authority has issued any work.
+
+        Ordinary rollback still requires every participant acknowledgement. This
+        operation cannot be used after even an unsuccessful managed transition.
+        """
+        self._guard()
+        _int(expected_mode_version, "expected_mode_version")
+        with self._tx() as db:
+            row = self._row(db)
+            if row["mode_version"] != expected_mode_version:
+                raise AuthorityError("stale", "mode version changed")
+            if row["mode"] not in ("PREPARING_V2", "QUIESCED"):
+                raise AuthorityError("bad_edge", "only initial setup may be cancelled")
+            if (row["transition_id"] or row["holder"] or row["lease_id"]
+                    or row["last_holder"] or row["max_validity"] != 0
+                    or db.execute("SELECT 1 FROM transitions LIMIT 1").fetchone()
+                    or db.execute("SELECT 1 FROM admissions LIMIT 1").fetchone()):
+                raise AuthorityError("busy", "managed history requires coordinated rollback")
+            # Quiesced participants may already have acknowledged version N+1.
+            # Reopening must be strictly newer than that durable high-water mark.
+            version = row["mode_version"] + 2
+            db.execute("UPDATE authority SET mode='LEGACY_ACTIVE', mode_version=?, updated_at=? "
+                       "WHERE fleet_id=?", (version, self._wall(), self.fleet_id))
+            return version
+
     # --- lease --------------------------------------------------------------------------
 
     def renew(self, holder, lease_id, incarnation, epoch):

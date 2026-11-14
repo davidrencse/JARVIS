@@ -28,6 +28,10 @@ def add_arguments(parser):
     cut.add_argument("--expect-mode", choices=("QUIESCED", "V2_ONLY_NO_MAIN"), required=True)
     cut.add_argument("--expect-version", type=int, required=True)
     cut.add_argument("--yes", action="store_true", help="confirm local service stop and fence")
+    cancel = boot.add_parser("cancel", help="cancel initial setup before any managed work")
+    _bootstrap_args(cancel)
+    cancel.add_argument("--expect-version", type=int, required=True)
+    cancel.add_argument("--yes", action="store_true")
     sub.add_parser("status")
     recover = sub.add_parser("recover", aliases=["lease"])
     recover.add_argument("--hub-config", required=True, help="local JARVIS config (read only)")
@@ -106,6 +110,11 @@ def run(args, client_factory=build_client, output=print, confirm=input):
                     result = bootstrap.configure(args.hub_config, args.state, args.operator_config,
                                                  settings_manifest=args.settings_manifest,
                                                  confirmed=True, client_factory=client_factory)
+                elif subaction == "cancel":
+                    if not args.yes and confirm("Cancel initial setup and restore legacy services? [y/N] ").strip().lower() != "y":
+                        return 1
+                    result = bootstrap.cancel_initial(args.hub_config, args.state, args.operator_config,
+                        expect_version=args.expect_version, confirmed=True, client_factory=client_factory)
                 elif subaction == "cutover":
                     if not args.yes and confirm("Stop local JARVIS and fence continuity admission? [y/N] ").strip().lower() != "y":
                         return 1
