@@ -421,7 +421,7 @@ class ProductionCompositionTests(unittest.TestCase):
 
                 # Prepare the explicit, hash-reviewed return approval using a
                 # source export while Dell is the ready MAIN. The actual return
-                # below re-exports and imports over the broker transition path.
+                # below sends those exact bytes over the broker transition path.
                 # The former Zenbook Hub has released its role locks; the
                 # hash-reviewed local preparation is deliberately offline.
                 _close_test_hub(hub, state)
@@ -447,6 +447,12 @@ class ProductionCompositionTests(unittest.TestCase):
                     freeze_sha256=hashlib.sha256(freeze_path.read_bytes()).hexdigest(), confirmed=True)
                 self.assertTrue(prepared["ok"], prepared)
                 self.assertTrue(approval.is_file())
+                reviewed = brainsync.approve_pending_handoff(
+                    acting_main_config(dell_config), dell_base, "dell", "zenbook",
+                    incarnation=final["incarnation"], epoch=final["epoch"],
+                    memory_sha256=hashlib.sha256(incoming_memory).hexdigest(),
+                    bundle_sha256=hashlib.sha256(reviewed_blob).hexdigest())
+                self.assertEqual(reviewed["bundle_sha256"], hashlib.sha256(reviewed_blob).hexdigest())
 
                 # The owner PC has handed its role to Dell. Stop its old Hub and
                 # run the shipped node worker as a separate process; its owner

@@ -139,6 +139,7 @@ class SafeMainTests(unittest.TestCase):
 
         with mock.patch("jarvis.continuity.repoint.effective_config", side_effect=effective), \
                 mock.patch.object(hub_control, "request_main", side_effect=request) as posted, \
+                mock.patch.object(hub_control, "owner_client"), \
                 mock.patch("jarvis.cluster.Hub.dispatch", side_effect=AssertionError("dispatch")), \
                 mock.patch("jarvis.config_lock.config_mutation", side_effect=AssertionError("fleet lock")):
             out = []

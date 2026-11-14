@@ -74,6 +74,8 @@ class HubControlTests(unittest.TestCase):
     def test_client_uses_owner_auth_and_no_remote_or_dns_origin(self):
         cfg = {'cluster': {'main_url': 'http://127.0.0.1:7780'}}
         with patch('jarvis.cluster.Client') as client:
+            client.return_value.owner = True
+            client.return_value.url = 'http://127.0.0.1:7780'
             hub_control.request_main(cfg, '/tmp/fake', 'dell')
             client.assert_called_once_with(cfg, '/tmp/fake', owner=True)
             client.return_value.request.assert_called_once_with(
