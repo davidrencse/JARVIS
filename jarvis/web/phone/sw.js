@@ -50,8 +50,7 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
   // Secrets can also arrive on a shell URL. Such requests must never touch the cache.
   if (url.search || req.headers.has("Authorization") || req.headers.has("X-CSRF-Token") || req.headers.has("X-JARVIS-Session")) return;
-  // Pairing and /phone/api/* (frame long-poll included) stay on the network. Never cached.
-  if (url.pathname === "/phone/api" || url.pathname.startsWith("/phone/api/")) return;
+  // Pairing and /phone/* (API and frame long-poll included) stay on the network. Never cached.
   if (url.pathname === "/phone" || url.pathname.startsWith("/phone/")) return;
   const key = req.mode === "navigate" ? (url.pathname === "/" ? "/" : null) : url.pathname;
   if (!key || !SHELL.includes(key)) return;
@@ -86,7 +85,6 @@ function cacheable(res, key) {
     path = final.pathname;
   } catch (e) { /* keep the request key */ }
   if (!SHELL.includes(path)) return false;
-  if (path === "/phone/api" || path.startsWith("/phone/api/")) return false;
   if (path === "/phone" || path.startsWith("/phone/")) return false;
   if (res.headers.has("Set-Cookie")) return false;
   const control = (res.headers.get("Cache-Control") || "").toLowerCase();

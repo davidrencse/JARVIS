@@ -1754,7 +1754,7 @@
       try {
         const res = await fetch(frameUrl(sess.lastSeq || 0),
           { signal: ctl.signal, credentials: "same-origin", cache: "no-store",
-            headers: Object.assign(phoneHeaders(false), { "X-JARVIS-Session": id }) });
+            headers: phoneHeaders(false, id) });
         if (g !== gen) return;
         if (res.status === 204) {
           fails = 0; reconnecting = false; reachable(true);
