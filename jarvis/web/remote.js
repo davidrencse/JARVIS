@@ -114,7 +114,7 @@
     if (st === "starting" || st === "stale") { h = "Starting the stream…"; p = `Waiting for the first frame from ${esc(dev?.label || "the computer")}.`; }
     else if (st === "failed") { h = "The session ended"; p = esc(ended.error); }
     else if (st === "ended") { h = "Disconnected"; p = "Choose a computer and press Connect to start again."; }
-    else if (!devices.some((d) => d.ready)) { h = "No computer is ready"; p = "The node must be online and running the current code. On the main computer, run <code>jarvis cluster update &lt;node&gt;</code>, then check again."; }
+    else if (!devices.some((d) => d.ready)) { h = "No computer is ready"; p = "The node must be online and running the current code. It pulls each release by itself; to speed it up, run <code>jarvis cluster update &lt;node&gt;</code> on the main computer, then check again."; }
     else { h = "Not connected"; p = "Choose a computer and press Connect."; }
     const html = `<div><h2>${esc(h)}</h2><p>${p}</p></div>`;
     if (el.ph.innerHTML !== html) el.ph.innerHTML = html;
