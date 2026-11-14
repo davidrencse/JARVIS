@@ -409,24 +409,31 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None, *, health=None):
 NODE_MODULES = ("__main__", "cluster_cli", "cluster", "deploy", "node", "remote")
 
 
+def _child_import(root, modules, timeout, failure):
+    """Import `jarvis.<m>` for each module in a child Python with `root` first on the path.
+    Returns None on success, else the last stderr line (or `failure: <exc>` if the child
+    could not run). Callers pick the modules and own the missing-module policy."""
+    import sys
+    code = "import " + ", ".join(f"jarvis.{m}" for m in modules)
+    try:
+        done = subprocess.run([sys.executable, "-c", code], cwd=str(root), capture_output=True,
+                              text=True, timeout=timeout, creationflags=NO_WINDOW,
+                              env={**os.environ, "PYTHONPATH": str(root), "PYTHONDONTWRITEBYTECODE": "1"})
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{failure}: {exc}"
+    if done.returncode:
+        last = (done.stderr.strip().splitlines() or ["exit " + str(done.returncode)])[-1]
+        return last[-300:]
+    return None
+
+
 def _starts(stage, timeout=60):
     """Why the staged package can't be imported, or None. Runs in a child Python with the
     staged folder first on the path, so it imports the new code, not this process's."""
     present = [m for m in NODE_MODULES if (Path(stage) / "jarvis" / f"{m}.py").is_file()]
     if not present or not (Path(stage) / "jarvis" / "__init__.py").is_file():
         return None  # not a full package (tests' small trees); the fingerprint check stands
-    import sys
-    code = "import " + ", ".join(f"jarvis.{m}" for m in present)
-    try:
-        done = subprocess.run([sys.executable, "-c", code], cwd=stage, capture_output=True,
-                              text=True, timeout=timeout, creationflags=NO_WINDOW,
-                              env={**os.environ, "PYTHONPATH": str(stage), "PYTHONDONTWRITEBYTECODE": "1"})
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"couldn't test it: {exc}"
-    if done.returncode:
-        last = (done.stderr.strip().splitlines() or ["exit " + str(done.returncode)])[-1]
-        return last[-300:]
-    return None
+    return _child_import(stage, present, timeout, "couldn't test it")
 
 
 def _keep_previous(repo):
@@ -536,18 +543,7 @@ def _import_agent(repo, timeout=60):
     Unlike `_starts`, this does not treat a missing package as success. The caller
     has already required every `NODE_MODULES` file. A child that cannot be started
     is a failure."""
-    import sys
-    code = "import " + ", ".join(f"jarvis.{name}" for name in NODE_MODULES)
-    try:
-        done = subprocess.run([sys.executable, "-c", code], cwd=str(repo), capture_output=True,
-                              text=True, timeout=timeout, creationflags=NO_WINDOW,
-                              env={**os.environ, "PYTHONPATH": str(repo), "PYTHONDONTWRITEBYTECODE": "1"})
-    except (OSError, subprocess.SubprocessError) as exc:
-        return f"couldn't import the agent: {exc}"
-    if done.returncode:
-        last = (done.stderr.strip().splitlines() or ["exit " + str(done.returncode)])[-1]
-        return last[-300:]
-    return None
+    return _child_import(repo, NODE_MODULES, timeout, "couldn't import the agent")
 
 
 def _local_doctor(repo, state):
