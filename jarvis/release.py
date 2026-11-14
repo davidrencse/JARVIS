@@ -79,6 +79,86 @@ def served_code(state):
     return current(state).get("code") or code_fingerprint()
 
 
+def validate_bundle_proof(raw, code):
+    """A signer-attested tested release, not an inference from a package signature."""
+    import math
+    try:
+        proof = json.loads(raw)
+        at = proof.get('at')
+        if (type(proof.get('schema')) is not int or proof.get('schema') != 1 or proof.get('code') != code
+                or not isinstance(code, str) or len(code) != 16
+                or any(c not in '0123456789abcdef' for c in code)
+                or isinstance(at, bool) or not isinstance(at, (int, float))
+                or not math.isfinite(at) or at <= 0
+                or not isinstance(proof.get('tests'), str)
+                or not isinstance(proof.get('commit'), str) or not proof['commit']
+                or not isinstance(proof.get('warnings', []), list)
+                or not all(isinstance(w, str) for w in proof.get('warnings', []))):
+            raise ValueError('invalid proof')
+    except (ValueError, TypeError, AttributeError, UnicodeError) as exc:
+        raise ValueError('Invalid tested-release proof; not installed.') from exc
+    return {k: proof[k] for k in ('schema', 'code', 'at', 'tests', 'commit', 'warnings') if k in proof}
+
+
+def bundle_proof(state, root, code):
+    """Only the current tested snapshot can assert test evidence inside a signed ZIP."""
+    note = current(state)
+    if (not note or note.get('code') != code or is_bad(state, code)
+            or Path(root).resolve() != (release_dir(state) / 'jarvis').resolve()):
+        return None
+    try:
+        return validate_bundle_proof(json.dumps({**note, 'schema': 1}), code)
+    except ValueError:
+        return None
+
+
+def adopt_bundle_proof(state, repo, proof, version):
+    """Publish an authenticated package snapshot only after installer health passed.
+
+    The caller verified the pinned version signature and strictly newer transport
+    version. The source release time also prevents rewrapping an old tested
+    release in a fresh transport version from replacing a newer local snapshot.
+    """
+    from .locking import exclusive_lock
+    from .deploy import installed_version
+    import math
+    state, repo = Path(state), Path(repo)
+    state.mkdir(parents=True, exist_ok=True)
+    with exclusive_lock(state / 'code-release.lock'):
+        old = current(state)
+        if is_bad(state, proof['code']) or version <= installed_version(state):
+            return False
+        if old:
+            at = old.get('at')
+            if (not isinstance(at, (int, float)) or isinstance(at, bool)
+                    or not math.isfinite(at) or at >= proof['at']):
+                return False
+        with tempfile.TemporaryDirectory(prefix='tested-bundle-', dir=state) as temporary:
+            fresh = Path(temporary) / 'snapshot'
+            fresh.mkdir()
+            shutil.copytree(repo / 'jarvis', fresh / 'jarvis',
+                            ignore=shutil.ignore_patterns(*SKIP, '*.pyc', *EXCLUDE))
+            project = repo / 'pyproject.toml'
+            if project.is_file():
+                shutil.copy2(project, fresh / 'pyproject.toml')
+            if code_fingerprint(fresh / 'jarvis') != proof['code']:
+                raise ValueError('Installed package changed after health; no tested proof adopted.')
+            _write(fresh / 'release.json', {**proof, 'bundle_version': version})
+            final = release_dir(state)
+            previous = state / (RELEASE + '.adopt-old')
+            shutil.rmtree(previous, ignore_errors=True)
+            if final.exists():
+                os.replace(final, previous)
+            try:
+                os.replace(fresh, final)
+            except OSError:
+                if previous.exists():
+                    os.replace(previous, final)
+                raise
+            shutil.rmtree(previous, ignore_errors=True)
+    return True
+
+
 def _tested_fingerprint(state):
     """The snapshot fingerprint, or None. Never the live-tree fallback `served_code` uses."""
     try:
@@ -176,7 +256,8 @@ def code_parity(state, reported=None):
     elif tested and reported_code != tested:
         blocks.append(("code_mismatch", (
             f"The other PC runs different JARVIS code ({reported_code}, tested release {tested}). "
-            "On the main: jarvis cluster update <node>. This check does not update a node.")))
+            "Nodes pull it automatically after a green push to origin/main; "
+            "`jarvis cluster update <node>` only speeds that up. This check does not update a node.")))
     bad = [code for code in (tested, reported_code) if code and is_bad(state, code)]
     if bad:
         shown = ", ".join(dict.fromkeys(bad))
@@ -191,8 +272,12 @@ def source(state):
     return release_dir(state) / "jarvis" if current(state) else PACKAGE
 
 
-def settled(root=PACKAGE, quiet=QUIET, now=None):
-    """True when no package file was saved in the last `quiet` seconds."""
+def settled(root=None, quiet=QUIET, now=None):
+    """True when no package file was saved in the last `quiet` seconds (the checkout's, even
+    when this process runs from the release copy)."""
+    if root is None:
+        from .home import home, in_release
+        root = home() / "jarvis" if in_release() else PACKAGE
     newest = 0
     for path in _files(Path(root)):
         try:
@@ -204,7 +289,8 @@ def settled(root=PACKAGE, quiet=QUIET, now=None):
 
 def source_commit(repo=None):
     """Resolve a local remote-tracking commit; never fetch or read dirty files."""
-    repo = Path(repo or PACKAGE.parent)
+    from .home import home, in_release
+    repo = Path(repo or (home() if in_release() else PACKAGE.parent))  # the checkout, even from the release copy
     for ref in ("origin/main", "HEAD"):
         result = subprocess.run(["git", "rev-parse", "--verify", ref + "^{commit}"],
                                 cwd=repo, capture_output=True, text=True, timeout=15)
@@ -218,7 +304,23 @@ def due(state, quiet=QUIET):
         commit = source_commit()
     except (OSError, ValueError, subprocess.SubprocessError):
         return False
-    return commit not in (current(state).get("commit"), _read(Path(state) / FAILED).get("commit"))
+    return (commit not in (current(state).get("commit"), _read(Path(state) / FAILED).get("commit"))
+            and _successor_commit_allowed(state, commit))
+
+
+def _successor_commit_allowed(state, commit, repo=None):
+    """A stale successor checkout cannot replace its newer imported tested release."""
+    note = current(state)
+    if not note.get('bundle_version') or note.get('commit') == commit:
+        return True
+    from .home import home, in_release
+    repo = Path(repo or (home() if in_release() else PACKAGE.parent))
+    try:
+        result = subprocess.run(['git', 'merge-base', '--is-ancestor', note['commit'], commit],
+                                cwd=repo, capture_output=True, timeout=15)
+    except (OSError, KeyError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _archive(repo, stage, commit):
@@ -260,16 +362,70 @@ def run_tests(stage, timeout=TEST_TIMEOUT):
     return gate(stage, timeout=timeout)
 
 
+LOCK_NOTE = "code-release.holder.json"   # who holds code-release.lock: {pid, at, command, commit}
+
+
+def _pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def lock_holder(state, now=None):
+    """Who is testing a release now: {pid, age, command, commit}, or None. A note whose
+    process is gone is a stale lock: it is cleared here, so the next cut is never blocked by it."""
+    path = Path(state) / LOCK_NOTE
+    note = _read(path)
+    if not note:
+        return None
+    if not _pid_alive(note.get("pid")):
+        path.unlink(missing_ok=True)
+        return None
+    at = note.get("at")
+    age = max(0, int((now or time.time()) - at)) if isinstance(at, (int, float)) else None
+    return {"pid": note["pid"], "age": age, "command": note.get("command") or "unknown",
+            "commit": note.get("commit")}
+
+
+def describe_holder(holder):
+    if not holder:
+        return "Another release is being tested."
+    age = "" if holder.get("age") is None else f", running {holder['age'] // 60} min {holder['age'] % 60} s"
+    return f"Another release is being tested by pid {holder['pid']}{age}: {holder['command']}"
+
+
 def status(state):
     failed = _read(Path(state) / FAILED)
     note = current(state)
+    holder = lock_holder(state)
+    if holder:
+        return {**note, "testing": holder, "message": describe_holder(holder)}
     if failed and failed.get("blocking", True):
         names = failed.get("failures") or [failed.get("tests") or "unknown test"]
         return {**failed, "message": "Release blocked: " + str(names[0])}
     return {**note, "message": "Release shipped with warnings" if note.get("warnings") else "Release ready"}
 
 
-def cut(state, repo=None, quiet=QUIET, tests=run_tests):
+def retry_failures(stage, ids, timeout=300):
+    """Re-run only these test ids once; return the ones that fail again. A runner failure
+    ("runner:core") has no test id to re-run and stays failed."""
+    from .release_gate import _run
+    again = []
+    for name in ids:
+        if not isinstance(name, str) or name.startswith("runner:") or _run(stage, name, timeout).get("failures"):
+            again.append(name)
+    return again
+
+
+def cut(state, repo=None, quiet=QUIET, tests=run_tests, retry=retry_failures):
     """Test a snapshot of the code and, if it passes, make it what nodes get. Returns a
     report: {released, code, ...}. Never touches the release when anything fails."""
     from .locking import exclusive_lock
@@ -280,20 +436,28 @@ def cut(state, repo=None, quiet=QUIET, tests=run_tests):
     try:
         lock.__enter__()
     except ValueError:  # busy: the hub's own cut, or `jarvis cluster release`
-        return {"released": False, "note": "Another release is being tested."}
+        holder = lock_holder(state)
+        return {"released": False, "note": describe_holder(holder), "holder": holder}
     try:
-        return _cut(state, repo, quiet, tests)
+        _write(state / LOCK_NOTE, {"pid": os.getpid(), "at": time.time(),
+                                   "command": " ".join(sys.argv[:4]) or "jarvis"})
+        return _cut(state, repo, quiet, tests, retry)
     finally:
+        (state / LOCK_NOTE).unlink(missing_ok=True)
         lock.__exit__(None, None, None)
 
 
-def _cut(state, repo, quiet, tests):
+def _cut(state, repo, quiet, tests, retry=retry_failures):
     try:
         commit = source_commit(repo)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {"released": False, "note": str(exc)}
     if commit == current(state).get("commit"):
         return {"released": False, "code": current(state)["code"], "note": "Nodes already get this code."}
+    if not _successor_commit_allowed(state, commit, repo):
+        return {'released': False, 'code': current(state).get('code'),
+                'note': 'The local Git commit does not descend from the imported tested release. '
+                        'Synchronize Git before cutting a successor release; kept the authenticated snapshot.'}
     with tempfile.TemporaryDirectory(prefix="jarvis-release-") as stage:
         stage = Path(stage)
         _archive(repo, stage, commit)
@@ -303,9 +467,20 @@ def _cut(state, repo, quiet, tests):
         tail = detail.get("summary", "")
         if detail.get("deferred"):
             return {"released": False, "deferred": True, "note": tail}
+        attempts = []
+        first = detail.get("failures")
+        if not passed and isinstance(first, list) and first:
+            # One more try for just the failing ids: a flaky test must not hold a release back.
+            second = retry(stage, first)
+            attempts = [{"failures": list(first)}, {"failures": list(second)}]
+            if not second:
+                passed = True
+                detail = {**detail, "failures": [], "retried": list(first)}
+                tail = "Passed after re-running: " + ", ".join(first)
         if not passed:
             note = {"code": code, "commit": commit, "at": time.time(), "tests": tail,
-                    "failures": detail.get("failures", [tail]), "blocking": True}
+                    "failures": attempts[1]["failures"] if attempts else detail.get("failures", [tail]),
+                    "blocking": True, **({"attempts": attempts} if attempts else {})}
             _write(state / FAILED, note)
             notified = _read(state / "code-release-notified.json")
             commits = notified.get("commits", [])
@@ -324,7 +499,8 @@ def _cut(state, repo, quiet, tests):
         shutil.rmtree(fresh, ignore_errors=True)
         return {"released": False, "note": "The release copy didn't match what was tested."}
     note = {"code": code, "commit": commit, "at": time.time(), "tests": tail,
-            "warnings": detail.get("warnings", [])}
+            "warnings": detail.get("warnings", []),
+            **({"retried": detail["retried"]} if detail.get("retried") else {})}
     _write(fresh / "release.json", note)
     old = state / (RELEASE + ".old")
     shutil.rmtree(old, ignore_errors=True)
@@ -350,6 +526,8 @@ def backup(state, repo=None):
     shutil.copytree(repo / "jarvis", fresh / "jarvis", ignore=shutil.ignore_patterns(*SKIP, "*.pyc", *EXCLUDE))
     if (repo / "pyproject.toml").is_file():
         shutil.copy2(repo / "pyproject.toml", fresh / "pyproject.toml")
+    if current(state):
+        shutil.copytree(release_dir(state), fresh / RELEASE)
     shutil.rmtree(target, ignore_errors=True)
     os.replace(fresh, target)
     return target
@@ -459,6 +637,19 @@ if os.path.isfile(os.path.join(prev, "pyproject.toml")):
     shutil.copyfile(os.path.join(prev, "pyproject.toml"), os.path.join(repo, "pyproject.toml"))
 with open(os.path.join(state, "cluster-code-bad.json"), "w", encoding="utf-8") as f:
     json.dump({"code": want, "at": time.time()}, f)
+# A promoted node must never serve the failed package's tested snapshot. Preserve
+# a concurrently newer snapshot; restore only the one this watchdog installed.
+release = os.path.join(state, "code-release")
+try:
+    with open(os.path.join(release, "release.json"), encoding="utf-8") as f:
+        installed_release = json.load(f)
+except (OSError, ValueError):
+    installed_release = {}
+if installed_release.get("code") == want:
+    shutil.rmtree(release)
+    saved = os.path.join(prev, "code-release")
+    if os.path.isdir(saved):
+        shutil.copytree(saved, release)
 log("restored the previous code; starting it")
 if mode == "launch":
     sys.exit(subprocess.call(argv))

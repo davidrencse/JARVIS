@@ -18,6 +18,7 @@ parked in the confirmation queue (chatgpt.ConfirmGate, registry.risk). The allow
 heuristic over the command text; it narrows what runs unasked, it isn't a sandbox.
 """
 
+from .home import home as _jarvis_home
 import json
 import os
 import posixpath
@@ -620,7 +621,7 @@ def sandbox(folder=None, repo=None, config=None):
     macOS, no bwrap, or terminal.sandbox: false in jarvis.config.json)."""
     if on_windows() or on_macos() or not shutil.which("bwrap"):
         return []
-    repo = Path(repo) if repo else Path(__file__).resolve().parent.parent
+    repo = Path(repo) if repo else _jarvis_home()
     if config is None:
         config = read_json(repo / 'jarvis.config.json', {})
     if (config.get("terminal") or {}).get("sandbox", True) is False:

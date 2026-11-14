@@ -1365,7 +1365,7 @@ class Console:
             elif not online:
                 why = "Offline: start JARVIS on it and check its link (jarvis cluster doctor)."
             elif node.get("code") != served:
-                why = f"Runs older JARVIS code. Run: jarvis cluster update {name}"
+                why = f"Runs older JARVIS code. It pulls the release by itself; to speed it up: jarvis cluster update {name}"
             elif not shipped:  # the release nodes get predates remote control
                 if failed.get("code") == live:
                     why = "This computer's latest code failed its release tests, so nodes can't get it yet. Fix the failing test, then run: jarvis cluster release"
@@ -1373,7 +1373,7 @@ class Console:
                     if tests:
                         why += f" ({tests[-160:]})"
                 else:
-                    why = "Nodes don't have this computer's latest code yet. Run: jarvis cluster release, then jarvis cluster update " + name
+                    why = "Nodes don't have this computer's latest code yet. It pulls the release by itself once one is cut; to speed it up: jarvis cluster release, then jarvis cluster update " + name
             out.append({"id": name, "label": device.get("label") or name, "online": online,
                         "presence": presence, "ready": why is None, "why": why, "platform": (node or {}).get("platform")})
         return {"devices": out, "session": hub.remote.current(), "why": None,
@@ -1388,7 +1388,7 @@ class Console:
             return hub.remote_open(device, quality)
         except (OSError, RuntimeError) as exc:  # offline, busy, old code: say it plainly
             if "Nodes execute only" in str(exc):
-                raise ValueError(f"That computer runs older JARVIS code that can't do remote control yet. Run: jarvis cluster update {device}") from None
+                raise ValueError(f"That computer runs older JARVIS code that can't do remote control yet. It pulls the release by itself; to speed it up: jarvis cluster update {device}") from None
             raise ValueError(str(exc)) from None
 
     def remote_frame(self, query):

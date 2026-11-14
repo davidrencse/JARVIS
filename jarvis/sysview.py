@@ -48,12 +48,12 @@ STATIONS = [
     {"id": "log", "title": "Log", "verb": "records",
      "plain": "Everything is written down: the conversation in memory, agent runs in the "
               "task ledger, and live events to this console.",
-     "modules": ["store", "events", "locking", "config_lock", "cluster_store", "fsio", "pathsafe"]},
+     "modules": ["store", "events", "locking", "config_lock", "cluster_store", "fsio", "pathsafe", "home"]},
 ]
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay, the phone app.",
-     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "cluster_recovery", "cluster_discovery", "linkfinder", "deploy", "release", "release_runtime", "release_gate", "node", "platforms", "autostart", "settings", "rest"]},
+     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "cluster_recovery", "cluster_discovery", "linkfinder", "deploy", "release", "release_runtime", "release_gate", "drift", "gateway_auto", "node", "platforms", "autostart", "settings", "rest"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",

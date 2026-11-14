@@ -22,6 +22,7 @@ Synthetic and read speech is kinder than David far from the mic: trust it for fa
 accepts and for ranking engines, not as proof that he will never be rejected live.
 """
 
+from .home import home as _jarvis_home
 import argparse
 import json
 import re
@@ -444,7 +445,7 @@ def run(state, out_path, data_dir, quick=False, with_whisper=True, seed=0, log=p
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m jarvis.voice_eval", description=__doc__.split("\n")[0])
-    ap.add_argument("--state", default=str(Path(__file__).resolve().parents[1] / ".jarvis"))
+    ap.add_argument("--state", default=str(_jarvis_home() / ".jarvis"))
     ap.add_argument("--out", default=str(CACHE / "voice-eval.json"))
     ap.add_argument("--data", default=str(CACHE / "datasets"))
     ap.add_argument("--download", action="store_true", help="fetch Mini LibriSpeech (126 MB) first")

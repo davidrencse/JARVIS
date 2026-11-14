@@ -19,6 +19,7 @@ the date it was last confirmed:
     - Review runs daily at 02:00. ^c3f2a1 — source: [[source-042]] · confirmed: 2026-10-18
 """
 
+from .home import home as _jarvis_home
 import copy
 import difflib
 import hashlib
@@ -1583,7 +1584,7 @@ class KnowledgeBase:
         atomic_write(
             service,
             "[Unit]\nDescription=JARVIS knowledge checker (contradictions, stale claims, orphans)\n\n"
-            f"[Service]\nType=oneshot\nWorkingDirectory={Path(__file__).resolve().parent.parent}\n"
+            f"[Service]\nType=oneshot\nWorkingDirectory={_jarvis_home()}\n"
             f'Environment="PATH={os.environ.get("PATH", "/usr/local/bin:/usr/bin")}"\n'
             f"ExecStart={quoted}\n")
         atomic_write(

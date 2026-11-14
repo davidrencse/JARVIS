@@ -21,6 +21,7 @@ structured lane, about a small fixed sample on the subscription, and only then. 
 is appended to .jarvis/eval/runs.jsonl and compared with the last one, so a drop shows.
 """
 
+from .home import home as _jarvis_home
 import hashlib
 import json
 import random
@@ -28,7 +29,7 @@ import subprocess
 import time
 from pathlib import Path
 
-HOME = Path(__file__).resolve().parent.parent
+HOME = _jarvis_home()
 CASES = HOME / "tests" / "eval" / "cases.jsonl"
 GROUNDING = HOME / "tests" / "eval" / "grounding.jsonl"
 TYPES = ("act", "agent", "converse", "build", "instant", "vault", "clarify")
@@ -38,7 +39,7 @@ DECIDER_MODE = {"act": "act", "agent": "agent", "converse": "converse", "build":
 BRAIN_MODE = {**DECIDER_MODE, "clarify": "clarify"}
 RANK = {"allow": 0, "confirm": 1, "ratchet": 1, "deny": 2}
 PARTS = ("parser", "registry", "decider", "vault", "grounding", "judge", "brain")
-JUDGE = Path(__file__).resolve().parent.parent / "tests" / "eval" / "judge.jsonl"
+JUDGE = _jarvis_home() / "tests" / "eval" / "judge.jsonl"
 SHOW = 5  # failures listed per part
 FOLDS = 5  # cross-validation folds for the decider
 

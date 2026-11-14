@@ -1,5 +1,6 @@
 """Open JARVIS console pages as standalone windows."""
 
+from .home import home as _jarvis_home
 import subprocess
 import sys
 import time
@@ -11,7 +12,7 @@ from .platforms import NO_WINDOW, on_windows
 
 PAGES = {"wiki": "knowledge.html", "system": "design.html", "console": ""}
 PORTS = (7777, *range(7790, 7800))
-REPO = Path(__file__).resolve().parent.parent
+REPO = _jarvis_home()
 
 
 def serves_console(port, timeout=1.5):

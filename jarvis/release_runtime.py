@@ -89,8 +89,56 @@ def busy(state, *, hub=None, voice=False):
     return False
 
 
+def run_from_release(config):
+    """cluster.run_from_release: the main's services run the tested release copy, not the checkout."""
+    return bool((config.get('cluster') or {}).get('run_from_release', False))
+
+
+def running_from(state, package=None):
+    """Where this process imported jarvis from: 'release' (<state>/code-release/jarvis) or 'dev tree'."""
+    from .deploy import PACKAGE
+    from .release import release_dir
+    try:
+        return ('release' if Path(package or PACKAGE).resolve() == (release_dir(state) / 'jarvis').resolve()
+                else 'dev tree')
+    except OSError:
+        return 'dev tree'
+
+
+def run_source(config, state):
+    """(ok, detail, fix) for the `cluster doctor` line "main runs from: release | dev tree"."""
+    from .release import current
+    where, want = running_from(state), run_from_release(config)
+    code = current(state).get('code')
+    if where == 'release':
+        return True, f"release (code {code})", ''
+    if not want:
+        return True, 'dev tree (cluster.run_from_release is off)', ''
+    if not code:
+        return False, 'dev tree; cluster.run_from_release is on but no tested release exists', \
+            'jarvis cluster release'
+    return False, 'dev tree; cluster.run_from_release is on but this process was started from the checkout', \
+        'jarvis cluster autostart on   (rewrites the unit), then restart jarvis-cluster'
+
+
+def unit_runs_release(state, unit=None):
+    """True when the installed jarvis-cluster unit loads the release copy, so a restart lands on it."""
+    from .autostart import unit_file
+    from .release import release_dir
+    try:
+        text = (Path(unit) if unit else unit_file('jarvis-cluster.service')).read_text(encoding='utf-8')
+    except OSError:
+        return False
+    return 'PYTHONPATH=' + str(release_dir(state).resolve()) in text
+
+
 def maybe_restart(hub):
-    """Opt-in only. Never replace the main's dirty checkout with the release."""
+    """Opt-in only. Never replace the main's dirty checkout with the release.
+
+    With cluster.run_from_release the services import the release copy, so the checkout's state
+    is irrelevant: restart whenever the loaded code differs from the release (busy() still gates
+    it). Until the unit is switched (running from the checkout, unit not pointing at the
+    release) a restart would load the same code again, so the old checkout rule applies."""
     from .release import current
     from .deploy import code_fingerprint
     note = current(hub.state)
@@ -99,7 +147,11 @@ def maybe_restart(hub):
     if note.get('code') == getattr(hub, 'loaded_code',
                                    getattr(hub, '_release_started_code', None)):
         return False
-    if code_fingerprint() != note.get('code') or busy(hub.state, hub=hub, voice=True):
+    lands_on_release = run_from_release(hub.config) and (
+        running_from(hub.state) == 'release' or unit_runs_release(hub.state))
+    if not lands_on_release and code_fingerprint() != note.get('code'):
+        return False
+    if busy(hub.state, hub=hub, voice=True):
         return False
     from .cluster import _systemd_service
     if _systemd_service('jarvis-cluster'):

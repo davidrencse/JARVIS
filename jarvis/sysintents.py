@@ -12,6 +12,7 @@ the real backend; where a feature has none the answer says so plainly instead of
                 as the JARVIS process that scheduled it: no daemon, no systemd unit.
 """
 
+from .home import home as _jarvis_home
 import json
 import os
 import re
@@ -461,7 +462,7 @@ BT_NEEDS_NAME = ("connect", "disconnect", "pair", "forget")
 MAC = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}\Z")
 SCAN_SECONDS = 8
 SEEN_TTL = 300  # pair only a device a scan saw in the last five minutes
-SEEN_FILE = Path(__file__).resolve().parent.parent / ".jarvis" / "bluetooth-seen.json"
+SEEN_FILE = _jarvis_home() / ".jarvis" / "bluetooth-seen.json"
 _SEEN = {}  # mac -> (name, icon, seen at); mirrored to SEEN_FILE so a later process can pair
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x01|\x02")
 _DEVICE = re.compile(r"Device ((?:[0-9A-F]{2}:){5}[0-9A-F]{2}) (.*)\Z")
