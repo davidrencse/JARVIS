@@ -231,7 +231,9 @@ class HubRouteAuthTests(unittest.TestCase):
             handler.client_address = ('127.0.0.1', 1234)
             sent = []
             with patch.object(ui.Handler, '_send', lambda self, status, body: sent.append((status, body))), \
-                    patch.object(hub_control, 'run_main', return_value={'ok': True}) as run:
+                    patch.object(hub_control, 'run_main', return_value={'ok': True}) as run, \
+                    patch('jarvis.release_runtime.require_loaded_code') as loaded:
                 handler.do_POST()
             self.assertEqual(sent[0][0], expected)
             self.assertEqual(run.call_count, int(expected == 200))
+            self.assertEqual(loaded.call_count, int(path == '/v1/continuity/main' and 'owner' in caps))
