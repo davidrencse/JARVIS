@@ -310,7 +310,15 @@ class Participant:
                 if getattr(self, 'production_controller', None) is not None:
                     from jarvis.brainsync import jarvis_handoff_config
                     config = jarvis_handoff_config(config)
-                return run_here(payload['operation'], self.state, config)
+                try:
+                    return run_here(payload['operation'], self.state, config)
+                except RuntimeRefusal:
+                    raise
+                except Exception as exc:
+                    # The node reply carries only RuntimeRefusal.code, never this text.
+                    from .brain_channel import safe_code
+                    raise RuntimeRefusal(safe_code(getattr(exc, 'code', None),
+                                                   'brain_' + safe_code(type(exc).__name__.lower(), 'error')[:40])) from None
             if action == 'repoint':
                 controller = getattr(self, 'production_controller', None)
                 if controller is None:
@@ -565,7 +573,12 @@ def dispatch(hub, node, payload, timeout=120):
                 if job['state'] in TERMINAL:
                     if job['state'] == 'done':
                         return job['result']
-                    raise RuntimeRefusal('uncertain' if job['state'] == 'uncertain' else 'callback_failed')
+                    refusal = RuntimeRefusal('uncertain' if job['state'] == 'uncertain' else 'callback_failed')
+                    # Diagnostics only: callers still see callback_failed/uncertain.
+                    from .brain_channel import safe_code
+                    reply = job.get('result') if isinstance(job.get('result'), dict) else {}
+                    refusal.remote_code = safe_code(reply.get('code'), None)
+                    raise refusal
                 remaining = end - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeRefusal('uncertain')

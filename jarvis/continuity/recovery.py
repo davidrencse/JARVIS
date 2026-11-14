@@ -97,7 +97,15 @@ class ManualRecovery:
         if status.get('lease_valid') and not (current.get('action') == 'recover' and
                 current.get('candidate') == device and current.get('state') == 'GRANTED_NOT_READY'):
             raise RuntimeRefusal('main_alive')
-        if status.get('mode') not in ('V2_ONLY_NO_MAIN', 'HANDOVER'):
+        # Expiry does not rewrite the authority mode. A recover request may
+        # legitimately start in V2_ACTIVE after its ready MAIN lease lapses;
+        # drain below performs the normal mode transition and fencing. Require
+        # explicit expiry evidence, never a missing/unknown lease flag.
+        expired_active = (status.get('mode') == 'V2_ACTIVE'
+                          and status.get('lease_valid') is False
+                          and current.get('action') == 'recover'
+                          and current.get('candidate') == device)
+        if status.get('mode') not in ('V2_ONLY_NO_MAIN', 'HANDOVER') and not expired_active:
             raise RuntimeRefusal('bad_state')
         if current.get('candidate') != device or current.get('action') != 'recover':
             raise RuntimeRefusal('candidacy_mismatch')

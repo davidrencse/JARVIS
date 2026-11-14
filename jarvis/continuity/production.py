@@ -32,6 +32,45 @@ def _pins(operator):
     return pins
 
 
+BRAIN_OUTCOME = "brainsync-last-handoff.json"
+BRAIN_OUTCOME_SCHEMA = "jarvis-brain-handoff-outcome/1"
+
+
+def _record_brain_outcome(base, old, new, result, transport):
+    """Write the last managed brain step as codes only (no paths, names or memory).
+
+    The SafeHandoff journal keeps only ok/false for the step. This file says which
+    stage failed and why. It is diagnostics: a write failure never changes the step.
+    """
+    import json
+    import time
+    from jarvis import brainsync
+    from .brain_channel import safe_code
+    try:
+        out = {"schema": BRAIN_OUTCOME_SCHEMA, "at": int(time.time()),
+               "old_main": safe_code(old, None), "new_main": safe_code(new, None)}
+        if isinstance(result, BaseException):
+            out.update(ok=False, raised=safe_code(type(result).__name__.lower()),
+                       code=safe_code(getattr(result, "code", None), None),
+                       remote_code=safe_code(getattr(result, "remote_code", None), None))
+        elif isinstance(result, dict):
+            out.update(ok=result.get("ok") is True, status=safe_code(result.get("status"), None),
+                       error=safe_code(result.get("error"), None))
+        else:
+            out.update(ok=False, error="bad_result")
+        diagnostic = getattr(transport, "diagnostic", None)
+        if isinstance(diagnostic, dict):
+            out["transport"] = {key: value for key, value in diagnostic.items()
+                                if key in ("operation", "stage", "ok", "status", "error", "raised",
+                                           "code", "remote_code")
+                                and (type(value) is bool or safe_code(value, None) is not None)}
+        out = {key: value for key, value in out.items() if value is not None}
+        brainsync._write_private(Path(base) / ".jarvis" / BRAIN_OUTCOME,
+                                 json.dumps(out, sort_keys=True).encode("utf-8"), 0o600)
+    except Exception:
+        pass
+
+
 def _route(operator, device):
     routes = operator.get("successor_routes") if isinstance(operator, dict) else None
     route = routes.get(device) if isinstance(routes, dict) else None
@@ -175,8 +214,17 @@ class ProductionController:
         from jarvis import brainsync
         from .brain_channel import TransitionBundleTransport
         config = brainsync.jarvis_handoff_config(config)
-        transport = TransitionBundleTransport(config, base, self._remote)
-        return brainsync.handoff(old, new, config, base, transport=transport)
+        transport = None
+        result = None
+        try:
+            transport = TransitionBundleTransport(config, base, self._remote)
+            result = brainsync.handoff(old, new, config, base, transport=transport)
+            return result
+        except Exception as exc:
+            result = exc
+            raise
+        finally:
+            _record_brain_outcome(base, old, new, result, transport)
 
     def _repoint(self, old, new, _lease):
         remote = self._remote(new)
@@ -210,6 +258,11 @@ class ProductionController:
 
     def _require_transfer_parity(self, device):
         from jarvis.release import code_parity
+        from jarvis.release_runtime import require_loaded_code
+        try:
+            require_loaded_code(self.hub)
+        except ValueError:
+            raise RuntimeRefusal("code_mismatch") from None
         row = next((item for item in self.hub.broker.nodes() if item.get("id") == device), None)
         parity = code_parity(self.state, reported=row.get("code") if row else None)
         if parity.get("matched") is not True:

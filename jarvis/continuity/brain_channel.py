@@ -16,6 +16,20 @@ from pathlib import Path
 
 ACTIONS = frozenset({'brain_receive', 'brain_export', 'brain_freeze', 'brain_stage', 'brain_discard'})
 BUNDLE_NAME = re.compile(r'brain-[a-f0-9]{32}\.bundle')
+# Safe diagnostic codes: no path, name or content ever goes into one.
+CODE = re.compile(r'[a-z][a-z0-9_]{0,47}')
+
+
+class BrainChannelError(ValueError):
+    """A refused brain operation. ``code`` is safe to report; the text is not."""
+
+    def __init__(self, code, text):
+        super().__init__(text)
+        self.code = code
+
+
+def safe_code(value, default='unreported'):
+    return value if isinstance(value, str) and CODE.fullmatch(value) else default
 # Staged bundles left by a crashed or abandoned transfer are removed after this.
 STALE_BUNDLE_SECONDS = 24 * 3600
 
@@ -42,7 +56,7 @@ def validate(payload):
 
 def _outside_git(path):
     if any((parent / '.git').exists() for parent in (path, *path.parents)):
-        raise ValueError('Brain staging must be outside Git checkouts.')
+        raise BrainChannelError('brain_dir_in_git', 'Brain staging must be outside Git checkouts.')
 
 
 def _drop(path):
@@ -84,7 +98,7 @@ def run_here(payload, state, config):
     _outside_git(path)
     if payload['action'] == 'brain_discard':
         if where['dir'] or not BUNDLE_NAME.fullmatch(path.name):
-            raise ValueError('Invalid brain bundle.')
+            raise BrainChannelError('bad_bundle_path', 'Invalid brain bundle.')
         try:
             path.unlink()
         except FileNotFoundError:
@@ -92,14 +106,14 @@ def run_here(payload, state, config):
         return {'ok': True}
     if payload['action'] == 'brain_receive':
         if where['dir']:
-            raise ValueError('Invalid brain bundle.')
+            raise BrainChannelError('bad_bundle_path', 'Invalid brain bundle.')
         # An upload that cannot be imported must not stay in the staging folder.
         try:
             if path.stat().st_size > brainsync.MAX_BUNDLE_BYTES:
-                raise ValueError('Invalid brain bundle.')
+                raise BrainChannelError('bundle_too_large', 'Invalid brain bundle.')
             blob = path.read_bytes()
             if hashlib.sha256(blob).hexdigest() != payload['sha256']:
-                raise ValueError('Brain bundle digest mismatch.')
+                raise BrainChannelError('bundle_digest_mismatch', 'Brain bundle digest mismatch.')
             from .return_brain import receive
             result = receive(config, state, blob)
         except BaseException:
@@ -111,7 +125,7 @@ def run_here(payload, state, config):
             _drop(path)
         return result
     if not where['dir']:
-        raise ValueError('Brain staging must be a directory.')
+        raise BrainChannelError('brain_dir_not_dir', 'Brain staging must be a directory.')
     _sweep(path)
     if payload['action'] == 'brain_stage':
         return {'ok': True}
@@ -130,6 +144,9 @@ class ClusterBundleTransport:
     def __init__(self, config, base, *, call=None):
         self.config, self.state = config, Path(base) / '.jarvis'
         self._caller = call
+        # Last operation, codes only: which stage it reached and how it ended.
+        self.stage = None
+        self.diagnostic = None
 
     def _folder(self, node):
         value = self.config.get('devices', {}).get(node, {}).get('brain_transfer_dir')
@@ -143,33 +160,59 @@ class ClusterBundleTransport:
             return self._caller(node, payload)
         return call(self.config, self.state, node, payload, timeout=180)
 
-    def _attempt(self, callback):
+    def _note(self, operation, result=None, exc=None):
+        out = {'operation': operation, 'stage': safe_code(self.stage, None)}
+        if exc is not None:
+            out.update(ok=False, raised=safe_code(type(exc).__name__.lower()),
+                       code=safe_code(getattr(exc, 'code', None), None),
+                       remote_code=safe_code(getattr(exc, 'remote_code', None), None))
+        elif isinstance(result, dict):
+            out.update(ok=result.get('ok') is True, status=safe_code(result.get('status'), None),
+                       error=safe_code(result.get('error'), None))
+        else:
+            out.update(ok=False, error='bad_result')
+        self.diagnostic = {key: value for key, value in out.items() if value is not None}
+
+    def _attempt(self, operation, callback):
+        self.stage = None
         try:
-            return callback()
-        except (ConnectionError, OSError, TimeoutError):
+            result = callback()
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            self._note(operation, exc=exc)
             return {'ok': False, 'status': 'source_offline', 'error': 'source_offline'}
-        except (ValueError, RuntimeError, KeyError, TypeError):
+        except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+            self._note(operation, exc=exc)
             return {'ok': False, 'status': 'transport_failed', 'error': 'transport_failed'}
+        except BaseException as exc:
+            self._note(operation, exc=exc)
+            raise
+        self._note(operation, result)
+        return result
 
     def push(self, node, bundle):
-        return self._attempt(lambda: self._push(node, bundle))
+        return self._attempt('push', lambda: self._push(node, bundle))
 
     def pull(self, node, request):
-        return self._attempt(lambda: self._pull(node, request))
+        return self._attempt('pull', lambda: self._pull(node, request))
 
     def freeze(self, node, request):
-        return self._attempt(lambda: self._call(node, {
-            'action': 'brain_freeze', 'request': request.decode('utf-8')}))
+        def run():
+            self.stage = 'freeze'
+            return self._call(node, {'action': 'brain_freeze', 'request': request.decode('utf-8')})
+        return self._attempt('freeze', run)
 
     def _push(self, node, bundle):
         from jarvis.transfer import push
         from jarvis import brainsync
+        self.stage = 'prepare'
         if len(bundle) > brainsync.MAX_BUNDLE_BYTES:
             raise ValueError('Brain bundle too large.')
         folder = self._folder(node)
+        self.stage = 'stage'
         checked = self._call(node, {'action': 'brain_stage', 'path': folder})
         if checked.get('ok') is not True:
             raise ValueError('Peer refused brain staging.')
+        self.stage = 'upload'
         name = 'brain-' + uuid.uuid4().hex + '.bundle'
         # A drop after staging may already have uploaded the bundle. That is
         # not source_offline: a retry could deliver the snapshot twice.
@@ -185,6 +228,7 @@ class ClusterBundleTransport:
             # Join using the peer's path convention, independent of this host's OS.
             import ntpath, posixpath
             join = ntpath.join if '\\' in folder else posixpath.join
+            self.stage = 'receive'
             return self._call(node, {'action': 'brain_receive',
                 'path': join(folder, remote), 'sha256': hashlib.sha256(bundle).hexdigest()})
         except (ConnectionError, OSError, TimeoutError):
@@ -195,7 +239,9 @@ class ClusterBundleTransport:
 
     def _pull(self, node, request):
         from jarvis import brainsync
+        self.stage = 'prepare'
         folder = self._folder(node)
+        self.stage = 'export'
         result = self._call(node, {'action': 'brain_export', 'path': folder,
                                    'request': request.decode('utf-8')})
         if result.get('ok') is not True:
@@ -206,6 +252,7 @@ class ClusterBundleTransport:
         name = result.get('name')
         if not isinstance(name, str) or not BUNDLE_NAME.fullmatch(name):
             raise ValueError('Invalid brain bundle name.')
+        self.stage = 'download'
         try:
             blob = bytearray()
             while len(blob) < size:
