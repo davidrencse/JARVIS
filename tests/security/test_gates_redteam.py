@@ -641,7 +641,7 @@ class Audit20261113ProgramWordAndWildcards(unittest.TestCase):
 
     ALLOWED = [
         "ls", "git status", "git clean -n", "python -c print(1)", "rm -r ./build", "echo {a,b}",
-        "touch /tmp/{a,b}", "mkdir -p /tmp/x/{a,b}", "mkdir -p dist && node dist", "mkdir -p ~/projects/app/{src,tests}",
+        "touch /tmp/x/{a,b}", "mkdir -p /tmp/x/{a,b}", "mkdir -p dist && node dist", "mkdir -p ~/projects/app/{src,tests}",
         "pytest -rA tests", "pip install -r requirements.txt", "grep -r foo .", "cp -r a b",
         "touch /tmp/a.log; tail /tmp/a.log", "echo hi > /tmp/a.txt; cat /tmp/a.txt", "cd ~/projects/x && ls",
         "for f in *.txt; do echo $f; done", "echo $(date)", "echo `date`", "FOO=1 ls", "git log --oneline",
