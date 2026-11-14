@@ -14,7 +14,7 @@ jarvis cluster invite <node>
 jarvis cluster join <code>
 jarvis cluster doctor
 jarvis cluster status | leave | revoke | caps
-jarvis cluster update <node> [--rollback]
+jarvis cluster update <node> [--rollback]   # optional: nodes pull releases automatically; this cuts early and waits
 jarvis cluster tunnel start | stop | status
 ```
 

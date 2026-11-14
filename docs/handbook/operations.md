@@ -14,7 +14,7 @@ User units in `~/.config/systemd/user`: `jarvis-voice`, `jarvis-cluster`, `jarvi
 | `cluster.py`, `remote_view.py`, `clipsync.py`, hub code | `systemctl --user restart jarvis-cluster` |
 | `ui.py` and other console Python | the `jarvis ui` process |
 | `jarvis/web/*` | reload the page |
-| code a node runs | `jarvis cluster update <node>` |
+| code a node runs | automatic after a green push to origin/main; `jarvis cluster update <node>` only speeds it up |
 
 David runs restarts. Do not enable `lan-mouse.service`.
 

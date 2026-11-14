@@ -73,8 +73,10 @@ He answers in the console gate or by saying "Jarvis, yes".
   - `jarvis cluster roles` lists roles; `jarvis cluster main <id>` switches the main.
   - Setup: `cluster init` + `cluster invite <node>` on the main, `cluster join <code>` on the node.
   - `cluster doctor` diagnoses either side.
-- **After code changes, nodes refuse mismatched code:** run `jarvis cluster update <node>`.
-  If a node is offline, say so and leave it. Don't keep retrying.
+- **Nodes refuse mismatched code, but get it automatically** after a green push to origin/main
+  (the hub tests and signs a release; nodes pull it). `jarvis cluster update <node>` only speeds
+  that up (cut early + wait). If a node is offline, say so and leave it: it pulls on reconnect.
+  `jarvis cluster doctor` shows nodes behind the release (alert after 30 min online).
 
 ## Working here
 - **Python:** use `.venv/bin/python`. It has numpy and the voice deps; bare system `python` doesn't.
@@ -195,4 +197,4 @@ He answers in the console gate or by saying "Jarvis, yes".
 
 ## Reporting to David
 He reads terse output. Lead with what changed and whether it's verified (test counts,
-screenshots checked). Then list what he must do himself (restart, `cluster update`) and anything left undone.
+screenshots checked). Then list what he must do himself (restart) and anything left undone.

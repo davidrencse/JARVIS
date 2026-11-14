@@ -123,7 +123,8 @@ Key files in plain words:
   `terminal` intent parked by `ConfirmGate` for David's OK and run by `run_confirmed`.
   It's a heuristic over the command text, not a sandbox.
 - `cluster.py`: the hub (main) and node client; long polling; liveness; code-mismatch refusal.
-- `deploy.py`: code fingerprint, `cluster update` (tar over SSH, keeps the previous copy for `--rollback`).
+- `deploy.py`: code fingerprint, `cluster update` (tar over SSH, keeps the previous copy for `--rollback`); optional, since nodes pull releases automatically.
+- `drift.py`: alerts when an online node stays on other code than the release for over 30 min; shown in `cluster doctor`.
 - `phone.py`: the phone PWA's server. It binds 127.0.0.1:7787 by default; David publishes that
   port with `tailscale serve`. If funnel publishes the port, the server stays shut. Each
   request must match this PC's tailnet name and `tailscale whois`, and `/phone/api/*` also
@@ -371,7 +372,7 @@ is whether each *job* arrived and answered, and that is tracked end to end:
 jarvis cluster roles              # every device, its role, and which one is this PC
 jarvis cluster main zenbook       # make zenbook the main; all others become nodes
 jarvis cluster status             # this PC's role and the hub's view of the nodes
-jarvis cluster update dell        # push code to an SSH node (forward nodes pull it themselves)
+jarvis cluster update dell        # optional: nodes get code automatically after a green push to origin/main; this only speeds it up
 ```
 
 After switching the main, put the same `jarvis.config.json` on every machine, run

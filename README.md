@@ -173,7 +173,7 @@ Cluster:
 
 ```fish
 .venv/bin/python -m jarvis cluster roles          # who is main, which nodes
-.venv/bin/python -m jarvis cluster update dell    # cuts a tested release; the Dell pulls it within ~30 s
+.venv/bin/python -m jarvis cluster update dell    # optional: releases go out automatically after a green push; this just speeds it up
 .venv/bin/python -m jarvis cluster doctor         # diagnose either side
 ```
 
