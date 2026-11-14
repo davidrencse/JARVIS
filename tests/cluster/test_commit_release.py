@@ -45,11 +45,84 @@ class CommitTests(unittest.TestCase):
                 (stage / 'jarvis/a.py').write_text('x')
             with patch.object(release, 'source_commit', return_value='sha'), patch.object(release, '_archive', archive), patch('jarvis.confirm.notify') as notify:
                 for _ in range(2):
-                    result = release.cut(state, tests=lambda _: (False, {'summary':'failed', 'failures':['test.core']}))
+                    result = release.cut(state, tests=lambda _: (False, {'summary':'failed', 'failures':['test.core']}), retry=lambda stage, ids: list(ids))
                     self.assertFalse(result['released'])
                 notify.assert_called_once()
             self.assertEqual(release.status(state)['message'], 'Release blocked: test.core')
 
+    def _cut(self, state, tests, retry):
+        def archive(repo, stage, commit):
+            (stage / 'jarvis').mkdir()
+            (stage / 'jarvis/a.py').write_text('x')
+        with patch.object(release, 'source_commit', return_value='sha'), patch.object(release, '_archive', archive), patch('jarvis.confirm.notify') as notify:
+            return release.cut(state, tests=tests, retry=retry), notify
+
+    def test_flaky_failure_passing_on_rerun_releases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            seen = []
+            result, notify = self._cut(state, lambda _: (False, {'summary': 'f', 'failures': ['t.A', 't.B']}),
+                                       lambda stage, ids: seen.append(list(ids)) or [])
+            self.assertTrue(result['released'])
+            self.assertEqual(seen, [['t.A', 't.B']])  # only the failing ids, once
+            self.assertEqual(release.current(state)['retried'], ['t.A', 't.B'])
+            notify.assert_not_called()
+            self.assertFalse((state / release.FAILED).exists())
+
+    def test_repeat_failure_blocks_and_records_both_attempts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            result, notify = self._cut(state, lambda _: (False, {'summary': 'f', 'failures': ['t.A', 't.B']}),
+                                       lambda stage, ids: ['t.B'])
+            self.assertFalse(result['released'])
+            saved = json.loads((state / release.FAILED).read_text())
+            self.assertEqual(saved['failures'], ['t.B'])
+            self.assertEqual(saved['attempts'], [{'failures': ['t.A', 't.B']}, {'failures': ['t.B']}])
+            self.assertEqual(release.status(state)['message'], 'Release blocked: t.B')
+            notify.assert_called_once()
+
+    def test_runner_failure_is_not_a_test_id_to_rerun(self):
+        with patch('jarvis.release_gate._run') as run:
+            self.assertEqual(release.retry_failures(Path('.'), ['runner:core']), ['runner:core'])
+            run.assert_not_called()
+            run.return_value = {'failures': []}
+            self.assertEqual(release.retry_failures(Path('.'), ['t.A']), [])
+            run.return_value = {'failures': ['t.A']}
+            self.assertEqual(release.retry_failures(Path('.'), ['t.A']), ['t.A'])
+
+
+class LockHolderTests(unittest.TestCase):
+    def test_busy_lock_names_holder_and_status_reports_it(self):
+        import os
+        from jarvis.locking import exclusive_lock
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            with exclusive_lock(state / 'code-release.lock'):
+                (state / release.LOCK_NOTE).write_text(json.dumps({'pid': os.getpid(), 'at': 1000, 'command': 'jarvis cluster release'}))
+                result = release.cut(state)
+                self.assertFalse(result['released'])
+                self.assertIn(f'pid {os.getpid()}', result['note'])
+                self.assertIn('jarvis cluster release', result['note'])
+                self.assertEqual(result['holder']['pid'], os.getpid())
+                self.assertIn('Another release is being tested', release.status(state)['message'])
+
+    def test_dead_holder_note_self_clears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            (state / release.LOCK_NOTE).write_text(json.dumps({'pid': 2 ** 22 + 12345, 'at': 1000, 'command': 'x'}))
+            with patch.object(release, '_pid_alive', return_value=False):
+                self.assertIsNone(release.lock_holder(state))
+            self.assertFalse((state / release.LOCK_NOTE).exists())
+
+    def test_cut_clears_its_note_when_done(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            with patch.object(release, 'source_commit', side_effect=ValueError('none')):
+                release.cut(state)
+            self.assertFalse((state / release.LOCK_NOTE).exists())
+
+
+class CutRetryAndWarningTests(unittest.TestCase):
     def test_warning_is_shipped_and_deferred_run_remains_due(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
