@@ -69,3 +69,48 @@ class CooperativeStopTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProcessLivenessTests(unittest.TestCase):
+    def test_windows_probe_never_signals_and_closes_full_width_handle(self):
+        import ctypes
+        from unittest.mock import Mock, patch
+        from jarvis.cluster import _local_pid_alive
+        kernel = Mock()
+        handle = 0x100000001
+        kernel.OpenProcess.return_value = handle
+        def query(_handle, pointer):
+            pointer._obj.value = 259
+            return 1
+        kernel.GetExitCodeProcess.side_effect = query
+        with patch('jarvis.cluster.on_windows', return_value=True), \
+             patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+             patch('jarvis.cluster.os.kill') as signal:
+            self.assertTrue(_local_pid_alive(123))
+            kernel.OpenProcess.assert_called_once_with(0x1000, False, 123)
+            kernel.GetExitCodeProcess.assert_called_once()
+            kernel.CloseHandle.assert_called_once_with(handle)
+            signal.assert_not_called()
+
+    def test_windows_exited_unqueryable_and_invalid_processes_refuse(self):
+        import ctypes
+        from unittest.mock import Mock, patch
+        from jarvis.cluster import _local_pid_alive
+        for opened, queried, code in ((0, 0, 0), (5, 0, 259), (5, 1, 0)):
+            kernel = Mock(); kernel.OpenProcess.return_value = opened
+            def query(_handle, pointer):
+                pointer._obj.value = code
+                return queried
+            kernel.GetExitCodeProcess.side_effect = query
+            with self.subTest(opened=opened, queried=queried, code=code), \
+                 patch('jarvis.cluster.on_windows', return_value=True), \
+                 patch.object(ctypes, 'WinDLL', return_value=kernel, create=True), \
+                 patch('jarvis.cluster.os.kill') as signal:
+                self.assertFalse(_local_pid_alive(123))
+                signal.assert_not_called()
+                if opened:
+                    kernel.CloseHandle.assert_called_once_with(opened)
+                else:
+                    kernel.CloseHandle.assert_not_called()
+        for pid in (None, True, 0, -1, '123'):
+            self.assertFalse(_local_pid_alive(pid))
