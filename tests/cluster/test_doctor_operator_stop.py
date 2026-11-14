@@ -5,6 +5,7 @@ The stop record is the real ``cluster-tunnel.manual-stop`` file. The cooperative
 ``cluster-tunnel.stop`` marker is not an operator stop.
 """
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,8 @@ class DoctorOperatorStopTests(unittest.TestCase):
                 patch("jarvis.cluster_tunnel.pinned_host", return_value=[]), \
                 patch("jarvis.cluster_tunnel.status", return_value={
                     "hub_healthy": False, "ssh_alive": False, "running": False}), \
+                patch("jarvis.cluster_tunnel.startup_path",
+                      return_value=SimpleNamespace(is_file=lambda: True)), \
                 patch("jarvis.cluster_recovery.tailscale_status", return_value=None), \
                 patch("jarvis.cluster_recovery.ensure_dependents") as dependents, \
                 patch.object(cluster_tunnel, "start", side_effect=AssertionError("start")), \
@@ -112,6 +115,23 @@ class DoctorOperatorStopTests(unittest.TestCase):
         dependents.assert_called_once()
         self.assertTrue(cluster_tunnel.manual_stop_path(self.state).is_file())
         self.assertTrue(cluster_tunnel.manual_stop_holds(CONFIG, self.state))
+
+    def test_stop_entry_then_passive_and_fix_leave_config_and_start_nothing(self):
+        """The stop comes from `stop(operator=True)` (boot-stamped), not a hand-written record."""
+        self.config_path.write_text(json.dumps(CONFIG), encoding="utf-8")
+        before = self.config_path.read_bytes()
+        with patch.object(cluster_tunnel, "status", return_value={"running": False}), \
+                patch.object(cluster_tunnel, "current_boot", return_value=50.0):
+            cluster_tunnel.stop(self.state, operator=True, config=CONFIG, sleep=lambda _s: None)
+            self.assertTrue(cluster_tunnel.manual_stop_holds(CONFIG, self.state))
+            # start/autostart spies in _checks raise if the doctor launches or enables anything.
+            _checks, passive = self._checks(fix=False)
+            passive.assert_not_called()
+            checks, fixed = self._checks(fix=True)
+            self.assertTrue(cluster_tunnel.manual_stop_holds(CONFIG, self.state))
+        fixed.assert_called_once()
+        self.assertEqual(self.config_path.read_bytes(), before)
+        self.assertFalse(checks["tunnel supervisor"]["ok"])
 
     def test_cooperative_stop_marker_is_not_an_operator_stop(self):
         (self.state / "cluster-tunnel.stop").write_text("marker\n", encoding="utf-8")

@@ -43,14 +43,17 @@ class PostUpdateKeepaliveTests(unittest.TestCase):
 
 
 class RealEnsureTests(unittest.TestCase):
-    def _run(self, config, pid, hand):
+    def _run(self, config, pid, hand, polls=True):
         state = "state-dir"
         with patch("jarvis.clipsync._pid", return_value=pid) as pid_fn, \
              patch("jarvis.clipsync.stopped_by_hand", return_value=hand) as hand_fn, \
              patch("jarvis.clipsync.start") as start, \
              patch("jarvis.sharedinput.guard_for") as guard:
             cluster._run_keepalive_after_update(state, config, None, 0)
-        pid_fn.assert_called_with(str(state))
+        if polls:
+            pid_fn.assert_called_with(str(state))
+        else:
+            pid_fn.assert_not_called()
         return start, guard, hand_fn
 
     def test_starts_clipboard_when_down_and_not_stopped_by_hand(self):
@@ -71,6 +74,16 @@ class RealEnsureTests(unittest.TestCase):
         start, guard, _hand = self._run(off, None, False)
         start.assert_called_once_with("state-dir")
         guard.assert_not_called()
+
+    def test_clipboard_autostart_off_and_guard_off_start_nothing(self):
+        both = {"clipboard": {"autostart": False}, "lan_mouse": {"off_when_apart": False}}
+        start, guard, _hand = self._run(both, None, False, polls=False)
+        start.assert_not_called()
+        guard.assert_not_called()
+
+    def test_running_clipboard_is_left_alone(self):
+        start, _guard, _hand = self._run({}, 123, False)
+        start.assert_not_called()
 
 
 if __name__ == "__main__":

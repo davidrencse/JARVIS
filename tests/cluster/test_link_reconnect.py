@@ -216,49 +216,6 @@ class ManualStopTests(unittest.TestCase):
         self.assertEqual(self.config_path.read_bytes(), before)
 
 
-class DoctorStopTests(unittest.TestCase):
-    def test_passive_and_fix_do_not_restart_an_operator_stop(self):
-        from jarvis import cluster_setup
-        with tempfile.TemporaryDirectory() as tmp:
-            state = Path(tmp)
-            config_path = state / 'jarvis.config.json'
-            config_path.write_text(json.dumps(CONFIG), encoding='utf-8')
-            before = config_path.read_bytes()
-            with patch.object(t, 'status', return_value={'running': False}), \
-                    patch.object(t, 'current_boot', return_value=50.0):
-                t.stop(state, operator=True, config=CONFIG, sleep=lambda _s: None)
-            started, autos, fixes = [], [], []
-            startup = SimpleNamespace(is_file=lambda: True)
-            ssh_ok = SimpleNamespace(returncode=0, stdout='jarvis-node-link', stderr='')
-            with patch.object(cluster_setup, 'Client'), \
-                    patch('jarvis.cluster_tunnel.peer', return_value=CONFIG['devices']['main']), \
-                    patch('jarvis.cluster_tunnel.candidates', return_value=['u@172.1.41.171']), \
-                    patch('jarvis.cluster_tunnel.reachable', return_value=True), \
-                    patch('jarvis.cluster_tunnel.pinned_host', return_value=[]), \
-                    patch('jarvis.cluster_tunnel.status', return_value={'hub_healthy': False, 'ssh_alive': False, 'running': False}), \
-                    patch('jarvis.cluster_tunnel.startup_path', return_value=startup), \
-                    patch('jarvis.cluster_tunnel.autostart', side_effect=lambda *a, **k: autos.append(a)), \
-                    patch('jarvis.cluster_tunnel.start', side_effect=lambda *a, **k: started.append(a)), \
-                    patch('jarvis.cluster_recovery.tailscale_status', return_value={'BackendState': 'Running'}), \
-                    patch('jarvis.cluster_recovery.ensure_dependents', side_effect=lambda *a, **k: fixes.append(a)), \
-                    patch.object(t, 'current_boot', return_value=50.0), \
-                    patch.object(cluster_setup.shutil, 'which', return_value='/usr/bin/ssh'), \
-                    patch.object(cluster_setup.subprocess, 'run', return_value=ssh_ok):
-                checks = []
-                cluster_setup._doctor_node(CONFIG, state, 'node', 'main', True, checks, 'code',
-                                           fix=False, config_path=config_path)
-                self.assertEqual(started, [])
-                self.assertEqual(fixes, [])
-                cluster_setup._doctor_node(CONFIG, state, 'node', 'main', True, [], 'code',
-                                           fix=True, config_path=config_path)
-                self.assertEqual(started, [])
-                self.assertEqual(autos, [])
-                self.assertEqual(len(fixes), 1)
-                self.assertTrue(t.manual_stop_holds(CONFIG, state))
-                self.assertEqual(config_path.read_bytes(), before)
-                self.assertFalse(checks[[c['check'] for c in checks].index('tunnel supervisor')]['ok'])
-
-
 class ScanBudgetTests(unittest.TestCase):
     def test_constants_match_the_handbook(self):
         self.assertEqual(d.SCAN_BUDGET, 45)

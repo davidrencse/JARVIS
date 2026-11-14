@@ -7,42 +7,19 @@ Signature refusal and the staged _starts preflight stay in front of that check.
 No network and no systemd.
 """
 
-import base64
-import io
 import json
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from jarvis import deploy, release
+from tests.cluster.bundles import make_tree, pack
 
 OLD_PROJECT = b'[project]\nname = "n"\nversion = "0"\ndependencies = []\n'
 NEW_PROJECT = b'[project]\nname = "n"\nversion = "1"\ndependencies = []\n'
 CODE_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForHealthCheckOnly="
 TOKEN = "t" * 24
-
-
-def make_tree(root, files):
-    for name, data in files.items():
-        path = Path(root, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-
-
-def pack(entries, code, signer, version=None):
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        for name, data in entries.items():
-            archive.writestr(name, data)
-    raw = buffer.getvalue()
-    bundle = {"code": code, "zip": base64.b64encode(raw).decode("ascii"),
-              "signature": deploy.sign(raw, signer)}
-    if version is not None:
-        bundle["version"] = version
-        bundle["vsig"] = deploy.sign(deploy._bundle_bytes(raw, version, code), signer)
-    return bundle
 
 
 def fingerprint(root, files):

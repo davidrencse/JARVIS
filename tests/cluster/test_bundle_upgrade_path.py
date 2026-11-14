@@ -5,49 +5,25 @@ while the node has never installed a versioned one. The window is simulated by p
 deploy.unversioned_allowed; nothing here sleeps or moves the clock.
 """
 
-import base64
 import calendar
 import importlib
-import io
 import re
 import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
-import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from jarvis import deploy
+from tests.cluster.bundles import make_tree, pack
 
 REPO = Path(__file__).resolve().parents[2]
 PYPROJECT = b'[project]\nname = "bundle-upgrade"\nversion = "0"\ndependencies = []\n'
 BUNDLE_KEYS = {"code", "zip", "signature", "version", "vsig"}
 CLOSED = ("The code bundle carries no version; unversioned bundles are no longer accepted. "
           "Update from the main (versioned bundles) or re-join.")
-
-
-def make_tree(root, files):
-    for name, data in files.items():
-        path = Path(root, name)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-
-
-def pack(entries, code, signer, version=None):
-    """A /v1/code bundle. `version` set means version + vsig, the same keys code_bundle serves."""
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w") as archive:
-        for name, data in entries.items():
-            archive.writestr(name, data)
-    raw = buffer.getvalue()
-    bundle = {"code": code, "zip": base64.b64encode(raw).decode("ascii"),
-              "signature": deploy.sign(raw, signer)}
-    if version is not None:
-        bundle["version"] = version
-        bundle["vsig"] = deploy.sign(deploy._bundle_bytes(raw, version, code), signer)
-    return bundle
 
 
 def load_head_deploy(directory):

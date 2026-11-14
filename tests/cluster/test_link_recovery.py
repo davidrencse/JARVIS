@@ -61,22 +61,6 @@ class RecoveryTests(unittest.TestCase):
             r.ensure_tunnel(CONFIG, 'fake-state', 'fake-config')
             start.assert_not_called()
 
-    def test_dependents_respect_manual_stop_and_opt_out(self):
-        with patch('jarvis.clipsync._pid', return_value=None), \
-             patch('jarvis.clipsync.stopped_by_hand', return_value=False), \
-             patch('jarvis.clipsync.start') as clip, patch('jarvis.sharedinput.guard_for') as guard:
-            r.ensure_dependents({}, 'fake-state')
-            clip.assert_called_once()
-            guard.assert_called_once()
-            clip.reset_mock(); guard.reset_mock()
-            r.ensure_dependents({'clipboard': {'autostart': False}, 'lan_mouse': {'off_when_apart': False}}, 'fake-state')
-            clip.assert_not_called(); guard.assert_not_called()
-        with patch('jarvis.clipsync._pid', return_value=None), \
-             patch('jarvis.clipsync.stopped_by_hand', return_value=True), \
-             patch('jarvis.clipsync.start') as clip, patch('jarvis.sharedinput.guard_for'):
-            r.ensure_dependents({}, 'fake-state')
-            clip.assert_not_called()
-
     def test_alert_one_per_outage_only_after_online(self):
         alert, notify = r.OfflineAlerts(), Mock()
         alert.check([{'id': 'node', 'online': False}], 1000, notify)
