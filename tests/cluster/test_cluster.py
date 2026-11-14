@@ -63,18 +63,22 @@ class TopologyTests(unittest.TestCase):
 
     def test_node_ask_bypasses_local_memory_and_recall(self):
         from jarvis.assistant import ask
-        lane = ProxyLane(configuration("node"), "some-state")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        lane = ProxyLane(configuration("node"), Path(temporary.name) / '.jarvis')
         memory = Mock()
         with patch("jarvis.cluster.Client") as client, patch("jarvis.assistant.vault_recall") as recall:
             client.return_value.ask.return_value = {"reply": "from main", "tier": "simple"}
-            result = ask("hello", None, memory, lane.config, ".", lane=lane)
+            result = ask("hello", None, memory, lane.config, temporary.name, lane=lane)
         self.assertEqual(result["via"], "main")
         memory.add.assert_not_called()
         recall.assert_not_called()
 
     def test_origin_defaults_desktop_to_requesting_node(self):
         from jarvis.remote import Remote
-        remote = Remote(configuration(), ".jarvis")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        remote = Remote(configuration(), Path(temporary.name) / '.jarvis')
         with patch("jarvis.cluster.dispatch", return_value={"ok": True, "text": "opened"}) as dispatch:
             with request_from("node"):
                 self.assertEqual(remote.call(None, "open_app", "Spotify"), (True, "opened"))
