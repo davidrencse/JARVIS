@@ -1,24 +1,20 @@
-# Moving JARVIS's main to another machine (e.g. the Arch Zenbook)
+# Moving JARVIS's main
 
-1. **On the current main: commit everything.** (Historical walkthrough: the Dell was the old main; the move to the Zenbook is done, `cluster.main_device` is `zenbook`.) `git status` must be clean, then push.
-   `.jarvis/` is not in git — copy it separately (step 4).
-2. **On the new machine: get a clean checkout.** The Zenbook's `~/projects/JARVIS` was
-   tar-synced by the cluster deployer, so it isn't a clean git tree. Either
-   `mv ~/projects/JARVIS ~/projects/JARVIS.old && git clone <remote> ~/projects/JARVIS`, or
-   inside it `git fetch && git reset --hard origin/main` (a backup `.tgz` already exists).
-3. **Python deps:** create a venv and `pip install -e .` (pyproject.toml); JARVIS never downloads at run time, so fetch the MiniLM ONNX model once: `python -c "from huggingface_hub import hf_hub_download as d; M='sentence-transformers/all-MiniLM-L6-v2'; d(M,'onnx/model.onnx'); d(M,'tokenizer.json')"`. Without it the decider and semantic memory silently stay off.
-4. **State for continuity:** done on 2026-10-26. Consistent snapshots (SQLite backup API,
-   safe while running) of the Dell's `memory.sqlite3` and `history.sqlite3` are on the
-   Zenbook in `~/projects/JARVIS/.jarvis/from-dell/`. When the new machine becomes main, stop
-   JARVIS there and move them into `.jarvis/` (keep its old files as `*.pre-main`).
-   (As of 2026-10-29 the Zenbook's `.jarvis/` has no `from-dell/` folder left, only its own
-   `memory.sqlite3`/`history.sqlite3`.)
-5. **Make the Zenbook main:** on the Zenbook `python -m jarvis cluster init` (forward tunnel, hub at
-   login; it says if sshd is off), then `python -m jarvis cluster invite dell`.
-6. **Join the Dell:** on the Dell, in its checkout, `python -m jarvis cluster join "<code>"`. It starts
-   the tunnel and node agent and installs both at login; the node pulls the main's code itself.
-   `python -m jarvis cluster doctor` on either machine shows what is left.
-7. **Vault:** currently off (`vault.enabled`, `recall`, `write` all false). If turned on, `vault.path.linux` points at `~/Documents/obsidian-vault`; make sure it syncs there.
-8. **Claude context:** this repo's `CLAUDE.md`, `JARVIS.md` and `docs/` travel with git. The memory notes are also
-   in `jarvis-memory/` (committed) and were copied to `~/.claude/projects/-home-<user>-projects-JARVIS/memory/`.
-9. **Check:** `python -m jarvis selftest keyboard` (Windows only; it skips elsewhere) and `python -m jarvis cluster status`.
+*How to make another machine the main. The configured main is `zenbook`.*
+
+`.jarvis/` is not in git. Copy it separately. Snapshot `memory.sqlite3` and `history.sqlite3` with SQLite's backup API, which is safe while JARVIS is running, or stop the daemons first. On the new machine, keep the previous files as `*.pre-main` and move the snapshots into `.jarvis/` only after JARVIS there is stopped.
+
+1. On the current main, leave the git tree clean and push. `CLAUDE.md`, `JARVIS.md`, `docs/`, and `jarvis-memory/` travel with the clone. Claude memory notes under `~/.claude/projects/` do not.
+2. On the new machine, use a real git checkout. A tree that was only tar-synced by the deployer is not one. Either move it aside and `git clone`, or `git fetch` and `git reset --hard origin/main` after a backup.
+3. Create a venv and `pip install -e .`. JARVIS does not download models at run time. Fetch MiniLM once, or semantic recall and the decider stay off:
+
+```text
+python -c "from huggingface_hub import hf_hub_download as d; M='sentence-transformers/all-MiniLM-L6-v2'; d(M,'onnx/model.onnx'); d(M,'tokenizer.json')"
+```
+
+4. On the new main: `python -m jarvis cluster init`, then `python -m jarvis cluster invite <old-main>`. `init` says so if sshd is off. Forward tunnel is what `init` sets: only the main needs an SSH server.
+5. On the old main, in its checkout: `python -m jarvis cluster join "<code>"`. The node pulls the main's code itself and installs the tunnel and agent at login. `python -m jarvis cluster doctor` on either side lists what is left. After a move, put the same `jarvis.config.json` on every machine. Old node links point at the old main, so invite them again.
+6. Vault: `vault.enabled` and `vault.recall` are on, `vault.write` is off. `vault.path.linux` is `~/Documents/obsidian-vault`. If write is turned on, that directory has to be the synced vault.
+7. Check: `python -m jarvis cluster status`, and `python -m jarvis selftest keyboard` on Windows (it skips elsewhere).
+
+Machine inventory and live SSH targets are in [handbook/operations.md](handbook/operations.md). Code rollout after the move is [handbook/release.md](handbook/release.md).

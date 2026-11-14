@@ -1,77 +1,42 @@
-# Provider quota verification and implementation
+# Provider quotas
 
-## Automatic Claude session renewal (October 22, 2026)
+*How JARVIS reads Claude and Codex plan windows. Point-in-time percentages are not recorded here; they expire with the window.*
 
-Claude Code access tokens expire routinely. JARVIS no longer stops at "sign-in expired":
+Subscription percentages are the plan allowance across that product's surfaces. A local token tally is not the remaining allowance. Context length is a third limit. Dollar estimates are not the bill. Usage credits, subscription windows, and API billing stay separate.
 
-- When the saved token has expired, or the usage endpoint rejects an unexpired token with HTTP 401, `jarvis/claude_auth.py` starts the native `claude` CLI once with only an SDK `initialize` control request, then closes stdin. Claude Code renews its own session during startup. JARVIS sends no prompt, starts no model turn, runs no login command, and never writes credentials itself.
-- The child runs in `--safe-mode` with no tools, no MCP servers, no Chrome, no session persistence, an empty temporary working directory, a 20-second timeout, and alternate auth environment variables (API keys, base URLs, Bedrock/Vertex switches) removed so only the existing subscription sign-in is used.
-- After the CLI exits, JARVIS rereads the credentials file and requires a new unexpired access token. A clean exit alone is not trusted. A 401 gets at most one renewal; a token that is unchanged afterwards is reported as a rejected sign-in instead of retrying in a loop.
-- Concurrent checks share one CLI start, and each config directory gets a 60-second cooldown, so a revoked sign-in cannot spawn a process on every dashboard refresh.
-- Renewal failures (timeout, missing CLI, revoked sign-in, missing refresh token) are sanitized and shown in the Credits panel with "run claude auth login". The local token tally remains visible.
-- The quota cache is invalidated when the credentials file changes (for example, a sign-in in another window) or when a cached window's reset time passes. The panel shows when the provider data was actually fetched, not when the cache was read.
-- Fixed on October 22: when the CLI rewrote the credentials file but left them unusable, JARVIS mistook its own rewrite for a concurrent sign-in. That hid the real "run claude auth login" message and retried every refresh. The CLI's rewrite is now tracked whether renewal succeeds or fails.
+Claude's five-hour and weekly windows are described in [Claude's usage help](https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work). The person-facing checks are Claude Code `/usage` and [Settings → Usage](https://claude.ai/settings/usage). Codex documents `account/rateLimits/read` on the app-server, including percents, window duration, and reset timestamps ([Codex app-server](https://learn.chatgpt.com/docs/app-server)). No fixed token or message ceiling is inferred from those responses.
 
-What still needs a person: a revoked or logged-out account, or one whose refresh token has expired, needs `claude auth login`. JARVIS reports this clearly; it cannot sign in for you.
+## What JARVIS calls
 
-Validation: `tests/runtime/test_quota_renewal.py` (10 scenarios through the real collector with a fake CLI renewal) and `tests/security/test_claude_auth.py` (7 scenarios with fake child processes covering protocol, timeout reaping, cooldown, concurrency and redaction). The full suite passed **293 of 293** tests, all 34 Python modules parsed, and all 8 browser JavaScript files passed `node --check`. A live read-only check at **15:30 UTC (11:30 AM EDT)** returned `source=live` for both providers: Claude 27% five-hour / 75% weekly remaining, Codex 0% five-hour / 31% weekly remaining.
+`jarvis/credits.py` reads the live quota before local logs.
 
-## Earlier checks (October 21)
+- Claude: authenticated GET `https://api.anthropic.com/api/oauth/usage`, using the Claude Code sign-in. The header shape was taken from the installed CLI.
+- Codex: authenticated GET `https://chatgpt.com/backend-api/wham/usage`, using the Codex ChatGPT sign-in.
+- Both URLs are internal compatibility surfaces, not a stable public API. The call does not infer, log in, buy, or change configuration. If the endpoint is down, the local or manual fallback stays available.
+- Requests use a fixed HTTPS destination, refuse redirects, time out at 8 seconds, and bound the body. Errors are sanitized. One lock is shared. Success and failure are cached for 60 seconds. The panel cache stays 120 seconds. A forced refresh still waits out the shorter cache.
+- Unknown window names are not given a guessed meaning. Extra-usage spending is not shown as a prepaid balance.
+- An expired Codex log window is not reported as 100% available. The old percent is kept as history and current usage is unknown.
+- The Claude hourly chart reads local logs only. It does not request quota. Removed cache rows, future-dated rows, and malformed numbers are dropped.
+- `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honored. The usual Windows CLI credential files are what this reads. An OS keychain is not extracted; that account falls back to local data and the provider's own dashboard.
 
-**Claude successfully renewed and verified October 22, 2026, 02:32:15 UTC (October 21, 10:32:15 PM EDT).** [Sanitized Claude snapshot](audit-evidence/claude-quota-renewed.json).
+The dashboard contract is unchanged: live source, numeric percent meters, reset timestamps, plan facts, and a remaining-percent headline.
 
-- **Claude Pro:** 6% used / **94% remaining** in the five-hour window; 14% used / **86% remaining** weekly. Extra usage is **disabled**. Five-hour reset: October 22 at **3:19:59 AM EDT**. Weekly reset: October 25 at **12:59:59 PM EDT**.
-- Opening the installed CLI with `claude --safe-mode --ax-screen-reader "/usage"` allowed Claude Code to renew its own existing session. Its usage screen and the JARVIS collector then agreed. The CLI reported zero input/output tokens and $0 session cost. No new browser login, purchase, or inference was needed. At that time the JARVIS collector did not renew sessions; it now does (see above).
-- This resolves the expired-token result below. Merely running `claude auth status` reported logged in but did not restore quota access; `/usage` was the useful verification step. If renewal fails in a future session, use the CLI's normal sign-in flow. See [Claude authentication documentation](https://code.claude.com/docs/en/authentication).
+## Claude session renewal
 
-The preceding combined check started **October 22, 2026, 02:28:39 UTC (October 21, 10:28:39 PM EDT)**. [Sanitized snapshot](audit-evidence/provider-quota-snapshot.json).
+Access tokens expire. JARVIS does not stop at "sign-in expired".
 
-- **Codex Plus:** 11% used / **89% remaining** in the five-hour window; 51% used / **49% remaining** weekly; **0 provider credits**. The five-hour reset is October 22 at **3:24:36 AM EDT**; weekly reset is October 27 at **2:32:48 AM EDT**.
-- **Claude at that earlier check:** the existing CLI access token had expired, so the collector made no authenticated usage request and showed the local token tally instead. That check alone could not establish current quota. The subsequent CLI renewal above resolved this.
+- When the saved token is expired, or the usage endpoint returns 401 for a token that still looks unexpired, `jarvis/claude_auth.py` starts `claude` once with only an SDK `initialize`, then closes stdin. Claude Code renews its own session. JARVIS sends no prompt, starts no model turn, runs no login, and never writes credentials.
+- The child uses `--safe-mode`, no tools, no MCP, no Chrome, no session persistence, an empty temporary directory, and a 20-second timeout. API keys, base URLs, and Bedrock or Vertex switches are removed so only the existing subscription sign-in is used.
+- After the process exits, JARVIS rereads the credentials and requires a new unexpired access token. A clean exit is not enough. A 401 gets one renewal. A token that did not change is a rejected sign-in, not a loop.
+- Concurrent checks share one CLI start. Each config directory has a 60-second cooldown, so a revoked sign-in cannot spawn a process on every refresh.
+- Renewal failure (timeout, missing CLI, revoked sign-in, missing refresh token) is shown in Credits as "run claude auth login". The local tally stays visible.
+- The quota cache drops when the credentials file changes, or when a cached window's reset time passes. The panel shows when the provider was fetched, not when the cache was read.
+- If the CLI rewrites the credentials file and leaves them unusable, that rewrite is the CLI's, not a concurrent sign-in. It must still surface "run claude auth login".
 
-These readings supersede the midday figures below. The earlier Claude reading remains historical evidence only; its five-hour reset has already passed and cannot establish current availability.
+A revoked account, or one whose refresh token has expired, needs `claude auth login`. JARVIS cannot sign in. `claude auth status` can say logged in without restoring quota access.
 
-## Earlier successful account snapshot
-
-Both providers were verified on October 21, 2026, at **16:07:03 UTC (12:07:03 PM EDT)**. These are point-in-time account readings, not promised future availability.
-
-| Provider / plan | Window | Used | Remaining | Reported reset (UTC) | Reset in New York (EDT) |
-| --- | --- | ---: | ---: | --- | --- |
-| Claude Pro | Five hours | 97% | **3%** | Oct 21, 17:59:59 | Oct 21, 1:59:59 PM |
-| Claude Pro | Weekly | 13% | **87%** | Oct 25, 16:59:59 | Oct 25, 12:59:59 PM |
-| Codex Plus | Five hours | 100% | **0%** | Oct 21, 18:12:59 | Oct 21, 2:12:59 PM |
-| Codex Plus | Weekly | 48% | **52%** | Oct 27, 06:32:48 | Oct 27, 2:32:48 AM |
-
-Claude reported **extra usage disabled**. Codex reported a credit balance of **101.7489250000 provider credits** during that midday check. An earlier check around 16:04 UTC returned 252.5924250000, so the balance was changing during active work. Neither number is a dollar balance, and exhausting the included five-hour window does not by itself establish that every paid-credit request is blocked.
-
-## What the figures mean
-
-Claude subscription percentages cover the account's plan allowance across Claude surfaces. Local Claude Code token totals cannot establish the remaining subscription allowance, and context length is another separate limit. Official help describes five-hour and weekly usage windows and factors that influence usage. [Claude usage and length limits](https://support.claude.com/en/articles/11647753-how-do-usage-and-length-limits-work)
-
-Claude Code's `/usage` command and [Settings > Usage](https://claude.ai/settings/usage) are the user-facing places to check current plan bars. Local dollar estimates are not authoritative billing figures. Usage credits, subscription windows, and API billing should remain distinct. [Claude Code cost and usage documentation](https://code.claude.com/docs/en/costs)
-
-OpenAI documents `account/rateLimits/read` in the Codex app-server protocol, including usage percentages, window duration and reset timestamps. That is the supported protocol for future app-server integration. [Codex app-server documentation](https://learn.chatgpt.com/docs/app-server)
-
-## Changes
-
-`jarvis/credits.py` now reads actual quotas before falling back to local logs:
-
-- Claude: authenticated GET to `https://api.anthropic.com/api/oauth/usage`, using the existing Claude Code sign-in. This first-party endpoint and its OAuth header were confirmed in the installed Claude executable and successfully exercised on this account.
-- Codex: authenticated GET to `https://chatgpt.com/backend-api/wham/usage`, using the existing Codex ChatGPT sign-in. This endpoint was confirmed in the installed Codex executable and successfully exercised on this account.
-- Both direct HTTP endpoints are **internal compatibility surfaces**, not a promise of a stable public API. No inference request, login, purchase, or configuration change is performed. Expired Claude sessions are renewed only through the CLI (see above); JARVIS never writes credentials. An unavailable endpoint leaves the existing local/manual fallback usable.
-- Fixed HTTPS destinations, refused redirects, an eight-second request timeout, bounded response reads, sanitized errors, and a shared lock with 60-second success/failure caching protect credentials and prevent repeated concurrent usage requests. The existing panel cache remains 120 seconds by default. A forced panel refresh still respects the shorter endpoint cache.
-- The existing dashboard data contract is preserved: live source, numeric percentage meters, reset timestamps, plan facts and a remaining-percentage headline. Unknown provider window names are not assigned guessed meanings. Extra-usage spending is not presented as a prepaid balance.
-- Expired Codex log windows are no longer invented as 100% available. Their previous percentage becomes a historical fact with current usage marked unknown; no misleading zero-percent meter is emitted.
-- The Claude hourly token chart only reads local logs. Removed/aged log cache entries are discarded; future-dated records and malformed numeric usage rows are excluded.
-
-Only allowlisted quota fields were printed in the investigation. Credentials remain in their original files and in transient request memory, with no copies in the report or application state. The implementation currently supports the usual Windows CLI credential-file locations. `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honored. Accounts using OS keychains fall back to local data and the provider dashboard; their credentials are not extracted by this change.
-
-## Validation
-
-- `python -m unittest discover -s tests -p test_provider_limits.py -v`: **12 passed**, offline with synthetic credentials and mocked provider responses.
-- `python -m unittest discover -s tests -p test_ui.py -v`: **16 passed**, including the corrected stale-reset expectation.
-- Direct live smoke check of the implemented Claude and Codex collectors returned `source=live`, `status=ok` and the sanitized readings above.
-
-Tests cover authentic quota normalization, credits versus dollars, expired sign-ins without refresh, cached failures, local fallback, no quota request from the hourly chart, invalid percentages, malformed window shapes, redirect refusal, error redaction, stale log handling and cache pruning.
-
-No fixed token/message ceiling was inferred for either plan. The providers returned percentages and reset windows; those are the account-specific limits actually observable here.
+```text
+python -m unittest discover -s tests -p test_provider_limits.py -v
+python -m unittest tests.runtime.test_quota_renewal
+python -m unittest tests.security.test_claude_auth
+```
