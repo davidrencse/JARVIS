@@ -529,7 +529,45 @@ def _stable_memory(path, between=None):
     return first, None
 
 
+# Rows here are settings, not memories: second_brain_queue.configure writes them into a
+# database that holds nothing yet. Every other archive_* table (outbox, heads, guards)
+# still counts, so unpublished history is never replaced.
+_SETTINGS_TABLES = frozenset({"archive_meta"})
+# Shadow tables a virtual table keeps for itself. They hold an index or config even when
+# the table is empty (a fresh FTS5 index has rows in _data and _config). The virtual
+# table itself is counted instead, which also covers FTS tables that store their own text.
+_SHADOW_SUFFIXES = {
+    "fts5": ("data", "idx", "content", "docsize", "config"),
+    "fts4": ("content", "segments", "segdir", "docsize", "stat"),
+    "fts3": ("content", "segments", "segdir", "docsize", "stat"),
+}
+
+
+def _content_tables(con):
+    """Tables whose rows are content. Shadow tables of virtual tables are left out."""
+    try:
+        rows = con.execute("PRAGMA main.table_list").fetchall()
+    except sqlite3.Error:
+        rows = None
+    if rows:
+        return [row[1] for row in rows if row[2] in ("table", "virtual")]
+    # SQLite before 3.37 has no table_list. Name the shadows of known FTS modules only.
+    tables = con.execute("SELECT name, sql FROM sqlite_master WHERE type='table'").fetchall()
+    shadows = set()
+    for name, sql in tables:
+        found = re.match(r"\s*CREATE\s+VIRTUAL\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?\S+\s+USING\s+(\w+)",
+                         sql or "", re.IGNORECASE)
+        if found:
+            shadows.update(f"{name}_{suffix}" for suffix in _SHADOW_SUFFIXES.get(found.group(1).lower(), ()))
+    return [name for name, _sql in tables if name not in shadows]
+
+
 def _db_nonempty(blob):
+    """True unless every content table is empty. Unreadable counts as nonempty.
+
+    A destination that has started JARVIS but never stored anything still has the
+    memory schema, an FTS index header and archive settings; that is empty.
+    """
     if not blob:
         return False
     handle = tempfile.NamedTemporaryFile(prefix="brainsync-read-", suffix=".sqlite3", delete=False)
@@ -539,8 +577,8 @@ def _db_nonempty(blob):
         handle.close()
         con = sqlite3.connect(f"{Path(name).resolve().as_uri()}?mode=ro", uri=True)
         try:
-            names = [row[0] for row in con.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+            names = [table for table in _content_tables(con)
+                     if not table.startswith("sqlite_") and table not in _SETTINGS_TABLES]
             for table in names:
                 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table):
                     return True

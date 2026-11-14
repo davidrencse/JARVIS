@@ -11,6 +11,41 @@ CHUNK = 256 * 1024
 MAX_BUNDLE = 128 * 1024 * 1024
 
 
+def loaded_code_status(hub):
+    """Separate the process startup fingerprint from mutable disk/release code.
+
+    ``code`` remains the offered release for older clients' update protocol.
+    Missing startup evidence is never inferred from disk.
+    """
+    from .deploy import code_fingerprint
+    from .release import served_code
+    loaded = getattr(hub, 'loaded_code', None)
+    served = served_code(hub.state)
+    try:
+        disk = code_fingerprint()
+    except (OSError, ValueError):
+        disk = None
+    return {'code': served, 'served_code': served, 'loaded_code': loaded,
+            'disk_code': disk,
+            'restart_required': not loaded or loaded != served or loaded != disk}
+
+
+def require_loaded_code(hub):
+    """Refuse MAIN admission until this process runs the tested local release.
+
+    Direct production callers must use this gate too, before readiness or brain
+    transfer. A disk/release parity check alone cannot attest the running hub.
+    """
+    from .release import code_parity
+    loaded = getattr(hub, 'loaded_code', None)
+    parity = code_parity(hub.state, reported=loaded)
+    if not loaded or parity.get('matched') is not True:
+        raise ValueError('MAIN transfer requires the hub to run the tested local release. '
+                         'Check release parity and restart jarvis-cluster before retrying. '
+                         + (parity.get('instruction') or ''))
+    return parity
+
+
 def busy(state, *, hub=None, voice=False):
     from .sharedinput import remote_session_live, controlling_remote
     if remote_session_live(state) or controlling_remote(state):
@@ -61,7 +96,8 @@ def maybe_restart(hub):
     note = current(hub.state)
     if not (hub.config.get('cluster') or {}).get('auto_restart', False) or not note:
         return False
-    if note.get('code') == getattr(hub, '_release_started_code', None):
+    if note.get('code') == getattr(hub, 'loaded_code',
+                                   getattr(hub, '_release_started_code', None)):
         return False
     if code_fingerprint() != note.get('code') or busy(hub.state, hub=hub, voice=True):
         return False

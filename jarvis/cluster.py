@@ -748,6 +748,10 @@ class AuthBackoffError(PermissionError):
 
 class Hub:
     def __init__(self, config, base, state, console=None, ask_handler=None):
+        # Capture once, before startup work or the release thread can observe an
+        # updated checkout. The release offered to nodes is a different fact.
+        self.loaded_code = code_fingerprint()
+        self._release_started_code = self.loaded_code
         self.config, self.base, self.state = config, Path(base), Path(state).resolve()
         self.local, self.main = identity(config)
         if self.local != self.main:
@@ -864,7 +868,6 @@ class Hub:
         from .release import FAST_QUIET, QUIET, cut, due
         if self.stop_event.wait(settle):  # let nodes reconnect and report their code
             return
-        self._release_started_code = code_fingerprint()
         auto = (self.config.get("cluster") or {}).get("auto_release", True)
         while True:
             try:
@@ -1540,7 +1543,8 @@ def make_server(hub, host, port):
                                 request["callbacks"].extend(orphaned)
                                 orphaned.clear()
                 if self.path == "/v1/status" and not post:
-                    return self._send(200, {"main_device": hub.main, "code": served_code(hub.state),
+                    from .release_runtime import loaded_code_status
+                    return self._send(200, {"main_device": hub.main, **loaded_code_status(hub),
                                             "nodes": hub.broker.nodes()})
                 if self.path.startswith("/v1/code/chunk?") and not post and "owner" not in caps:
                     from .release_runtime import serve_chunk
@@ -1603,6 +1607,8 @@ def make_server(hub, host, port):
                 if self.path == "/v1/continuity/main":
                     if "owner" not in caps:
                         raise PermissionError("MAIN transitions require the local owner credential.")
+                    from .release_runtime import require_loaded_code
+                    require_loaded_code(hub)
                     from .continuity.hub_control import run_main
                     return self._send(200, run_main(hub, data, self.client_address[0]))
                 if self.path == "/v1/redeem" and "owner" not in caps:
