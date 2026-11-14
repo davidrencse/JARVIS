@@ -40,6 +40,8 @@ def load_head_deploy(directory):
         "SOURCE = None\n\n"
         "def source(state):\n"
         "    return SOURCE\n\n"
+        "def bundle_proof(state, root, code):\n"
+        "    return None\n\n"
         "def install_dependencies(*args, **kwargs):\n"
         "    return None\n",
         encoding="utf-8")

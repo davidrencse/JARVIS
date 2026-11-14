@@ -234,16 +234,24 @@ def local_server(config, base, state, port, overlay=None):
             raise
     # Extra local windows and overlays must share the existing main brain too.
     running = _HUBS.get(str(Path(state).resolve()))
+    owner_config = config
+    if running and getattr(running, 'server', None) is not None:
+        import copy
+        owner_config = copy.deepcopy(config)
+        host, listen_port = running.server.server_address[:2]
+        loopback = '[::1]' if ':' in host else '127.0.0.1'
+        owner_config.setdefault('cluster', {}).update(
+            main_device=running.main, main_url=f'http://{loopback}:{listen_port}')
     client = None
     if (Path(state) / OWNER_TOKEN).is_file():
-        candidate = Client(config, state, owner=True)
         try:
+            candidate = Client(owner_config, state, owner=True)
             candidate.request("/v1/status", timeout=1)
             client = candidate
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             pass
     if running or client:
-        client = client or Client(config, state, owner=True)
+        client = client or Client(owner_config, state, owner=True)
         return ConsoleServer(("127.0.0.1", port), proxy_handler(client, overlay)), Runtime()
     console = Console(config, base, state).start_live()
     hub = Hub(config, base, state, console=console)
