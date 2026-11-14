@@ -10,7 +10,8 @@
     "main_url": "http://127.0.0.1:7780",
     "listen_host": "127.0.0.1",
     "listen_port": 7780,
-    "port_note": "7778 is the Grokbot tunnel's forward on the Zenbook; the cluster uses 7780."
+    "port_note": "7778 is the Grokbot tunnel's forward on the Zenbook; the cluster uses 7780.",
+    "auto_restart": true
   },
   "devices": {
     "dell": {
