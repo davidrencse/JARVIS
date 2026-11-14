@@ -125,3 +125,18 @@ class JarvisScopeTests(unittest.TestCase):
             B._pending_bin(self.bases['arch']).write_bytes(wrong)
             with self.assertRaises(B.BrainSyncError) as invalid:self.approve(wrong)
             self.assertEqual(invalid.exception.code,'reviewed_handoff_invalid')
+
+    def test_changed_review_refuses_before_transition_coordinator(self):
+        from jarvis.continuity.production import ProductionController
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        controller=object.__new__(ProductionController)
+        controller.state=self.bases['arch']/'.jarvis'
+        controller.participant=SimpleNamespace(client=SimpleNamespace(status=lambda:{'incarnation':3,'epoch':14}))
+        controller._require_transfer_parity=Mock()
+        (controller.state/B.REVIEW_FILE).write_text('{}')
+        with patch.object(B,'_reviewed_pending_bundle',side_effect=B.BrainSyncError('reviewed_memory_changed')), \
+             patch('jarvis.continuity.production.SafeHandoff') as coordinator:
+            result=controller._handoff('arch','dell',self.configs['arch'],self.bases['arch'])
+        self.assertFalse(result['ok']);self.assertEqual(result['code'],'reviewed_memory_changed')
+        coordinator.assert_not_called()
