@@ -25,6 +25,7 @@ that admission inside the payload, so the existing job signature covers it and a
 process can read it from the broker.
 """
 
+from ..home import home as _jarvis_home
 import contextvars
 import hashlib
 import base64
@@ -285,7 +286,7 @@ def peer_report():
 
 def deployment_facts(config_path=None):
     """Read-only cluster identity. Device records, keys, and addresses are not copied."""
-    path = Path(config_path) if config_path else Path(__file__).resolve().parents[2] / "jarvis.config.json"
+    path = Path(config_path) if config_path else _jarvis_home() / "jarvis.config.json"
     facts = {
         "config_read": False,
         "device_ids": [],
@@ -642,7 +643,7 @@ class IsolatedFleet:
 
     def __init__(self, directory, clock):
         root = Path(directory).resolve()
-        live = (Path(__file__).resolve().parents[2] / ".jarvis").resolve()
+        live = (_jarvis_home() / ".jarvis").resolve()
         if root == live or live in root.parents:
             raise IntegrationError("refuses_live_state")
         self.root = root

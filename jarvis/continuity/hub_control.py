@@ -14,14 +14,27 @@ def _loopback(host):
         return False
 
 
-def request_main(config, state, device):
+def owner_client(config, state, refusal):
+    """The local hub's owner client, checked on the origin it will really use.
+
+    Client applies the verified continuity rewrite, so the caller's main_url
+    alone proves nothing: check it first (no token read for a remote or DNS
+    origin), then check the Client's own url after the rewrite.
+    """
     from jarvis.cluster import Client
     from jarvis.topology import endpoint
-    # Do not send the owner token to a configured remote origin or a DNS alias.
     if not _loopback(urlsplit(endpoint(config)).hostname):
-        raise ValueError("MAIN control requires a loopback cluster.main_url.")
-    return Client(config, state, owner=True).request(
-        "/v1/continuity/main", {"device": device}, timeout=600)
+        raise ValueError(refusal)
+    client = Client(config, state, owner=True)
+    if client.owner is not True or not _loopback(urlsplit(client.url).hostname):
+        raise ValueError(refusal)
+    return client
+
+
+def request_main(config, state, device):
+    # Do not send the owner token to a configured remote origin or a DNS alias.
+    client = owner_client(config, state, "MAIN control requires a loopback cluster.main_url.")
+    return client.request("/v1/continuity/main", {"device": device}, timeout=600)
 
 
 _RECEIPT_NAME = "continuity-main-receipt.json"

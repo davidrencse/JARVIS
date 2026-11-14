@@ -217,6 +217,14 @@ class ProductionController:
         transport = None
         result = None
         try:
+            review = self.state / brainsync.REVIEW_FILE
+            if review.exists() or review.is_symlink():
+                current = self.participant.client.status()
+                transition = current.get("transition") or {}
+                if transition.get("source") != old or transition.get("candidate") != new:
+                    raise RuntimeRefusal("reviewed_handoff_stale")
+                brainsync._reviewed_pending_bundle(config, base, old, new,
+                    incarnation=current["incarnation"], epoch=transition["expected_epoch"])
             transport = TransitionBundleTransport(config, base, self._remote)
             result = brainsync.handoff(old, new, config, base, transport=transport)
             return result
@@ -237,6 +245,15 @@ class ProductionController:
             # same release gate. A node without the owner key may only use the
             # explicitly configured, tuple-scoped proxy to its owner PC.
             self._require_transfer_parity(new)
+            from jarvis import brainsync
+            review = self.state / brainsync.REVIEW_FILE
+            if review.exists() or review.is_symlink():
+                status = self.participant.client.status()
+                try:
+                    brainsync._reviewed_pending_bundle(brainsync.jarvis_handoff_config(config),
+                        base, old, new, incarnation=status["incarnation"], epoch=status["epoch"])
+                except brainsync.BrainSyncError as exc:
+                    raise RuntimeRefusal(exc.code) from None
             route = _route(self.operator, new)
             del route  # candidate process independently consumes its own pinned route.
             owner_port = self._handoff_port(old, new)

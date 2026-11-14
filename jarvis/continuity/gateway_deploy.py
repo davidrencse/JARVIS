@@ -13,6 +13,7 @@ Every subprocess call goes through one injectable `runner`, so tests never
 touch ssh. `--dry-run` builds the tarball and prints the script and commands.
 """
 
+from ..home import home as _jarvis_home
 import argparse
 import gzip
 import hashlib
@@ -36,7 +37,7 @@ CONF = "/var/lib/jarvis-gateway/gateway.json"
 SERVICE_USER = "jarvis-gateway"
 PYTHON = "/usr/bin/python3"
 SSH_OPTS = ("-o", "BatchMode=yes", "-o", "ConnectTimeout=10")
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = _jarvis_home()
 
 _PHONE = ("jarvis", "web", "phone")
 

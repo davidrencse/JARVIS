@@ -28,6 +28,7 @@ the gateway directory, then stays `LEGACY_ACTIVE` until a new cutover.
 See `GatewayConfig`, `FailoverPolicy`, `backup_gateway`, and `restore_gateway`.
 """
 
+from ..home import home as _jarvis_home
 import argparse
 import base64
 import hashlib
@@ -2438,7 +2439,7 @@ class GatewayConfig:
 
 
 def _live_roots():
-    repo = Path(__file__).resolve().parents[2]
+    repo = _jarvis_home()
     return (repo / ".jarvis", Path.home() / ".local" / "state" / "jarvis")
 
 
