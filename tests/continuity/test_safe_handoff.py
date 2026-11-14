@@ -16,7 +16,6 @@ import sys
 import tempfile
 import threading
 import time
-import types
 import unittest
 from pathlib import Path
 
@@ -31,18 +30,14 @@ from jarvis.continuity.runtime import (
     _repoint_ok,
 )
 from jarvis.continuity import runtime as runtime_module
-from tests.continuity._fleet import Clock, ack, cutover, open_store, promote, ticket
+from tests.continuity._fleet import (
+    Clock, HandoffFixtures, ack, cutover, handoff_facts as _facts, open_store, promote, ticket)
 
 
 TOKEN = "HANDOFF-TOKEN-7f3a"
 BASE = "HANDOFF-BASE-7f3a"
-_MISSING = object()
 PC = ["status", "lease", "fence", "candidate", "consume", "reconcile"]
 SERVER = ["status", "fence", "reconcile"]
-
-
-def _facts(candidate):
-    return {"control_ready": True, "ai_ready": False, "checkpoint": "cp-1"}
 
 
 def _confirmed(old, new, lease):
@@ -80,7 +75,7 @@ def _secret_keys(value):
     return found
 
 
-class SafeHandoffTests(unittest.TestCase):
+class SafeHandoffTests(HandoffFixtures, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -102,34 +97,6 @@ class SafeHandoffTests(unittest.TestCase):
         except Exception:
             pass
 
-    def pc(self, device, cls=MainRuntime):
-        return cls(
-            self.port, device, device + "-inst",
-            lambda: {"control_ready": True, "checkpoint": "cp-1"},
-            clock=self.clock.mono, boot=lambda: "boot-a")
-
-    def seat(self, device="zenbook", cls=MainRuntime):
-        runtime = self.pc(device, cls)
-        if device == "zenbook":
-            runtime.accept_lease(self.lease)
-        runtime.start()
-        return runtime
-
-    def use_brain(self, fn):
-        previous = sys.modules.get("jarvis.brainsync", _MISSING)
-        module = types.ModuleType("jarvis.brainsync")
-        module.handoff = fn
-        sys.modules["jarvis.brainsync"] = module
-
-        def restore():
-            if previous is _MISSING:
-                sys.modules.pop("jarvis.brainsync", None)
-            else:
-                sys.modules["jarvis.brainsync"] = previous
-
-        self.addCleanup(restore)
-        return module
-
     def brain(self, old, new, config, base):
         self.events.append("brain")
         self.brain_status.append(self.store.status())
@@ -146,15 +113,6 @@ class SafeHandoffTests(unittest.TestCase):
         self.events.append("canary")
         self.assertEqual(new, "dell")
         return True
-
-    def handoff(self, source, candidate, port=None, **kwargs):
-        readiness = kwargs.get("readiness", _facts)
-        repoint = kwargs.get("repoint", self.repoint)
-        canary = kwargs.get("canary", self.canary)
-        return SafeHandoff(
-            port or self.port, source_runtime=source, candidate_runtime=candidate,
-            readiness=readiness, repoint=repoint, canary=canary,
-            journal_path=kwargs.get("journal_path"))
 
     def refuse_store(self, fn, code):
         with self.assertRaises(AuthorityError) as caught:

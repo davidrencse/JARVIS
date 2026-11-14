@@ -11,9 +11,9 @@ from pathlib import Path
 
 from jarvis.continuity.authority import LEASE_SECONDS
 from jarvis.continuity.recovery import ManualRecovery
-from jarvis.continuity.runtime import LinkError, MainRuntime, RuntimeRefusal, SafeHandoff
-from tests.continuity._fleet import Clock, ack, cutover, open_store, promote
-from tests.continuity.test_safe_handoff import TOKEN, BASE, AckingRuntime, _facts
+from jarvis.continuity.runtime import LinkError, MainRuntime, RuntimeRefusal
+from tests.continuity._fleet import Clock, HandoffFixtures, ack, cutover, open_store, promote
+from tests.continuity.test_safe_handoff import TOKEN, BASE, AckingRuntime
 
 
 def _confirmed(old, new, lease):
@@ -40,7 +40,7 @@ class _PortSpy:
         return getattr(self.inner, name)
 
 
-class HandoffRecoveryTests(unittest.TestCase):
+class HandoffRecoveryTests(HandoffFixtures, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -57,35 +57,6 @@ class HandoffRecoveryTests(unittest.TestCase):
         from jarvis.continuity.runtime import StoreAdapter
         return StoreAdapter(self.store)
 
-    def pc(self, device, cls=MainRuntime):
-        return cls(
-            self.port, device, device + "-inst",
-            lambda: {"control_ready": True, "checkpoint": "cp-1"},
-            clock=self.clock.mono, boot=lambda: "boot-a")
-
-    def seat(self, device="zenbook", cls=MainRuntime):
-        runtime = self.pc(device, cls)
-        if device == "zenbook":
-            runtime.accept_lease(self.lease)
-        runtime.start()
-        return runtime
-
-    def use_brain(self, fn):
-        import sys
-        import types
-        previous = sys.modules.get("jarvis.brainsync")
-        module = types.ModuleType("jarvis.brainsync")
-        module.handoff = fn
-        sys.modules["jarvis.brainsync"] = module
-
-        def restore():
-            if previous is None:
-                sys.modules.pop("jarvis.brainsync", None)
-            else:
-                sys.modules["jarvis.brainsync"] = previous
-
-        self.addCleanup(restore)
-
     def brain(self, old, new, config, base):
         self.events.append("brain")
         return {"ok": True, "status": "synced"}
@@ -97,14 +68,6 @@ class HandoffRecoveryTests(unittest.TestCase):
     def canary(self, new):
         self.events.append("canary")
         return True
-
-    def handoff(self, source, candidate, **kwargs):
-        return SafeHandoff(
-            self.port, source_runtime=source, candidate_runtime=candidate,
-            readiness=kwargs.get("readiness", _facts),
-            repoint=kwargs.get("repoint", self.repoint),
-            canary=kwargs.get("canary", self.canary),
-            journal_path=kwargs.get("journal_path"))
 
     def prepare(self, candidate_cls=MainRuntime):
         self.use_brain(self.brain)
