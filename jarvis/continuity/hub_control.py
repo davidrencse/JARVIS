@@ -204,6 +204,9 @@ def switch_main(config, state, device):
         raise ValueError("MAIN switch needs the local hub state directory.")
     if not _loopback(urlsplit(endpoint(config)).hostname):
         raise ValueError("MAIN control requires a loopback cluster.main_url.")
+    # Refuse an owner origin the continuity rewrite would move before any
+    # receipt says a post may have happened.
+    owner_client(config, folder, "MAIN control requires a loopback cluster.main_url.")
     current = _load_receipt(folder)
     if (current.get("target") not in (None, device)
             and current.get("publication") in _OPEN_RECEIPT):
@@ -275,14 +278,11 @@ def operator_configured(config, base):
 
 
 def request_recover(config, state, device, request_id):
-    from jarvis.cluster import Client
-    from jarvis.topology import endpoint
     from .runtime import _ident_ok
     if not _ident_ok(request_id) or not _ident_ok(device):
         raise ValueError("Invalid manual recovery request.")
-    if not _loopback(urlsplit(endpoint(config)).hostname):
-        raise ValueError("Recovery control requires a loopback cluster.main_url.")
-    return Client(config, state, owner=True).request('/v1/continuity/recover',
+    client = owner_client(config, state, "Recovery control requires a loopback cluster.main_url.")
+    return client.request('/v1/continuity/recover',
         {'device': device, 'request_id': request_id}, timeout=600)
 
 

@@ -217,7 +217,7 @@ class ProductionController:
         transport = None
         result = None
         try:
-            review = self.state / brainsync.REVIEW_FILE
+            review = Path(base) / ".jarvis" / brainsync.REVIEW_FILE
             if review.exists() or review.is_symlink():
                 current = self.participant.client.status()
                 transition = current.get("transition") or {}
