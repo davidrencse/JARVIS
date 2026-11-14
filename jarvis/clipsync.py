@@ -1296,7 +1296,8 @@ def control(arg, state=None):
     """The `clipboard` desktop action, so any computer can switch this one's half on or off:
     start, stop, status, autostart-on or autostart-off. (ok, json text)."""
     from pathlib import Path
-    state = state or str(Path(__file__).resolve().parents[1] / ".jarvis")
+    from .home import home
+    state = state or str(home() / ".jarvis")
     try:
         if arg == "start":
             result = start(state)

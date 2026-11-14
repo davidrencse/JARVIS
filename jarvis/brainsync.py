@@ -56,6 +56,8 @@ from .second_brain import looks_secret
 
 SCHEMA = "jarvis-brainsync-bundle/1"
 JARVIS_SCHEMA = "jarvis-memory-handoff/1"
+REVIEW_FILE = "brainsync-reviewed-handoff.json"
+REVIEW_SCHEMA = "jarvis-reviewed-memory-handoff/1"
 EXPORT_SCHEMA = "jarvis-brainsync-export/1"
 MARKER_SCHEMA = "jarvis-brainsync-handoff/1"
 MEMORY_GIT_PATH = "state/memory.sqlite3"
@@ -1512,6 +1514,81 @@ def _source_unchanged(config, base, pending):
     return _vault_fingerprint(overlay) == remembered_vault
 
 
+def _reviewed_pending_bundle(config, base, old_main, new_main, *, incarnation=None, epoch=None):
+    """Return exactly the reviewed bytes, or refuse. Never rebuild them implicitly."""
+    path = _state_dir(base) / REVIEW_FILE
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise BrainSyncError("reviewed_handoff_invalid")
+    record = _read_json(path)
+    fields = {"schema", "old_main", "new_main", "incarnation", "epoch",
+              "memory_sha256", "bundle_sha256"}
+    if (not isinstance(record, dict) or set(record) != fields or record.get("schema") != REVIEW_SCHEMA
+            or record.get("old_main") != old_main or record.get("new_main") != new_main
+            or any(type(record.get(k)) is not int or record[k] < 0 for k in ("incarnation", "epoch"))
+            or any(not isinstance(record.get(k), str) or not re.fullmatch(r"[a-f0-9]{64}", record[k])
+                   for k in ("memory_sha256", "bundle_sha256"))):
+        raise BrainSyncError("reviewed_handoff_invalid")
+    if ((incarnation is not None and record["incarnation"] != incarnation)
+            or (epoch is not None and record["epoch"] != epoch)):
+        raise BrainSyncError("reviewed_handoff_stale")
+    bundle_path = _pending_bin(base)
+    if bundle_path.is_symlink() or not bundle_path.is_file() or bundle_path.stat().st_size > MAX_BUNDLE_BYTES:
+        raise BrainSyncError("reviewed_handoff_invalid")
+    blob = bundle_path.read_bytes()
+    header, git_payload, memory = _unbundle(blob)
+    if (header.get("schema") != JARVIS_SCHEMA or git_payload
+            or header.get("old_main") != old_main or header.get("new_main") != new_main
+            or hashlib.sha256(blob).hexdigest() != record["bundle_sha256"]
+            or hashlib.sha256(memory).hexdigest() != record["memory_sha256"]
+            or header.get("memory_sha256") != record["memory_sha256"]):
+        raise BrainSyncError("reviewed_handoff_invalid")
+    current, reason = _stable_memory(_state_dir(base) / "memory.sqlite3")
+    if current is None or hashlib.sha256(current).hexdigest() != record["memory_sha256"]:
+        raise BrainSyncError("reviewed_memory_changed")
+    return blob
+
+
+def approve_pending_handoff(config, base, old_main, new_main, *, incarnation, epoch,
+                            memory_sha256, bundle_sha256):
+    """Local operator pins a reviewed JARVIS bundle before requesting its transition."""
+    role, error = _role(config)
+    if (error or role != (old_main, old_main) or old_main == new_main
+            or not isinstance(new_main, str) or not DEVICE_ID.fullmatch(new_main)
+            or (_settings(config) or {}).get("handoff_scope") != "jarvis"):
+        raise BrainSyncError("handoff_identity")
+    _known_devices(config, old_main, new_main)
+    if (any(type(v) is not int or v < 0 for v in (incarnation, epoch))
+            or any(not isinstance(v, str) or not re.fullmatch(r"[a-f0-9]{64}", v)
+                   for v in (memory_sha256, bundle_sha256))):
+        raise BrainSyncError("reviewed_handoff_invalid")
+    record = {"schema": REVIEW_SCHEMA, "old_main": old_main, "new_main": new_main,
+              "incarnation": incarnation, "epoch": epoch, "memory_sha256": memory_sha256,
+              "bundle_sha256": bundle_sha256}
+    with _Lock(base):
+        # Validate before publishing, preserving any old review on failure.
+        blob_path = _pending_bin(base)
+        review_path = _state_dir(base) / REVIEW_FILE
+        if (blob_path.is_symlink() or not blob_path.is_file()
+                or blob_path.stat().st_size > MAX_BUNDLE_BYTES or review_path.is_symlink()
+                or (review_path.exists() and not review_path.is_file())):
+            raise BrainSyncError("reviewed_handoff_invalid")
+        blob = blob_path.read_bytes()
+        header, git_payload, memory = _unbundle(blob)
+        current, reason = _stable_memory(_state_dir(base) / "memory.sqlite3")
+        if (header.get("schema") != JARVIS_SCHEMA or git_payload
+                or header.get("old_main") != old_main or header.get("new_main") != new_main
+                or hashlib.sha256(blob).hexdigest() != bundle_sha256
+                or hashlib.sha256(memory).hexdigest() != memory_sha256
+                or header.get("memory_sha256") != memory_sha256):
+            raise BrainSyncError("reviewed_handoff_invalid")
+        if current is None or hashlib.sha256(current).hexdigest() != memory_sha256:
+            raise BrainSyncError("reviewed_memory_changed")
+        _write_private(_state_dir(base) / REVIEW_FILE, json.dumps(record, sort_keys=True).encode(), 0o600)
+    return record
+
+
 def _make_jarvis_bundle(config, base, old_main, new_main, between):
     """Build the memory-only wire format without resolving a vault or a Git repo."""
     cfg = _settings(config)
@@ -1537,6 +1614,9 @@ def _make_jarvis_bundle(config, base, old_main, new_main, between):
                 or hashlib.sha256(blob).hexdigest() != pending.get("bundle_sha256")):
             raise BrainSyncError("handoff_scope")
         return blob, "frozen_resend"
+    reviewed = _reviewed_pending_bundle(config, base, old_main, new_main)
+    if reviewed is not None:
+        return reviewed, "reviewed_pending"
     memory, reason = _stable_memory(_state_dir(base) / "memory.sqlite3", between)
     if memory is None:
         raise BrainSyncError(reason or "memory_unavailable")

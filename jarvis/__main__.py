@@ -1,3 +1,4 @@
+from .home import home as _jarvis_home
 import argparse
 import json
 import os
@@ -10,7 +11,7 @@ from pathlib import Path
 from . import __version__
 
 # Anchor config and state to the project so `jarvis` works from any folder.
-HOME = Path(__file__).resolve().parent.parent
+HOME = _jarvis_home()
 
 COGNITION = ("ask", "chat", "route", "mem", "orchestrate", "voice")
 

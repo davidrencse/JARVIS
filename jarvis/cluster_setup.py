@@ -1517,6 +1517,8 @@ def doctor(config, path, state, fix=False):
 
 
 def _doctor_main(config, state, main, forward, checks, code):
+    from .release_runtime import run_source
+    _check(checks, "main runs from", *run_source(config, state))
     status = None
     try:
         status = Client(config, state, owner=True).request("/v1/status", timeout=3)
@@ -1526,6 +1528,10 @@ def _doctor_main(config, state, main, forward, checks, code):
                "jarvis cluster autostart on   (or run: jarvis cluster run)")
     if forward:
         _check(checks, "SSH server on this PC", _sshd_up(), "port 22 on 127.0.0.1", SSHD_FIX[_os()])
+    from .release import describe_holder, lock_holder
+    holder = lock_holder(state)
+    if holder:
+        _check(checks, "release test run", True, describe_holder(holder))
     nodes = {n["id"]: n for n in (status or {}).get("nodes") or Broker(state).nodes()}
     for device in sorted(set(config.get("devices") or {}) - {main}):
         node = nodes.get(device)
@@ -1548,14 +1554,18 @@ def _doctor_main(config, state, main, forward, checks, code):
         _check(checks, f"{device}: every job delivered (24 h)", not lost,
                ", ".join(f"{count} {name}" for name, count in sorted(ended.items())) or "no jobs",
                f"Jobs went unanswered: on {device}, jarvis cluster doctor (look at link health)")
+        from .drift import notes as drift_notes
+        drifted = drift_notes(state, [node], code).get(device, "")
         if node.get("online"):
             if not code:
                 _check(checks, f"{device}: same code", False, "no tested release on this main",
                        "On this main: jarvis cluster release   (a live tree is not a tested release)")
             else:
                 _check(checks, f"{device}: same code", node.get("code") == code,
-                       f"{node.get('code') or 'unknown'} vs main {code}",
-                       f"jarvis cluster update {device}   (forward nodes update themselves within a minute)")
+                       f"{node.get('code') or 'unknown'} vs main {code}" + (f"; {drifted}" if drifted else ""),
+                       f"Nodes pull the release automatically; wait, or speed it up: jarvis cluster update {device}")
+        elif drifted:
+            _check(checks, f"{device}: same code", True, drifted)
 
 
 def _link_hint(error, forward, main):

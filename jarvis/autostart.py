@@ -9,6 +9,7 @@
     install("jarvis-cluster", "JARVIS main or node agent", argv, enable=True)
 """
 
+from .home import home as _jarvis_home
 import json
 import os
 import plistlib
@@ -20,7 +21,33 @@ from pathlib import Path
 NAME = re.compile(r"[a-z][a-z0-9-]{1,40}\Z")
 # Every startup runs `python -m jarvis`, which needs the checkout as its working folder
 # (JARVIS isn't pip-installed). Login managers start elsewhere (systemd: $HOME).
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = _jarvis_home()
+
+
+def release_env(argv, root=None):
+    """Environment= lines that make a `python -m jarvis` unit import the tested release copy
+    (<state>/code-release) instead of the checkout, so editing the checkout never changes what
+    runs. Only with cluster.run_from_release on in jarvis.config.json AND a valid release (a
+    unit pointing at a missing copy could not even import jarvis). PYTHONSAFEPATH stops
+    `python -m` putting the working folder, the checkout, ahead of PYTHONPATH; JARVIS_HOME
+    (jarvis/home.py) keeps config, state, .venv and JARVIS.md pointing at the checkout.
+    Generation only: nothing here installs or restarts a unit."""
+    argv = [str(a) for a in argv]
+    if "jarvis" not in argv or "-m" not in argv:
+        return []
+    root = Path(root or ROOT)
+    from .fsio import read_json
+    config = read_json(root / "jarvis.config.json", {})
+    if not isinstance(config, dict) or not (config.get("cluster") or {}).get("run_from_release"):
+        return []
+    state = Path(argv[argv.index("--state") + 1]) if "--state" in argv[:-1] else root / ".jarvis"
+    from .release import current, release_dir
+    if not current(state):
+        return []
+    pairs = [("PYTHONPATH", release_dir(state).resolve()), ("PYTHONSAFEPATH", "1"),
+             ("JARVIS_HOME", root.resolve())]
+    return ["Environment=" + " ".join(json.dumps(f"{k}={str(v).replace('%', '%%').replace('$', '$$')}")
+                                       for k, v in pairs)]
 
 
 def vbs(line):
@@ -59,7 +86,7 @@ def systemd_unit(title, argv, comment=None, after="graphical-session.target netw
               "StartLimitIntervalSec=300", "StartLimitBurst=5", "",
               "[Service]", "Type=simple", f"WorkingDirectory={str(ROOT).replace('%', '%%')}",
               f"ExecStart={' '.join(_word(arg) for arg in interpreter(argv))}",
-              "Restart=on-failure", "RestartSec=5", *service, "",
+              "Restart=on-failure", "RestartSec=5", *service, *release_env(argv), "",
               "[Install]", f"WantedBy={wanted}", ""]
     return "\n".join(lines)
 

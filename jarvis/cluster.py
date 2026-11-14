@@ -4,6 +4,7 @@ Nodes poll for allowlisted work. Dispatched actions are never automatically repl
 Only the main creates model lanes, writes shared memory, or accepts control requests.
 """
 
+from .home import home as _jarvis_home
 import hmac
 import json
 import math
@@ -390,15 +391,32 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # credentials must never follow redirects
 
 
+OWNER_ORIGIN_REFUSAL = ("The owner credential only goes to this PC's own hub: set cluster.main_url "
+                        "to its numeric loopback origin (http://127.0.0.1:<port>).")
+
+
+def numeric_loopback_origin(url):
+    """True only for an origin whose host is a literal loopback IP (no DNS name)."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(urlsplit(str(url)).hostname or "").is_loopback
+    except ValueError:
+        return False
+
+
 class Client:
     def __init__(self, config, state, owner=False):
         self.config, self.state, self.owner = config, Path(state), owner
         # The real pairing lives in the checkout's .jarvis; under tests it would let an ask
         # reach the live main and its ChatGPT brain (see jarvis/__init__.py).
         if os.environ.get("JARVIS_NO_MODELS") == "1" and \
-                self.state.resolve() == (Path(__file__).resolve().parent.parent / ".jarvis").resolve():
+                self.state.resolve() == (_jarvis_home() / ".jarvis").resolve():
             raise PermissionError("Tests may not use this PC's real cluster credentials (JARVIS_NO_MODELS).")
         from .continuity.repoint import effective_config
+        if owner:
+            # The caller's own origin, read before the continuity rewrite below.
+            chosen = endpoint(config)
+            chosen_main = (config.get("cluster") or {}).get("main_device")
         config = effective_config(config, self.state)
         self.config = config
         self.local, self.main = identity(config)
@@ -406,6 +424,13 @@ class Client:
         if owner:
             if self.local != self.main:
                 raise ValueError("Only the configured main PC can use its owner credential.")
+            # The verified successor route decides who the main is, never where the
+            # owner token goes: that route may be a public HTTPS proxy. The token only
+            # goes to the numeric-loopback origin the caller chose for this same main
+            # (a caller origin written for another main may be an SSH tunnel to it).
+            if chosen_main != self.main or not numeric_loopback_origin(chosen):
+                raise ValueError(OWNER_ORIGIN_REFUSAL)
+            self.url = chosen
             path = self.state / OWNER_TOKEN
             if not path.is_file():
                 raise ValueError("Start JARVIS on the main PC first (jarvis cluster serve).")
@@ -429,6 +454,8 @@ class Client:
     def open(self, path, body=None, timeout=45, headers=None, method=None):
         if not path.startswith("/") or path.startswith("//"):
             raise ValueError("Cluster paths must be relative to the configured main.")
+        if self.owner and not numeric_loopback_origin(self.url):
+            raise ValueError(OWNER_ORIGIN_REFUSAL)
         request = urllib.request.Request(self.url + path, data=body, method=method,
             headers={**(headers or {}), "Authorization": f"Bearer {self.token}",
                      "X-JARVIS-Main": self.main})
@@ -884,6 +911,11 @@ class Hub:
                 self._auto_update(settle=0)
                 from .release_runtime import maybe_restart
                 maybe_restart(self)
+                from .drift import check as check_drift
+                check_drift(self)
+                if not _under_tests():
+                    from .gateway_auto import step as gateway_step  # opt-in Oracle gateway deploy
+                    gateway_step(self)
             except Exception as exc:  # a file saved mid-copy must not end auto-update for good
                 print(f"JARVIS: auto-update step failed: {exc}", flush=True)
             if self.stop_event.wait(every):
@@ -984,7 +1016,7 @@ class Hub:
         if not _read_only(kind, payload) and status.get("code") != served_code(self.state):
             # Mismatched code can misread a newer job; refuse rather than guess.
             raise ValueError(f"{node} runs different JARVIS code ({status.get('code') or 'unknown'}, "
-                             f"main {served_code(self.state)}). Run: jarvis cluster update {node}")
+                             f"main {served_code(self.state)}). It pulls the release by itself; to speed it up: jarvis cluster update {node}")
         try:
             from .continuity.integration import seal_job_payload
         except ImportError:
@@ -1178,7 +1210,7 @@ class Hub:
         if not (status.get("online") or self.alive(device_id, status)):
             return every(False, "Offline: start JARVIS on it and check its link (jarvis cluster doctor).")
         if status.get("code") != served_code(self.state):
-            return every(False, f"Runs older JARVIS code. Run: jarvis cluster update {device_id}")
+            return every(False, f"Runs older JARVIS code. It pulls the release by itself; to speed it up: jarvis cluster update {device_id}")
         caps = set(status.get("capabilities") or ())
         grant = (f" Grant it on the main: jarvis cluster caps {device_id} --capability ... (list every "
                  "capability it should keep; the command replaces the set).")
@@ -1778,7 +1810,7 @@ class NodeWorker:
             raise ValueError("Run the node agent on a PC other than the configured main.")
         self.config, self.state = config, Path(state).resolve()
         self.client = Client(config, state)
-        self.config_path = config_path or Path(__file__).resolve().parent.parent / "jarvis.config.json"
+        self.config_path = config_path or _jarvis_home() / "jarvis.config.json"
         self.executor = executor or (lambda kind, payload: execute_local(kind, payload, config, state))
         self._acts_locally = executor is None  # a test's stand-in executor: don't touch real Lan Mouse
         self.stop_event = threading.Event()

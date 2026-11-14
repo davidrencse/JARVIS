@@ -252,8 +252,9 @@ def installed_version(state):
 def code_bundle(state):
     """What /v1/code serves: the tested release's jarvis/ + pyproject.toml (release.py) as
     base64 zip, with its fingerprint and the main's signature over the zip."""
-    from .release import source
+    from .release import source, bundle_proof
     root = source(state)
+    code, version = code_fingerprint(root), int(time.time())
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
         for path in _files(root):
@@ -261,12 +262,22 @@ def code_bundle(state):
         pyproject = root.parent / "pyproject.toml"
         if pyproject.is_file():
             bundle.write(pyproject, "pyproject.toml")
+        proof = bundle_proof(state, root, code)
+        if proof is not None:
+            # The raw ZIP signature covers its comment. Older installers ignore
+            # comments, unlike a new top-level entry their path allowlist rejects.
+            comment = TESTED_PROOF + json.dumps(proof, sort_keys=True).encode('utf-8')
+            if len(comment) > 65535:
+                raise ValueError('Tested-release proof exceeds the ZIP comment limit.')
+            bundle.comment = comment
     raw = buffer.getvalue()
-    code, version = code_fingerprint(root), int(time.time())
     # `signature` (over the zip alone) stays for nodes that predate versions; `vsig` also covers
     # the version and fingerprint, so a replayed older bundle can't pass as a newer one.
     return {"code": code, "zip": base64.b64encode(raw).decode("ascii"), "signature": sign(raw, state),
             "version": version, "vsig": sign(_bundle_bytes(raw, version, code), state)}
+
+
+TESTED_PROOF = b'jarvis-tested-release-v1\n'
 
 
 def _zip_symlink(info):
@@ -302,7 +313,10 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None, *, health=None):
     install should stay. Any other result, or a check that raises, restores
     `jarvis.prev` from `_keep_previous`, deletes files the bundle added, and does not
     advance the installed version. With `state`, that failure records the bundle
-    fingerprint as a bad release."""
+    fingerprint as a bad release. A versioned bundle may also carry explicit tested
+    release evidence in its signed ZIP comment. Only a strictly newer, healthy
+    install can adopt that evidence and its package snapshot for successor serving;
+    signatures on legacy/live-tree bundles alone never establish test evidence."""
     repo = Path(repo).resolve()
     if not key:
         raise ValueError("No code-signing key is pinned for the main PC; re-join with a fresh "
@@ -329,7 +343,11 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None, *, health=None):
     elif not verify(raw, bundle.get("signature"), key):
         raise ValueError("The code bundle isn't signed by the main PC's pinned key; not installed.")
     previous_project = None
+    proof = None
     with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        if archive.comment.startswith(TESTED_PROOF):
+            from .release import validate_bundle_proof
+            proof = validate_bundle_proof(archive.comment[len(TESTED_PROOF):], bundle.get('code'))
         entries = []
         for info in archive.infolist():
             if info.is_dir():
@@ -398,6 +416,9 @@ def apply_bundle(bundle, key, repo=PACKAGE.parent, state=None, *, health=None):
         raise ValueError(f"The installed code failed its health check ({outcome}); "
                          "restored the previous code.")
     if state is not None and version is not None:
+        if proof is not None and version > have:
+            from .release import adopt_bundle_proof
+            adopt_bundle_proof(state, repo, proof, version)
         from .fsio import atomic_write
         atomic_write(Path(state) / VERSION_FILE, json.dumps({"version": version}))
     return len(entries)

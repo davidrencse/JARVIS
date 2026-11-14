@@ -25,6 +25,7 @@ Safety, checked before every action:
 Every action is logged to .jarvis/logs/control.jsonl.
 """
 
+from .home import home as _jarvis_home
 import base64
 import io
 import json
@@ -38,7 +39,7 @@ from pathlib import Path
 
 from . import platforms
 
-STATE = Path(os.environ.get("JARVIS_STATE") or Path(__file__).resolve().parent.parent / ".jarvis")
+STATE = Path(os.environ.get("JARVIS_STATE") or _jarvis_home() / ".jarvis")
 STOP_FILE = "control-stop"
 STOP_MINUTES = 10
 PAUSE_SECONDS = 15

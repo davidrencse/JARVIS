@@ -9,6 +9,7 @@ The checks that need the outside world take it as arguments (reachable, ready,
 app_exists), so the gates themselves stay pure and testable.
 """
 
+from .home import home as _jarvis_home
 import json
 import os
 from .platforms import on_windows
@@ -115,7 +116,7 @@ def local_config(base=None):
     """This computer's jarvis.config.json (next to the jarvis package), for checks that run
     where no config was handed down (a node's terminal, desktop typing). {} if unreadable:
     hard_deny still refuses everything it can judge without the vault paths."""
-    path = Path(base or Path(__file__).resolve().parent.parent) / "jarvis.config.json"
+    path = Path(base or _jarvis_home()) / "jarvis.config.json"
     try:
         mtime = path.stat().st_mtime
         cached = _LOCAL.get(str(path))
@@ -954,7 +955,7 @@ def _terminal_denial(args, config, base, depth=0, expand=True):
         return "JARVIS doesn't run code piped or decoded into a shell"
     if OWN_TEXT.search(command) or _globbed_secret(command):
         return "JARVIS's own config, state and keys are off limits"
-    repo = Path(base).resolve() if base else Path(__file__).resolve().parent.parent
+    repo = Path(base).resolve() if base else _jarvis_home()
     repo_s = str(repo).replace("\\", "/")
     home = _abs("~", "/")
     vaults = [_abs(v, "/") for v in _vault_paths(config)]

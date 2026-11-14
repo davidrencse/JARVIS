@@ -17,6 +17,7 @@ desktop scrolling: it ends on "stop scrolling", after SCROLL_MAX, or once the br
 has been closed for SCROLL_MISSES checks in a row.
 """
 
+from .home import home as _jarvis_home
 import json
 import os
 import re
@@ -31,7 +32,7 @@ from .platforms import NO_WINDOW, on_windows
 PACKAGE = "agent-browser"
 VERSION = "0.39.1"  # pinned with actions.AGENT_BROWSER
 SESSION = "jarvis"
-STATE = Path(__file__).resolve().parents[1] / ".jarvis"
+STATE = _jarvis_home() / ".jarvis"
 ACTIONS = ("open", "scroll", "back", "forward", "reload", "close")
 SCROLL_PX = 700             # one "scroll" in the agent browser, about a screen
 SCROLL_EVERY = 10.0
