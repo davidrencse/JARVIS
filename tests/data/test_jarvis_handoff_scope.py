@@ -89,3 +89,39 @@ class JarvisScopeTests(unittest.TestCase):
         sent=handoff.call_args.args[2]
         self.assertEqual(sent['brainsync']['handoff_scope'],'jarvis')
         self.assertNotIn('handoff_scope',config['brainsync'])
+
+    def approve(self, blob):
+        _header,_git,memory=B._unbundle(blob)
+        return B.approve_pending_handoff(self.configs['arch'],self.bases['arch'],'arch','dell',
+            incarnation=3,epoch=14,memory_sha256=hashlib.sha256(memory).hexdigest(),
+            bundle_sha256=hashlib.sha256(blob).hexdigest())
+
+    def test_reviewed_memory_reuses_exact_bundle_without_rebuilding(self):
+        with self.no_vault():
+            blob=self.make(); self.approve(blob)
+            with patch.object(B,'_remember_pending') as remember, \
+                 patch.object(B,'_bundle_bytes',side_effect=AssertionError('reviewed bytes rebuilt')):
+                replay,how=B._make_bundle(self.configs['arch'],self.bases['arch'],'arch','dell',None)
+        self.assertEqual(replay,blob); self.assertEqual(how,'reviewed_pending')
+        remember.assert_not_called()
+
+    def test_changed_memory_refuses_and_preserves_reviewed_bundle(self):
+        with self.no_vault():
+            blob=self.make(); self.approve(blob)
+            with closing(sqlite3.connect(self.bases['arch']/'.jarvis/memory.sqlite3')) as db,db:
+                db.execute("INSERT INTO items VALUES ('new real memory')")
+            with self.assertRaises(B.BrainSyncError) as caught:self.make()
+            self.assertEqual(caught.exception.code,'reviewed_memory_changed')
+        self.assertEqual(B._pending_bin(self.bases['arch']).read_bytes(),blob)
+
+    def test_reviewed_tuple_and_extra_payload_refuse(self):
+        with self.no_vault():
+            blob=self.make(); self.approve(blob)
+            with self.assertRaises(B.BrainSyncError) as stale:
+                B._reviewed_pending_bundle(self.configs['arch'],self.bases['arch'],'arch','dell',incarnation=3,epoch=15)
+            self.assertEqual(stale.exception.code,'reviewed_handoff_stale')
+            header,_git,memory=B._unbundle(blob)
+            wrong=B._bundle_bytes(header,b'external data',memory)
+            B._pending_bin(self.bases['arch']).write_bytes(wrong)
+            with self.assertRaises(B.BrainSyncError) as invalid:self.approve(wrong)
+            self.assertEqual(invalid.exception.code,'reviewed_handoff_invalid')
