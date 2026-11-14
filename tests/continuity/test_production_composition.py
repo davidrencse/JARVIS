@@ -101,7 +101,9 @@ def _close_test_hub(hub, state):
 
 
 class ProductionCompositionTests(unittest.TestCase):
-    def test_deferred_role_callback_runs_only_after_response_write(self):
+    def _bare_hub_request(self):
+        """A handler over a bare Hub with one role-transition request in flight.
+        Returns (hub, handler)."""
         from email.message import Message
         from jarvis import ui
         from jarvis.cluster import Hub, make_server
@@ -123,6 +125,13 @@ class ProductionCompositionTests(unittest.TestCase):
         request = {"callbacks": [], "written": False, "role_transition": True}
         hub._response_context.request = request
         hub._active_responses[id(request)] = request
+        return hub, handler
+
+    def test_deferred_role_callback_runs_only_after_response_write(self):
+        from jarvis import ui
+        from jarvis.cluster import Hub
+        from unittest.mock import patch
+        hub, handler = self._bare_hub_request()
         events = []
         thread = threading.Thread(target=lambda: Hub.defer_after_response(
             hub, lambda: events.append("pivot")))
@@ -134,27 +143,10 @@ class ProductionCompositionTests(unittest.TestCase):
         self.assertEqual(events, ["write", "pivot"])
 
     def test_failed_response_write_does_not_run_deferred_role_callback(self):
-        from email.message import Message
         from jarvis import ui
-        from jarvis.cluster import Hub, make_server
+        from jarvis.cluster import Hub
         from unittest.mock import patch
-        hub = object.__new__(Hub)
-        hub.console = None
-        hub.config = {"cluster": {"main_url": "http://127.0.0.1:7781"}}
-        hub._response_context = threading.local()
-        hub._active_responses = {}
-        hub._active_responses_lock = threading.RLock()
-        hub._orphaned_response_callbacks = []
-        def server_init(server, address, handler):
-            server.RequestHandlerClass = handler
-        with patch.object(ui.ConsoleServer, "__init__", server_init):
-            server = make_server(hub, "127.0.0.1", 0)
-        handler = object.__new__(server.RequestHandlerClass)
-        handler._node_path = None
-        handler.headers = Message()
-        request = {"callbacks": [], "written": False, "role_transition": True}
-        hub._response_context.request = request
-        hub._active_responses[id(request)] = request
+        hub, handler = self._bare_hub_request()
         events = []
         Hub.defer_after_response(hub, lambda: events.append("pivot"))
         def failed_write(*_args, **_kwargs):
@@ -269,7 +261,7 @@ class ProductionCompositionTests(unittest.TestCase):
                             "main_url": origin, "auto_release": False, "auto_update": False},
                 "devices": devices, "clipboard": {"autostart": False},
                 "continuity": {"operator_config": str(base / "operator.json")},
-                "brainsync": {"enabled": complete},
+                "brainsync": {"enabled": complete, "handoff_scope": "jarvis"},
                 "vault": {"enabled": True, "path": str(base / "vault")},
                 "storage": {"zenbook": {"roots": [str(root)]}, "dell": {"roots": [str(root)]}},
             }
@@ -282,7 +274,7 @@ class ProductionCompositionTests(unittest.TestCase):
                             "listen_port": port, "main_url": origin},
                 "devices": devices, "clipboard": {"autostart": False},
                 "continuity": {"operator_config": str(dell_base / "operator.json")},
-                "brainsync": {"enabled": complete},
+                "brainsync": {"enabled": complete, "handoff_scope": "jarvis"},
                 "vault": {"enabled": True, "path": str(dell_base / "vault")},
                 "storage": zenbook_config["storage"],
             }

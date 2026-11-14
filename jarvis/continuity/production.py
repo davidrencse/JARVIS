@@ -174,6 +174,7 @@ class ProductionController:
     def _brain(self, old, new, config, base):
         from jarvis import brainsync
         from .brain_channel import TransitionBundleTransport
+        config = brainsync.jarvis_handoff_config(config)
         transport = TransitionBundleTransport(config, base, self._remote)
         return brainsync.handoff(old, new, config, base, transport=transport)
 

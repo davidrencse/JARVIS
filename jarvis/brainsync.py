@@ -1,4 +1,8 @@
-"""Brain transport: a private git snapshot of the vault, and a direct memory handoff.
+"""Explicit vault sync and scoped JARVIS memory transport.
+
+Managed PC transitions use ``jarvis-memory-handoff/1``: a SQLite memory snapshot
+with no Git payload. That path never resolves, scans, bundles or materializes a
+configured external vault. Vault sync below is a separate explicit operation.
 
 Off unless ``config["brainsync"]["enabled"] is True``. The git repository is a
 dedicated directory (default ``<base>/.jarvis/brain-git``). It is not the JARVIS
@@ -51,6 +55,7 @@ from .platforms import NO_WINDOW
 from .second_brain import looks_secret
 
 SCHEMA = "jarvis-brainsync-bundle/1"
+JARVIS_SCHEMA = "jarvis-memory-handoff/1"
 EXPORT_SCHEMA = "jarvis-brainsync-export/1"
 MARKER_SCHEMA = "jarvis-brainsync-handoff/1"
 MEMORY_GIT_PATH = "state/memory.sqlite3"
@@ -114,7 +119,16 @@ def _settings(config):
     repo = raw.get("repo", None)
     if repo is not None and not isinstance(repo, str):
         return None
-    return {"enabled": raw.get("enabled") is True, "allow": allow, "remote": remote, "repo": repo}
+    scope = raw.get("handoff_scope", "vault")
+    if scope not in ("vault", "jarvis"):
+        return None
+    return {"enabled": raw.get("enabled") is True, "allow": allow, "remote": remote, "repo": repo,
+            "handoff_scope": scope}
+
+
+def jarvis_handoff_config(config):
+    """Managed PC transitions transfer JARVIS memory, never a configured vault."""
+    return {**config, "brainsync": {**(config.get("brainsync") or {}), "handoff_scope": "jarvis"}}
 
 
 def _norm_rel(value):
@@ -1327,7 +1341,7 @@ def _known_devices(config, *device_ids):
 
 
 def _header_ok(header, local, expect_new):
-    if header.get("schema") != SCHEMA or header.get("quiesced") is not True:
+    if header.get("schema") not in (SCHEMA, JARVIS_SCHEMA) or header.get("quiesced") is not True:
         return False
     old_main, new_main = header.get("old_main"), header.get("new_main")
     if not isinstance(old_main, str) or not isinstance(new_main, str):
@@ -1340,8 +1354,26 @@ def _header_ok(header, local, expect_new):
 
 
 def _receive_unlocked(config, base, blob):
-    cfg, (local, _main), vault, repo, _remote = _prepare(config, base)
     header, git_bundle, memory = _unbundle(blob)
+    if header.get("schema") == JARVIS_SCHEMA:
+        cfg = _settings(config)
+        role, error = _role(config)
+        if cfg is None or not cfg["enabled"]:
+            raise BrainSyncError("disabled")
+        if error or not _header_ok(header, role[0], role[0]):
+            raise BrainSyncError("handoff_identity")
+        _known_devices(config, header["old_main"], header["new_main"])
+        if (git_bundle or not memory.startswith(b"SQLite format 3\x00")
+                or hashlib.sha256(memory).hexdigest() != header.get("memory_sha256")):
+            raise BrainSyncError("bad_bundle")
+        installed = _install_memory(base, memory)
+        if not installed["ok"]:
+            return installed
+        return _result(True, "imported", None, enabled=True, device=role[0],
+                       memory=installed["status"], created=[], conflicts=[], skipped=[], scope="jarvis")
+    if (_settings(config) or {}).get("handoff_scope") == "jarvis":
+        raise BrainSyncError("handoff_scope")
+    cfg, (local, _main), vault, repo, _remote = _prepare(config, base)
     if not _header_ok(header, local, local):
         raise BrainSyncError("handoff_identity")
     _known_devices(config, header["old_main"], header["new_main"])
@@ -1436,11 +1468,51 @@ def _source_unchanged(config, base, pending):
         return False
     if hashlib.sha256(memory).hexdigest() != remembered_memory:
         return False
+    if (_settings(config) or {}).get("handoff_scope") == "jarvis":
+        return remembered_vault == _vault_fingerprint({})
     overlay, _excluded = _collect_vault(_vault_root(config, base))
     return _vault_fingerprint(overlay) == remembered_vault
 
 
+def _make_jarvis_bundle(config, base, old_main, new_main, between):
+    """Build the memory-only wire format without resolving a vault or a Git repo."""
+    cfg = _settings(config)
+    if not cfg or not cfg["enabled"]:
+        raise BrainSyncError("disabled")
+    role, error = _role(config)
+    if error or role[0] != old_main or role[1] not in (old_main, new_main) or old_main == new_main:
+        raise BrainSyncError("handoff_identity")
+    _known_devices(config, old_main, new_main)
+    if not DEVICE_ID.fullmatch(new_main):
+        raise BrainSyncError("bad_device")
+    marker = _read_marker(base)
+    if marker:
+        if marker.get("old_main") != old_main or marker.get("new_main") != new_main:
+            raise BrainSyncError("handoff_conflict")
+        pending = _read_json(_pending_json(base))
+        path = _pending_bin(base)
+        if not pending or not path.is_file():
+            raise BrainSyncError("frozen_bundle_missing")
+        blob = path.read_bytes()
+        header, git_bundle, _memory = _unbundle(blob)
+        if (header.get("schema") != JARVIS_SCHEMA or git_bundle
+                or hashlib.sha256(blob).hexdigest() != pending.get("bundle_sha256")):
+            raise BrainSyncError("handoff_scope")
+        return blob, "frozen_resend"
+    memory, reason = _stable_memory(_state_dir(base) / "memory.sqlite3", between)
+    if memory is None:
+        raise BrainSyncError(reason or "memory_unavailable")
+    digest = hashlib.sha256(memory).hexdigest()
+    header = {"schema": JARVIS_SCHEMA, "old_main": old_main, "new_main": new_main,
+              "device": old_main, "quiesced": True, "memory_sha256": digest}
+    blob = _bundle_bytes(header, b"", memory)
+    _remember_pending(base, old_main, new_main, blob, digest, _vault_fingerprint({}))
+    return blob, "exported"
+
+
 def _make_bundle(config, base, old_main, new_main, between):
+    if (_settings(config) or {}).get("handoff_scope") == "jarvis":
+        return _make_jarvis_bundle(config, base, old_main, new_main, between)
     cfg, (local, main), vault, repo, _remote = _prepare(config, base)
     _known_devices(config, old_main, new_main)
     if local != old_main or main not in (old_main, new_main) or old_main == new_main:

@@ -306,7 +306,11 @@ class Participant:
                 return {key: facts.get(key) for key in ('control_ready', 'ai_ready', 'checkpoint')}
             if action == 'brain':
                 from jarvis.transfer import run_here
-                return run_here(payload['operation'], self.state, self.config)
+                config = self.config
+                if getattr(self, 'production_controller', None) is not None:
+                    from jarvis.brainsync import jarvis_handoff_config
+                    config = jarvis_handoff_config(config)
+                return run_here(payload['operation'], self.state, config)
             if action == 'repoint':
                 controller = getattr(self, 'production_controller', None)
                 if controller is None:
