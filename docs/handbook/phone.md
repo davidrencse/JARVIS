@@ -1,241 +1,99 @@
 # Phone app
 
-A small web app (a PWA) on David's phone that drives JARVIS over Tailscale. It is a remote
-control for JARVIS, not a second JARVIS:
+*The phone PWA: pairing, Ask, camera, and the screen it draws. Fleet admin is [fleet-ui.md](fleet-ui.md).*
 
-- **Devices**: every computer, online or not, what each can do now, session status.
-- **Control**: the screen, mouse and keyboard of the main or a node (same sessions as the
-  console's Remote view).
-- **Camera**: a live view of a computer's webcam, 15 minutes at most.
-- **Ask**: a request through the normal JARVIS pipeline, as if typed at the main. While it works,
-  the phone shows the real decision path (see below).
+The phone is a remote control for the main, not a second JARVIS. Devices lists every computer. Control is the same remote session as the console. Camera is a live webcam, 15 minutes at most. Ask goes through the normal pipeline. Code: `jarvis/phone.py`, `jarvis/web/phone/`, `jarvis/camera.py`, session kinds in `jarvis/remote_view.py`.
 
-Code: `jarvis/phone.py` (server, pairing, CLI), `jarvis/web/phone/` (the app),
-`jarvis/camera.py`, `jarvis/locate.py`, session kinds and owners in `jarvis/remote_view.py`,
-hub calls in `jarvis/cluster.py`. Tests: `tests/test_phone*.py`, `test_camera`,
-`test_locate`, `test_remote_kinds`.
+The server binds `127.0.0.1:7787` (`phone.port`; not 7790–7799). It starts inside `jarvis-cluster` only when the link is on. A bind failure does not take the console down. It serves a fixed file list and never falls through to the console on 7777. Nodes do not listen for the phone. Publish with Tailscale Serve, never Funnel:
 
-## How it is wired
-
-```mermaid
-flowchart LR
-    P[Phone app] -- HTTPS on the tailnet --> S[tailscale serve :443]
-    S -- http + X-Forwarded-For + Tailscale-User-Login --> F[phone.py 127.0.0.1:7787]
-    F --> H[Hub, in-process]
-    F --> C[Console: Ask, events]
-    H -- signed remote / camera job --> N[Node]
-    H -- in-process --> M[The main itself]
+```text
+jarvis phone on
+systemctl --user restart jarvis-cluster
+sudo tailscale serve --bg --https=443 http://127.0.0.1:7787
+jarvis phone status
 ```
 
-- The server binds `127.0.0.1:7787` only (`phone.port` in config overrides; not 7790-7799,
-  the overlay uses those). It starts inside the main's runtime (`jarvis-cluster`), only when
-  the link is on, and a failure to bind never takes the console down.
-- It is its own server with a fixed list of files and routes. It never falls through to the
-  console on :7777, which trusts anything on loopback.
-- Nothing new listens on a node: sessions and locating ride the existing hub and tunnel.
+`status` must show a `url`, `serve_points_here` true, `funnel` false, and `refusing` null. On the iPhone, Tailscale on, open that URL in Safari, Share → Add to Home Screen, and pair from the icon. iOS keeps the icon's storage apart from Safari's.
 
-## Threat model
+```text
+jarvis phone pair [--name "David's iPhone"]
+jarvis phone off
+jarvis phone revoke <id> | revoke all
+jarvis phone list
+jarvis camera allow on | off | status
+jarvis cluster caps <node> --capability desktop --capability files --capability grokbot --capability inventory --capability camera
+```
 
-**A paired phone is owner-level.** Remote control is raw keyboard and mouse, and Ask reaches
-the brain under David's rules. So pairing and every request are checked hard, and the phone
-gets nothing beyond the five features: no shell, file or settings API.
+`caps` replaces the set. Camera consent is per computer, read from disk at every start and every frame. Infrared cameras are skipped. Windows needs `ffmpeg` on the node agent's PATH and Settings → Privacy → Camera → desktop apps. `jarvis control stop` on the watched computer ends screen and camera sessions.
 
-Every request must pass, failing closed at each step:
+## Checks
 
-1. `Host` is the main's tailnet name (or `127.0.0.1:7787` / `localhost:7787`).
-2. `X-Forwarded-For` (set by Serve) is a tailnet address that `tailscale whois` knows.
-3. `Tailscale-User-Login` (set by Serve) equals whois's login.
-4. `Sec-Fetch-Site` is absent, `same-origin` or `none` (no other site can send it).
+A paired phone is owner-level: raw keyboard and mouse, and Ask under David's rules. There is no shell, file, or settings API. Each request fails closed:
+
+1. `Host` is the main's tailnet name, or `127.0.0.1:7787` / `localhost:7787`.
+2. `X-Forwarded-For` is a tailnet address `tailscale whois` knows.
+3. `Tailscale-User-Login` equals that whois login.
+4. `Sec-Fetch-Site` is absent, `same-origin`, or `none`.
 5. A POST carries `X-JARVIS-Phone: 1` and a JSON object of at most 256 KiB.
-6. `/phone/api/*` carries the phone's cookie (`__Host-jarvis_phone`, HttpOnly, Secure,
-   SameSite=Strict, 90 days). Only its SHA-256 is stored, and it works only from the same
-   Tailscale device and login it was paired from. The cookie rotates: a non-frame request
-   after 7 days mints a new one (`Set-Cookie`), and the previous one still works for 10 minutes.
-   A frame request sends its session id in the `X-JARVIS-Session` header, not the URL
-   (`?session=` is still accepted until 2026-12-31 for phones running an old cached page).
+6. `/phone/api/*` carries `__Host-jarvis_phone` (HttpOnly, Secure, SameSite=Strict, 90 days). Only the SHA-256 is stored, and only from the paired Tailscale device and login. A non-frame request after 7 days rotates it; the previous cookie works for 10 minutes. Frames send `X-JARVIS-Session`. `?session=` is accepted until 2026-12-31 for an old cached page.
 
-The whole server answers 503 to everything while the link is off, while Tailscale Funnel
-reaches the port (the public internet), or while Serve's settings can't be read.
+The server answers 503 while the link is off, while Funnel reaches the port, or while Serve's settings cannot be read. The pairing code is 8 characters, hashed, valid 5 minutes, printed on the main's terminal only. The terminal asks `<device> (<OS>, <login>) wants to pair as '<name>'. Allow? [y/N]`. Only `y` pairs. The main, any cluster computer, and anything that is not iOS or Android are refused before the code is checked (`--allow-desktop` is for tests). Five wrong codes per device per 10 minutes, then a wait. After `y`, the key must arrive within 60 s.
 
-**Pairing** needs David at the main: `jarvis phone pair` prints an 8-character code (valid
-5 minutes, stored hashed) to that terminal only. The phone sends it, and the terminal asks
-`<device> (<OS>, <login>) wants to pair as '<name>'. Allow? [y/N]`. Only `y` pairs. The main
-itself, any cluster computer and anything that isn't iOS or Android are refused before a code
-is checked. Five wrong codes per device per 10 minutes, then a wait.
+The phone cannot approve. Confirmation words are refused with "Approve on your PC". A request that needs an OK says "Waiting for your OK on the PC". Someone else's session is 409. Another phone's session id is 404. `camera`, `locate`, and `remote` are refused on `/v1/action` and `/v1/control` for every caller, including the owner token. The watched computer shows a notification when control, camera, or locate starts or stops.
 
-**What the phone can't do:**
-- Approve anything. Confirmation words ("yes", "approve", "ok"...) are refused with
-  "Approve on your PC", and a request that needs an OK says "Waiting for your OK on the PC".
-- Take a session someone else holds. The console's or another phone's session answers 409;
-  another phone's session ids read as unknown (404).
-- Reach the brain with new powers. The brain gets no new tool. `camera`, `locate` and
-  `remote` jobs are refused on `/v1/action` and `/v1/control` for every caller, the owner
-  token included; only the console and the phone server start them, in-process.
+Location, Radar, Maps links, and mobile geolocation are removed. The overview does not carry coordinates. `/phone/api/locate` is 404. Other non-mobile location tools are unchanged. Promoting MAIN from the phone is not a config change. It needs the fencing and handover in [docs/design/continuity-design.md](../design/continuity-design.md). Ordinary commands still go through the current MAIN.
 
-**What the computer being watched shows:**
-- A notification when the phone starts or ends control of its screen, when its camera turns
-  on or off, and when the phone locates it.
-- The camera needs that computer's own consent (`jarvis camera allow on` there), read from
-  disk at every start and every frame. Infrared cameras are skipped.
-- `jarvis control stop` there ends screen and camera sessions.
-
-**Out of scope** (this design can't stop these):
-- Unsandboxed code running as David on the main can forge loopback requests to the server or
-  edit `.jarvis/phone.json`. That includes Grok's local exec and the desktop `computer` tool
-  typing into a real terminal. `gates.hard_deny` refuses `jarvis phone|camera`, webcam and
-  location commands, the phone port and paths, and `tailscale serve|funnel` changes. It is a
-  speed bump, not a wall: string-built Python gets past it.
-- A paired phone that is stolen and unlocked has David's access until it is revoked at the
-  main (`jarvis phone revoke <id>`).
-- Anyone who controls David's Tailscale account or the Tailscale client on the main.
-
-## Setup (David runs these himself)
-
-On the main (Arch, fish is fine for all of these):
-
-1. `jarvis phone on`
-2. `systemctl --user restart jarvis-cluster` so the server binds.
-3. `sudo tailscale serve --bg --https=443 http://127.0.0.1:7787`. Tailnet only: **never**
-   `tailscale funnel`.
-4. `jarvis phone status`. Check `url`, that `serve_points_here` is true, `funnel` is false and
-   `refusing` is null.
-
-On the iPhone:
-
-5. Turn Tailscale on, open the `url` from step 4 in Safari, then **Share > Add to Home
-   Screen**. Open JARVIS from the new icon. iOS keeps the Home Screen app's storage apart from
-   Safari's, so pair from the icon, not from Safari (the page says so if you try).
-6. On the main: `jarvis phone pair` (optional `--name "David's iPhone"`). Type the code on the
-   phone, then answer `y` at the terminal.
-
-Camera:
-
-7. Camera consent, once per computer whose webcam the phone may view, the main included:
-   `jarvis camera allow on` (on that computer). `jarvis camera status` shows the camera it
-   would open, ffmpeg and whether it's busy.
-8. Nodes need the capabilities. When the Dell is available, on the main:
-   `jarvis cluster caps dell --capability desktop --capability files --capability grokbot --capability inventory --capability camera`
-   (it **replaces** the set, so list everything it should keep).
-9. Nodes run the main's code: `jarvis cluster update dell` after these changes.
-10. Windows camera: install ffmpeg so `ffmpeg` is on the node agent's PATH (for example
-    `winget install Gyan.FFmpeg`), then restart the node agent. In Settings > Privacy &
-    security, turn on Camera > "Let desktop apps access your camera".
-
-## Turning it off
-
-| To | Run |
-|---|---|
-| Refuse every phone request now | `jarvis phone off` (503 at once; unbinds at the next restart) |
-| Cut one phone, or all | `jarvis phone revoke <id>` / `jarvis phone revoke all` (ids: `jarvis phone list`); its sessions end within 5 s |
-| Stop publishing it on the tailnet | `sudo tailscale serve --https=443 http://127.0.0.1:7787 off`, or `sudo tailscale serve reset` (that one clears every Serve entry) |
-| No camera on a computer | `jarvis camera allow off` there (a running view ends within a second) |
-| No camera or locate on a node | `jarvis cluster caps <node> ...` again without `camera` / `locate` |
-| End everything on a computer now | `jarvis control stop` there |
-
-## Privacy
-
-- **Camera** frames go only to the main's memory (newest frame wins) and the phone that opened
-  the session. Nothing is recorded.
-- **Events** on the console (`phone.paired`, `phone.revoked`, `phone.session`, `camera.on`,
-  `camera.off`, `phone.locate`) never carry codes, keys, session ids or coordinates. Codes and
-  cookies are never logged.
+Out of scope: unsandboxed code on the main can forge loopback or edit `.jarvis/phone.json`. `gates.hard_deny` refuses `jarvis phone`, `jarvis camera`, webcam and location commands, the phone port, and `tailscale serve` or `funnel` changes. A stolen unlocked phone keeps access until `jarvis phone revoke`. Anyone who controls the Tailscale account or the client on the main is outside this design.
 
 ## Limits
 
 | What | Value |
 |---|---|
-| Pairing code | 8 characters, 5 minutes; 60 s to collect the key after `y` |
-| Wrong codes | 5 per device (and per address) per 10 minutes |
-| Cookie | 90 days, rotated after 7 days (10 min grace for the old value), bound to the Tailscale device and login |
-| Connections | 24 at once (503 above), one frame request per phone (429), 30 s socket timeout |
-| Session quality | low by default from the phone |
-| Camera presets | low 640x480 @ 5 fps, medium 960x540 @ 8, high 1280x720 @ 10 |
-| Camera session | 15 minutes, then start again |
+| Connections | 24, then 503; one frame request per phone (429); 30 s socket timeout |
+| Session quality from the phone | low |
+| Camera presets | low 640×480 @ 5 fps, medium 960×540 @ 8, high 1280×720 @ 10 |
+| Camera session | 15 minutes |
 | Locate | 15 s on the computer; the main waits up to 25 s for a node |
-| Ask | 2,000 characters; the first reply waits up to 3 s, then the phone long-polls (8 s, or sooner when a step lands) |
-| Phone in the background | lets go at once, ends the session after 15 s (the hub's own `MAIN_IDLE` of 20 s is the real guarantee) |
+| Ask | 2,000 characters; first reply waits up to 3 s, then an 8 s long-poll |
+| Background | lets go at once; the session ends after 15 s (`MAIN_IDLE` is 20 s) |
+| Trace | 48 jobs, 64 steps each |
 
-## Ask: the decision path
+Camera frames go only to the main's memory (newest wins) and the phone that opened the session. Nothing is recorded. Console events (`phone.paired`, `phone.revoked`, `phone.session`, `camera.on`, `camera.off`, `phone.locate`) never carry codes, keys, session ids, or coordinates.
 
-While a request runs, Ask shows an expandable tree of what JARVIS is actually doing: memory recall,
-route choice, planning, each planned job and each tool used. It folds to "How it got there" under the
-answer, and stays open ("Where it stopped") if a step failed.
+Ask shows the console's `turn.*` events. Tool steps show the tool name only. `phone.redact` strips tokens, passwords, URL credentials, and deep local paths. Only the phone that sent the request sees the trace. A retry sends the same `key` and finds the first request. A failure on the PC is a new request. `jarvis.phone.ask` keeps a job id for 30 minutes so a reload can resume.
 
-- **Source.** The console's own `turn.*` events (`jarvis/events.py`, channel `console`), kept per job in
-  `phone.Trace` (48 jobs, 64 steps each) and sent as `trace` with `/phone/api/ask` and
-  `/phone/api/ask/<job>?after=<rev>`. The poll returns as soon as a step lands (a short batching wait),
-  so the tree moves with the work. No events means no tree, only "Working… N s"; nothing is invented.
-- **What is not shown.** Reasoning text, tool arguments and output (tool steps show the tool name only),
-  and the detail of failed steps. Labels and summaries pass `phone.redact`: tokens, passwords, URL
-  credentials and queries and deep local paths are removed. The phone draws everything as text.
-- **Who sees it.** Only the phone that sent the request; any other phone gets 404, as for the reply.
-  Approvals still happen on the PC.
-- **Retries.** The phone sends a `key` with each Ask. A retry after a lost reply carries the same key and
-  finds the first request instead of running it twice. A request that failed on the PC retries as a new one.
-  A saved job id (`jarvis.phone.ask`, 30 minutes) lets the app pick a running request up after a reload.
+**Send to** chooses the main or an online node. The phone remembers it. An explicit computer name in the request still wins. The main interprets, and execution uses the signed node channel with `origin_device` set to the target. Approvals stay on the main (`topology.approvals_on`). Offline, unenrolled, and outdated nodes return a concrete error. Retries stay on the original target.
 
-## Troubleshooting
+Native requests prefer `open_app`, `app_ui`, and the target's `computer` tools, including that machine's keybinds. Spotify instructions prefer native search, then verified selection. They do not require a Chrome search for a track id. A Spotify accessibility snapshot may wait up to 10 s for enabled controls and returns as soon as they are ready. Other apps opt in with `app_ui snapshot` and `wait_ready` from 0 to 15 s. Only read-only snapshots are retried.
+
+**Usage & cost** under a reply is reported tokens, model calls, and an API-equivalent USD figure. It is a comparison, not an extra charge. Missing usage is said to be missing. Local requests are labelled as having no metered calls.
+
+Manage computers reads `GET /phone/api/fleet` only. The phone can look. Invite, permissions, revoke, and Move MAIN stay on the main's console. Devices is the home screen. The phone does not show the locate permission.
+
+## Screen
+
+Look is monochrome, Geist for UI, Geist Mono for numbers, Doto for the wordmark only. Colour means state. Tokens live in `jarvis/web/phone/phone.css`. Do not put hex in screen CSS, do not rename tokens, and do not add a font.
+
+Each computer card has a 3 px left rail from `.ld[data-st]`: green live, amber needs you, grey idle or offline. One `.strong` button per screen. Targets are at least 44 px. Rows are at least 52 px. Press feedback is 120 ms at scale 0.975. State changes are 180 ms. Sheets are 320 ms. `prefers-reduced-motion` removes transforms. Inputs are 16 px so iOS does not zoom. Icons are Lucide, 24 px, 2 px stroke, with a visible word. The session picture owns the screen; Disconnect is one red outline in thumb reach. Ask is a conversation. The composer sits above the tabs. Approvals stay on the PC. Ink and state tokens are at least 4.5:1 on `--bg` and `--surface` in both themes.
+
+## When it fails
 
 | The phone says | Check |
 |---|---|
-| "Can't reach JARVIS — is Tailscale on?" | Tailscale on the phone; the main awake; `jarvis phone status` (`listening`, `serve_points_here`) |
+| "Can't reach JARVIS — is Tailscale on?" | Tailscale on the phone, the main awake, `jarvis phone status` |
 | "JARVIS's phone link is off" | `jarvis phone on`, then restart `jarvis-cluster` |
-| "Tailscale Funnel publishes JARVIS to the internet" | Funnel reaches port 7787. Turn it off, then set up Serve again (step 3) |
+| "Tailscale Funnel publishes JARVIS to the internet" | Turn Funnel off, then Serve again |
 | "JARVIS can't read Tailscale's serve settings" | `tailscale serve status --json` must work as David, without sudo |
-| "Tailscale serve did not forward the client address" | Something other than Serve proxied the request. Use the Serve command above exactly |
-| "Unexpected Host header" | Open `https://<main>.<tailnet>.ts.net/`, not an IP address |
-| "That Tailscale login doesn't match this device" | The phone must be signed in to Tailscale as David, not as a tagged device |
-| Pair screen again after it worked | Opened in Safari instead of the Home Screen icon; the phone was revoked; or Tailscale was reinstalled on it (new device id). Pair again |
-| "Only a phone can pair with JARVIS" | Tailscale reports a desktop OS. `--allow-desktop` is for testing only |
-| "Too many wrong codes" | Wait 10 minutes, then `jarvis phone pair` again |
-| "Someone else is already controlling that computer" / "watching that camera" | The console or another phone holds it. End it there |
-| "The camera is off for JARVIS on this computer" | `jarvis camera allow on` on that computer |
-| "The camera is in use by another app" | Close the app holding it. On the Arch main, Zen browser can hold `/dev/video1` |
-| "ffmpeg isn't installed on this computer" | Step 10 (Windows), or install ffmpeg |
-| "Windows wouldn't open the camera" | Settings > Privacy & security > Camera, desktop apps on |
-| "Runs older JARVIS code" | `jarvis cluster update <node>` |
-| "Approve on your PC" / "Waiting for your OK on the PC" | By design: answer at the console gate or say "Jarvis, yes" |
-| Session ends soon after switching apps | By design: a phone in the background stops watching |
-
-Not yet checked on a real tailnet: that Serve keeps the `Host` header and sets
-`X-Forwarded-For` (both taken from Tailscale's source). After setup, run
-`jarvis phone status` and make one request from the phone. If every request fails with
-"did not forward the client address", tell Claude.
-
-
-## Choosing the computer for Ask
-
-Use **Ask > Send to** to choose the main or an online node (for example Dell).
-The selection is remembered on this phone. Requests without an explicit PC act on the
-selected computer; an explicit computer name still takes priority. The main interprets
-requests and uses the existing signed node channel for execution. Offline, unenrolled,
-and outdated nodes return a concrete error. Retries remain bound to the original target.
-Approvals stay on the main, and the phone cannot approve them.
-
-Native application requests use native app launch, accessibility and the target PC's
-keyboard/mouse tools. Spotify's tool instructions prefer native search followed by
-verified selection; they no longer require a Chrome search to obtain a track ID.
-
-## Per-request usage and cost
-
-Expand **Usage & cost** below an Ask reply to see reported tokens, model calls and the
-API-equivalent USD estimate. This is a comparison value, not an additional subscription
-charge. While a request is running the section explains that totals are pending; if usage
-was not reported, it says so instead of presenting a made-up zero. Provider usage can be
-incomplete. Local requests are labelled as having no metered model calls.
-
-Spotify accessibility snapshots now allow up to ten seconds for enabled interactive controls
-(the first window alone is not readiness). They return immediately when controls are ready.
-Other native apps can opt in with `app_ui snapshot` and `wait_ready` from 0 to 15 seconds.
-Only read-only snapshots are retried; clicks and typed input are never repeated by this wait.
-
-## Mobile location removal and MAIN management
-
-Location/Radar, Locate, Maps links and mobile geolocation have been removed. The mobile
-overview excludes location coordinates/capabilities, and `/phone/api/locate` returns404.
-Other non-mobile location tools are unchanged.
-
-Mobile MAIN promotion/preference/recovery is planned in
-`docs/design/mobile-continuity/DESIGN.md`; it is not implemented by changing a config file.
-It requires single-MAIN fencing, candidate readiness, explicit fleet-admin authentication
-and a visible handover operation. Ordinary mobile commands continue through MAIN.
+| "Tailscale serve did not forward the client address" | Use the Serve command above. Serve's `Host` and `X-Forwarded-For` behavior was taken from Tailscale's source and still needs one real request after setup |
+| "Unexpected Host header" | Open `https://<main>.<tailnet>.ts.net/`, not an IP |
+| "That Tailscale login doesn't match this device" | The phone must be David, not a tagged device |
+| Pair screen again | Safari instead of the icon, revoked, or Tailscale reinstalled |
+| "Only a phone can pair with JARVIS" | Desktop OS. `--allow-desktop` is for tests |
+| "Too many wrong codes" | Wait 10 minutes |
+| "Someone else is already controlling / watching" | End it on the console or the other phone |
+| "The camera is off for JARVIS on this computer" | `jarvis camera allow on` there |
+| "The camera is in use by another app" | On the Arch main, Zen browser can hold `/dev/video1` |
+| "ffmpeg isn't installed" / "Windows wouldn't open the camera" | ffmpeg on PATH, and desktop-app camera privacy |
+| "Runs older JARVIS code" | [release.md](release.md) |
+| "Approve on your PC" | By design |
+| Session ends after switching apps | By design |

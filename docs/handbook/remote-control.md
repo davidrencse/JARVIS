@@ -1,83 +1,39 @@
 # Remote control
 
-David drives a node's screen, mouse and keyboard from the main's console (the Remote
-view). It rides the existing hub and tunnel: no new port. Job kind `remote`; only the main's
-console can send it, and the brain has no tool for it.
+*Driving a computer's screen from the main's console. No new port.*
 
-**Invariant:** however a session ends, the node lets go of every held key and button.
+The Remote view rides the hub. Job kind `remote`. Only the main's console can send it. The brain has no tool for it. The same sessions are what the phone's Control screen uses. However a session ends, the node releases every held key and button.
 
-## Lifecycle
-
-```mermaid
-sequenceDiagram
-    participant C as Console (remote.js)
-    participant H as Hub on main
-    participant N as Node (remote_view.py)
-    C->>H: /api/remote/start
-    H->>H: Sessions.open(pending=True)
-    H->>N: job: start session
-    N->>N: write remote-session.json, pause its Lan Mouse
-    N->>H: first frame (within 30 s)
-    H->>H: Sessions.touch, state live
-    loop while live
-        N->>H: /v1/remote/frame (JPEG)
-        H-->>C: newest frame only
-        C->>H: /api/remote/input (events)
-        H-->>N: input poll reply
-        N->>N: inject; dead-man timer reset
-    end
-    alt Disconnect / stop job / closed tab / link loss / restart
-        C->>H: /api/remote/stop
-        H-->>N: end
-        N->>N: release held keys and buttons
-        N->>N: delete own marker, restart Lan Mouse once
-    end
-```
-
-While a session runs, the main's Lan Mouse is paused too (`sharedinput.ControllerPause`,
-marker `remote-controlling.json`) so David's mouse and keyboard stay on the main.
-
-## Limits (`remote_view.py`)
+The node writes `remote-session.json`, pauses its Lan Mouse, and must send a first frame within `START_GRACE` (30 s). The hub keeps the newest frame only. While the session runs, the main's Lan Mouse is paused too (`sharedinput.ControllerPause`, marker `remote-controlling.json`). `ControllerPause.apply` loops until the newest wish is applied, so a quick open then close does not leave Lan Mouse stopped. A marker older than `REMOTE_MARKER_TTL` (60 s) is stale; it is touched every 10 s. Markers from a previous boot are ignored. A future timestamp keeps blocking, because treating it as expired could start Lan Mouse during a live session.
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `START_GRACE` | 30 s | Node has this long to send its first frame |
+| `START_GRACE` | 30 s | First frame |
 | `MAIN_IDLE` | 20 s | Console silent this long: hub ends the session |
-| `NODE_IDLE` | 15 s | Node silent this long after starting: hub ends it |
-| `CONSOLE_QUIET` | 4 s | Total console silence: node told to release everything |
+| `NODE_IDLE` | 15 s | Node silent this long after start: hub ends it |
+| `CONSOLE_QUIET` | 4 s | Node told to release everything |
 | `DEADMAN` | 6 s | No input reply: node lets go of what it holds |
 | `MAX_SESSION` | 4 h | Hard cap |
 | `KEEP_ENDED` | 120 s | Ended session stays readable so the console can say why |
-| `MAX_FRAME` | 2,500,000 B | JPEG size cap |
-| `MAX_EVENTS` / `MAX_QUEUE` | 200 / 2000 | Per console request / waiting for node |
-| `MAX_FAILS` | 5 | Failed presses in a row before the node ends the session |
-| hidden tab | 15 s | Console (`remote.js`) ends the session; stays under `MAIN_IDLE` |
-| `REMOTE_MARKER_TTL` | 60 s | Marker older than this is stale (touched every 10 s) |
+| `MAX_FRAME` | 2,500,000 bytes | JPEG cap |
+| `MAX_EVENTS` / `MAX_QUEUE` | 200 / 2000 | Per request / waiting for the node |
+| `MAX_FAILS` | 5 | Failed presses in a row, then the node ends the session |
+| Hidden tab | 15 s | `remote.js` ends the session, under `MAIN_IDLE` |
 
-Quality presets: low 960 px / q45 / 6 fps, medium 1280 / q60 / 10, high 1920 / q75 / 15.
+Quality: low 960 px / q45 / 6 fps, medium 1280 / q60 / 10, high 1920 / q75 / 15.
 
-## Console behaviour
+Keys do not reach console shortcuts while a session is starting, live, or stale. Fullscreen uses Keyboard Lock so Ctrl+W goes to the node. Hold Esc to leave. Ctrl+Alt+Shift+Esc releases the keyboard. Closing or reloading the tab asks first. Mouse back and forward are blocked, not forwarded. Wheel steps are clamped to ±20. Horizontal scroll is not sent. A 404 on frames means the main restarted.
 
-- Keys never reach console shortcuts while a session runs (including Starting and stale).
-- Fullscreen uses Keyboard Lock so Ctrl+W and similar go to the node; hold Esc to leave.
-  Ctrl+Alt+Shift+Esc releases the keyboard.
-- Closing or reloading the tab mid-session asks first.
-- Mouse back and forward are blocked, not forwarded. Wheel steps are clamped to +/-20.
-  Horizontal scroll is not sent.
-- A 404 on frames means the main restarted; the console says so and asks you to Connect again.
-
-## Troubleshooting
+A replaced session must not delete the new session's marker or restart Lan Mouse in the middle. The restart is handed on and runs once, after the last session. Second-button and failed-request tracking send releases. Per-session monitor choice on Hyprland includes rotated monitors. SendInput result checks on Windows are not done. Forwarding back and forward buttons is not done.
 
 | You see | Do |
 |---|---|
-| "<Device> didn't answer within 20 s" | Check it is awake, press Connect again |
+| "<Device> didn't answer within 20 s" | Wake it, press Connect |
 | "JARVIS on the main restarted..." | Press Connect |
 | "tab was in the background" | Keep the console tab visible |
-| "Couldn't move the pointer / click here" | On Windows, a UAC prompt, locked screen or admin window blocks input; close it |
-| Lan Mouse stays off after a session | `jarvis lanmouse status`; the guard or next boot brings it back, or `jarvis lanmouse start` (ask David first) |
+| "Couldn't move the pointer / click here" | A UAC prompt, locked screen, or admin window is blocking input |
+| Lan Mouse stays off | `jarvis lanmouse status`, then `jarvis lanmouse start` if David agrees |
 
-A node crash leaves `remote-session.json` in its state folder; the next start finds it,
-treats the session as dead and cleans up.
+A node crash leaves `remote-session.json`. The next start treats it as dead and cleans up. Tests use fakes: `tests/remote/test_remote_view.py`, `tests/remote/test_remote_lifecycle.py`, `tests/remote/test_remote_web.py`, and `node tests/remote/web_remote_test.cjs`.
 
-Tests use fakes only: `tests/remote/test_remote_view.py`, `tests/remote/test_remote_lifecycle.py`,
-`tests/remote/test_remote_web.py`, and `node tests/remote/web_remote_test.cjs`.
+`jarvis desktop --device <node> …` is a different path and is cut off at 30 s. Keep those steps short. Stopping control is in [operations.md](operations.md). Lan Mouse rules are in [lan-mouse.md](lan-mouse.md).
