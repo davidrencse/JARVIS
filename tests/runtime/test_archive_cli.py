@@ -249,6 +249,20 @@ class MainWiring(Base):
         self.assertIn("proxy node", err)
         self.assertEqual(self.tree(self.vault), [".obsidian"])
 
+    def test_node_may_still_move_files_to_the_main(self):
+        # A node's file commands go through the hub, which only lets it reach the drop folder.
+        src = self.tmp / "f.txt"
+        src.write_text("hi")
+        with mock.patch("jarvis.topology.is_node", return_value=True), \
+                mock.patch("jarvis.transfer.send_file", return_value={"sent": "f.txt"}) as send, \
+                mock.patch("jarvis.transfer.list_inbox", return_value=["a.txt"]) as inbox:
+            code, out, err = self.main("send", str(src))
+            self.assertEqual((code, json.loads(out)), (0, {"sent": "f.txt"}), err)
+            code, out, err = self.main("inbox")
+            self.assertEqual((code, json.loads(out)), (0, ["a.txt"]), err)
+        send.assert_called_once()
+        inbox.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

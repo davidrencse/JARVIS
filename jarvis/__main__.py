@@ -287,8 +287,9 @@ def main():
             from .devices import devices_here
             config["devices"] = devices_here(config.get("devices", {}))
         if is_node(config) and args.command in ("add", "runs", "show", "plan", "engineer", "run",
-                "mem", "orchestrate", "kb", "vault", "archive", "tasks", "task", "credits", "grokbot", "route",
-                "send", "fetch", "inbox"):
+                "mem", "orchestrate", "kb", "vault", "archive", "tasks", "task", "credits", "grokbot", "route"):
+            # send/fetch/inbox stay open on nodes: they move files to and from the main's drop
+            # folder over the hub, which limits a node to exactly that (cluster.py /v1/control).
             raise ValueError("This PC is a proxy node. Use the main console or jarvis ask for shared state and control.")
         if args.command == "doctor":
             emit({"version": __version__, "tools": {name: shutil.which(name) is not None
