@@ -599,6 +599,40 @@ class DropZoneTests(unittest.TestCase):
             self.assertEqual(push.call_args.kwargs["dest"], "desktop")
             self.assertEqual(push.call_args.kwargs["name"], source.name)
 
+    def test_windows_edge_drop_goes_to_peer_desktop(self):
+        shared, logs = [], []
+
+        def fake_run(edge, on_drop, log):
+            self.assertEqual(edge, "left")
+            on_drop([r"C:\Users\jdoe\Desktop\a.txt"])
+
+        with mock.patch.object(clipsync, "_peer_edge", return_value="left"):
+            clipsync._dropzone_windows(lambda kind, data, dest: shared.append((kind, data, dest)),
+                                       logs.append, run=fake_run)
+        self.assertEqual(shared, [("files", [r"C:\Users\jdoe\Desktop\a.txt"], "desktop")])
+        self.assertIn("dropped 1 file(s) on the edge zone", logs)
+
+    def test_windows_zone_failure_retries(self):
+        calls, logs = [], []
+
+        def broken(*_):
+            calls.append(1)
+            raise OSError("no desktop")
+
+        with mock.patch.object(clipsync, "_peer_edge", return_value="left"):
+            with self.assertRaises(StopIteration):
+                clipsync._dropzone_windows(lambda *a: None, logs.append, run=broken,
+                                           sleep=mock.Mock(side_effect=StopIteration))
+        self.assertEqual(calls, [1])
+        self.assertTrue(any("drop zone failed" in line for line in logs))
+
+    def test_windows_zone_geometry(self):
+        from jarvis.dropzone_win import geometry
+        virtual = (-1920, 0, 3840, 1080)
+        self.assertEqual(geometry("left", virtual, 6), (-1920, 0, 6, 1080))
+        self.assertEqual(geometry("right", virtual, 6), (1914, 0, 6, 1080))
+        self.assertEqual(geometry("bottom", virtual, 6), (-1920, 1074, 3840, 6))
+
     def test_servers_get_no_clipboard(self):
         logs = []
         config = {"devices": {"dell": {}, "oracle": {"profile": "cloud"}}}

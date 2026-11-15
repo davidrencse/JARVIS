@@ -803,6 +803,9 @@ def run_cluster(config, state, device_name=None, board=None, log=None):
 
         threading.Thread(target=_dropzone, args=(config, targets, share_drop, log, board.env),
                          name="dropzone", daemon=True).start()
+    elif isinstance(board, Windows) and config.get("clipboard", {}).get("dropzone", True):
+        threading.Thread(target=_dropzone_windows, args=(share, log),
+                         name="dropzone", daemon=True).start()
     while True:
         try:
             board.watch(changed)  # Wayland: returns if wl-paste dies; Windows: runs on
@@ -861,6 +864,35 @@ def _dropzone(config, targets, share, log, session=None, popen=subprocess.Popen,
             return  # closed on purpose
         log("drop zone exited; restarting in 30 s")
         sleep(30)
+
+
+def _peer_edge(default="right"):
+    """The edge Lan Mouse crosses to the peer (its configured position)."""
+    try:
+        from .sharedinput import read_config
+        return (read_config().get("clients") or [{}])[0].get("position") or default
+    except Exception:
+        return default
+
+
+def _dropzone_windows(share, log, run=None, sleep=time.sleep):
+    """The Windows edge strip (dropzone_win.py) in this process; a drop goes to the peer's
+    Desktop the same way as on Wayland. Restarted after a failure, at most every 30 s."""
+    if run is None:
+        from .dropzone_win import run
+    edge = _peer_edge("left")
+
+    def dropped(paths):
+        log(f"dropped {len(paths)} file(s) on the edge zone")
+        share("files", paths, dest="desktop")
+
+    while True:
+        try:
+            run(edge, dropped, log)
+            return
+        except Exception as exc:
+            log(f"drop zone failed: {exc}; retrying in 30 s")
+            sleep(30)
 
 
 # ---- the local half: connect, reconnect, daemon ------------------------------------------
