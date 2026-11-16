@@ -11,7 +11,7 @@
     "listen_host": "127.0.0.1",
     "listen_port": 7780,
     "port_note": "7778 is the Grokbot tunnel's forward on the Zenbook; the cluster uses 7780.",
-    "auto_restart": true
+    "auto_restart": false
   },
   "devices": {
     "dell": {
@@ -267,5 +267,8 @@
   },
   "continuity": {
     "operator_config": "/home/jdoe/.config/jarvis/continuity/operator.json"
+  },
+  "phone": {
+    "front_origin": "https://oracle-vm.tailnet-example.ts.net:8443"
   }
 }
