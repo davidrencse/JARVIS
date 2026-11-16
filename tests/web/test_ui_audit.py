@@ -42,6 +42,15 @@ class FailMessageTests(unittest.TestCase):
             self.assertNotIn("secret", body["error"])
             self.assertNotIn("token-abc", body["error"])
 
+    def test_lost_main_is_retryable_without_internal_exception_text(self):
+        from jarvis.continuity.runtime import RuntimeRefusal
+        from jarvis.continuity.integration import IntegrationError
+        for exc in (RuntimeRefusal("not_holder"), IntegrationError("managed_unbound")):
+            status, body = self.fail(exc)
+            self.assertEqual(status, HTTPStatus.SERVICE_UNAVAILABLE)
+            self.assertEqual(body["code"], "main_unavailable")
+            self.assertNotIn(exc.code, body["error"])
+
 
 class SettingsApplyTests(Tmp):
     def test_brain_change_drops_the_warm_lane_and_semantic_rebuilds_memory(self):
