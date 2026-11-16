@@ -114,6 +114,10 @@ class ProductionController:
         self.participant, self.config = participant, config
         self.base, self.state, self.operator_path = Path(base), Path(state), Path(operator_path)
         self.operator, self.pins, self.hub, self.services = operator, _pins(operator), hub, services
+        self._ready_rejoin = None
+        self._ready_issuer = None
+        from jarvis.deploy import code_fingerprint
+        self.loaded_code = getattr(hub, 'loaded_code', None) or code_fingerprint()
         self.local = identity(config)[0]
         if self.pins.get(self.local, {}).get("installation_id") != participant.client.installation_id:
             raise RuntimeRefusal("enrollment_pins_missing")
@@ -321,6 +325,19 @@ class ProductionController:
 
     def attach_hub(self, hub):
         self._attach_hub(hub)
+
+    def rejoin_recovered_main(self):
+        """Existing renewal lifecycle only; no transport or authority election thread."""
+        if self._ready_rejoin is None:
+            from .recovery_repoint import Rejoin
+            self._ready_rejoin = Rejoin(self)
+        return self._ready_rejoin.tick()
+
+    def ready_rejoin_issuer(self):
+        if self._ready_issuer is None:
+            from .recovery_repoint import Issuer
+            self._ready_issuer = Issuer(self)
+        return self._ready_issuer
 
     def _recovery(self):
         from .recovery import ManualRecovery

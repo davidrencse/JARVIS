@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 from .runtime import RuntimeRefusal
-from .repoint import FILE, _read, _save, _grant, verify, Installer
+from .repoint import FILE, _read, _save, _grant, verify, verify_durable, Installer
 
 GRANT_FILE = 'continuity-successor-grant.json'
 PHASE_FILE = 'continuity-role-phase.json'
@@ -117,7 +117,7 @@ class RoleLifecycle:
         path = self.state/FILE
         if not path.exists():
             return
-        prior = verify(_read(path), authority_id=self.participant.client.authority_id,
+        prior = verify_durable(_read(path), authority_id=self.participant.client.authority_id,
                        target=self.participant.device_id, pins=self.pins)
         if (prior['incarnation'], prior['epoch']) > (body['incarnation'], body['epoch']):
             raise RuntimeRefusal('stale')

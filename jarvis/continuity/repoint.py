@@ -149,6 +149,14 @@ def verify(instruction, *, authority_id, target, pins):
     return copy.deepcopy(stored)
 
 
+def verify_durable(instruction, *, authority_id, target, pins):
+    """Read either durable route format, retaining separate authority validators."""
+    from .recovery_repoint import SCHEMA as READY_SCHEMA, verify as verify_ready
+    if isinstance(instruction, dict) and (instruction.get('body') or {}).get('schema') == READY_SCHEMA:
+        return verify_ready(instruction, authority_id=authority_id, target=target, pins=pins)
+    return verify(instruction, authority_id=authority_id, target=target, pins=pins)
+
+
 def _grant(status, body):
     transition = status.get('transition') or {}
     if (status.get('authority_id') != body['authority_id'] or status.get('fleet_id') != body['fleet_id'] or
@@ -257,7 +265,7 @@ class Installer:
                 raise RuntimeRefusal('target_unfenced')
             path = self.state/FILE
             if path.exists():
-                prior = verify(_read(path), authority_id=client.authority_id, target=client.device_id, pins=self.pins)
+                prior = verify_durable(_read(path), authority_id=client.authority_id, target=client.device_id, pins=self.pins)
                 if (prior['incarnation'], prior['epoch']) > (body['incarnation'], body['epoch']):
                     raise RuntimeRefusal('stale')
                 if (prior['incarnation'], prior['epoch']) == (body['incarnation'], body['epoch']) and prior != body:
@@ -316,7 +324,7 @@ def effective_config(config, state):
     local = identity(config)[0]
     if client.device_id != local:
         raise RuntimeRefusal('candidacy_mismatch')
-    body = verify(_read(path), authority_id=client.authority_id, target=local, pins=data.get('enrollment', {}))
+    body = verify_durable(_read(path), authority_id=client.authority_id, target=local, pins=data.get('enrollment', {}))
     note = _read(Path(state)/'cluster-node.json')
     if any(note.get(k) != v for k, v in {'node_id': local, 'main_device': body['main'],
             'code_key': body['code_key'], 'token': body['token']}.items()):

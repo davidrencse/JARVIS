@@ -171,6 +171,7 @@ class LeaseRenewer:
         self.thread = None
         self.recovery = SelfRecovery(participant)
         self.last_recovery = None
+        self.last_rejoin = None
         self.last_error = None
 
     def _suspended(self):
@@ -200,6 +201,13 @@ class LeaseRenewer:
                 services.sync(self.participant.runtime)  # a demoted node stops serving
             except Exception:
                 pass
+        controller = getattr(self.participant, 'production_controller', None)
+        rejoin = getattr(controller, 'rejoin_recovered_main', None)
+        if callable(rejoin):
+            try:
+                self.last_rejoin = rejoin()
+            except Exception as exc:
+                self.last_rejoin = {'ok': False, 'code': getattr(exc, 'code', 'unavailable')}
         return result
 
     def _next_delay(self, result):

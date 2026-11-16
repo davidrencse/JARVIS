@@ -96,6 +96,13 @@ class NodeMainServices:
             if self.phone is not None:
                 return True
             view = acting_main_config(self.config)
+            endpoint = getattr(self.hub, "continuity_endpoint", None)
+            use_hub_phone = (isinstance(endpoint, str) and endpoint.startswith("https://")
+                             and (view.get("phone") or {}).get("public_origin") is None)
+            if use_hub_phone:
+                # Runtime view only: use the already provisioned successor listener.
+                # PhoneServer validates this against its own live Tailscale DNS name.
+                view.setdefault("phone", {})["public_origin"] = endpoint
             console = server = None
             old_console = getattr(self.hub, "console", None)
             try:
@@ -116,6 +123,11 @@ class NodeMainServices:
                 if callable(refusal) and refusal() is not None:
                     _close(server)
                     server = None
+                if server is not None and use_hub_phone:
+                    from jarvis.phone_hub import mount
+                    if not mount(self.hub, server):
+                        _close(server)
+                        server = None
             except Exception as exc:
                 if self.hub is not None:
                     self.hub.console = old_console
@@ -141,6 +153,8 @@ class NodeMainServices:
             self.phone = self.console = None
             if self.hub is not None and self.hub.console is console:
                 self.hub.console = None
+            if self.hub is not None and getattr(self.hub, "phone", None) is phone:
+                self.hub.phone = None
         if phone is None and console is None:
             return False
         _close(phone)
