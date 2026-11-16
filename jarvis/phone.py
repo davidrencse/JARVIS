@@ -885,6 +885,25 @@ class Trace:
 FRONT_PORT = 8443  # the gateway's tailnet port for the phone front (tailscale serve)
 
 
+def _public_origin(config, name):
+    """The exact configured HTTPS Serve origin on this PC's own tailnet DNS name."""
+    value = ((config or {}).get("phone") or {}).get("public_origin")
+    if not isinstance(value, str) or not value or any(c.isspace() for c in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if (parts.scheme != "https" or not name or not name.endswith(".ts.net")
+            or host != name or port is None or not 1 <= port <= 65535
+            or parts.username is not None or parts.password is not None
+            or parts.path or parts.query or parts.fragment
+            or value.lower() != f"https://{name}:{port}"):
+        return None
+    return f"https://{name}:{port}"
+
+
 def _front_from_gateway(config, port):
     """https://<gateway host>:<port>, from the continuity operator config's `origin`."""
     raw = ((config or {}).get("continuity") or {}).get("operator_config")
@@ -1059,10 +1078,21 @@ class PhoneServer:
         name = self.tailnet.dns_name()
         if name:
             allowed |= {name, f"{name}:443"}
+        public = self._public_origin()
+        if public:
+            allowed.add(urlsplit(public).netloc)
         front = self._front_origin()
         if front:
             allowed.add(urlsplit(front).netloc)
         return host in allowed
+
+    def _public_origin(self):
+        """An optional dedicated HTTPS Serve port on this PC's own tailnet name.
+
+        This grants only the configured origin, never another machine or every port.
+        The Oracle front still has its separate origin and identity trust setting.
+        """
+        return _public_origin(self.config, self.tailnet.dns_name())
 
     def _front_origin(self):
         """`phone.front_origin`: the stable https origin of the phone front on the
@@ -1100,6 +1130,9 @@ class PhoneServer:
         name = self.tailnet.dns_name()
         if name:
             allowed |= {f"https://{name}", f"https://{name}:443"}
+        public = self._public_origin()
+        if public:
+            allowed.add(public)
         front = self._front_origin()
         if front:
             allowed.add(front)
@@ -2057,6 +2090,10 @@ def status(config, state, tailnet=None):
     tailnet = tailnet or Tailnet()
     data = store.load()
     name = tailnet.dns_name()
+    public = _public_origin(config, name)
+    external_port = urlsplit(public).port if public else 443
+    setup = SETUP.format(port=port).replace("--https=443", f"--https={external_port}")
+    undo = UNDO.format(port=port).replace("--https=443", f"--https={external_port}")
     serve = tailnet.serve_config()
     serving = published = None
     if serve is not None:
@@ -2072,14 +2109,14 @@ def status(config, state, tailnet=None):
         refusing = "Tailscale's serve settings can't be read, so the server refuses everything."
     elif published:
         refusing = ("Tailscale Funnel publishes this port to the internet, so the server refuses "
-                    f"everything. Turn it off: {UNDO.format(port=port)}, then {SETUP.format(port=port)}")
+                    f"everything. Turn it off: {undo}, then {setup}")
     else:
         refusing = None
     return {"on": data["on"], "port": port, "listening": _listening(port),
-            "url": f"https://{name}/" if name else None, "dns_name": name,
+            "url": public + "/" if public else f"https://{name}/" if name else None, "dns_name": name,
             "serve_points_here": serving, "funnel": published, "refusing": refusing,
             "phones": len(data["phones"]),
-            "setup": SETUP.format(port=port) if not serving else None,
+            "setup": setup if not serving else None,
             "note": "Tailnet only, never funnel. `jarvis phone on` binds at the next JARVIS start; "
                     "`jarvis phone off` refuses at once."}
 

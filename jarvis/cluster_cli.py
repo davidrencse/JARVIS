@@ -63,13 +63,19 @@ def parser(sub):
     command.add_argument("--autostart", action="store_true", help="Tunnel start/stop: also enable or disable login startup")
 
 
-def roles(config):
-    """Every configured machine and its role. Exactly one is main: cluster.main_device."""
+def roles(config, state=None):
+    """Show authority roles when managed, preserving configured topology separately."""
     main = (config.get("cluster") or {}).get("main_device")
+    authority = {}
+    if state is not None and enabled(config):
+        from .continuity.role_status import report
+        authority = report(config, state)
+        main = authority["main_device"]
     local = identity(config)[0] if (config.get("cluster") or {}).get("enabled") else None
-    return {"main_device": main, "tunnel": (config.get("cluster") or {}).get("tunnel", "reverse"),
+    return {**authority, "main_device": main, "tunnel": (config.get("cluster") or {}).get("tunnel", "reverse"),
             "devices": {key: {"label": (device or {}).get("label") or key,
-                              "role": "main" if key == main else "node", "this_pc": key == local}
+                              "role": ("main" if key == main else "node") if main else "unknown",
+                              "this_pc": key == local}
                         for key, device in (config.get("devices") or {}).items()}}
 
 
@@ -970,7 +976,16 @@ def set_main(config, path, device, state=None):
             return perform(pre, intent)
         if intent.get("target") == device and intent.get("publication") == "pending":
             return perform(pre, intent)
-        if not _candidate_ready(handoff, device):
+        from .continuity.runtime import RuntimeRefusal
+        try:
+            candidate_ready = _candidate_ready(handoff, device)
+        except RuntimeRefusal as exc:
+            return _unchanged(
+                {"status": "refused", "code": exc.code, "main_device": old_main,
+                 "main": pre.get("main")},
+                publication="not_ready", authority="unchecked",
+                error=("Candidate readiness was refused. cluster.main_device was not changed."))
+        if not candidate_ready:
             return _unchanged(
                 {"status": "not_ready", "main_device": old_main, "main": pre.get("main")},
                 publication="not_ready", authority="unchecked",
@@ -998,7 +1013,7 @@ def run(args, config, base):
         logs.mkdir(parents=True, exist_ok=True)
         sys.stdout = sys.stderr = open(logs / "cluster.log", "a", encoding="utf-8", buffering=1)
     if action == "roles":
-        return roles(config)
+        return roles(config, state)
     if action == "main":
         return set_main(config, path, args.value, state=state)
     if action == "configure":
@@ -1349,6 +1364,8 @@ def run(args, config, base):
             result["connected"] = True
         except (OSError, ValueError, RuntimeError) as exc:
             result.update(connected=False, error=str(exc))
+        from .continuity.role_status import report
+        result.update(report(config, state, base=base))
         return result
     if action == "serve" and local != main:
         raise ValueError("This PC is a node. Run jarvis cluster node.")

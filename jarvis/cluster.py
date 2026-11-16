@@ -1461,7 +1461,11 @@ def make_server(hub, host, port):
     from .ui import ConsoleServer, Handler
 
     class MainHandler(Handler):
-        console = hub.console
+        # A successor starts this control listener before its MAIN console.
+        # Resolve on use so canary activation can attach the actual console.
+        @property
+        def console(self):
+            return hub.console
 
         def _host_ok(self):
             found = self._header_all("Host")
@@ -1576,7 +1580,9 @@ def make_server(hub, host, port):
                                 orphaned.clear()
                 if self.path == "/v1/status" and not post:
                     from .release_runtime import loaded_code_status
-                    return self._send(200, {"main_device": hub.main, **loaded_code_status(hub),
+                    from .continuity.role_status import report
+                    return self._send(200, {**report(hub.config, hub.state, base=hub.base),
+                                            "hub_device": hub.main, **loaded_code_status(hub),
                                             "nodes": hub.broker.nodes()})
                 if self.path.startswith("/v1/code/chunk?") and not post and "owner" not in caps:
                     from .release_runtime import serve_chunk

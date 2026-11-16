@@ -1355,6 +1355,18 @@ class Console:
             hub = self._hub()
         except LookupError as exc:
             return {"devices": [], "session": None, "why": str(exc), "release": release}
+        from .continuity.integration import continuity_state, production_binding, IntegrationError
+        from .continuity.runtime import RuntimeRefusal
+        try:
+            if continuity_state(self.state) == "managed":
+                binding = production_binding(self.state)
+                if not binding or binding.get("runtime") is None:
+                    raise IntegrationError("managed_unbound")
+                binding["runtime"].require_authority("control")
+        except (RuntimeRefusal, IntegrationError):
+            return {"devices": [], "session": None,
+                    "why": "This computer does not currently hold MAIN. Remote control will be available after the MAIN connection is restored.",
+                    "release": release}
         nodes = {n["id"]: n for n in hub.broker.nodes()}
         from .connections import presence as node_presence, busy_nodes
         busy = busy_nodes(self.state)
@@ -1730,6 +1742,12 @@ class Handler(BaseHTTPRequestHandler):
             self.console.bus.unsubscribe(sub)
 
     def _fail(self, exc, close=False):
+        from .continuity.integration import IntegrationError
+        from .continuity.runtime import RuntimeRefusal
+        if isinstance(exc, (RuntimeRefusal, IntegrationError)):
+            return self._send(HTTPStatus.SERVICE_UNAVAILABLE,
+                              {"error": "The MAIN connection is unavailable. Wait for the handoff to finish, then reconnect.",
+                               "code": "main_unavailable"}, close=close)
         payload = getattr(exc, "payload", None)  # fleet_management.FleetError: a stable code + step
         if isinstance(payload, dict) and isinstance(getattr(exc, "status", None), int):
             return self._send(exc.status, payload, close=close,
