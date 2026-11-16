@@ -149,15 +149,21 @@ class RoutingTests(FrontCase):
         self.assertEqual(len(self.dell.seen), 1)
         self.assertGreaterEqual(self.calls, 2)
 
-    def test_phone_bare_and_slash_forward_and_root_redirects(self):
+    def test_phone_bare_and_slash_forward(self):
         self.assertEqual(self.request("GET", "/phone")[0], 200)
         self.assertEqual(self.request("GET", "/phone/")[0], 200)
-        status, response, _ = self.request("GET", "/")
-        self.assertEqual(status, 302)
-        self.assertEqual(response.getheader("Location"), "/phone/")
+
+    def test_app_shell_at_root_forwards(self):
+        # The PC serves the PWA shell at its root; through the front it must load too.
+        for path in ("/", "/?v=1", "/phone.js", "/sw.js", "/manifest.webmanifest",
+                     "/icons/icon-192.png", "/fonts/geist.woff2", "/icons.svg"):
+            status, _, body = self.request("GET", path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(json.loads(body)["path"], path)
 
     def test_other_paths_are_404_json_and_never_reach_upstream(self):
-        for path in ("/api/state", "/phonex", "/phone/../secret", "/phone/%2e%2e/x", "/other/phone/"):
+        for path in ("/api/state", "/phonex", "/phone/../secret", "/phone/%2e%2e/x", "/other/phone/",
+                     "/icons/../phone.json", "/fonts/", "/index.html"):
             status, response, body = self.request("GET", path)
             self.assertEqual(status, 404, path)
             self.assertEqual(json.loads(body)["code"], "not_found")

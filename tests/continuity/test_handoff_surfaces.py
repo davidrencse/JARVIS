@@ -888,6 +888,7 @@ class HandoffSurfaces(unittest.TestCase):
                 return getattr(os, key)
 
         with mock.patch("jarvis.cluster_cli.os", _NtOs()), \
+                mock.patch("jarvis.continuity.hub_control.os", _NtOs()), \
                 mock.patch("os.open", side_effect=guard), \
                 mock.patch("os.fsync", wraps=os.fsync) as synced:
             out = cluster_cli.set_main(self.stale(), self.path, "dell", state=self.state)
