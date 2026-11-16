@@ -53,7 +53,7 @@ STATIONS = [
 SIDE = [
     {"id": "surfaces", "title": "Surfaces",
      "plain": "Ways in: this console, the jarvis command, the Windows overlay, the phone app.",
-     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "cluster_recovery", "cluster_discovery", "linkfinder", "deploy", "release", "release_runtime", "release_gate", "drift", "gateway_auto", "node", "platforms", "autostart", "settings", "rest"]},
+     "modules": ["ui", "__main__", "phone", "sysview", "cluster_cli", "cluster_setup", "cluster_proxy", "cluster_tunnel", "cluster_recovery", "cluster_discovery", "linkfinder", "deploy", "release", "release_runtime", "release_gate", "drift", "gateway_auto", "node", "jobtiming", "phone_hub", "platforms", "autostart", "settings", "rest"]},
     {"id": "machines", "title": "Machines",
      "plain": "Knows both laptops: hardware, the shared mouse and keyboard, and how much "
               "of each AI plan is left.",
@@ -64,7 +64,7 @@ SIDE = [
                  "continuity.clock", "continuity.console", "continuity.executor", "continuity.gateway",
                  "continuity.hub_control", "continuity.ingress", "continuity.integration",
                  "continuity.lifecycle", "continuity.local_lifecycle", "continuity.participant", "continuity.production", "continuity.recovery",
-                 "continuity.renewal", "continuity.startup", "continuity.phone_front", "continuity.gateway_deploy", "continuity.repoint", "continuity.return_brain",
+                 "continuity.renewal", "continuity.startup", "continuity.phone_front", "continuity.gateway_deploy", "continuity.repoint", "continuity.recovery_repoint", "continuity.role_status", "continuity.return_brain",
                  "continuity.runtime"]},
 ]
 # Which station a request's tier lights up, in order.

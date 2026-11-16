@@ -113,7 +113,7 @@ class Broker:
             temp.unlink(missing_ok=True)
         return path.read_text(encoding="ascii").strip()
 
-    def enroll(self, node, capabilities=NODE_DEFAULT, invite_ttl=None, settle_jobs=True):
+    def enroll(self, node, capabilities=NODE_DEFAULT, invite_ttl=None, settle_jobs=True, *, token=None):
         """A fresh credential for `node`. With `invite_ttl` (seconds) it is an invite's:
         good only until the node redeems it for its own token, and only for that long.
         settle_jobs=False leaves running jobs alone; the caller must call settle_rotated(node)
@@ -125,8 +125,18 @@ class Broker:
         caps = set(capabilities)
         if not caps or not caps <= CAPABILITIES:
             raise ValueError("Unknown or empty node capabilities.")
-        token = secrets.token_urlsafe(32)
+        supplied = token is not None
+        if supplied and (not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', token)):
+            raise ValueError("Invalid node credential.")
+        token = token if supplied else secrets.token_urlsafe(32)
         with self.db() as db:
+            if supplied:
+                existing = db.execute('SELECT token_hash,capabilities,invite_expires FROM nodes WHERE id=?',
+                                      (node,)).fetchone()
+                if (existing and existing['token_hash'] == hashlib.sha256(token.encode()).hexdigest()
+                        and set(json.loads(existing['capabilities'])) == caps
+                        and existing['invite_expires'] is None and invite_ttl is None):
+                    return token  # a durable recovery offer retry must not reset its live node
             db.execute("INSERT INTO nodes(id,token_hash,capabilities,invite_expires) VALUES(?,?,?,?) "
                        "ON CONFLICT(id) DO UPDATE SET token_hash=excluded.token_hash, "
                        "capabilities=excluded.capabilities, seen=NULL, info='{}', "

@@ -148,7 +148,10 @@ def run_tests(stage, timeout=3600):
     full = _tier(stage, 'full', timeout)
     core_ids = set(core.get('ids', []))
     tagged = set(full.get('safety', []))
-    blocked = [name for name in full['failures'] if safety(name) or name in tagged or name in core_ids]
+    blocked = [name for name in full['failures']
+               if name.startswith('runner:') or safety(name) or name in tagged or name in core_ids]
+    if full.get('complete') is False and 'runner:full' not in blocked:
+        blocked.append('runner:full')
     warnings = [name for name in full['failures'] if name not in blocked]
     return not blocked, {'failures': blocked, 'warnings': warnings, 'core': core, 'full': full,
                          'summary': ('Safety tests failed: ' + ', '.join(blocked) if blocked else

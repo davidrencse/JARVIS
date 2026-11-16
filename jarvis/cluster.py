@@ -1550,12 +1550,34 @@ def make_server(hub, host, port):
                     hub._active_responses[id(request)] = request
             try:
                 self._node_path = None  # one handler serves a whole keep-alive connection
+                from .phone_hub import dispatch as phone_dispatch
+                if phone_dispatch(self, hub):
+                    return
                 if not Handler._allowed(self):  # this class's _allowed is the console credential
                     site = self.headers.get("Sec-Fetch-Site")
                     detail = ("Unexpected Host header."
                               if site in (None, "same-origin", "none")
                               else "Requests from other sites are refused.")
                     return self._send(403, {"error": detail})
+                from .continuity.recovery_repoint import OFFER_PATH, PROOF_PATH, MAX_BYTES
+                if self.path == OFFER_PATH:
+                    if not post or not self._host_ok():
+                        return self._send(403, {'error': 'Signed recovery request required.'})
+                    length = self._content_length()
+                    if length is None or not 0 < length <= MAX_BYTES:
+                        return self._send(400, {'error': 'Invalid recovery request length.'})
+                    self.connection.settimeout(10)
+                    from .continuity.participant import lookup
+                    from .continuity.runtime import RuntimeRefusal
+                    participant = lookup(hub.state)
+                    controller = getattr(participant, 'production_controller', None)
+                    if controller is None or controller.hub is not hub:
+                        return self._send(409, {'error': 'managed_unbound'})
+                    try:
+                        offer = controller.ready_rejoin_issuer().offer(json.loads(self.rfile.read(length)))
+                        return self._send(200, offer, headers={'Cache-Control': 'no-store'})
+                    except RuntimeRefusal as exc:
+                        return self._send(409, {'error': exc.code}, headers={'Cache-Control': 'no-store'})
                 if self.path.startswith("/api/"):
                     self.node_id, caps = hub.authenticate(
                         self.headers, "console", self.client_address[0])
@@ -1635,6 +1657,20 @@ def make_server(hub, host, port):
                     from .continuity.runtime import RuntimeRefusal
                     try:
                         return self._send(200, endpoint_receipt(hub, node, data['nonce']))
+                    except RuntimeRefusal as exc:
+                        return self._send(409, {'error': exc.code})
+                if self.path == PROOF_PATH:
+                    if 'files' not in caps or 'owner' in caps or set(data) != {'nonce'}:
+                        raise PermissionError('An enrolled target credential is required.')
+                    from .continuity.participant import lookup
+                    from .continuity.runtime import RuntimeRefusal
+                    participant = lookup(hub.state)
+                    controller = getattr(participant, 'production_controller', None)
+                    if controller is None or controller.hub is not hub:
+                        return self._send(409, {'error': 'managed_unbound'})
+                    try:
+                        return self._send(200, controller.ready_rejoin_issuer().proof(node, data['nonce']),
+                                          headers={'Cache-Control': 'no-store'})
                     except RuntimeRefusal as exc:
                         return self._send(409, {'error': exc.code})
                 if self.path == "/v1/continuity/recover":
