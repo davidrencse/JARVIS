@@ -19,6 +19,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from ..phone import SHELL
+
 MAX_BODY = 1 << 20
 CHUNK = 16384
 RETRY_AFTER = 2
@@ -111,8 +113,11 @@ def _default_opener():
 
 
 def _routable(path):
-    """Only /phone and what sits under it. No dot segments."""
+    """The app shell's exact files (served at the PC's root, as `phone.SHELL` lists them),
+    plus /phone and what sits under it. No dot segments."""
     bare = path.split("?", 1)[0].split("#", 1)[0]
+    if bare in SHELL:
+        return True
     if bare != "/phone" and not bare.startswith("/phone/"):
         return False
     if "\\" in bare:
@@ -248,13 +253,6 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _handle(self):
         path = self.path
-        if path == "/" or path.startswith("/?"):
-            self.send_response(302)
-            self.send_header("Location", "/phone/")
-            self.send_header("Content-Length", "0")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            return
         if not _routable(path):
             self._json(404, {"error": "Not found.", "code": "not_found"})
             return

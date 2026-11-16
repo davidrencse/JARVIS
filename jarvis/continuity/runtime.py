@@ -807,7 +807,7 @@ class MainRuntime:
         if not status.get("main_ready"):
             raise RuntimeRefusal("not_ready")
         with self._lock:
-            lease = self._lease_copy()
+            lease = self.lease_snapshot()
         # Status naming this device is not enough. The process must hold that
         # incarnation and epoch. Windows has no cache veto, so this is the fence.
         # A local probe miss must not hide a stale tuple.
@@ -826,7 +826,7 @@ class MainRuntime:
                     raise RuntimeRefusal("expired" if renewed["code"] == "ok" else renewed["code"])
                 status = self._last
                 with self._lock:
-                    lease = self._lease_copy()
+                    lease = self.lease_snapshot()
                 if lease is None or not _grant_still_current(lease, status):
                     raise RuntimeRefusal(self._drop("stale", gen))
             live = _status_tuple(status)
@@ -845,7 +845,7 @@ class MainRuntime:
                 raise RuntimeRefusal(self._hold)
             if self._gen != gen and self._block is not None:
                 raise RuntimeRefusal(self._block)
-            if not _grant_still_current(self._lease_copy(), status):
+            if not _grant_still_current(self.lease_snapshot(), status):
                 raise RuntimeRefusal("stale")
             if self._block not in _STICKY_BLOCK:
                 self._block = None
@@ -963,12 +963,6 @@ class MainRuntime:
             self._hold = _reason(reason)
             self._gen += 1
             self._cache.invalidate("stopped")
-
-    def _lease_copy(self):
-        lease = self._lease
-        if not isinstance(lease, dict) or any(key not in lease for key in _LEASE_FIELDS):
-            return None
-        return {key: lease[key] for key in _LEASE_FIELDS}
 
     def _drop(self, code, gen=None):
         """Forget the cached grant. A newer block (drain, suspend) wins the latch."""

@@ -220,9 +220,6 @@ class PinnedTarget:
         self.device_id, self.connect_ip = device_id, connect_ip
         self.port, self.scheme, self.sni = int(port), scheme, sni
 
-    def as_dict(self):
-        return {"connect_ip": self.connect_ip, "port": self.port, "scheme": self.scheme, "sni": self.sni}
-
 
 class PeerProof:
     """Identity produced by `identify`. A dict from the client is not a proof."""

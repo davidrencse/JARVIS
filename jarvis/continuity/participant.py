@@ -499,9 +499,6 @@ class RemoteRuntime:
     def pause_renewal(self):
         return self._request('pause_renewal')
 
-    def issue_repoint(self, target):
-        return self._request('repoint', target=target)
-
 
 class CandidatePort:
     """Route readiness to the candidate, keeping owner steps on the owner port."""
