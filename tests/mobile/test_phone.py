@@ -1093,6 +1093,18 @@ class Wiring(unittest.TestCase):
         self.assertEqual(phone.serve_targets(tcp, 7787), (True, True))
         self.assertEqual(phone.serve_targets(funnel_config(7787, target_port=77870), 7787), (False, False))
 
+    def test_status_uses_dedicated_public_port_without_suggesting_a_443_change(self):
+        ts = FakeTailscale()
+        phone.Store(self.state).set_on(True)
+        config = {**CONFIG, "phone": {"public_origin": f"https://{DNS}:8444"}}
+        found = phone.status(config, self.state, phone.Tailnet(run=ts))
+        self.assertEqual(found["url"], f"https://{DNS}:8444/")
+        self.assertEqual(found["setup"], "sudo tailscale serve --bg --https=8444 http://127.0.0.1:7787")
+        config["phone"]["public_origin"] = "https://another.ts.net:8444"
+        found = phone.status(config, self.state, phone.Tailnet(run=ts))
+        self.assertEqual(found["url"], f"https://{DNS}/")
+        self.assertIn("--https=443", found["setup"])
+
     def test_tailnet_caches_whois_and_failed_status(self):
         ts = FakeTailscale()
         clock = Clock(0.0)

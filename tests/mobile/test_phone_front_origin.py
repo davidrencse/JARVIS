@@ -74,6 +74,41 @@ class FrontOriginTests(unittest.TestCase):
 
 
 
+class PublicOriginTests(FrontOriginTests):
+    def test_dedicated_port_accepts_only_its_exact_own_origin(self):
+        public = f"https://{DNS}:8444"
+        server = self.server({"phone": {"public_origin": public, "front_origin": FRONT}})
+        self.assertEqual(server._public_origin(), public)
+        self.assertTrue(server.host_ok(f"{DNS}:8444"))
+        self.assertTrue(server.host_ok(f"{DNS.upper()}:8444"))
+        self.assertTrue(server.origin_ok({"Origin": public}))
+        for port in (8443, 8445, 9119):
+            self.assertFalse(server.host_ok(f"{DNS}:{port}"))
+            self.assertFalse(server.origin_ok({"Origin": f"https://{DNS}:{port}"}))
+        self.assertTrue(server.host_ok(DNS))
+        self.assertTrue(server.host_ok(f"{DNS}:443"))
+        self.assertTrue(server.origin_ok({"Origin": FRONT}))
+        self.assertFalse(server.origin_ok({"Origin": public + "/"}))
+        self.assertFalse(server.origin_ok({"Origin": "null"}))
+
+    def test_bad_public_origins_grant_no_additional_host_or_origin(self):
+        public = f"https://{DNS}:8444"
+        for bad in (None, False, 8444, f"http://{DNS}:8444", f"https://{DNS}",
+                    "https://other.ts.net:8444", "https://127.0.0.1:8444",
+                    public + "/", public + "/phone", public + "?x=1", public + "#x",
+                    public + "?", public + "#", public + "\x00",
+                    public.replace("https://", "https://user:pass@"),
+                    public.replace(":8444", ":0"), public.replace(":8444", ":65536"),
+                    public.replace(":8444", ":08444"), public.replace(":8444", ":bad"),
+                    " " + public, public + "\n", public.replace("https", "ht\ttps")):
+            with self.subTest(public_origin=bad):
+                server = self.server({"phone": {"public_origin": bad}})
+                self.assertIsNone(server._public_origin())
+                self.assertFalse(server.host_ok(f"{DNS}:8444"))
+                self.assertFalse(server.origin_ok({"Origin": public}))
+                self.assertFalse(server.host_ok("other.ts.net:8444"))
+
+
 class FrontFromGatewayTests(FrontOriginTests):
     """No phone.front_origin: a managed PC takes the gateway host from its operator config."""
 

@@ -1369,6 +1369,26 @@ const scenarios = {
     assert.equal(last.headers["X-Jarvis-Csrf-zenbook"], arch);
   },
 
+  async paired_successor_keeps_the_app_open_after_main_changes() {
+    const tokens = { zen: "csrf-zen-0123456789abcdef", dell: "csrf-dell-0123456789abcdef" };
+    const p = page({ storage: { "jarvis.phone.csrf.by-main": JSON.stringify(tokens) } });
+    p.state.replyHeaders = { "X-Jarvis-Main": "zen" };
+    await p.settle(10);
+    assert.equal(p.els.app.hidden, false);
+    p.state.replyHeaders = { "X-Jarvis-Main": "dell" };
+    p.state.overview.devices = p.state.overview.devices.map((d) => Object.assign({}, d,
+      d.id === "dell" ? { role: "main" } : { role: "node", online: false }));
+    await p.settle(5100);
+    assert.equal(p.els.app.hidden, false);
+    assert.equal(p.els.pair.hidden, true);
+    assert.equal(p.els["main-label"].textContent, "Dell");
+    assert.deepEqual(JSON.parse(p.storage("jarvis.phone.csrf.by-main")), tokens);
+    const latest = p.callsTo("/phone/api/overview", "GET").at(-1);
+    assert.equal(latest.headers["X-Jarvis-Csrf-dell"], tokens.dell);
+    assert.equal(latest.headers["X-Jarvis-Csrf-zen"], tokens.zen);
+    assert.equal(p.callsTo("/phone/pair").length, 0);
+  },
+
   async csrf_is_captured_on_pair_reused_and_cleared_only_on_forget_or_revoke() {
     const token = "csrf-token-value-0123456789abcd";
     const kept = page({ storage: { "jarvis.phone.csrf": token } });
