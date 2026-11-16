@@ -511,12 +511,13 @@ class Composed(unittest.TestCase):
         self.assert_phone_served_by("dell", "op-crash-dell")
         self.assertEqual(self.arch.effects, [])
 
-    def test_returning_arch_automatically_reclaims_main_and_routes_same_phone(self):
-        """Isolate failback even while automatic crash recovery is broken.
+    def test_returning_arch_does_not_reclaim_main_without_safe_handoff(self):
+        """A returning preferred PC must not take MAIN back on its own.
 
-        The one manual recovery below is an explicit setup precondition, not
-        evidence of automatic failover. The first regression tests that part.
-        Everything after Arch returns must happen without an owner command.
+        The successor's brain has taken new memories since the failover. The
+        metadata-only self-recovery path cannot move them, so automatic
+        failback is refused (`renewal._RecoveryOnly`) and the successor keeps
+        serving the same phone until an explicit SafeHandoff return.
         """
         self.crash_arch()
         self.clock.tick(LEASE_SECONDS + SAFETY_MARGIN + 1)
@@ -530,14 +531,11 @@ class Composed(unittest.TestCase):
         self.arch.runtime.start()
         self.arch.thread = threading.Thread(target=self.arch.server.serve_forever, daemon=False)
         self.arch.thread.start()
-        # Keep Dell alive while the returning preferred PC is observed for the
-        # full 30-second stability window used by RuntimePolicy. Then the fence
-        # still waits out Dell's last lease plus the safety margin (no full ack
-        # quorum: the Oracle server participant does not tick here), so the
-        # handback cannot finish before 30 + LEASE_SECONDS + SAFETY_MARGIN.
+        # Run past the whole window an automatic return would have needed
+        # (30 s stability + Dell's lease + margin): MAIN must still be Dell.
         self.background_ticks(int(30 + LEASE_SECONDS + SAFETY_MARGIN + 5), self.dell, self.arch)
-        self.assert_phone_served_by("zenbook", "op-return-arch")
-        self.assertEqual(self.dell.effects, [])
+        self.assert_phone_served_by("dell", "op-return-arch")
+        self.assertEqual(self.arch.effects, [])
 
     def test_reboot_partition_and_restart_do_not_replay(self):
         self.assertEqual(self.ask("op-before-01").status, 200)

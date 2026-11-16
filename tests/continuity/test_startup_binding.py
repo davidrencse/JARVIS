@@ -233,6 +233,26 @@ class StartupBindingTest(unittest.TestCase):
         self.assertTrue(phone.closed)
         self.assertTrue(console.closed)
 
+    def test_explicit_dedicated_phone_origin_is_preserved_without_hub_mount(self):
+        config = _config("dell")
+        dedicated = "https://winlaptop.tailnet-example.ts.net:8444"
+        config["phone"] = {"public_origin": dedicated}
+        views = []
+
+        def start(view, *_args):
+            views.append(view)
+            return FakeServer()
+
+        services = NodeMainServices(config, self.root / "dell", self.states["dell"],
+                                    console_factory=lambda *_: FakeServer(), phone_start=start)
+        services.hub = SimpleNamespace(console=None, continuity_endpoint="https://winlaptop.tailnet-example.ts.net:8443")
+        with patch("jarvis.phone_hub.mount") as mount:
+            self.assertTrue(services.activate())
+        mount.assert_not_called()
+        self.assertEqual(views[0]["phone"]["public_origin"], dedicated)
+        self.assertEqual(config["phone"]["public_origin"], dedicated)
+        services.deactivate()
+
     def test_service_sync_preserves_not_ready_grant_until_cancelled(self):
         services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],
                                    console_factory=lambda *_: FakeServer(),
