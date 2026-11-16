@@ -513,6 +513,17 @@ class ReleaseReadinessTests(unittest.TestCase):
         self.assertFalse(device["ready"])
         self.assertIn("awaiting contact", device["why"])
 
+    def test_fenced_former_main_does_not_advertise_remote_ready(self):
+        from jarvis.continuity.runtime import RuntimeRefusal
+        from types import SimpleNamespace
+        runtime = SimpleNamespace(require_authority=lambda _profile: (_ for _ in ()).throw(RuntimeRefusal("not_holder")))
+        with (patch("jarvis.continuity.integration.continuity_state", return_value="managed"),
+              patch("jarvis.continuity.integration.production_binding", return_value={"runtime": runtime})):
+            status = self.console.remote_status()
+        self.assertEqual(status["devices"], [])
+        self.assertIsNone(status["session"])
+        self.assertIn("MAIN", status["why"])
+
     def test_release_with_remote_control_is_ready_even_if_live_code_moved_on(self):
         self._release(True)
         with patch("jarvis.deploy.code_fingerprint", return_value="live"):
