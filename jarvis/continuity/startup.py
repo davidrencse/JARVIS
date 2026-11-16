@@ -81,6 +81,7 @@ class NodeMainServices:
         self._console_factory = console_factory
         self._phone_start = phone_start
         self.console = self.phone = None
+        self.hub = None
         self._failed = False
         self._lock = threading.Lock()
 
@@ -95,6 +96,8 @@ class NodeMainServices:
             if self.phone is not None:
                 return True
             view = acting_main_config(self.config)
+            console = server = None
+            old_console = getattr(self.hub, "console", None)
             try:
                 if self._console_factory is None:
                     from jarvis.ui import Console
@@ -102,16 +105,28 @@ class NodeMainServices:
                     console = Console(view, self.base, self.state).start_live(warm=False)
                 else:
                     console = self._console_factory(view, self.base, self.state)
+                if self.hub is not None:
+                    self.hub.console = console
                 if self._phone_start is None:
                     from jarvis import phone
-                    server = phone.start(view, self.state, console=console, hub=None)
+                    server = phone.start(view, self.state, console=console, hub=self.hub)
                 else:
                     server = self._phone_start(view, self.state, console)
+                refusal = getattr(server, "refusal", None)
+                if callable(refusal) and refusal() is not None:
+                    _close(server)
+                    server = None
             except Exception as exc:
+                if self.hub is not None:
+                    self.hub.console = old_console
+                _close(server)
+                _close(console)
                 self._failed = True
                 _log(f"MAIN services did not start ({type(exc).__name__}: {exc})")
                 return False
             if server is None:
+                if self.hub is not None:
+                    self.hub.console = old_console
                 _close(console)
                 self._failed = True
                 _log("MAIN services did not start (phone server off or port busy)")
@@ -124,6 +139,8 @@ class NodeMainServices:
         with self._lock:
             phone, console = self.phone, self.console
             self.phone = self.console = None
+            if self.hub is not None and self.hub.console is console:
+                self.hub.console = None
         if phone is None and console is None:
             return False
         _close(phone)
@@ -407,6 +424,7 @@ def bind_managed(config, state, base=None, *, client_factory=None, services=None
                         hub = controller.ensure_local_main_hub()
                     except Exception:
                         return False
+                    services.hub = hub
                     return (hub.started is True and services.activate() is True)
                 participant.canary = canary
             else:

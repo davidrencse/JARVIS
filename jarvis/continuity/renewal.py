@@ -3,14 +3,15 @@
 Renewal never requests, elects or promotes. Self-recovery is a separate step on
 the same tick (`SelfRecovery`): it does nothing unless the gateway config turns
 `self_recovery` on and lists this PC. Then this node opens a `recover`
-transition for itself once the old MAIN's lease has lapsed, or (preferred PC
-only) a `set_preferred_main` after 30 s of steady readiness. The authority's
+transition for itself once the old MAIN's lease has lapsed. A live MAIN's
+return to the preferred PC requires SafeHandoff's brain transfer and signed
+repoint; this metadata-only path cannot perform that handoff. The authority's
 fence still waits out the old lease, so two MAINs never hold valid leases.
 """
 import threading
 import time
 
-from .runtime import RecoveryOrchestrator, RuntimePolicy, RuntimeRefusal, SelfRecoveryPort
+from .runtime import RecoveryOrchestrator, RuntimePolicy, RuntimeRefusal, SelfRecoveryPort, _step
 
 # Constructor interval stays in (0, 5]. A successful renew waits for the
 # authority's renew_after, never past this cap, and never in a hot loop.
@@ -38,6 +39,23 @@ def _positive_seconds(value):
 _POLICY_TTL = 300.0
 
 
+class _RecoveryOnly(RecoveryOrchestrator):
+    """Production's local canary cannot substitute for SafeHandoff's data and route steps."""
+
+    def _failback(self, status):
+        target = status.get('preferred') or self.policy.preferred
+        if target == self._candidate.device_id and target != status.get('main'):
+            return _step(False, 'main', 'safe_handoff_required', candidate=target)
+        return super()._failback(status)
+
+    def _advance(self, status, transition):
+        # A restart must not resume an earlier metadata-only automatic return.
+        # Leave explicit handoff coordination to its composed SafeHandoff owner.
+        if transition.get('action') == 'set_preferred_main':
+            return _step(False, 'standby', 'safe_handoff_required', transition=transition)
+        return super()._advance(status, transition)
+
+
 class SelfRecovery:
     """Runs one `RecoveryOrchestrator.step` per tick for this node only.
 
@@ -46,7 +64,8 @@ class SelfRecovery:
     (`candidate_runtime`): it only advances transitions where this node is the
     candidate, except cancelling a dead candidate's not-ready grant. Readiness
     is this node's own probe; activation is the participant's canary.
-    A missing canary does not count as success.
+    A missing canary does not count as success. Automatic failback is refused:
+    this adapter has no brain-transfer or signed-repoint composition.
     """
 
     def __init__(self, participant, *, clock=None):
@@ -91,9 +110,9 @@ class SelfRecovery:
             return None
         policy = RuntimePolicy(
             preferred=preferred, recover_candidates=(me,), auto_recover=True,
-            auto_failback=preferred == me, failback_stability_s=float(stability or 30.0),
+            auto_failback=False, failback_stability_s=float(stability or 30.0),
             caller='self-recovery')
-        return RecoveryOrchestrator(
+        return _RecoveryOnly(
             SelfRecoveryPort(self.participant.client), self, policy, self._clock,
             candidate_runtime=runtime, activate=self._activate)
 

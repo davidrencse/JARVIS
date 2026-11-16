@@ -1243,7 +1243,12 @@ class RecoveryOrchestrator:
             self._stable_key = None
             self._stable_since = None
             return 0.0
-        key = (device, facts["control_ready"], facts["ai_ready"], facts.get("checkpoint"), self.policy.profile)
+        # Stability measures continuous service readiness. The live brain can
+        # receive new memories throughout that window; requiring unchanged DB
+        # bytes prevents a healthy, active preferred PC from ever returning.
+        # The current checkpoint is recorded separately when drain validates
+        # this transition, and an absent checkpoint still resets readiness.
+        key = (device, facts["control_ready"], facts["ai_ready"], self.policy.profile)
         if key != self._stable_key:
             self._stable_key = key
             self._stable_since = now

@@ -25,6 +25,9 @@ def _read(path, factory):
         s = client.status()
         out.update(mode=s.get("mode"), main=s.get("main"), lease_valid=bool(s.get("lease_valid")),
                    epoch=s.get("epoch"))
+        for field in ("main_ready", "incarnation"):
+            if field in s:
+                out[field] = s[field]
     except Exception as exc:
         out.update(state="unreachable", error=type(exc).__name__)
     return out

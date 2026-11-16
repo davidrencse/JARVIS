@@ -32,7 +32,7 @@ _REQUEST_HEADERS = (
 _RESPONSE_HEADERS = (
     "Content-Type", "Cache-Control", "ETag", "Last-Modified", "Location", "Retry-After",
     "Service-Worker-Allowed", "Content-Security-Policy", "X-Content-Type-Options",
-    "Referrer-Policy",
+    "Referrer-Policy", "X-Frame-Seq", "X-Frame-Width", "X-Frame-Height", "X-Node-Ago",
 )
 _TS_HOST = re.compile(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.ts\.net")
 _DEVICE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -159,7 +159,10 @@ class PhoneFront:
             status = self.status_fn()
         except Exception:
             return None
-        if not isinstance(status, dict) or status.get("lease_valid") is not True:
+        # A granted lease can name a successor before its receiver and MAIN services
+        # are ready. Keep the phone in its retry state until readiness is published.
+        if (not isinstance(status, dict) or status.get("lease_valid") is not True
+                or status.get("main_ready") is not True):
             return None
         main = status.get("main")
         if not isinstance(main, str) or main not in self.upstreams:
