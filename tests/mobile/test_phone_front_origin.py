@@ -74,6 +74,40 @@ class FrontOriginTests(unittest.TestCase):
 
 
 
+class FrontFromGatewayTests(FrontOriginTests):
+    """No phone.front_origin: a managed PC takes the gateway host from its operator config."""
+
+    def managed(self, origin, phone_cfg=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "operator.json"
+        path.write_text(json.dumps({"origin": origin}))
+        config = {"continuity": {"operator_config": str(path)}}
+        if phone_cfg is not None:
+            config["phone"] = phone_cfg
+        return self.server(config)
+
+    def test_front_derived_from_gateway(self):
+        server = self.managed("https://oracle-vm.tailnet-example.ts.net:443")
+        self.assertTrue(server.host_ok("oracle-vm.tailnet-example.ts.net:8443"))
+        self.assertTrue(server.origin_ok({"Origin": FRONT}))
+        self.assertFalse(server.origin_ok({"Origin": "https://oracle-vm.tailnet-example.ts.net"}))
+
+    def test_front_port_and_off_switch(self):
+        server = self.managed("https://oracle-vm.tailnet-example.ts.net", {"front_port": 9443})
+        self.assertTrue(server.origin_ok({"Origin": "https://oracle-vm.tailnet-example.ts.net:9443"}))
+        self.assertFalse(server.origin_ok({"Origin": FRONT}))
+        server = self.managed("https://oracle-vm.tailnet-example.ts.net", {"front_origin": False})
+        self.assertFalse(server.origin_ok({"Origin": FRONT}))
+
+    def test_bad_gateway_origin_gives_no_front(self):
+        for bad in ("http://oracle-vm.tailnet-example.ts.net", "nonsense", 5, None):
+            server = self.managed(bad)
+            self.assertFalse(server.origin_ok({"Origin": FRONT}), repr(bad))
+        server = self.server({"continuity": {"operator_config": "/nonexistent/operator.json"}})
+        self.assertFalse(server.origin_ok({"Origin": FRONT}))
+
+
 class FrontIdentityTests(FrontOriginTests):
     """Through the front, the hop is the Oracle node; the phone is named in the front's
     X-Jarvis-Front-For/-Login, and this PC checks that name with its own whois."""
