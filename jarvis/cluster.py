@@ -2029,7 +2029,17 @@ class NodeWorker:
         job = response.get("job")
         if not job:
             return False
+        from . import jobtiming
+        jobtiming.start()
+        try:
+            return self._run_job(job, received)
+        finally:
+            jobtiming.finish(self.state, kind=job.get("kind"), id=str(job.get("id"))[:16])
+
+    def _run_job(self, job, received):
+        from . import jobtiming
         refusal = self._untrusted(job)
+        jobtiming.mark("untrusted_checked")
         if refusal:  # never ran: report it if this really is the main, else nobody listens
             print(f"JARVIS node: refused job {str(job.get('id'))[:40]}: {refusal}", flush=True)
             if isinstance(job.get("id"), str):
@@ -2059,6 +2069,7 @@ class NodeWorker:
             if managed_node_disposition is not None:
                 # After the code-key check above. A payload boolean cannot admit this job.
                 disposition = managed_node_disposition(self.state, job)
+            jobtiming.mark("disposition_" + disposition)
             if job['kind'] == 'continuity':
                 # _untrusted already checked the pinned code-key signature. RPCs
                 # check their own live transition instead of an ordinary ticket.
@@ -2115,8 +2126,11 @@ class NodeWorker:
             # The main answers an oversized body 400 and the result would be dropped unseen.
             message = {"id": message["id"], "failed": True, "result": {
                 "error": "result too large to send back (it may have run)"}}
+        jobtiming.mark("ran")
         save_json(self.outbox, {"main_device": self.client.main, "message": message})
+        jobtiming.mark("outbox_saved")
         self._send_result(message)
+        jobtiming.mark("result_sent")
         self._record(results_sent=1)
         return True
 

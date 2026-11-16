@@ -25,6 +25,7 @@ that admission inside the payload, so the existing job signature covers it and a
 process can read it from the broker.
 """
 
+from .. import jobtiming
 from ..home import home as _jarvis_home
 import contextvars
 import hashlib
@@ -1415,12 +1416,16 @@ def run_admitted_node_job(state, job, executor):
             "desktop": None,
         }
         token = _bridge.set(record)
+        jobtiming.mark("guard_admitted")
         try:
             captured["result"] = executor(kind, stripped)
         finally:
             _bridge.reset(token)
+            jobtiming.mark("effect_done")
 
+    jobtiming.mark("envelope_opened")
     guard.accept(signed, ticket, sink)
+    jobtiming.mark("guard_returned")
     if "result" not in captured:
         # The guard returned without running the sink. Do not invent a result or run it here.
         raise IntegrationError("not_run")

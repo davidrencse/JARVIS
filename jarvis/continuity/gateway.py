@@ -28,6 +28,7 @@ the gateway directory, then stays `LEGACY_ACTIVE` until a new cutover.
 See `GatewayConfig`, `FailoverPolicy`, `backup_gateway`, and `restore_gateway`.
 """
 
+from .. import jobtiming
 from ..home import home as _jarvis_home
 import argparse
 import base64
@@ -319,6 +320,7 @@ def sign_message(namespace, private_key, data):
     """SSH signature of `data` under `namespace`. The private key never leaves this call."""
     if namespace not in _NAMESPACES or not isinstance(data, bytes) or len(data) > MAX_BODY:
         raise GatewayError("bad_request")
+    jobtiming.mark("sign_begin")
     try:
         out = subprocess.run(
             ["ssh-keygen", "-Y", "sign", "-q", "-f", str(private_key), "-n", namespace],
@@ -329,6 +331,7 @@ def sign_message(namespace, private_key, data):
     if out.returncode or b"BEGIN SSH SIGNATURE" not in out.stdout:
         raise GatewayError("unauthorized")
     text = out.stdout.decode("ascii", "strict")
+    jobtiming.mark("signed")
     return _signature(text)
 
 
@@ -355,6 +358,7 @@ def verify_message(namespace, data, signature, public_key):
             )
     except (OSError, subprocess.SubprocessError, UnicodeError):
         return False
+    jobtiming.mark("verified")
     return out.returncode == 0
 
 
@@ -1969,6 +1973,12 @@ class AuthorityClient:
         }})
 
     def _send(self, path, obj):
+        try:
+            return self._send_once(path, obj)
+        finally:
+            jobtiming.mark("authority" + path[len("/v1/authority"):])
+
+    def _send_once(self, path, obj):
         if not path.startswith("/v1/authority/"):
             raise GatewayError("bad_request")
         request = urllib.request.Request(self.origin + path, data=canonical(obj), method="POST")
