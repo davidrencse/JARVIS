@@ -500,6 +500,18 @@ class HandoffSurfaces(unittest.TestCase):
         self.assertEqual(self.disk()["cluster"]["main_device"], "zenbook")
         self.assertEqual(len(self.calls), 1)
 
+    def test_candidate_runtime_refusal_is_structured_and_cannot_publish(self):
+        from jarvis.continuity.runtime import RuntimeRefusal
+        self.bind(self.accept)
+        self.auth.readiness = mock.Mock(side_effect=RuntimeRefusal("candidacy_mismatch"))
+        before = self.path.read_bytes()
+        out = cluster_cli.set_main(self.stale(), self.path, "dell", state=self.state)
+        self.assertEqual(out["status"], "refused")
+        self.assertEqual(out["code"], "candidacy_mismatch")
+        self.assertFalse(out["mutated"])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_publication_failure_retries_without_a_second_handoff(self):
         self.bind(self.handoff)
         real = patch_config

@@ -739,6 +739,30 @@ class RuntimeTests(unittest.TestCase):
         self.advance(1, runtime)
         self.assertEqual(watcher.step()["action"], "set_preferred_main")
 
+    def test_failback_readiness_stays_stable_while_live_checkpoint_changes(self):
+        _arch, _lease = self.v2()
+        ack(self.store)
+        _tid, lease = promote(self.store, "make_main_now", "dell", "k-dell")
+        runtime = self.pc("dell")
+        runtime.accept_lease(lease)
+        runtime.start()
+        self.touch()
+        watcher = self.orch(auto_failback=True, preferred="zenbook")
+        self.assertEqual(watcher.step()["code"], "stabilising")
+        for index in range(1, 6):
+            self.advance(5, runtime)
+            self.probes["zenbook"]["checkpoint"] = "cp-live-" + str(index)
+            self.touch()
+            self.assertEqual(watcher.step()["stable_for"], index * 5)
+        self.advance(5, runtime)
+        self.probes["zenbook"]["checkpoint"] = "cp-current"
+        self.touch()
+        opened = watcher.step()
+        self.assertEqual((opened["action"], opened["candidate"]), ("set_preferred_main", "zenbook"))
+        # Drain still validates the current candidate checkpoint independently.
+        watcher.step()
+        self.assertEqual(self.store.transition(opened["transition_id"])["checkpoint"], "cp-current")
+
     def test_oracle_cannot_be_nominated_and_a_lie_is_still_ineligible(self):
         _arch, _lease = self.v2()
         self.clock.tick(LEASE_SECONDS + 1)

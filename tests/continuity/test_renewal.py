@@ -239,6 +239,62 @@ class _PolicyClient:
 
 
 class SelfRecoveryGate(unittest.TestCase):
+    def _preferred_recovery(self, *, lease_valid=True, transition=None):
+        client = _PolicyClient([{'enabled': True, 'candidates': ['zenbook', 'dell'],
+                                 'preferred': 'zenbook', 'stability_s': 30}])
+        client.device_id = 'zenbook'
+        client.authority_id = 'oracle-auth'
+        client.requests = []
+        client.steps = []
+        def unexpected(*args, **kwargs):
+            raise AssertionError('unrelated authority operation')
+        for method in ('renew', 'release', 'acknowledge', 'readiness', 'step',
+                       'transition_request', 'consume', 'admission'):
+            setattr(client, method, unexpected)
+        client.status = lambda: {'mode': 'V2_ACTIVE', 'main': 'dell' if lease_valid else None,
+            'preferred': None, 'lease_valid': lease_valid, 'main_ready': lease_valid,
+            'transition': transition, 'incarnation': 5, 'epoch': 35, 'policy_version': 1}
+        def request(*args, **kwargs):
+            client.requests.append((args, kwargs))
+            return {'state': 'REQUESTED', 'candidate': 'zenbook', 'transition_id': 'return-1',
+                    'action': kwargs.get('action', args[1] if len(args) > 1 else None)}
+        client.self_request = request
+        client.self_step = lambda *args, **kwargs: client.steps.append((args, kwargs))
+        clock = {'t': 0.0}
+        runtime = types.SimpleNamespace(device_id='zenbook', _started=True,
+            readiness=lambda profile: {'meets': True, 'control_ready': True, 'checkpoint': 'cp-live'})
+        recovery = SelfRecovery(types.SimpleNamespace(runtime=runtime, client=client,
+                                                       canary=lambda: True), clock=lambda: clock['t'])
+        return recovery, client, clock
+
+    def test_preferred_pc_cannot_return_over_live_main_without_safe_handoff(self):
+        recovery, client, clock = self._preferred_recovery()
+        for elapsed in (0, 30, 300, 3600):
+            # Refill policy before its bounded refresh; preference never grants a handoff.
+            client.answers.append({'enabled': True, 'candidates': ['zenbook', 'dell'],
+                                   'preferred': 'zenbook', 'stability_s': 30})
+            clock['t'] = elapsed
+            self.assertEqual(recovery.tick()['code'], 'safe_handoff_required')
+        self.assertFalse(recovery._orchestrator.policy.auto_failback)
+        self.assertEqual(client.requests, [])
+        self.assertEqual(client.steps, [])
+
+    def test_metadata_only_recovery_cannot_resume_an_open_preferred_return(self):
+        for state in ('REQUESTED', 'DRAINING', 'FENCING', 'GRANTED_NOT_READY'):
+            with self.subTest(state=state):
+                recovery, client, _ = self._preferred_recovery(transition={
+                    'action': 'set_preferred_main', 'candidate': 'zenbook',
+                    'transition_id': 'return-1', 'state': state})
+                self.assertEqual(recovery.tick()['code'], 'safe_handoff_required')
+                self.assertEqual(client.requests, [])
+                self.assertEqual(client.steps, [])
+
+    def test_expired_main_recovery_remains_available_to_preferred_pc(self):
+        recovery, client, _ = self._preferred_recovery(lease_valid=False)
+        self.assertEqual(recovery.tick()['code'], 'requested')
+        self.assertEqual(len(client.requests), 1)
+        self.assertEqual(client.requests[0][0][1], 'recover')
+
     def _recovery(self, canary, answers, clock):
         runtime = types.SimpleNamespace(
             device_id='dell',

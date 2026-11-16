@@ -8,6 +8,7 @@ import json
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
@@ -188,6 +189,49 @@ class StartupBindingTest(unittest.TestCase):
         view = acting_main_config(config)
         self.assertEqual(view["cluster"]["main_device"], "dell")
         self.assertEqual(config["cluster"]["main_device"], "zenbook")
+
+    def test_successor_phone_and_control_listener_share_console_and_hub(self):
+        console, phone = FakeServer(), FakeServer()
+        services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],
+                                   console_factory=lambda *_: console)
+        hub = SimpleNamespace(console=None)
+        services.hub = hub
+        with patch("jarvis.phone.start", return_value=phone) as start:
+            self.assertTrue(services.activate())
+        self.assertIs(hub.console, console)
+        self.assertIs(start.call_args.kwargs["hub"], hub)
+        self.assertIs(start.call_args.kwargs["console"], console)
+        services.deactivate()
+        self.assertIsNone(hub.console)
+        self.assertTrue(phone.closed)
+        self.assertTrue(console.closed)
+
+    def test_phone_start_failure_restores_hub_console_and_closes_new_console(self):
+        for failure in (RuntimeError("bind failed"), None):
+            with self.subTest(failure=failure):
+                old, console = FakeServer(), FakeServer()
+                services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],
+                                           console_factory=lambda *_: console)
+                services.hub = SimpleNamespace(console=old)
+                kwargs = {"side_effect": failure} if failure else {"return_value": None}
+                with patch("jarvis.phone.start", **kwargs):
+                    self.assertFalse(services.activate())
+                self.assertIs(services.hub.console, old)
+                self.assertFalse(old.closed)
+                self.assertTrue(console.closed)
+
+    def test_refusing_phone_listener_does_not_pass_canary(self):
+        console, phone = FakeServer(), FakeServer()
+        phone.refusal = lambda: "serve config unavailable"
+        services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],
+                                   console_factory=lambda *_: console,
+                                   phone_start=lambda *_: phone)
+        services.hub = SimpleNamespace(console=None)
+        self.assertFalse(services.activate())
+        self.assertIsNone(services.hub.console)
+        self.assertFalse(services.running())
+        self.assertTrue(phone.closed)
+        self.assertTrue(console.closed)
 
     def test_service_sync_preserves_not_ready_grant_until_cancelled(self):
         services = NodeMainServices(_config("dell"), self.root / "dell", self.states["dell"],

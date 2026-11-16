@@ -69,6 +69,20 @@ class Upstream:
                         time.sleep(0.02)
                     self.close_connection = True
                     return
+                if self.path.startswith("/phone/frame"):
+                    self.send_response(200)
+                    self.send_header("X-Frame-Seq", "321")
+                    self.send_header("X-Frame-Width", "1920")
+                    self.send_header("X-Frame-Height", "1080")
+                    self.send_header("Content-Length", "3")
+                    self.end_headers()
+                    self.wfile.write(b"jpg")
+                    return
+                if self.path.startswith("/phone/idle"):
+                    self.send_response(204)
+                    self.send_header("X-Node-Ago", "0.3")
+                    self.end_headers()
+                    return
                 raw = json.dumps({"from": outer.name, "path": self.path}).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -149,6 +163,28 @@ class RoutingTests(FrontCase):
         self.assertEqual(len(self.dell.seen), 1)
         self.assertGreaterEqual(self.calls, 2)
 
+    def test_ready_successor_serves_shell_and_api_with_original_main_off(self):
+        self.request("GET", "/")
+        self.arch.close()
+        # The original server is physically closed for all subsequent requests,
+        # not merely marked offline in the role snapshot.
+        self.status = {"main": "dell", "lease_valid": True, "main_ready": True}
+        credentials = {
+            "Cookie": "__Host-jarvis_phone.arch=A; __Host-jarvis_phone.dell=D",
+            "X-Jarvis-Csrf-arch": "csrf-arch", "X-Jarvis-Csrf-dell": "csrf-dell",
+        }
+        for path in ("/", "/phone.js", "/sw.js", "/manifest.webmanifest", "/phone/api/me"):
+            status, response, body = self.request("GET", path, headers=credentials)
+            self.assertEqual((status, json.loads(body)["from"]), (200, "dell"), path)
+            self.assertEqual(response.getheader("X-Jarvis-Main"), "dell", path)
+        status, _, _ = self.request("POST", "/phone/api/ask", body=b'{"q":"status"}',
+                                    headers=credentials)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.arch.seen), 1)
+        for seen in self.dell.seen:
+            self.assertEqual(seen["headers"]["cookie"], "__Host-jarvis_phone=D")
+            self.assertEqual(seen["headers"]["x-csrf-token"], "csrf-dell")
+
     def test_phone_bare_and_slash_forward(self):
         self.assertEqual(self.request("GET", "/phone")[0], 200)
         self.assertEqual(self.request("GET", "/phone/")[0], 200)
@@ -197,6 +233,17 @@ class UnavailableTests(FrontCase):
     def test_lease_valid_not_true(self):
         self.status = {"main": "arch", "lease_valid": "yes"}
         self.assert_no_main()
+
+    def test_granted_successor_is_not_routed_until_ready(self):
+        for ready in (False, None, "yes", 1):
+            self.status = {"main": "dell", "lease_valid": True, "main_ready": ready}
+            with self.subTest(main_ready=ready):
+                self.assert_no_main()
+        self.status = {"main": "dell", "lease_valid": True}
+        self.assert_no_main()
+        self.status["main_ready"] = True
+        status, _, body = self.request("GET", "/phone/x")
+        self.assertEqual((status, json.loads(body)["from"]), (200, "dell"))
 
     def test_main_unknown(self):
         self.status = {"main": "oracle", "lease_valid": True}
@@ -286,6 +333,16 @@ class ForwardingTests(FrontCase):
     def test_streamed_body_without_length(self):
         status, response, body = self.request("GET", "/phone/stream")
         self.assertEqual((status, body), (200, b"one-two-three"))
+
+    def test_frame_sequence_dimensions_and_idle_liveness_are_preserved(self):
+        status, response, body = self.request("GET", "/phone/frame")
+        self.assertEqual((status, body), (200, b"jpg"))
+        for name, value in (("X-Frame-Seq", "321"), ("X-Frame-Width", "1920"),
+                            ("X-Frame-Height", "1080")):
+            self.assertEqual(response.getheader(name), value)
+        status, response, body = self.request("GET", "/phone/idle")
+        self.assertEqual((status, body), (204, b""))
+        self.assertEqual(response.getheader("X-Node-Ago"), "0.3")
 
     def test_big_body_is_413_and_never_forwarded(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
