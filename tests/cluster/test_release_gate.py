@@ -43,6 +43,14 @@ class GateTests(unittest.TestCase):
         self.assertEqual(result['core']['retried'], ['tests.cluster.test_x.C.test_flaky'])
         self.assertEqual(result['warnings'], [])
 
+    def test_incomplete_full_runner_is_blocking_not_a_shipping_warning(self):
+        for incomplete in (report('runner:full'), {**report(), 'complete': False}):
+            with self.subTest(incomplete=incomplete):
+                ok, result = self.run_gate([report(), incomplete])
+                self.assertFalse(ok)
+                self.assertIn('runner:full', result['failures'])
+                self.assertEqual(result['warnings'], [])
+
     def test_overload_defers_without_running_or_counting_failure(self):
         with patch.object(gate, 'wait_for_capacity', return_value=False), patch.object(gate, '_run') as run:
             ok, result = gate.run_tests('stage')
