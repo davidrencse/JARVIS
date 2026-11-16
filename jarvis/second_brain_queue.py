@@ -126,8 +126,7 @@ def _triggers(store):
     return out
 
 
-def _has_table(db, name):
-    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+_has_table = sb.has_table
 
 
 def _meta(db, key, default=None):

@@ -1155,6 +1155,29 @@ class Console:
     def fs_list(self, device, path=""):
         return self.storage().list(device or "", path or "")
 
+    def desktop_call(self, body):
+        """`jarvis desktop --device <node> ...` from a terminal on this PC. A separate CLI
+        process holds no MAIN lease, so it asks this running JARVIS to send the job. Same
+        Remote.call as the brain's tools: the lease, routing and the node's own hard_deny all
+        still apply. Never from a browser (the handler refuses those before this runs)."""
+        from .remote import ACTIONS, Remote
+        body = body if isinstance(body, dict) else {}
+        action, device, value = body.get("action"), body.get("device"), body.get("value", "")
+        if action not in ACTIONS:
+            raise ValueError("Unknown desktop action.")
+        if device is not None and (not isinstance(device, str) or not device.strip()):
+            raise ValueError("device must be a computer's name.")
+        if not isinstance(value, str) or len(value) > DESKTOP_VALUE_MAX:
+            raise ValueError("value must be text under 64 KB.")
+        from .continuity.integration import IntegrationError
+        from .continuity.runtime import RuntimeRefusal
+        try:
+            ok, text = Remote(self.config, self.state).call(device, action, value)
+        except (RuntimeRefusal, IntegrationError) as exc:  # no lease in RAM yet (just restarted), or not MAIN
+            return {"ok": False, "text": f"This PC doesn't hold MAIN right now ({exc.code}). "
+                                         "Right after a restart, wait a minute and try again."}
+        return {"ok": bool(ok), "text": str(text)}
+
     def fs_copy(self, body):
         result = self.storage().copy(body.get("src_device"), body.get("src_path") or "",
                                      body.get("dst_device"), body.get("dst_dir") or "")
@@ -1557,11 +1580,6 @@ class Handler(BaseHTTPRequestHandler):
             return True
         media = types[0].split(";", 1)[0].strip().lower() if types else ""
         return media in _POST_TYPES
-
-    def _target_ok(self):
-        """Origin-form only. An absolute URL in the request line is not a console call."""
-        path = self.path or ""
-        return not path.startswith(("http://", "https://", "//"))
 
     def _allowed(self):
         # Works on a real handler and on the bare object the host-list test passes in.
@@ -1983,6 +2001,10 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     c.ttl.clear()  # again after: a GET during the action may have cached the old state
                 return self._send(HTTPStatus.OK, result)
+            if url.path == "/api/desktop":
+                if self._browser_request():  # terminal-only: a page can't run commands on a node
+                    return self._send(HTTPStatus.FORBIDDEN, {"error": "Not from a browser."})
+                return self._send(HTTPStatus.OK, c.desktop_call(body))
             if url.path == "/api/fs/copy":
                 return self._send(HTTPStatus.OK, c.fs_copy(body))
             if url.path == "/api/overlay":
@@ -2106,6 +2128,32 @@ def focus_app_window():
         return len(found) == 1 and raise_window(found[0])
     except (LookupError, OSError, ValueError, subprocess.SubprocessError):
         return False
+
+
+DESKTOP_VALUE_MAX = 65536
+
+
+def desktop_via_console(device, action, value, port=7777, timeout=120, opener=None):
+    """(ok, text) from the running console's /api/desktop: how the CLI reaches a node."""
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/desktop", method="POST",
+        data=json.dumps({"device": device, "action": action, "value": value}).encode(),
+        headers={"X-JARVIS": "1", "Content-Type": "application/json"})
+    open_ = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+    try:
+        with open_(request, timeout=timeout) as response:
+            reply = json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            reply = json.loads(exc.read() or b"{}")
+        except ValueError:
+            reply = {}
+        return False, str(reply.get("error") or f"The console answered {exc.code}.")
+    except (urllib.error.URLError, OSError, ValueError):
+        return False, "JARVIS isn't running on this PC, so it can't reach another computer."
+    return bool(reply.get("ok")), str(reply.get("text", ""))
 
 
 def serve(config, base, state, port=7777, open_browser=False, app=False):

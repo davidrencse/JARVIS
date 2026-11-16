@@ -433,7 +433,15 @@ def main():
             import base64 as b64
             from .remote import Remote
             value = b64.b64decode(args.b64).decode("utf-8") if args.b64 else args.value
-            ok, text = Remote(config, args.state).call(args.device, args.action, value)
+            try:
+                ok, text = Remote(config, args.state).call(args.device, args.action, value)
+            except Exception as exc:
+                # A CLI process holds no MAIN lease (managed_unbound). Ask the running
+                # JARVIS on this PC to send it instead; it holds the lease.
+                if getattr(exc, "code", None) != "managed_unbound" or not args.device:
+                    raise
+                from .ui import desktop_via_console
+                ok, text = desktop_via_console(args.device, args.action, value)
             print(json.dumps({"ok": ok, "text": text}))
             return 0 if ok else 1
         elif args.command == "grokbot":

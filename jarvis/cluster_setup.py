@@ -473,37 +473,6 @@ def unauthorize(node, path=None):
     return len(lines) - len(keep)
 
 
-def unauthorize_key(node, public_key, path=None):
-    """Remove this node's line only when it still holds this exact public key.
-
-    A newer line for the same node is left as it is. Callers that also hold the
-    fleet lock take that lock first: this takes the SSH-key lock, which is the
-    order revoke already uses. Returns how many lines were removed.
-    """
-    if not isinstance(node, str) or not DEVICE_ID.fullmatch(node):
-        raise ValueError("Invalid node ID.")
-    try:
-        kind, blob = _public_key_parts(public_key)
-    except ValueError:
-        return 0
-    bits = f"{kind} {blob}"
-    path = path or _authorized_keys()
-    mark = " " + MARK + node
-    with _keys_locked(path):
-        lines = _key_lines(path)
-        keep = []
-        removed = 0
-        for line in lines:
-            stripped = line.rstrip()
-            if stripped.endswith(mark) and f" {bits} " in f" {stripped} ":
-                removed += 1
-                continue
-            keep.append(line)
-        if removed:
-            _write_keys(path, keep)
-    return removed
-
-
 def keypair(node):
     """A new ed25519 key for one node: (private OpenSSH text, public line)."""
     binary = shutil.which("ssh-keygen")

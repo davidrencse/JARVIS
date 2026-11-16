@@ -10,6 +10,8 @@ is down. Anything not clearly one of these returns None and goes to the brain.
 import re
 from datetime import date, datetime, timedelta
 
+from .instant import _ordinal
+
 _LEAD = r"^\W*(?:hey\s+|ok(?:ay)?\s+)?(?:jarvis\W+)?(?:so\s+|um\s+|uh\s+|please\s+|can\s+you\s+)?"
 _TAIL = r"(?:\s+please)?\W*$"
 BRIEF = re.compile(_LEAD + r"(?:(?:give\s+me\s+)?(?:my\s+|the\s+|a\s+)?(?:morning\s+|daily\s+)?"
@@ -25,10 +27,6 @@ DUE = re.compile(_LEAD + r"(?:what(?:'s|s|\s+is)\s+(due|overdue)(?:\s+(?:this\s+
                  r"am\s+i\s+(?:behind|late)\s+on\s+anything|is\s+anything\s+overdue|"
                  r"what\s+deadlines\s+do\s+i\s+have(?:\s+(?:this\s+week|coming\s+up|soon))?|"
                  r"what\s+are\s+my\s+deadlines|when\s+are\s+my\s+deadlines)" + _TAIL, re.I)
-
-
-def _ordinal(n):
-    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
 
 
 def _clock(hhmm):

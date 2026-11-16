@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 from .platforms import NO_WINDOW
-from .fastlane import SENTENCE_END, close_process, now_line, pump_lines, subscription_env
+from .fastlane import SENTENCE_END, TurnSnapshot, close_process, now_line, pump_lines, subscription_env
 from .memory import ThreadRecall
 
 # David's own Codex loads ~400 tools from plugins and connectors (gmail.delete_emails,
@@ -198,7 +198,7 @@ def usage_limit(now=None):
 MALFORMED = (KeyError, TypeError, ValueError, AttributeError, IndexError, OSError)
 
 
-class ChatGPTLane:
+class ChatGPTLane(TurnSnapshot):
     """Same interface as FastLane: warm(), ask(text, recall, on_sentence), close()."""
 
     def __init__(self, config, base, max_turns=30, timeout=90, command=None,
@@ -386,30 +386,8 @@ class ChatGPTLane:
         self.proc = self.thread = self.lines = self._reader = None
         close_process(proc, reader)
 
-    def _remember_turn(self):
-        """Freeze this turn's tool list while the lane lock is held. The tuple is immutable
-        and per thread. The list object is remembered so a merge can prepend onto the list
-        this turn filled, and only while the lane still points at that same list."""
-        owned = self.tool_log if isinstance(getattr(self, "tool_log", None), list) else None
-        self._mine.owned = owned
-        self._mine.log = tuple(owned or ())
-
-    def turn_log(self):
-        """This thread's last finished turn, copied out of the snapshot. None if this thread
-        has not finished a turn since ask() started. An empty list is a real snapshot: the
-        caller must not fall back to the shared tool_log, which the next turn replaces."""
-        snap = getattr(self._mine, "log", None)
-        if snap is None:
-            return None
-        return list(snap)
-
-    def owned_log(self):
-        """The list object snapshotted for this thread, or None. Not a copy."""
-        return getattr(self._mine, "owned", None)
-
     def ask(self, text, recall=(), on_sentence=None):
-        self._mine.log = None
-        self._mine.owned = None
+        self._forget_turn()
         limited = usage_limit()
         if limited:  # don't spend ~2 s asking a plan that already said no
             # Not self.tool_log: another turn on this lane may be mid-flight and own it.

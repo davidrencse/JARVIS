@@ -326,8 +326,8 @@ def _units():
 
 
 def _windows_launcher():
-    return (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu"
-            / "Programs" / "Startup" / STARTUP_NAME)
+    from .autostart import startup_file
+    return startup_file(STARTUP_NAME)
 
 
 def _windows_once_launcher():
@@ -533,8 +533,7 @@ def _verify_locked_down(home):
 
 
 def _is_admin():
-    import ctypes
-    return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    return platforms._windows_process_is_admin()
 
 
 def elevate(state=None):
@@ -933,15 +932,20 @@ REMOTE_MARKER = "remote-session.json"  # remote_view.MARKER; refreshed every few
 REMOTE_MARKER_TTL = 60.0
 
 
-def remote_session_live(state):
-    """A remote-control session from the main is driving this computer right now."""
+def _marker_live(state, marker):
+    """The marker was touched since boot and within REMOTE_MARKER_TTL."""
     import time
     try:
-        stamp = (Path(state) / REMOTE_MARKER).stat().st_mtime
+        stamp = (Path(state) / marker).stat().st_mtime
         boot = platforms.boot_time()
         return (boot is None or stamp >= boot) and time.time() - stamp < REMOTE_MARKER_TTL
     except (OSError, TypeError):
         return False
+
+
+def remote_session_live(state):
+    """A remote-control session from the main is driving this computer right now."""
+    return _marker_live(state, REMOTE_MARKER)
 
 
 CONTROLLING_MARKER = "remote-controlling.json"  # on the main while its console drives a node
@@ -949,13 +953,7 @@ CONTROLLING_MARKER = "remote-controlling.json"  # on the main while its console 
 
 def controlling_remote(state):
     """This computer's console is driving another computer right now (ControllerPause)."""
-    import time
-    try:
-        stamp = (Path(state) / CONTROLLING_MARKER).stat().st_mtime
-        boot = platforms.boot_time()
-        return (boot is None or stamp >= boot) and time.time() - stamp < REMOTE_MARKER_TTL
-    except (OSError, TypeError):
-        return False
+    return _marker_live(state, CONTROLLING_MARKER)
 
 
 class ControllerPause:

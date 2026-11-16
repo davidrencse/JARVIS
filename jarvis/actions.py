@@ -475,7 +475,7 @@ class DesktopTools:
             # The names the observer knows it by (discord -> Vesktop, calculator -> KCalc), by app
             # name or a piece of its desktop-entry ID, ahead of loose name hits: "Calculator"
             # must not pick "KiCad PCB Calculator" when KCalc is installed (audit 2026-11-07).
-            from .observe import _flat, app_ids
+            from .observe import app_ids
             alternates = app_ids(query)[1:]
             known = [a for a in apps if alternates and (
                 _flat(a["Name"]) in alternates

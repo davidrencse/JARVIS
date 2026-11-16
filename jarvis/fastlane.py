@@ -141,7 +141,37 @@ def _tool_name(name):
     return name.split("__", 2)[-1] if name.startswith("mcp__") else name
 
 
-class FastLane:
+class TurnSnapshot:
+    """Per-thread snapshot of a lane's finished tool list. Lanes set self._mine =
+    threading.local() and self.tool_log; ask() clears the snapshot with _forget_turn()."""
+
+    def _forget_turn(self):
+        self._mine.log = None
+        self._mine.owned = None
+
+    def _remember_turn(self):
+        """Freeze this turn's finished tools while the lane lock is held.
+
+        The tuple is per thread. The next ask rebinds the shared tool_log."""
+        owned = self.tool_log if isinstance(getattr(self, "tool_log", None), list) else None
+        self._mine.owned = owned
+        self._mine.log = tuple(owned or ())
+
+    def turn_log(self):
+        """This thread's last finished turn, copied out of the snapshot. None if this
+        thread has not finished a turn since ask() started. An empty list is a real
+        snapshot: the caller must not fall back to the shared tool_log."""
+        snap = getattr(self._mine, "log", None)
+        if snap is None:
+            return None
+        return list(snap)
+
+    def owned_log(self):
+        """The list object snapshotted for this thread, or None. Not a copy."""
+        return getattr(self._mine, "owned", None)
+
+
+class FastLane(TurnSnapshot):
     def __init__(self, config, base, max_turns=25, timeout=90, command=None, tier="low",
                  system=None, mcp_config=None, allowed_tools=(), builtin_tools=None,
                  permission_mode="plan", persona=PERSONA):
@@ -214,27 +244,6 @@ class FastLane:
                 self.close()
                 self._spawn()
 
-    def _remember_turn(self):
-        """Freeze this turn's finished tools while the lane lock is held.
-
-        The tuple is per thread. The next ask rebinds the shared tool_log."""
-        owned = self.tool_log if isinstance(getattr(self, "tool_log", None), list) else None
-        self._mine.owned = owned
-        self._mine.log = tuple(owned or ())
-
-    def turn_log(self):
-        """This thread's last finished turn, copied out of the snapshot. None if this
-        thread has not finished a turn since ask() started. An empty list is a real
-        snapshot: the caller must not fall back to the shared tool_log."""
-        snap = getattr(self._mine, "log", None)
-        if snap is None:
-            return None
-        return list(snap)
-
-    def owned_log(self):
-        """The list object snapshotted for this thread, or None. Not a copy."""
-        return getattr(self._mine, "owned", None)
-
     def _attach_evidence(self, exc):
         """Copy this turn's tools onto exc before close() and before the lock drops."""
         self._remember_turn()
@@ -253,8 +262,7 @@ class FastLane:
 
         on_sentence(str) is called with each complete sentence as it streams in, so
         speech can start ~1-2 s before the CLI finishes the turn."""
-        self._mine.log = None
-        self._mine.owned = None
+        self._forget_turn()
         limited = claude_limit()
         if limited and not self.command:  # a fake test CLI isn't the real plan
             exc = RuntimeError(f"Claude usage limit {limited}; not starting a run.")

@@ -882,6 +882,25 @@ class Trace:
                     "streaming": rec["streaming"], "steps": steps}
 
 
+FRONT_PORT = 8443  # the gateway's tailnet port for the phone front (tailscale serve)
+
+
+def _front_from_gateway(config, port):
+    """https://<gateway host>:<port>, from the continuity operator config's `origin`."""
+    raw = ((config or {}).get("continuity") or {}).get("operator_config")
+    if not isinstance(raw, str) or not raw or type(port) is not int or not 1 <= port <= 65535:
+        return None
+    try:
+        origin = json.loads(Path(raw).expanduser().read_text(encoding="utf-8")).get("origin")
+        parts = urlsplit(origin)
+        host = parts.hostname
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    if parts.scheme != "https" or not host:
+        return None
+    return f"https://{host}:{port}"
+
+
 class PhoneServer:
     """The phone app's server, inside the main's runtime (cluster_proxy.local_server).
     console: ui.Console (Ask, events, remote_status); hub: cluster.Hub (sessions)."""
@@ -1047,8 +1066,15 @@ class PhoneServer:
 
     def _front_origin(self):
         """`phone.front_origin`: the stable https origin of the phone front on the
-        Oracle server, which relays to whichever PC holds MAIN. Absent: no front."""
-        value = (self.config.get("phone") or {}).get("front_origin")
+        Oracle server, which relays to whichever PC holds MAIN.
+
+        Absent: a continuity-managed PC uses its gateway's host on `phone.front_port`
+        (default 8443), so no PC needs the setting by hand. `false` turns the front off.
+        Unmanaged and absent: no front."""
+        phone_cfg = self.config.get("phone") or {}
+        value = phone_cfg.get("front_origin")
+        if value is None:
+            value = _front_from_gateway(self.config, phone_cfg.get("front_port", FRONT_PORT))
         if not isinstance(value, str):
             return None
         try:

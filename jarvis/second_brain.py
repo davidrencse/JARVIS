@@ -173,6 +173,10 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+def has_table(db, name):
+    return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
 def _slug(text, limit):
     text = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")[:limit].strip("-")
     return text or "x"
@@ -1089,9 +1093,7 @@ class SecondBrain:
                 return
             yield from rows
 
-    @staticmethod
-    def _has(db, table):
-        return db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+    _has = staticmethod(has_table)
 
     def _memory_records(self, db, counts):
         keep_out = set()   # ids of items the owner marked PC-only: their links stay PC-only too

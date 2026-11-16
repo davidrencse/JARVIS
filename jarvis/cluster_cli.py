@@ -12,6 +12,7 @@ from .fsio import read_json
 from .cluster import Client, NodeWorker, save_json
 from .cluster_store import CAPABILITIES, NODE_DEFAULT, Broker
 from .deploy import code_key
+from .continuity.hub_control import _fsync_directory, _int_field
 from .topology import DEFAULT_PORT, DEVICE_ID, enabled, endpoint, identity
 
 
@@ -266,21 +267,6 @@ def _load_intent(state):
     return record
 
 
-def _fsync_directory(folder):
-    """Make the directory entry durable on POSIX.
-
-    Windows cannot open a directory. The file fsync inside the atomic replacement
-    still runs there. A failure here is not turned into a raw config rewrite.
-    """
-    if os.name == "nt":
-        return
-    descriptor = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _store_intent(state, **fields):
     """Replace state/main-handoff.json under the fleet lock. Atomic, fsynced, no secrets."""
     record = {key: fields.get(key) for key in _INTENT_FIELDS}
@@ -321,10 +307,6 @@ def _call_authority_status(handoff):
         raise ValueError("Authenticated authority status was not a status record. "
                          "cluster.main_device was not changed.")
     return status
-
-
-def _int_field(value):
-    return not isinstance(value, bool) and isinstance(value, int)
 
 
 def _barrier_clear(status):
