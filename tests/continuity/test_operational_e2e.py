@@ -39,6 +39,7 @@ from jarvis.continuity.integration import (
     ContinuityIntegration,
     IntegrationError,
     IsolatedFleet,
+    LinkedClient,
     _blockers,
     deployment_facts,
     apply_node_seen,
@@ -57,7 +58,7 @@ from jarvis.continuity.ingress import (
     IngressError,
     PhoneProtocolAdapter,
 )
-from jarvis.continuity.runtime import RuntimeRefusal
+from jarvis.continuity.runtime import GatewayPort, RuntimeRefusal, SafeHandoff
 from jarvis.continuity.participant import Participant
 from jarvis.continuity.renewal import LeaseRenewer
 from tests.continuity._fleet import Clock
@@ -281,6 +282,66 @@ class ProductionBlocked(unittest.TestCase):
         self.assertEqual(http_status("never_heard_of")[0], 503)
 
 
+class _CandidateReadinessPort:
+    """Like production's CandidatePort: readiness is signed by the candidate itself."""
+
+    def __init__(self, owner_port, candidate):
+        self._owner, self._candidate = owner_port, candidate
+
+    def __getattr__(self, name):
+        return getattr(self._owner, name)
+
+    def transition_readiness(self, transition_id, facts):
+        return self._candidate.client.readiness(
+            transition_id, facts["control_ready"], facts["ai_ready"], facts["checkpoint"])
+
+
+class StandInHandoff:
+    """Stand-in for the current MAIN's bound ProductionController.
+
+    The handoff itself is the real SafeHandoff over the isolated authority, run
+    with the current MAIN as source. Only its edges are recorded stand-ins: the
+    brain transfer, the signed repoint, and the owner-proxy route (a client
+    signed as the source PC plus the owner key, standing in for the proxy).
+    """
+
+    def __init__(self, test, source, candidate, journal):
+        self.config, self.base = {}, str(journal.parent)
+        self.candidate, self.clock = candidate, test.clock
+        self.brain_calls, self.brain_at, self.repoint_calls = [], [], []
+        self._handoff = SafeHandoff(
+            _CandidateReadinessPort(
+                GatewayPort(test.fleet._client(LinkedClient, source.name, owner=True)), candidate),
+            source_runtime=source.runtime,
+            candidate_runtime=candidate.runtime, readiness=self._facts, repoint=self._repoint,
+            canary=lambda device: device == candidate.name and test.node_canary(candidate),
+            journal_path=journal, brain=self._brain)
+
+    def _facts(self, device):
+        if device != self.candidate.name:
+            return None
+        facts = self.candidate.runtime.readiness("control")
+        return {key: facts.get(key) for key in ("control_ready", "ai_ready", "checkpoint")}
+
+    def candidate_readiness(self, device):
+        facts = self._facts(device)
+        if facts is None:
+            raise RuntimeRefusal("candidacy_mismatch")
+        return facts
+
+    def _brain(self, old, new, config, base):
+        self.brain_calls.append((old, new))
+        self.brain_at.append(self.clock.wall())
+        return {"ok": True, "status": "moved"}
+
+    def _repoint(self, old, new, lease):
+        self.repoint_calls.append((old, new))
+        return {"ok": True, "authenticated": True, "key_updated": True, "endpoint_updated": True}
+
+    def __call__(self, old, new, config, base):
+        return self._handoff(old, new, config, base)
+
+
 class Composed(unittest.TestCase):
     """Temp fleet. Arch is MAIN. The phone session is the in-process ingress, not :7787."""
 
@@ -441,7 +502,7 @@ class Composed(unittest.TestCase):
         self.assertFalse(self.arch.thread.is_alive())
         self.assertTrue(self.dell.client.status()["lease_valid"])
 
-    def background_ticks(self, seconds, *nodes):
+    def background_ticks(self, seconds, *nodes, controllers=None):
         """Drive the production background worker with deterministic time.
 
         Hub.start and Agent.run currently start LeaseRenewer, not the optional
@@ -450,9 +511,13 @@ class Composed(unittest.TestCase):
         private key is given to a node. Each candidate's canary checks the
         actual loopback listener, open executor and local control readiness.
         """
-        workers = [LeaseRenewer(Participant(node.client, node.runtime, guard=node.executor,
-                                            canary=lambda node=node: self.node_canary(node)))
-                   for node in nodes]
+        workers = []
+        for node in nodes:
+            participant = Participant(node.client, node.runtime, guard=node.executor,
+                                      canary=lambda node=node: self.node_canary(node))
+            if controllers and node.name in controllers:
+                participant.production_controller = controllers[node.name]
+            workers.append(LeaseRenewer(participant))
         results = []
         for _ in range(seconds):
             self.clock.tick(1)
@@ -511,13 +576,14 @@ class Composed(unittest.TestCase):
         self.assert_phone_served_by("dell", "op-crash-dell")
         self.assertEqual(self.arch.effects, [])
 
-    def test_returning_arch_does_not_reclaim_main_without_safe_handoff(self):
-        """A returning preferred PC must not take MAIN back on its own.
+    def test_returning_arch_automatically_reclaims_main_and_routes_same_phone(self):
+        """The returning preferred PC gets MAIN back with no owner command.
 
-        The successor's brain has taken new memories since the failover. The
-        metadata-only self-recovery path cannot move them, so automatic
-        failback is refused (`renewal._RecoveryOnly`) and the successor keeps
-        serving the same phone until an explicit SafeHandoff return.
+        The one manual recovery below is an explicit setup precondition, not
+        evidence of automatic failover. Everything after Arch returns happens
+        on the background tick: Dell (current MAIN) runs its bound SafeHandoff,
+        so the brain moves Dell -> Arch and nodes are repointed before Arch
+        serves the same phone.
         """
         self.crash_arch()
         self.clock.tick(LEASE_SECONDS + SAFETY_MARGIN + 1)
@@ -531,10 +597,45 @@ class Composed(unittest.TestCase):
         self.arch.runtime.start()
         self.arch.thread = threading.Thread(target=self.arch.server.serve_forever, daemon=False)
         self.arch.thread.start()
-        # Run past the whole window an automatic return would have needed
-        # (30 s stability + Dell's lease + margin): MAIN must still be Dell.
-        self.background_ticks(int(30 + LEASE_SECONDS + SAFETY_MARGIN + 5), self.dell, self.arch)
-        self.assert_phone_served_by("dell", "op-return-arch")
+        handoff = StandInHandoff(self, self.dell, self.arch, Path(self.tmp.name) / "dell-handoff.json")
+        # Keep Dell alive while the returning preferred PC is observed for the
+        # full 30-second stability window. Then the fence still waits out
+        # Dell's last lease plus the safety margin (no full ack quorum: the
+        # Oracle server participant does not tick here), so the handback
+        # cannot finish before 30 + LEASE_SECONDS + SAFETY_MARGIN.
+        returned_at = self.clock.wall()
+        self.background_ticks(int(30 + LEASE_SECONDS + SAFETY_MARGIN + 5), self.dell, self.arch,
+                              controllers={"dell": handoff})
+        # The handoff started only after the full stability window.
+        self.assertGreaterEqual(handoff.brain_at[0] - returned_at, 30)
+        self.assertEqual(handoff.brain_calls, [("dell", "zenbook")])
+        self.assertEqual(handoff.repoint_calls, [("dell", "zenbook")])
+        self.assert_phone_served_by("zenbook", "op-return-arch")
+        self.assertEqual(self.dell.effects, [])
+
+    def test_returning_arch_stays_off_main_when_brain_transfer_fails(self):
+        """A failed brain transfer never hands MAIN over: no memories are dropped."""
+        self.crash_arch()
+        self.clock.tick(LEASE_SECONDS + SAFETY_MARGIN + 1)
+        self.dell.runtime.start()
+        _, lease = self.fleet.promote("dell")
+        self.dell.runtime.accept_lease(lease)
+        self.arch.reboot()
+        self.arch.runtime.invalidate_after_resume()
+        self.arch.runtime.start()
+        self.arch.thread = threading.Thread(target=self.arch.server.serve_forever, daemon=False)
+        self.arch.thread.start()
+        handoff = StandInHandoff(self, self.dell, self.arch, Path(self.tmp.name) / "dell-handoff.json")
+        failed = []
+        handoff._handoff._brain = lambda *args: failed.append(args[:2]) or {
+            "ok": False, "status": "error", "error": "hook_failed"}
+        # 30 s stability + fence wait, then the aborted grant's wait before
+        # Dell (newest brain, given first claim) recovers MAIN for itself.
+        self.background_ticks(int(30 + 2 * (LEASE_SECONDS + SAFETY_MARGIN) + 15), self.dell, self.arch,
+                              controllers={"dell": handoff})
+        self.assertEqual(failed, [("dell", "zenbook")])  # tried once, then backed off
+        self.assertEqual(self.fleet.status()["main"], "dell")
+        self.assertEqual(handoff.repoint_calls, [])
         self.assertEqual(self.arch.effects, [])
 
     def test_reboot_partition_and_restart_do_not_replay(self):

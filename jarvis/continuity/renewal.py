@@ -3,10 +3,14 @@
 Renewal never requests, elects or promotes. Self-recovery is a separate step on
 the same tick (`SelfRecovery`): it does nothing unless the gateway config turns
 `self_recovery` on and lists this PC. Then this node opens a `recover`
-transition for itself once the old MAIN's lease has lapsed. A live MAIN's
-return to the preferred PC requires SafeHandoff's brain transfer and signed
-repoint; this metadata-only path cannot perform that handoff. The authority's
-fence still waits out the old lease, so two MAINs never hold valid leases.
+transition for itself once the old MAIN's lease has lapsed. That path is
+metadata only, so it never returns MAIN to the preferred PC (`_RecoveryOnly`).
+
+The return is `AutoReturn`, on the same tick of the CURRENT MAIN: once the
+preferred PC has been steadily ready for the stability window it calls the
+bound SafeHandoff (the same brain transfer, signed repoint and canary as
+`jarvis continuity main <preferred>`). The authority's fence still waits out
+the old lease, so two MAINs never hold valid leases.
 """
 import threading
 import time
@@ -39,8 +43,22 @@ def _positive_seconds(value):
 _POLICY_TTL = 300.0
 
 
+# After a handoff to this PC (`set_preferred_main`) disappears without making
+# it MAIN, the source PC holds the newest brain. Give it this long to reclaim
+# MAIN before this PC may `recover` for itself with older memories.
+_SOURCE_FIRST = 120.0
+
+
 class _RecoveryOnly(RecoveryOrchestrator):
     """Production's local canary cannot substitute for SafeHandoff's data and route steps."""
+
+    _return_seen_at = None
+
+    def _recover(self, status):
+        seen = self._return_seen_at
+        if seen is not None and self._clock() - seen < _SOURCE_FIRST:
+            return _step(False, 'standby', 'source_first')
+        return super()._recover(status)
 
     def _failback(self, status):
         target = status.get('preferred') or self.policy.preferred
@@ -52,6 +70,7 @@ class _RecoveryOnly(RecoveryOrchestrator):
         # A restart must not resume an earlier metadata-only automatic return.
         # Leave explicit handoff coordination to its composed SafeHandoff owner.
         if transition.get('action') == 'set_preferred_main':
+            self._return_seen_at = self._clock()
             return _step(False, 'standby', 'safe_handoff_required', transition=transition)
         return super()._advance(status, transition)
 
@@ -64,8 +83,9 @@ class SelfRecovery:
     (`candidate_runtime`): it only advances transitions where this node is the
     candidate, except cancelling a dead candidate's not-ready grant. Readiness
     is this node's own probe; activation is the participant's canary.
-    A missing canary does not count as success. Automatic failback is refused:
-    this adapter has no brain-transfer or signed-repoint composition.
+    A missing canary does not count as success. Failback is refused here:
+    this adapter has no brain-transfer or signed-repoint composition. The
+    current MAIN's `AutoReturn` runs the composed SafeHandoff instead.
     """
 
     def __init__(self, participant, *, clock=None):
@@ -101,6 +121,12 @@ class SelfRecovery:
             self._policy = key
             self._orchestrator = None
         return self._policy
+
+    def policy(self):
+        """The cached gateway self-recovery key, or None when it is off or unusable."""
+        if not self._usable:
+            return None
+        return self._refresh()
 
     def _build(self, key):
         runtime = self.participant.runtime
@@ -162,6 +188,160 @@ class SelfRecovery:
         return self._orchestrator.step()
 
 
+# After a failed or uncertain automatic return, wait this long before trying
+# again. A fresh stability window is still required after the wait.
+_RETURN_BACKOFF = 300.0
+# A handoff answer that means "still working on it": call again next tick and
+# let SafeHandoff resume its own journal instead of opening anything new.
+_RETURN_RESUME = frozenset({'pending'})
+
+
+def _auto_return_enabled(controller):
+    config = getattr(controller, 'config', None)
+    continuity = config.get('continuity') if isinstance(config, dict) else None
+    if isinstance(continuity, dict) and continuity.get('auto_return') is False:
+        return False
+    return True
+
+
+class AutoReturn:
+    """On the current MAIN: give MAIN back to the preferred PC once it is steadily ready.
+
+    This is the manual `jarvis continuity main <preferred>` path, driven by the
+    renewal tick instead of the owner: it calls the participant's bound
+    handoff (`ProductionController`, i.e. SafeHandoff with brain transfer,
+    signed repoint and canary) with this node as the source. Nothing here
+    opens a transition by itself, and the metadata-only `_RecoveryOnly` path
+    still refuses failback on the preferred PC.
+
+    Inert unless the gateway's self-recovery policy is on and names a
+    different preferred PC, this node holds a valid, ready lease with no
+    transition open, and a bound handoff with `candidate_readiness` exists.
+    The preferred PC's validated readiness must hold for the policy's
+    stability window. A pending handoff is resumed on the next tick; any other
+    failure leaves SafeHandoff's own outcome (it keeps this node MAIN until
+    the fence) and backs off before a fresh window starts.
+    Off switch: `continuity.auto_return: false` in the bound config.
+    """
+
+    def __init__(self, participant, recovery, *, clock=None):
+        self.participant = participant
+        self._recovery = recovery
+        client = getattr(participant, 'client', None)
+        self._clock = clock or getattr(client, '_wall', None) or time.time
+        self._stable_since = None
+        self._target = None
+        self._transition_id = None
+        self._backoff_until = None
+        self.last_result = None
+        self._worker = None
+        # Direct `tick()` callers (tests) run the handoff inline; the
+        # renewer's own thread sets this False so renewal never waits on it.
+        self._sync = True
+
+    def _reset(self):
+        self._stable_since = None
+        self._target = None
+
+    def _controller(self):
+        controller = getattr(self.participant, 'production_controller', None)
+        if not callable(controller) or not callable(getattr(controller, 'candidate_readiness', None)):
+            return None
+        if not _auto_return_enabled(controller):
+            return None
+        return controller
+
+    def _ready(self, controller, target):
+        try:
+            facts = controller.candidate_readiness(target)
+        except Exception:
+            return False
+        return (isinstance(facts, dict) and facts.get('control_ready') is True
+                and facts.get('meets') is not False and bool(facts.get('checkpoint')))
+
+    def _handoff(self, controller, me, target):
+        # The brain transfer can outlast a lease. Run it off the renewer
+        # thread so this node keeps renewing until the authority fences it.
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            return {'code': 'auto_return_running', 'candidate': target}
+        if self._sync:
+            return self._run_handoff(controller, me, target)
+        self._worker = threading.Thread(
+            target=self._run_handoff, args=(controller, me, target),
+            name='jarvis-auto-return', daemon=True)
+        self._worker.start()
+        return {'code': 'auto_return_started', 'candidate': target}
+
+    def _run_handoff(self, controller, me, target):
+        try:
+            result = controller(me, target, getattr(controller, 'config', None),
+                                getattr(controller, 'base', None))
+        except Exception as exc:
+            result = {'ok': False, 'status': 'refused', 'code': getattr(exc, 'code', 'error')}
+        if not isinstance(result, dict):
+            result = {'ok': False, 'status': 'refused', 'code': 'bad_result'}
+        self.last_result = result
+        if result.get('ok') is True:
+            self._transition_id = None
+            self._reset()
+        elif result.get('status') in _RETURN_RESUME and result.get('transition_id'):
+            self._transition_id = result.get('transition_id')
+        else:
+            self._transition_id = None
+            self._backoff_until = self._clock() + _RETURN_BACKOFF
+            self._reset()
+        return {'code': 'auto_return', 'result': result}
+
+    def tick(self):
+        controller = self._controller()
+        key = self._recovery.policy() if controller is not None else None
+        if key is None:
+            self._reset()
+            return None
+        candidates, preferred, stability = key
+        me = self.participant.runtime.device_id
+        try:
+            status = self.participant.client.status()
+        except Exception:
+            self._reset()
+            return None
+        if not isinstance(status, dict):
+            self._reset()
+            return None
+        target = status.get('preferred') or preferred
+        transition = status.get('transition') or {}
+        if transition:
+            self._reset()
+            # Resume only the handoff this node opened. Anything else belongs
+            # to its own coordinator (an owner command, a recovery).
+            if (self._transition_id is not None
+                    and transition.get('transition_id') == self._transition_id
+                    and transition.get('action') == 'set_preferred_main'
+                    and transition.get('candidate') == target):
+                return self._handoff(controller, me, target)
+            return None
+        self._transition_id = None
+        if (not target or target == me or target not in candidates
+                or status.get('mode') != 'V2_ACTIVE' or status.get('lease_valid') is not True
+                or status.get('main') != me or status.get('main_ready') is not True):
+            self._reset()
+            return None
+        now = self._clock()
+        if self._backoff_until is not None and now < self._backoff_until:
+            self._reset()
+            return {'code': 'backoff', 'until': self._backoff_until}
+        if not self._ready(controller, target):
+            self._reset()
+            return {'code': 'not_ready', 'candidate': target}
+        if self._target != target or self._stable_since is None:
+            self._target, self._stable_since = target, now
+        stable = now - self._stable_since
+        if stable < float(stability or 30.0):
+            return {'code': 'stabilising', 'candidate': target, 'stable_for': stable}
+        return self._handoff(controller, me, target)
+
+
 class LeaseRenewer:
     def __init__(self, participant, *, interval=3):
         if type(interval) not in (int, float) or not 0 < interval <= _MAX_INTERVAL:
@@ -170,7 +350,9 @@ class LeaseRenewer:
         self.stop = threading.Event()
         self.thread = None
         self.recovery = SelfRecovery(participant)
+        self.auto_return = AutoReturn(participant, self.recovery)
         self.last_recovery = None
+        self.last_return = None
         self.last_rejoin = None
         self.last_error = None
 
@@ -184,12 +366,18 @@ class LeaseRenewer:
             # Sleep already invalidated the cache. Do not renew, recover, or
             # tell services this node is still MAIN.
             self.last_recovery = None
+            self.last_return = None
             return {'code': 'suspend'}
         try:
             self.last_recovery = self.recovery.tick()
         except Exception as exc:
             # Recovery must never stop renewal of a lease this node already holds.
             self.last_recovery = {'code': 'error', 'error': type(exc).__name__}
+        try:
+            self.last_return = self.auto_return.tick()
+        except Exception as exc:
+            # Same rule: a failed return attempt never stops renewal.
+            self.last_return = {'code': 'error', 'error': type(exc).__name__}
         if self.participant.runtime.lease_snapshot() is None:
             # A restarted process has no grant in RAM and must not renew one.
             result = {'code': 'no_lease'}
@@ -255,6 +443,7 @@ class LeaseRenewer:
         if self.thread is not None:
             raise RuntimeRefusal('bad_state')
         self.stop.clear()
+        self.auto_return._sync = False
         self.thread = threading.Thread(target=self._run, name='continuity-lease-renewal', daemon=True)
         self.thread.start()
         return self

@@ -5,7 +5,7 @@ import time
 import types
 import unittest
 
-from jarvis.continuity.renewal import LeaseRenewer, SelfRecovery
+from jarvis.continuity.renewal import _RETURN_BACKOFF, AutoReturn, LeaseRenewer, SelfRecovery
 from jarvis.continuity.runtime import RuntimeRefusal
 
 
@@ -339,6 +339,142 @@ class SelfRecoveryGate(unittest.TestCase):
         self.assertIsNone(recovery._policy)
         self.assertIsNone(recovery._orchestrator)
         self.assertEqual(recovery.participant.client.calls, 2)
+
+
+class _Controller:
+    """Stand-in for the bound ProductionController (SafeHandoff)."""
+
+    def __init__(self, results, ready=True):
+        self.config, self.base = {}, '/tmp/jarvis-test'
+        self.results, self.ready, self.calls = list(results), ready, []
+
+    def candidate_readiness(self, device):
+        if self.ready is None:
+            raise RuntimeRefusal('partition')
+        return {'control_ready': self.ready, 'ai_ready': False, 'checkpoint': 'cp-1'}
+
+    def __call__(self, old, new, config, base):
+        self.calls.append((old, new))
+        return self.results.pop(0)
+
+
+class AutoReturnOnCurrentMain(unittest.TestCase):
+    def _auto(self, controller, *, main='dell', transition=None, preferred='zenbook'):
+        clock = {'t': 0.0}
+        client = _PolicyClient([{'enabled': True, 'candidates': ['zenbook', 'dell'],
+                                 'preferred': preferred, 'stability_s': 30}] * 50)
+        state = {'main': main, 'transition': transition}
+        client.status = lambda: {'mode': 'V2_ACTIVE', 'main': state['main'], 'preferred': None,
+                                 'lease_valid': True, 'main_ready': True,
+                                 'transition': state['transition']}
+        runtime = types.SimpleNamespace(device_id='dell', _started=True)
+        participant = types.SimpleNamespace(runtime=runtime, client=client,
+                                            production_controller=controller)
+        recovery = SelfRecovery(participant, clock=lambda: clock['t'])
+        return AutoReturn(participant, recovery, clock=lambda: clock['t']), clock, state
+
+    def test_hands_back_through_the_bound_handoff_after_the_stability_window(self):
+        controller = _Controller([{'ok': True, 'status': 'ready', 'transition_id': 't-1'}])
+        auto, clock, _ = self._auto(controller)
+        for elapsed in (0, 10, 29.5):
+            clock['t'] = elapsed
+            self.assertEqual(auto.tick()['code'], 'stabilising')
+        self.assertEqual(controller.calls, [])
+        clock['t'] = 30
+        self.assertEqual(auto.tick()['result']['ok'], True)
+        self.assertEqual(controller.calls, [('dell', 'zenbook')])
+
+    def test_renewer_thread_runs_the_handoff_off_its_own_thread(self):
+        release = threading.Event()
+
+        class Slow(_Controller):
+            def __call__(self, old, new, config, base):
+                release.wait(5)
+                return super().__call__(old, new, config, base)
+
+        controller = Slow([{'ok': True, 'status': 'ready', 'transition_id': 't-1'}])
+        auto, clock, _ = self._auto(controller)
+        auto._sync = False
+        auto.tick()
+        clock['t'] = 30
+        self.assertEqual(auto.tick()['code'], 'auto_return_started')
+        self.assertEqual(auto.tick()['code'], 'auto_return_running')
+        release.set()
+        auto._worker.join(5)
+        self.assertEqual(controller.calls, [('dell', 'zenbook')])
+        self.assertTrue(auto.last_result['ok'])
+
+    def test_a_readiness_miss_restarts_the_window(self):
+        controller = _Controller([])
+        auto, clock, _ = self._auto(controller)
+        auto.tick()
+        clock['t'] = 20
+        controller.ready = None
+        self.assertEqual(auto.tick()['code'], 'not_ready')
+        controller.ready = True
+        clock['t'] = 21
+        auto.tick()
+        clock['t'] = 45
+        self.assertEqual(auto.tick()['code'], 'stabilising')
+        self.assertEqual(controller.calls, [])
+
+    def test_pending_handoff_resumes_its_own_transition_only(self):
+        controller = _Controller([
+            {'ok': False, 'status': 'pending', 'code': 'not_quiet', 'transition_id': 't-1'},
+            {'ok': True, 'status': 'ready', 'transition_id': 't-1'}])
+        auto, clock, state = self._auto(controller)
+        auto.tick()
+        clock['t'] = 30
+        auto.tick()
+        state['transition'] = {'transition_id': 't-1', 'action': 'set_preferred_main',
+                               'candidate': 'zenbook', 'state': 'DRAINING'}
+        clock['t'] = 31
+        self.assertTrue(auto.tick()['result']['ok'])
+        self.assertEqual(len(controller.calls), 2)
+        state['transition'] = {'transition_id': 'owner-9', 'action': 'set_preferred_main',
+                               'candidate': 'zenbook', 'state': 'DRAINING'}
+        self.assertIsNone(auto.tick())
+        self.assertEqual(len(controller.calls), 2)
+
+    def test_failure_backs_off_then_needs_a_fresh_window(self):
+        controller = _Controller([{'ok': False, 'status': 'no_main', 'code': 'brain'}])
+        auto, clock, _ = self._auto(controller)
+        auto.tick()
+        clock['t'] = 30
+        auto.tick()
+        clock['t'] = 30 + _RETURN_BACKOFF - 1
+        self.assertEqual(auto.tick()['code'], 'backoff')
+        clock['t'] = 30 + _RETURN_BACKOFF
+        self.assertEqual(auto.tick()['code'], 'stabilising')
+        self.assertEqual(len(controller.calls), 1)
+
+    def test_inert_without_bound_handoff_off_switch_or_when_not_main(self):
+        auto, _, _ = self._auto(None)
+        self.assertIsNone(auto.tick())
+        controller = _Controller([])
+        controller.config = {'continuity': {'auto_return': False}}
+        auto, _, _ = self._auto(controller)
+        self.assertIsNone(auto.tick())
+        for kwargs in ({'main': 'zenbook'}, {'preferred': 'dell'}):
+            auto, clock, _ = self._auto(_Controller([]), **kwargs)
+            clock['t'] = 100
+            self.assertIsNone(auto.tick())
+
+
+class SourceFirstAfterFailedReturn(SelfRecoveryGate):
+    def test_preferred_pc_waits_for_the_source_after_an_aborted_return(self):
+        recovery, client, clock = self._preferred_recovery(transition={
+            'action': 'set_preferred_main', 'candidate': 'zenbook',
+            'transition_id': 'return-1', 'state': 'GRANTED_NOT_READY'})
+        recovery.tick()
+        client.status = lambda: {'mode': 'V2_ONLY_NO_MAIN', 'main': None, 'preferred': 'zenbook',
+            'lease_valid': False, 'main_ready': False, 'transition': None,
+            'incarnation': 5, 'epoch': 36, 'policy_version': 1}
+        clock['t'] = 119
+        self.assertEqual(recovery.tick()['code'], 'source_first')
+        self.assertEqual(client.requests, [])
+        clock['t'] = 120
+        self.assertEqual(recovery.tick()['code'], 'requested')
 
 
 class Constructor(unittest.TestCase):
