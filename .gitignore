@@ -13,3 +13,12 @@ jarvis.egg-info/
 *.pre-*
 jarvis.prev/
 *.sqlite3
+
+# Private: never publish
+jarvis-memory/
+artifacts/
+docs/audit-evidence/
+.learnings/
+history.sqlite3
+tests/eval/cases.jsonl
+WORKER_DIFF.patch
