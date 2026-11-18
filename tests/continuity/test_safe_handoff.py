@@ -1137,7 +1137,7 @@ def _spawn(script, args, err_path):
     env["PYTHONUNBUFFERED"] = "1"
     proc = subprocess.Popen(
         [sys.executable, "-c", script, *args],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0, cwd="/home/jdoe/projects/JARVIS",
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, bufsize=0, cwd=str(Path(__file__).resolve().parents[2]),
         env=env)
     proc._err = err
     return proc
@@ -1482,7 +1482,7 @@ def _loopback_handoff(case):
         return state.get("phase") == "main_not_ready" and state.get("main") == new
 
     case.use_brain(brain)
-    config_path = Path("/home/jdoe/projects/JARVIS/jarvis.config.json")
+    config_path = Path(__file__).resolve().parents[2] / "jarvis.config.json"
     before = config_path.read_bytes()
     result = SafeHandoff(
         _LivePort(zen, dell_client), source_runtime=source, candidate_runtime=candidate,

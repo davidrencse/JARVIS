@@ -9,7 +9,7 @@ from pathlib import Path
 
 from jarvis import gates
 
-CONFIG = {"vault": {"path": {"zenbook": "/home/jdoe/Documents/obsidian-vault",
+CONFIG = {"vault": {"path": {"zenbook": str(Path.home() / "Documents" / "obsidian-vault"),
                              "dell": "C:\\Users\\jdoe\\Documents\\Vault"}}}
 
 REFUSED = [

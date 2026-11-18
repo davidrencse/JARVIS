@@ -8,7 +8,7 @@ from jarvis import browser_gate, gates
 HOME = str(Path.home())
 CONFIG = {"vault": {"path": {"linux": "~/Documents/obsidian-vault", "windows": "C:\\Vault"}},
           "rules": {"confirm": "never"}}
-BASE = "/home/jdoe/projects/JARVIS"
+BASE = str(Path.home() / "projects" / "JARVIS")
 REPO = Path(__file__).resolve().parents[2]
 
 
@@ -25,7 +25,7 @@ class TerminalDenyTests(unittest.TestCase):
                         "cp a ~/Documents/x/../obsidian-vault/b.md",
                         f"cp a {HOME}/Documents/obsidian-vault",
                         "sed -i s/a/b/ jarvis.config.json",
-                        "echo {} > /home/jdoe/projects/JARVIS/jarvis.config.json",
+                        f"echo {{}} > {BASE}/jarvis.config.json",
                         "rm .jarvis/history.sqlite3",
                         "sqlite3 ~/projects/JARVIS/.jarvis/memory.sqlite3 'delete from m'",
                         "echo x >> JARVIS.md", "cp x ~/.ssh/authorized_keys",

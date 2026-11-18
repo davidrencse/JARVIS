@@ -294,7 +294,7 @@ class Validation(Case):
     def test_macs_only_well_formed(self):
         for good in (JBL, "00:00:00:00:00:00"):
             self.assertTrue(sysintents.MAC.fullmatch(good))
-        for bad in ("18:90:67:96:5A", "02:11:22:33:44:01; reboot", "02:11:22:33:44:01", "02-11-22-33-44-01", "$(id)"):
+        for bad in ("02:11:22:33:44", "02:11:22:33:44:01; reboot", "02:11:22:33:44:0a", "02-11-22-33-44-01", "$(id)"):
             self.assertFalse(sysintents.MAC.fullmatch(bad), bad)
         self.assertEqual(sysintents._info("1;rm"), {})
         self.assertEqual(self.bt.calls, [])

@@ -8,8 +8,13 @@ from jarvis import deploy, release
 from tests.cluster import test_successor_release_proof as fixtures
 
 
+HELPER=Path(__file__).resolve().parents[2]/'artifacts/main-handoff/dell-roundtrip-operator.py'
+
+
 def load_helper():
-    path=Path(__file__).resolve().parents[2]/'artifacts/main-handoff/dell-roundtrip-operator.py'
+    if not HELPER.exists():
+        raise unittest.SkipTest('private handoff helper not in this checkout')
+    path=HELPER
     spec=importlib.util.spec_from_file_location('local_roundtrip_operator',path)
     module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
     return module

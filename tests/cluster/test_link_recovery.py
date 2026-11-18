@@ -84,7 +84,7 @@ class RecoveryTests(unittest.TestCase):
 
     def test_discovery_new_ip_wrong_key_rate_limit_and_subnet_cap(self):
         interfaces = [ipaddress.ip_interface('172.1.41.171/16')]
-        self.assertEqual(str(d.scan_networks(interfaces)[0]), '172.1.44.0/22')
+        self.assertEqual(str(d.scan_networks(interfaces)[0]), '172.1.40.0/22')
         self.assertEqual(d.scan_networks([ipaddress.ip_interface('127.0.0.1/8')]), [])
         machine = CONFIG['devices']['main']
         with tempfile.TemporaryDirectory() as tmp, \

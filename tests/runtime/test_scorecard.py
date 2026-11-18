@@ -17,6 +17,10 @@ DEVICES = {
 CONFIG = {"devices": DEVICES, "cluster": {"main_device": "zenbook"}}
 
 
+NEEDS_CASES = unittest.skipUnless(scorecard.CASES.exists(), "tests/eval/cases.jsonl is private and not in this checkout")
+
+
+@NEEDS_CASES
 class CasesTests(unittest.TestCase):
     def setUp(self):
         self.meta, self.cases = scorecard.load()
@@ -57,6 +61,7 @@ class CasesTests(unittest.TestCase):
                 scorecard.load(path)
 
 
+@NEEDS_CASES
 class PartTests(unittest.TestCase):
     ACT = {"text": "open chrome on arch", "type": "act",
            "commands": [{"intent": "open_app", "device": "zenbook", "args": {"name": "Chrome"}}]}
@@ -134,6 +139,7 @@ class PartTests(unittest.TestCase):
         self.assertEqual(len({c["type"] for c in one}), 7)
 
 
+@NEEDS_CASES
 class RunTests(unittest.TestCase):
     def test_runs_are_saved_and_a_drop_shows(self):
         decider = {"score": 0.9, "n": 10, "correct": 9, "fails": [], "folds": 5, "labels": {},

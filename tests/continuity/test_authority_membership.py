@@ -4,6 +4,7 @@ WS5 enroll calls register_participant(device_id, installation_id, kind, True) an
 not pass reenable. That replay must leave a revoked installation disabled.
 """
 
+from pathlib import Path
 import json
 import os
 import sqlite3
@@ -235,7 +236,7 @@ class Membership(Base):
         env["JARVIS_NO_MODELS"] = "1"
         proc = subprocess.run(
             [sys.executable, "-c", script, str(self.db)],
-            cwd="/home/jdoe/projects/JARVIS",
+            cwd=str(Path(__file__).resolve().parents[2]),
             capture_output=True, text=True, timeout=30, env=env, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout), {"code": "writer_busy"})
