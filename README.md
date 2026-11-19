@@ -1,6 +1,6 @@
 # JARVIS
 
-**A personal assistant and OS layer that runs across David's computers.** Say "Jarvis, …"
+**A personal assistant and OS layer that runs across your computers.** Say "Jarvis, …"
 or type a request. JARVIS works out what you meant, does it on the right machine, checks
 that it happened and remembers it.
 
